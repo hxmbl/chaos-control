@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/model"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.88"
+
+[workspace.dependencies]
+model = { path = "crates/model" }
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
