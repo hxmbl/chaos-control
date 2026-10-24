@@ -2,6 +2,7 @@
 //! radii on a warm off-white. Dark mode follows the OS appearance.
 
 use gpui::{App, BoxShadow, Global, Hsla, WindowAppearance, point, px, rgb};
+use model::AgentState;
 
 /// Bundled UI font (see `assets/fonts`).
 pub const FONT_FAMILY: &str = "Plus Jakarta Sans";
@@ -37,9 +38,10 @@ pub struct Theme {
     pub muted: Hsla,
     pub faint: Hsla,
     pub accent: Hsla,
-    pub status_working: Hsla,
-    pub status_idle: Hsla,
-    pub status_blocked: Hsla,
+    /// Agent Status glows, one per `AgentState`.
+    pub agent_active: Hsla,
+    pub agent_sleeping: Hsla,
+    pub agent_unresponsive: Hsla,
     pub skeleton: Hsla,
     pub skeleton_shine: Hsla,
     pub selection: Hsla,
@@ -67,9 +69,9 @@ impl Theme {
             muted: c(0x8a867e),
             faint: c(0xb3afa6),
             accent: c(0x6e56cf),
-            status_working: c(0x22b35e),
-            status_idle: c(0x4f6bff),
-            status_blocked: c(0xef4444),
+            agent_active: c(0x22b35e),
+            agent_sleeping: c(0x8b5cf6),
+            agent_unresponsive: c(0xef4444),
             skeleton: c(0xd2cfc7),
             skeleton_shine: c(0xe9e7e1),
             selection: c(0x6e56cf).opacity(0.22),
@@ -93,9 +95,9 @@ impl Theme {
             muted: c(0x8f8b83),
             faint: c(0x5f5c56),
             accent: c(0x9b87f5),
-            status_working: c(0x3ddc84),
-            status_idle: c(0x7b8cff),
-            status_blocked: c(0xff5c5c),
+            agent_active: c(0x3ddc84),
+            agent_sleeping: c(0xa78bfa),
+            agent_unresponsive: c(0xff5c5c),
             skeleton: c(0x393834),
             skeleton_shine: c(0x4d4b46),
             selection: c(0x9b87f5).opacity(0.3),
@@ -138,13 +140,24 @@ impl Theme {
         ]
     }
 
-    /// Status glow pooled under an agent pill. On a dark surface the glow reads as
-    /// light, so it spreads a little more.
+    /// Glow colour for an agent's state: green active, purple sleeping, red
+    /// unresponsive.
+    pub fn agent_state(&self, state: AgentState) -> Hsla {
+        match state {
+            AgentState::Active => self.agent_active,
+            AgentState::Sleeping => self.agent_sleeping,
+            AgentState::Unresponsive => self.agent_unresponsive,
+        }
+    }
+
+    /// Status glow pooled under an agent pill. Kept soft (about a third weaker
+    /// than the first cut) so eight of them don't shout; on a dark surface the
+    /// glow reads as light, so it spreads a little more.
     pub fn glow_shadow(&self, glow: Hsla) -> Vec<BoxShadow> {
         let (y, blur, spread, a1, a2) = if self.is_dark() {
-            (6., 16., -6., 0.70, 0.55)
+            (5., 12., -6., 0.45, 0.38)
         } else {
-            (5., 12., -5., 0.75, 0.45)
+            (4., 9., -5., 0.50, 0.32)
         };
         vec![
             BoxShadow {

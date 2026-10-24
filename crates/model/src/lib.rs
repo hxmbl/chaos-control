@@ -31,20 +31,27 @@ pub struct Channel {
     pub project_wide: bool,
 }
 
-/// What an agent is doing right now. Shown as a glow under its pill.
+/// Whether an agent can be talked to right now. Drawn as a coloured glow under
+/// its pill in Agent Status (colours come from the theme, see
+/// `ui::Theme::agent_state`):
+///
+/// - green, [`AgentState::Active`]: running and ready to read and reply.
+/// - purple, [`AgentState::Sleeping`]: idle; it needs a ping before it picks
+///   anything up.
+/// - red, [`AgentState::Unresponsive`]: missing or not answering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentStatus {
-    Working,
-    Idle,
-    Blocked,
+pub enum AgentState {
+    Active,
+    Sleeping,
+    Unresponsive,
 }
 
-impl AgentStatus {
+impl AgentState {
     pub fn label(self) -> &'static str {
         match self {
-            AgentStatus::Working => "Working",
-            AgentStatus::Idle => "Idle",
-            AgentStatus::Blocked => "Blocked",
+            AgentState::Active => "Active",
+            AgentState::Sleeping => "Sleeping, needs a ping",
+            AgentState::Unresponsive => "Unresponsive",
         }
     }
 }
@@ -70,7 +77,7 @@ pub struct Agent {
     pub id: Id,
     pub name: Arc<str>,
     pub brand: Brand,
-    pub status: AgentStatus,
+    pub state: AgentState,
 }
 
 #[derive(Clone, Debug)]

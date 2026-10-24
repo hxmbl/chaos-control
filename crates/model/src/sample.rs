@@ -28,11 +28,11 @@ pub fn sample() -> Workspace {
         unread,
         project_wide: id == MAIN,
     };
-    let agent = |id, name: &str, brand, status| Agent {
+    let agent = |id, name: &str, brand, state| Agent {
         id,
         name: s(name),
         brand,
-        status,
+        state,
     };
     let link = |label: &str, brand, url: &str| QuickLink {
         label: s(label),
@@ -69,30 +69,30 @@ pub fn sample() -> Workspace {
                 CODEX_PLAN,
                 "Codex (planner)",
                 Brand::OpenAi,
-                AgentStatus::Working,
+                AgentState::Active,
             ),
-            agent(CLAUDE, "Claude Code", Brand::Claude, AgentStatus::Idle),
-            agent(DEVIN, "Devin", Brand::Devin, AgentStatus::Working),
+            agent(CLAUDE, "Claude Code", Brand::Claude, AgentState::Sleeping),
+            agent(DEVIN, "Devin", Brand::Devin, AgentState::Active),
             agent(
                 CODEX_REVIEW,
                 "Codex (reviewer)",
                 Brand::OpenAi,
-                AgentStatus::Working,
+                AgentState::Active,
             ),
             agent(
                 COPILOT,
                 "GitHub Copilot",
                 Brand::Copilot,
-                AgentStatus::Working,
+                AgentState::Active,
             ),
             agent(
                 MISTRAL,
                 "Mistral Vibe",
                 Brand::Mistral,
-                AgentStatus::Blocked,
+                AgentState::Unresponsive,
             ),
-            agent(OPENCODE, "opencode", Brand::Opencode, AgentStatus::Idle),
-            agent(PI, "Pi", Brand::Pi, AgentStatus::Blocked),
+            agent(OPENCODE, "opencode", Brand::Opencode, AgentState::Sleeping),
+            agent(PI, "Pi", Brand::Pi, AgentState::Unresponsive),
         ],
         mentions: vec![
             mention(

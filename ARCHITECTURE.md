@@ -18,6 +18,18 @@ immediate-mode elements) instead of a webview.
   `RightSidebar` (+ `CatchUp`), `Conversation`, `Composer`, laid out by the
   root `Workspace` view.
 
+## Agent state
+
+Each agent has a `model::AgentState`, drawn as a soft glow under its pill in
+Agent Status. The theme maps it to a colour (`Theme::agent_state`), so no view
+hardcodes one:
+
+| State | Glow | Meaning |
+| --- | --- | --- |
+| `Active` | green | Running and ready to read and reply. |
+| `Sleeping` | purple | Idle; needs a ping before it picks anything up. |
+| `Unresponsive` | red | Missing or not answering. |
+
 ## State
 
 - One `Entity<ChatStore>` owns the chat state: the workspace, the selected

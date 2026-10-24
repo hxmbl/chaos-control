@@ -8,7 +8,6 @@ use gpui::{
     SharedString, StyleRefinement, Window, div, linear_color_stop, linear_gradient, point,
     prelude::*, px, relative, transparent_black,
 };
-use model::AgentStatus;
 use ui::{ActiveTheme, Ellipsis, IconName, Theme, Tooltip, brand_icon, icon, pill};
 
 use crate::store::ChatStore;
@@ -61,13 +60,7 @@ impl Render for RightSidebar {
         let agents: Vec<_> = ws
             .agents
             .iter()
-            .map(|a| {
-                (
-                    a.brand,
-                    a.status,
-                    format!("{}: {}", a.name, a.status.label()),
-                )
-            })
+            .map(|a| (a.brand, a.state, format!("{}: {}", a.name, a.state.label())))
             .collect();
         let count = mention_rows.len();
         let open = self.mentions_open;
@@ -219,12 +212,8 @@ impl Render for RightSidebar {
                                 .flex()
                                 .gap(px(6.))
                                 .children(chunk.iter().enumerate().map(
-                                    |(col, (brand, status, label))| {
-                                        let glow = match status {
-                                            AgentStatus::Working => t.status_working,
-                                            AgentStatus::Idle => t.status_idle,
-                                            AgentStatus::Blocked => t.status_blocked,
-                                        };
+                                    |(col, (brand, state, label))| {
+                                        let glow = t.agent_state(*state);
                                         pill(("agent", row * 4 + col), cx)
                                             .flex_1()
                                             .min_w_0()
