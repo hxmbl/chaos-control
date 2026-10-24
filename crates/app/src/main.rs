@@ -27,10 +27,16 @@ fn main() {
             ui::init(cx);
 
             cx.on_action(|_: &Quit, cx| cx.quit());
+            // Shortcuts stay conventional (see "Shortcuts" in ARCHITECTURE.md): a
+            // combo people already know keeps its usual meaning here.
             cx.bind_keys([
                 KeyBinding::new("secondary-q", Quit, None),
-                KeyBinding::new("secondary-b", panels::ToggleLeftSidebar, None),
-                KeyBinding::new("secondary-alt-b", panels::ToggleRightSidebar, None),
+                // Plain cmd/ctrl-[ and ] stay free for back/forward through
+                // channel history; cmd/ctrl-B stays free for bold in the composer.
+                KeyBinding::new("secondary-alt-[", panels::ToggleLeftSidebar, None),
+                KeyBinding::new("secondary-alt-]", panels::ToggleRightSidebar, None),
+                // TODO: cmd/ctrl-F and ctrl-shift-P will focus the bar too once it
+                // doubles as the command palette. Reserved, not bound yet.
                 KeyBinding::new("secondary-k", search::FocusSearch, None),
                 KeyBinding::new("down", search::SelectNext, Some(search::KEY_CONTEXT)),
                 KeyBinding::new("up", search::SelectPrevious, Some(search::KEY_CONTEXT)),

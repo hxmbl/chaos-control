@@ -97,7 +97,7 @@ UI.
   handles on each edge; when it insists on server decorations, those are skipped.
 - Window: 1440×900 by default, 760×520 minimum.
 - Sidebar toggles: titlebar buttons at either end (the left one just past the
-  macOS traffic lights) and `cmd/ctrl-B` / `cmd/ctrl-alt-B`. The open state is
+  macOS traffic lights) and `cmd/ctrl-alt-[` / `cmd/ctrl-alt-]`. The open state is
   user intent held in an `Entity<Panels>`; toggling slides the panel off its
   edge over 180ms while the centre column reflows. Below 1200px of width the
   right sidebar stays hidden whatever its toggle says, and comes back on
@@ -107,3 +107,28 @@ UI.
   (the channel list, catch-up card and mentions take the extra height). The
   conversation and composer share one centred column that widens with the
   window, from 720px up to 960px.
+
+## Shortcuts
+
+Rule (pre-release, standing): stay conventional. If a combo already means
+something to most people, it does that here, even if one of our features has to
+move. Chat apps (Slack, Discord) and desktop text editing win over IDE habits
+where they clash, and text fields never lose the standard editing keys (copy,
+paste, cut, undo, select all, word and line navigation). `secondary` is cmd on
+macOS and ctrl elsewhere.
+
+| Keys | Does | Where |
+| --- | --- | --- |
+| `cmd/ctrl-K` | Focus search | Anywhere |
+| `cmd/ctrl-alt-[` | Show/hide the left sidebar | Anywhere |
+| `cmd/ctrl-alt-]` | Show/hide the right sidebar | Anywhere |
+| `up` / `down` | Move through results | Search field |
+| `enter` | Jump to the highlighted result | Search field |
+| `escape` | Close results; again to clear | Search field |
+| `enter` | Send | Composer |
+| `cmd/ctrl-Q` | Quit | Anywhere |
+
+Reserved, not bound yet: `cmd/ctrl-F` and `ctrl-shift-P` (also focus the bar
+once it doubles as the command palette), `cmd/ctrl-[` / `cmd/ctrl-]` (back and
+forward through channel history), `cmd/ctrl-B`, `I`, `U` (bold, italic,
+underline in the composer).
