@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { Composer } from "./components/Composer";
 import { Conversation } from "./components/Conversation";
+import { RightSidebar } from "./components/RightSidebar";
 import { Sidebar } from "./components/Sidebar";
 import { Titlebar } from "./components/Titlebar";
-import { channels, projects, quickLinks } from "./data/sample";
+import { agents, channels, mentions, projects, quickLinks } from "./data/sample";
 
 export default function App() {
   const project = projects[0];
@@ -15,12 +16,15 @@ export default function App() {
       <Titlebar />
 
       <div className="relative min-h-0 flex-1">
-        {/* Centre column. Mirrors the sidebar's width on the right when there is room, so content sits mid-window. */}
-        <main className="absolute inset-0 flex flex-col pr-5 pl-[290px] min-[1380px]:pr-[290px]">
+        {/*
+          Centre column. Below 1200px only the left sidebar shows. From 1200px the right sidebar
+          appears and both sides reserve the wider panel's width, so search and composer stay mid-window.
+        */}
+        <main className="absolute inset-0 flex flex-col pr-5 pl-[290px] min-[1200px]:px-[344px]">
           <div className="min-h-0 flex-1 pb-32">
             <Conversation channel={channel} projectName={project.name} />
           </div>
-          <div className="pointer-events-none absolute inset-x-0 bottom-6 flex justify-center pr-5 pl-[290px] min-[1380px]:pr-[290px]">
+          <div className="pointer-events-none absolute inset-x-0 bottom-6 flex justify-center pr-5 pl-[290px] min-[1200px]:px-[344px]">
             <div className="w-full max-w-[800px]">
               <Composer channelName={channel.name} />
             </div>
@@ -37,6 +41,15 @@ export default function App() {
             onSelect={setSelectedId}
           />
         </aside>
+
+        {/* Floating, detached activity panel mirroring the left sidebar. Hidden below 1200px. */}
+        <div className="absolute right-3 hidden w-[320px] top-[max(4px,calc(14.3vh-52px))] bottom-[max(12px,14.3vh)] min-[1200px]:block">
+          <RightSidebar
+            agents={agents}
+            mentions={mentions}
+            onOpenMention={(m) => setSelectedId(m.channelId)}
+          />
+        </div>
       </div>
     </div>
   );
