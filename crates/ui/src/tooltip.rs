@@ -1,6 +1,6 @@
 use gpui::{
-    AnyView, App, Context, IntoElement, ParentElement, Render, SharedString, Styled, Window, div,
-    px,
+    AnyView, App, AppContext, Context, IntoElement, ParentElement, Render, SharedString, Styled,
+    Window, div, px,
 };
 
 use crate::{ActiveTheme, FONT_FAMILY};
