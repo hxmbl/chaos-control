@@ -23,6 +23,15 @@
   --color-focus: #6e56cf;
 
   --shadow-float: 0 1px 2px rgb(31 30 28 / 0.04), 0 8px 24px -12px rgb(31 30 28 / 0.12);
+
+  /* Agent status glows: working, idle, blocked. */
+  --color-status-working: #22b35e;
+  --color-status-idle: #4f6bff;
+  --color-status-blocked: #ef4444;
+
+  /* Catch-up skeleton. */
+  --color-skeleton: #d2cfc7;
+  --color-skeleton-shine: #e9e7e1;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -42,6 +51,13 @@
     --color-focus: #9b87f5;
 
     --shadow-float: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 32px -12px rgb(0 0 0 / 0.5);
+
+    --color-status-working: #3ddc84;
+    --color-status-idle: #7b8cff;
+    --color-status-blocked: #ff5c5c;
+
+    --color-skeleton: #393834;
+    --color-skeleton-shine: #4d4b46;
   }
 }
 
@@ -68,4 +84,75 @@ body {
 :focus-visible {
   outline: 2px solid var(--color-focus);
   outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------- right sidebar */
+
+/* Blurred placeholder lines with a slow shimmer sweeping across them. */
+.skeleton-line {
+  background: linear-gradient(
+    100deg,
+    var(--color-skeleton) 30%,
+    var(--color-skeleton-shine) 50%,
+    var(--color-skeleton) 70%
+  );
+  background-size: 300% 100%;
+  filter: blur(3px);
+  animation: skeleton-shimmer 2.4s ease-in-out infinite;
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: 0 0;
+  }
+}
+
+.catchup-sparkle {
+  animation: sparkle-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes sparkle-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+/* Status glow pooled under each agent pill, as in the wireframe. */
+.agent-pill {
+  --glow: transparent;
+  box-shadow:
+    0 5px 12px -5px color-mix(in srgb, var(--glow) 75%, transparent),
+    0 2px 0 -1px color-mix(in srgb, var(--glow) 45%, transparent);
+}
+.glow-working {
+  --glow: var(--color-status-working);
+}
+.glow-idle {
+  --glow: var(--color-status-idle);
+}
+.glow-blocked {
+  --glow: var(--color-status-blocked);
+}
+
+@media (prefers-color-scheme: dark) {
+  /* On a dark surface the glow reads as light, so let it spread a little more. */
+  .agent-pill {
+    box-shadow:
+      0 6px 16px -6px color-mix(in srgb, var(--glow) 70%, transparent),
+      0 2px 0 -1px color-mix(in srgb, var(--glow) 55%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton-line,
+  .catchup-sparkle {
+    animation: none;
+  }
 }
