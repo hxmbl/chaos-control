@@ -2,6 +2,7 @@
 
 mod composer;
 mod conversation;
+mod panels;
 mod right_sidebar;
 mod sidebar;
 mod store;
@@ -25,7 +26,11 @@ fn main() {
             ui::init(cx);
 
             cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.bind_keys([KeyBinding::new("secondary-q", Quit, None)]);
+            cx.bind_keys([
+                KeyBinding::new("secondary-q", Quit, None),
+                KeyBinding::new("secondary-b", panels::ToggleLeftSidebar, None),
+                KeyBinding::new("secondary-alt-b", panels::ToggleRightSidebar, None),
+            ]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();

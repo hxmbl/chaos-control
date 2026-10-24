@@ -24,6 +24,8 @@ static FILES: &[(&str, &[u8])] = embed![
     "icons/phosphor/magnifying-glass-bold.svg",
     "icons/phosphor/minus.svg",
     "icons/phosphor/plus.svg",
+    "icons/phosphor/sidebar-simple-right.svg",
+    "icons/phosphor/sidebar-simple.svg",
     "icons/phosphor/sparkle.svg",
     "icons/phosphor/square.svg",
     "icons/phosphor/x.svg",

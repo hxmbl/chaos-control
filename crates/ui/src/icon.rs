@@ -17,6 +17,8 @@ pub enum IconName {
     MagnifyingGlassBold,
     Minus,
     Plus,
+    SidebarLeft,
+    SidebarRight,
     Sparkle,
     Square,
     X,
@@ -34,7 +36,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [IconName; 26] = [
+    pub const ALL: [IconName; 28] = [
         IconName::Archive,
         IconName::ArrowUpBold,
         IconName::CaretDown,
@@ -47,6 +49,8 @@ impl IconName {
         IconName::MagnifyingGlassBold,
         IconName::Minus,
         IconName::Plus,
+        IconName::SidebarLeft,
+        IconName::SidebarRight,
         IconName::Sparkle,
         IconName::Square,
         IconName::X,
@@ -77,6 +81,9 @@ impl IconName {
             IconName::MagnifyingGlassBold => "icons/phosphor/magnifying-glass-bold.svg",
             IconName::Minus => "icons/phosphor/minus.svg",
             IconName::Plus => "icons/phosphor/plus.svg",
+            IconName::SidebarLeft => "icons/phosphor/sidebar-simple.svg",
+            // Phosphor's sidebar-simple, mirrored.
+            IconName::SidebarRight => "icons/phosphor/sidebar-simple-right.svg",
             IconName::Sparkle => "icons/phosphor/sparkle.svg",
             IconName::Square => "icons/phosphor/square.svg",
             IconName::X => "icons/phosphor/x.svg",

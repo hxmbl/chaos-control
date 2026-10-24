@@ -65,8 +65,13 @@ batched per frame when many agents post at once.
 - Linux: the window asks for client-side decorations. When the compositor
   agrees, the app draws minimise, maximise and close, a 1px border and resize
   handles on each edge; when it insists on server decorations, those are skipped.
-- Window: 1440×900 by default, 760×520 minimum. The right sidebar hides below
-  1200px of width.
+- Window: 1440×900 by default, 760×520 minimum.
+- Sidebar toggles: titlebar buttons at either end (the left one just past the
+  macOS traffic lights) and `cmd/ctrl-B` / `cmd/ctrl-alt-B`. The open state is
+  user intent held in an `Entity<Panels>`; toggling slides the panel off its
+  edge over 180ms while the centre column reflows. Below 1200px of width the
+  right sidebar stays hidden whatever its toggle says, and comes back on
+  widening only if it was left open.
 - Layout: both sidebars float 12px from the window edges and run from just
   under the titlebar to 12px above the bottom, so they grow with the window
   (the channel list, catch-up card and mentions take the extra height). The

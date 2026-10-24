@@ -8,12 +8,17 @@ use gpui::{
 use ui::{ActiveTheme, FONT_FAMILY, Theme};
 
 use crate::{
-    composer::Composer, conversation::Conversation, right_sidebar::RightSidebar, sidebar::Sidebar,
-    store::ChatStore, titlebar::Titlebar,
+    composer::Composer,
+    conversation::Conversation,
+    panels::{Panels, ToggleLeftSidebar, ToggleRightSidebar},
+    right_sidebar::RightSidebar,
+    sidebar::Sidebar,
+    store::ChatStore,
+    titlebar::Titlebar,
 };
 
-/// Below this window width only the left sidebar shows.
-const WIDE_BREAKPOINT: Pixels = px(1200.);
+/// Below this window width the right sidebar is hidden, whatever its toggle says.
+pub const WIDE_BREAKPOINT: Pixels = px(1200.);
 const LEFT_WIDTH: Pixels = px(258.);
 const RIGHT_WIDTH: Pixels = px(320.);
 /// Gap between the window edge and a floating panel. The sidebars use it on the
@@ -49,12 +54,13 @@ fn centre_column(viewport: Pixels, left: Pixels, right: Pixels) -> (Pixels, Pixe
 }
 
 pub struct Workspace {
+    panels: Entity<Panels>,
     titlebar: Entity<Titlebar>,
     sidebar: Entity<Sidebar>,
     right_sidebar: Entity<RightSidebar>,
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
-    _appearance: Subscription,
+    _subscriptions: [Subscription; 2],
 }
 
 impl Workspace {
@@ -67,13 +73,17 @@ impl Workspace {
         // The app-level theme was picked before the window existed; trust the window.
         cx.set_global(Theme::for_appearance(window.appearance()));
 
+        let panels = cx.new(|_| Panels::new());
+        let panels_changed = cx.observe(&panels, |_, _, cx| cx.notify());
+
         Self {
-            titlebar: cx.new(|cx| Titlebar::new(window, cx)),
+            titlebar: cx.new(|cx| Titlebar::new(panels.clone(), window, cx)),
+            panels,
             sidebar: cx.new(|cx| Sidebar::new(store.clone(), cx)),
             right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), cx)),
             conversation: cx.new(|cx| Conversation::new(store.clone(), cx)),
             composer: cx.new(|cx| Composer::new(store.clone(), window, cx)),
-            _appearance: appearance,
+            _subscriptions: [appearance, panels_changed],
         }
     }
 }
@@ -90,18 +100,28 @@ impl Render for Workspace {
         let viewport = window.viewport_size();
         let wide = viewport.width >= WIDE_BREAKPOINT;
 
-        let left_space = SIDE_INSET + LEFT_WIDTH;
-        let right_space = if wide {
-            RIGHT_WIDTH + SIDE_INSET
-        } else {
-            px(0.)
-        };
+        // 0 = hidden, 1 = shown; in between while a toggle slides the panel.
+        let (left_shown, right_toggle, sliding) = self.panels.read(cx).progress();
+        let right_shown = if wide { right_toggle } else { 0. };
+        if sliding {
+            window.request_animation_frame();
+        }
+
+        let left_space = (SIDE_INSET + LEFT_WIDTH) * left_shown;
+        let right_space = (RIGHT_WIDTH + SIDE_INSET) * right_shown;
         let (pad_l, pad_r, column_w) = centre_column(viewport.width, left_space, right_space);
 
         let decorations = window.window_decorations();
 
         div()
             .id("workspace")
+            .key_context("Workspace")
+            .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _, cx| {
+                this.panels.update(cx, |p, cx| p.toggle_left(cx));
+            }))
+            .on_action(cx.listener(|this, _: &ToggleRightSidebar, _, cx| {
+                this.panels.update(cx, |p, cx| p.toggle_right(cx));
+            }))
             .size_full()
             .relative()
             .flex()
@@ -151,23 +171,28 @@ impl Render for Workspace {
                             .justify_center()
                             .child(div().w_full().max_w(column_w).child(self.composer.clone())),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .left(SIDE_INSET)
-                            .w(LEFT_WIDTH)
-                            .top(SIDE_TOP)
-                            .bottom(SIDE_INSET)
-                            .child(cached(&self.sidebar)),
-                    )
-                    .when(wide, |this| {
+                    // Hidden sidebars slide off their edge and fade.
+                    .when(left_shown > 0., |this| {
                         this.child(
                             div()
                                 .absolute()
-                                .right(SIDE_INSET)
+                                .left(SIDE_INSET - (LEFT_WIDTH + SIDE_INSET) * (1. - left_shown))
+                                .w(LEFT_WIDTH)
+                                .top(SIDE_TOP)
+                                .bottom(SIDE_INSET)
+                                .opacity(left_shown)
+                                .child(cached(&self.sidebar)),
+                        )
+                    })
+                    .when(right_shown > 0., |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .right(SIDE_INSET - (RIGHT_WIDTH + SIDE_INSET) * (1. - right_shown))
                                 .w(RIGHT_WIDTH)
                                 .top(SIDE_TOP)
                                 .bottom(SIDE_INSET)
+                                .opacity(right_shown)
                                 .child(cached(&self.right_sidebar)),
                         )
                     }),
@@ -229,4 +254,29 @@ fn resize_handles() -> impl Iterator<Item = gpui::AnyElement> {
     ]
     .into_iter()
     .map(handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn column_centres_when_there_is_room() {
+        let (l, r, w) = centre_column(px(1920.), px(270.), px(332.));
+        assert_eq!(l, r);
+        assert_eq!(w, COLUMN_MAX);
+    }
+
+    #[test]
+    fn column_uses_leftover_space_when_centring_would_squeeze_it() {
+        let (l, r, w) = centre_column(px(1440.), px(270.), px(332.));
+        assert!(l < r);
+        assert!(px(1440.) - l - r <= w);
+    }
+
+    #[test]
+    fn column_widens_with_the_window_within_bounds() {
+        assert_eq!(centre_column(px(800.), px(0.), px(0.)).2, COLUMN_MIN);
+        assert_eq!(centre_column(px(3000.), px(0.), px(0.)).2, COLUMN_MAX);
+    }
 }

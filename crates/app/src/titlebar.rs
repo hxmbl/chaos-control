@@ -1,23 +1,37 @@
-//! Window titlebar: centred search pill and, with client-side decorations,
-//! window controls. On macOS the native traffic lights sit in the top-left gap.
+//! Window titlebar: sidebar toggles at either end, the centred search pill and,
+//! with client-side decorations, window controls. On macOS the native traffic
+//! lights sit in the top-left corner, so the left toggle moves past them.
 
 use gpui::{
     Context, Decorations, Entity, Focusable, MouseButton, Window, WindowControlArea, div,
     prelude::*, px,
 };
-use ui::{ActiveTheme, IconName, TextInput, icon};
+use ui::{ActiveTheme, IconName, TextInput, Tooltip, icon};
+
+use crate::{
+    panels::{Panels, ToggleLeftSidebar, ToggleRightSidebar},
+    workspace::WIDE_BREAKPOINT,
+};
+
+/// Where the left toggle sits on macOS: just right of the traffic lights.
+const MAC_TRAFFIC_LIGHTS_END: f32 = 84.;
+/// Width of the Linux window controls (three 28px buttons, 4px gaps) plus a gap.
+const WINDOW_CONTROLS_WIDTH: f32 = 3. * 28. + 2. * 4. + 8.;
 
 pub struct Titlebar {
+    panels: Entity<Panels>,
     search: Entity<TextInput>,
     /// Set on mouse-down so a following drag moves the window (Linux CSD).
     should_move: bool,
 }
 
 impl Titlebar {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(panels: Entity<Panels>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.observe(&panels, |_, _, cx| cx.notify()).detach();
         let search =
             cx.new(|cx| TextInput::new("Looking for something? Let's search.", cx).centered());
         Self {
+            panels,
             search,
             should_move: false,
         }
@@ -93,9 +107,85 @@ impl Render for Titlebar {
                     )))
                     .child(div().w_full().px(px(32.)).child(self.search.clone())),
             )
+            .child(self.render_toggles(window, cx))
             .when(client_decorations, |this| {
                 this.child(window_controls(window, cx))
             })
+    }
+}
+
+impl Titlebar {
+    /// Zed/Arc-style panel toggles: left sidebar at the left end, right sidebar
+    /// at the right end. Highlighted while their panel is open.
+    fn render_toggles(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
+        let panels = self.panels.read(cx);
+        let (left_open, right_open) = (panels.left_open(), panels.right_open());
+        let narrow = window.viewport_size().width < WIDE_BREAKPOINT;
+        let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
+        let mac_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
+
+        let left_x = if mac_lights {
+            px(MAC_TRAFFIC_LIGHTS_END)
+        } else {
+            px(12.)
+        };
+        let right_x = if client_decorations {
+            px(12. + WINDOW_CONTROLS_WIDTH)
+        } else {
+            px(12.)
+        };
+
+        let (hover, selected) = (t.hover, t.selected);
+        let toggle = |id: &'static str, name: IconName, on: bool| {
+            div()
+                .id(id)
+                .absolute()
+                .size(px(28.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(8.))
+                .when(on, |s| s.bg(selected))
+                .hover(move |s| s.bg(if on { selected } else { hover }))
+                // Clicks on the button must not start a window drag.
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(icon(name, px(17.), if on { t.ink } else { t.muted }))
+        };
+
+        let right_tip = match (right_open, narrow) {
+            (_, true) => "Activity panel (hidden below 1200px wide)",
+            (true, false) => "Hide activity panel",
+            (false, false) => "Show activity panel",
+        };
+
+        div()
+            .absolute()
+            .inset_0()
+            .child(
+                toggle("toggle-left-sidebar", IconName::SidebarLeft, left_open)
+                    .top(px(12.))
+                    .left(left_x)
+                    .tooltip(Tooltip::text(if left_open {
+                        "Hide sidebar"
+                    } else {
+                        "Show sidebar"
+                    }))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleLeftSidebar), cx)
+                    }),
+            )
+            .child(
+                toggle(
+                    "toggle-right-sidebar",
+                    IconName::SidebarRight,
+                    right_open && !narrow,
+                )
+                .top(px(12.))
+                .right(right_x)
+                .tooltip(Tooltip::text(right_tip))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleRightSidebar), cx)),
+            )
     }
 }
 
