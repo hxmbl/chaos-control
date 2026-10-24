@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/model"]
+members = ["crates/model", "crates/ui"]
 
 [workspace.package]
 version = "0.0.1"
@@ -10,6 +10,10 @@ publish = false
 rust-version = "1.88"
 
 [workspace.dependencies]
+# GPUI, Zed's UI framework. Pinned to the latest crates.io release so CI and
+# local builds resolve the same thing; bump deliberately.
+gpui = "=0.2.2"
+unicode-segmentation = "1.12"
 model = { path = "crates/model" }
 
 [workspace.lints.clippy]
