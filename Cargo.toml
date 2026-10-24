@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/model", "crates/ui"]
+members = ["crates/app", "crates/model", "crates/ui"]
+default-members = ["crates/app"]
 
 [workspace.package]
 version = "0.0.1"
@@ -15,6 +16,7 @@ rust-version = "1.88"
 gpui = "=0.2.2"
 unicode-segmentation = "1.12"
 model = { path = "crates/model" }
+ui = { path = "crates/ui" }
 
 [workspace.lints.clippy]
 dbg_macro = "deny"
