@@ -1,7 +1,71 @@
 @import "tailwindcss";
 
+/*
+ * Calm, outline-first palette taken from the v0.0.1 wireframe: thin lines,
+ * pills and generous radii on a warm off-white. Dark follows the OS.
+ */
+@theme {
+  --font-sans: "Plus Jakarta Sans Variable", "Plus Jakarta Sans", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji";
+
+  --color-canvas: #f6f5f2;
+  --color-surface: #ffffff;
+  --color-sunken: #f1f0ec;
+  --color-hover: #f3f2ee;
+  --color-selected: #ecebe6;
+  --color-line: #e2e0da;
+  --color-line-strong: #cfccc4;
+  --color-ink: #1f1e1c;
+  --color-ink-soft: #4a4843;
+  --color-muted: #8a867e;
+  --color-faint: #b3afa6;
+  --color-accent: #6e56cf;
+  --color-focus: #6e56cf;
+
+  --shadow-float: 0 1px 2px rgb(31 30 28 / 0.04), 0 8px 24px -12px rgb(31 30 28 / 0.12);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-canvas: #151514;
+    --color-surface: #1c1c1a;
+    --color-sunken: #191917;
+    --color-hover: #242422;
+    --color-selected: #2b2b28;
+    --color-line: #2f2e2b;
+    --color-line-strong: #43423e;
+    --color-ink: #edece8;
+    --color-ink-soft: #c9c6bf;
+    --color-muted: #8f8b83;
+    --color-faint: #5f5c56;
+    --color-accent: #9b87f5;
+    --color-focus: #9b87f5;
+
+    --shadow-float: 0 1px 2px rgb(0 0 0 / 0.3), 0 12px 32px -12px rgb(0 0 0 / 0.5);
+  }
+}
+
 html,
 body,
 #root {
   height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Desktop app: text is not selectable unless it is content. */
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-focus);
+  outline-offset: 2px;
 }
