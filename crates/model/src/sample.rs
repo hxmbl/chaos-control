@@ -147,7 +147,7 @@ pub fn demo_history(count: usize) -> impl Iterator<Item = Message> {
         x ^= x << 13;
         x ^= x >> 17;
         x ^= x << 5;
-        let author = if x % 7 == 0 {
+        let author = if x.is_multiple_of(7) {
             Author::Human
         } else {
             Author::Agent(AGENTS[(x as usize) % AGENTS.len()])
