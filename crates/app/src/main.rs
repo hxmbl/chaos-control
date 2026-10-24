@@ -4,6 +4,7 @@ mod composer;
 mod conversation;
 mod panels;
 mod right_sidebar;
+mod search;
 mod sidebar;
 mod store;
 mod titlebar;
@@ -30,6 +31,10 @@ fn main() {
                 KeyBinding::new("secondary-q", Quit, None),
                 KeyBinding::new("secondary-b", panels::ToggleLeftSidebar, None),
                 KeyBinding::new("secondary-alt-b", panels::ToggleRightSidebar, None),
+                KeyBinding::new("secondary-k", search::FocusSearch, None),
+                KeyBinding::new("down", search::SelectNext, Some(search::KEY_CONTEXT)),
+                KeyBinding::new("up", search::SelectPrevious, Some(search::KEY_CONTEXT)),
+                KeyBinding::new("escape", search::Dismiss, Some(search::KEY_CONTEXT)),
             ]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {

@@ -4,8 +4,13 @@
 //! Strings are `Arc<str>` so the UI can turn them into `SharedString`s without copying.
 
 mod sample;
+pub mod search;
 
 pub use sample::{demo_history, sample};
+pub use search::{
+    CorpusChannel, SearchAction, SearchCorpus, SearchHit, SearchProvider, SearchResult,
+    SubstringSearch,
+};
 
 use std::sync::Arc;
 
@@ -137,9 +142,12 @@ impl Workspace {
 ///
 /// Messages arrive whole and are only ever appended, so the UI can splice the new
 /// rows onto the end of its virtualized list instead of re-measuring history.
+///
+/// The messages sit behind an `Arc` so search can take a snapshot without
+/// copying; appending while a snapshot is alive copies once (copy-on-write).
 #[derive(Debug, Default)]
 pub struct ChannelLog {
-    messages: Vec<Message>,
+    messages: Arc<Vec<Message>>,
 }
 
 impl ChannelLog {
@@ -157,9 +165,15 @@ impl ChannelLog {
 
     /// Appends a batch and returns the index range the new messages occupy.
     pub fn extend(&mut self, batch: impl IntoIterator<Item = Message>) -> std::ops::Range<usize> {
-        let start = self.messages.len();
-        self.messages.extend(batch);
-        start..self.messages.len()
+        let messages = Arc::make_mut(&mut self.messages);
+        let start = messages.len();
+        messages.extend(batch);
+        start..messages.len()
+    }
+
+    /// The whole history as it is now, for reading off the UI thread.
+    pub fn snapshot(&self) -> Arc<Vec<Message>> {
+        self.messages.clone()
     }
 }
 
@@ -194,6 +208,16 @@ mod tests {
         assert_eq!(r, 0..3);
         let r = log.extend(demo_history(2));
         assert_eq!(r, 3..5);
+        assert_eq!(log.len(), 5);
+    }
+
+    #[test]
+    fn snapshots_do_not_see_later_appends() {
+        let mut log = ChannelLog::default();
+        log.extend(demo_history(3));
+        let snapshot = log.snapshot();
+        log.extend(demo_history(2));
+        assert_eq!(snapshot.len(), 3);
         assert_eq!(log.len(), 5);
     }
 

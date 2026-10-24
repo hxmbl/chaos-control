@@ -6,10 +6,11 @@ use gpui::{
     Context, Decorations, Entity, Focusable, MouseButton, Window, WindowControlArea, div,
     prelude::*, px,
 };
-use ui::{ActiveTheme, IconName, TextInput, Tooltip, icon};
+use ui::{ActiveTheme, IconName, Tooltip, icon};
 
 use crate::{
     panels::{Panels, ToggleLeftSidebar, ToggleRightSidebar},
+    search::Search,
     workspace::WIDE_BREAKPOINT,
 };
 
@@ -20,16 +21,19 @@ const WINDOW_CONTROLS_WIDTH: f32 = 3. * 28. + 2. * 4. + 8.;
 
 pub struct Titlebar {
     panels: Entity<Panels>,
-    search: Entity<TextInput>,
+    search: Entity<Search>,
     /// Set on mouse-down so a following drag moves the window (Linux CSD).
     should_move: bool,
 }
 
 impl Titlebar {
-    pub fn new(panels: Entity<Panels>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        panels: Entity<Panels>,
+        search: Entity<Search>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&panels, |_, _, cx| cx.notify()).detach();
-        let search =
-            cx.new(|cx| TextInput::new("Looking for something? Let's search.", cx).centered());
         Self {
             panels,
             search,
@@ -46,6 +50,9 @@ impl Render for Titlebar {
         let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
         let hover_line = t.line_strong;
         let search_focused = self.search.focus_handle(cx).is_focused(window);
+        let field = self
+            .search
+            .update(cx, |search, cx| search.field(window, cx));
 
         div()
             .id("titlebar")
@@ -105,7 +112,7 @@ impl Render for Titlebar {
                         px(15.),
                         t.muted,
                     )))
-                    .child(div().w_full().px(px(32.)).child(self.search.clone())),
+                    .child(div().w_full().px(px(32.)).child(field)),
             )
             .child(self.render_toggles(window, cx))
             .when(client_decorations, |this| {

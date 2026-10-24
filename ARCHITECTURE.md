@@ -51,6 +51,24 @@ already laid out is left alone. When a backend exists, it receives on a
 background task and hands finished messages to `append` on the main thread,
 batched per frame when many agents post at once.
 
+## Search
+
+The titlebar field (`cmd/ctrl-K`) searches channel names and message text
+across every channel. The UI only knows the `model::SearchProvider` trait: each
+keystroke takes a `SearchCorpus` snapshot from the store (it clones `Arc`s, not
+messages; `ChannelLog` is copy-on-write) and runs the provider on
+`cx.background_spawn`, so a 100k-message history never blocks typing. A newer
+query sets the previous one's cancel flag and drops its task, so stale results
+never land. Results (channels first, then messages newest first, capped at 20)
+show in one panel hanging from the titlebar at the chat column's width: the
+highlighted result as a card, then the rest as rows, with a "…" row when more
+are hidden. Up/down move, Enter or a click jumps to the channel and scrolls to
+the message, Escape closes. Each `SearchResult` can carry `SearchAction`s for
+the coming command palette (new chat, ask an agent, link in main); none are
+produced yet. Today's provider, `SubstringSearch`, is a plain case-insensitive
+scan; ranking, semantic search or commands can replace it without touching the
+UI.
+
 ## Rendering
 
 - **Virtualized lists.** The message history uses GPUI `list` with a

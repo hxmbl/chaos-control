@@ -39,6 +39,10 @@ impl Composer {
         }
     }
 
+    pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.input.focus_handle(cx));
+    }
+
     fn send(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text().clone();
         if text.trim().is_empty() {

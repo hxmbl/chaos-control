@@ -7,8 +7,8 @@
 //! without touching the heights already measured.
 
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, ListAlignment, ListState, SharedString, Subscription,
-    Window, div, list, prelude::*, px,
+    AnyElement, Context, Entity, FontWeight, ListAlignment, ListOffset, ListState, SharedString,
+    Subscription, Window, div, list, prelude::*, px,
 };
 use model::{Author, Id};
 use ui::{ActiveTheme, Ellipsis, IconName, brand_icon, icon};
@@ -19,6 +19,8 @@ pub struct Conversation {
     store: Entity<ChatStore>,
     channel: Id,
     list: ListState,
+    /// Message picked in search, tinted until the channel changes.
+    highlighted: Option<usize>,
     _store_events: Subscription,
 }
 
@@ -32,8 +34,20 @@ impl Conversation {
                 let count = store.read(cx).log(this.channel).map_or(0, |l| l.len());
                 // Bottom-aligned, so a reset lands on the newest message.
                 this.list.reset(count);
+                this.highlighted = None;
                 cx.notify();
             }
+            StoreEvent::Reveal { channel, index } if *channel == this.channel => {
+                // Put a couple of messages of context above the hit. Works before
+                // rows are measured, unlike scroll_to_reveal_item.
+                this.list.scroll_to(ListOffset {
+                    item_ix: index.saturating_sub(2),
+                    offset_in_item: px(0.),
+                });
+                this.highlighted = Some(*index);
+                cx.notify();
+            }
+            StoreEvent::Reveal { .. } => {}
             StoreEvent::Appended { channel, range } if *channel == this.channel => {
                 let old = this.list.item_count();
                 this.list.splice(old..old, range.len());
@@ -45,6 +59,7 @@ impl Conversation {
             store,
             channel,
             list: ListState::new(count, ListAlignment::Bottom, px(600.)),
+            highlighted: None,
             _store_events: subscription,
         }
     }
@@ -84,6 +99,8 @@ impl Conversation {
                     .gap(px(12.))
                     .px(px(8.))
                     .py(px(8.))
+                    .rounded(px(14.))
+                    .when(self.highlighted == Some(ix), |row| row.bg(t.selected))
                     .child(
                         div()
                             .size(px(32.))

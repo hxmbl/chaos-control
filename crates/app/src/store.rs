@@ -7,7 +7,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{Context, EventEmitter};
-use model::{Author, ChannelLog, Id, Message, Workspace};
+use model::{Author, ChannelLog, CorpusChannel, Id, Message, SearchCorpus, Workspace};
 
 pub enum StoreEvent {
     /// The selected channel changed.
@@ -17,6 +17,9 @@ pub enum StoreEvent {
         channel: Id,
         range: std::ops::Range<usize>,
     },
+    /// Scroll to and highlight a message (from search). Follows `Selected` when
+    /// the message is in another channel.
+    Reveal { channel: Id, index: usize },
 }
 
 pub struct ChatStore {
@@ -70,6 +73,36 @@ impl ChatStore {
             }
             cx.emit(StoreEvent::Selected);
             cx.notify();
+        }
+    }
+
+    /// Switches to `channel` and asks its view to scroll to the message at
+    /// `index` in its log (logs are append-only, so indices are stable).
+    pub fn reveal(&mut self, channel: Id, index: usize, cx: &mut Context<Self>) {
+        self.select(channel, cx);
+        if self.selected == channel {
+            cx.emit(StoreEvent::Reveal { channel, index });
+        }
+    }
+
+    /// Everything search reads, as a snapshot it can take to another thread.
+    /// Only clones `Arc`s, so it is cheap even with very large histories.
+    pub fn search_corpus(&self) -> SearchCorpus {
+        SearchCorpus {
+            channels: self
+                .workspace
+                .channels
+                .iter()
+                .map(|c| CorpusChannel {
+                    id: c.id,
+                    name: c.name.clone(),
+                    messages: self
+                        .logs
+                        .get(&c.id)
+                        .map(|log| log.snapshot())
+                        .unwrap_or_default(),
+                })
+                .collect(),
         }
     }
 

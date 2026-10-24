@@ -12,6 +12,7 @@ use crate::{
     conversation::Conversation,
     panels::{Panels, ToggleLeftSidebar, ToggleRightSidebar},
     right_sidebar::RightSidebar,
+    search::{FocusSearch, Search, SearchEvent},
     sidebar::Sidebar,
     store::ChatStore,
     titlebar::Titlebar,
@@ -55,12 +56,13 @@ fn centre_column(viewport: Pixels, left: Pixels, right: Pixels) -> (Pixels, Pixe
 
 pub struct Workspace {
     panels: Entity<Panels>,
+    search: Entity<Search>,
     titlebar: Entity<Titlebar>,
     sidebar: Entity<Sidebar>,
     right_sidebar: Entity<RightSidebar>,
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl Workspace {
@@ -75,15 +77,29 @@ impl Workspace {
 
         let panels = cx.new(|_| Panels::new());
         let panels_changed = cx.observe(&panels, |_, _, cx| cx.notify());
+        let search = cx.new(|cx| {
+            Search::new(
+                store.clone(),
+                std::sync::Arc::new(model::SubstringSearch),
+                window,
+                cx,
+            )
+        });
+        let composer = cx.new(|cx| Composer::new(store.clone(), window, cx));
+        // After a jump, hand the keyboard back to the composer.
+        let jumped = cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
+            SearchEvent::Jumped => this.composer.update(cx, |c, cx| c.focus(window, cx)),
+        });
 
         Self {
-            titlebar: cx.new(|cx| Titlebar::new(panels.clone(), window, cx)),
+            titlebar: cx.new(|cx| Titlebar::new(panels.clone(), search.clone(), window, cx)),
             panels,
+            search,
             sidebar: cx.new(|cx| Sidebar::new(store.clone(), cx)),
             right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), cx)),
             conversation: cx.new(|cx| Conversation::new(store.clone(), cx)),
-            composer: cx.new(|cx| Composer::new(store.clone(), window, cx)),
-            _subscriptions: [appearance, panels_changed],
+            composer,
+            _subscriptions: [appearance, panels_changed, jumped],
         }
     }
 }
@@ -121,6 +137,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _, cx| {
                 this.panels.update(cx, |p, cx| p.toggle_right(cx));
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                this.search.update(cx, |s, cx| s.focus(window, cx));
             }))
             .size_full()
             .relative()
@@ -196,6 +215,19 @@ impl Render for Workspace {
                                 .child(cached(&self.right_sidebar)),
                         )
                     }),
+            )
+            // Search results float over everything, just under the titlebar.
+            .child(
+                div()
+                    .absolute()
+                    .top(TITLEBAR_HEIGHT - px(8.))
+                    .left_0()
+                    .right_0()
+                    .pl(pad_l)
+                    .pr(pad_r)
+                    .flex()
+                    .justify_center()
+                    .child(div().w_full().max_w(column_w).child(self.search.clone())),
             )
             .map(|this| match decorations {
                 Decorations::Server => this,
