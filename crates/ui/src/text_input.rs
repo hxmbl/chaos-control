@@ -557,9 +557,21 @@ impl Element for TextElement {
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_line(display_text, font_size, &runs, None);
+        let mut runs = runs;
+        let mut line =
+            window
+                .text_system()
+                .shape_line(display_text.clone(), font_size, &runs, None);
+        // A placeholder that does not fit ends in "…" rather than being clipped.
+        if input.content.is_empty() && line.width > bounds.size.width {
+            let truncated = cx
+                .text_system()
+                .line_wrapper(style.font(), font_size)
+                .truncate_line(display_text, bounds.size.width, "…", &mut runs);
+            line = window
+                .text_system()
+                .shape_line(truncated, font_size, &runs, None);
+        }
 
         // Centre short text; once it overflows, scroll so the cursor stays visible.
         let cursor_x = line.x_for_index(cursor);

@@ -11,7 +11,7 @@ use gpui::{
     Window, div, list, prelude::*, px,
 };
 use model::{Author, Id};
-use ui::{ActiveTheme, IconName, brand_icon, icon};
+use ui::{ActiveTheme, Ellipsis, IconName, brand_icon, icon};
 
 use crate::store::{ChatStore, StoreEvent};
 
@@ -110,21 +110,29 @@ impl Conversation {
                                     .flex()
                                     .items_baseline()
                                     .gap(px(8.))
+                                    .min_w_0()
                                     .child(
                                         div()
+                                            .flex_shrink()
+                                            .ellipsis()
                                             .text_size(px(14.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(name),
                                     )
                                     .child(
                                         div()
+                                            .flex_none()
                                             .text_size(px(12.))
                                             .text_color(t.muted)
                                             .child(clock(message.sent_at)),
                                     ),
                             )
                             .child(
+                                // Long messages wrap; they are never clipped.
                                 div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .whitespace_normal()
                                     .text_color(t.ink_soft)
                                     .child(SharedString::from(message.body.clone())),
                             ),
@@ -195,6 +203,8 @@ impl Render for Conversation {
                     )
                     .child(
                         div()
+                            .max_w_full()
+                            .ellipsis()
                             .text_size(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.ink_soft)

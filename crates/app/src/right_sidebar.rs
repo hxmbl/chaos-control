@@ -9,7 +9,7 @@ use gpui::{
     prelude::*, px, relative, transparent_black,
 };
 use model::AgentStatus;
-use ui::{ActiveTheme, IconName, Theme, Tooltip, brand_icon, icon, pill};
+use ui::{ActiveTheme, Ellipsis, IconName, Theme, Tooltip, brand_icon, icon, pill};
 
 use crate::store::ChatStore;
 
@@ -151,11 +151,7 @@ impl Render for RightSidebar {
                                         )
                                     })
                                     .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .child(SharedString::from(text)),
+                                        div().flex_1().ellipsis().child(SharedString::from(text)),
                                     )
                             },
                         ))
@@ -171,6 +167,7 @@ impl Render for RightSidebar {
                     .child(
                         div()
                             .px(px(8.))
+                            .ellipsis()
                             .text_size(px(13.))
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
@@ -249,6 +246,7 @@ impl Render for CatchUp {
                     .child(
                         div()
                             .mt(px(1.))
+                            .flex_none()
                             .child(icon(IconName::Sparkle, px(19.), t.ink_soft))
                             .with_animation(
                                 "catch-up-sparkle",
@@ -262,6 +260,8 @@ impl Render for CatchUp {
                     )
                     .child(
                         div()
+                            .flex_1()
+                            .ellipsis()
                             .text_size(px(15.))
                             .line_height(px(20.))
                             .font_weight(FontWeight::MEDIUM)

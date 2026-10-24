@@ -3,6 +3,7 @@
 mod assets;
 mod icon;
 mod pill;
+mod text;
 pub mod text_input;
 mod theme;
 mod tooltip;
@@ -10,6 +11,7 @@ mod tooltip;
 pub use assets::{Assets, load_fonts};
 pub use icon::{IconName, brand_icon, icon};
 pub use pill::pill;
+pub use text::Ellipsis;
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{ActiveTheme, Appearance, FONT_FAMILY, Theme};
 pub use tooltip::Tooltip;

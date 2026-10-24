@@ -4,7 +4,7 @@ use gpui::{
     Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, relative, uniform_list,
 };
 use model::Channel;
-use ui::{ActiveTheme, IconName, Tooltip, brand_icon, icon, pill};
+use ui::{ActiveTheme, Ellipsis, IconName, Tooltip, brand_icon, icon, pill};
 
 use crate::store::ChatStore;
 
@@ -48,7 +48,7 @@ impl Sidebar {
                 } else {
                     icon(IconName::Hash, px(17.), t.ink_soft).into_any_element()
                 })
-                .child(div().flex_1().min_w_0().truncate().child(name))
+                .child(div().flex_1().ellipsis().child(name))
                 .when(channel.unread, |p| {
                     p.child(div().size(px(6.)).flex_none().rounded_full().bg(t.accent))
                 })
@@ -112,7 +112,7 @@ impl Render for Sidebar {
                     .font_weight(FontWeight::SEMIBOLD)
                     .tooltip(Tooltip::text("Switch project"))
                     .child(div().text_size(px(16.)).child(project_emoji))
-                    .child(div().flex_1().min_w_0().truncate().child(project_name))
+                    .child(div().flex_1().ellipsis().child(project_name))
                     .child(icon(IconName::CaretDown, px(16.), t.muted)),
             )
             // Channels. Virtualized: a project can collect hundreds of issue channels.
@@ -159,7 +159,7 @@ impl Render for Sidebar {
                             .gap(px(10.))
                             .px(px(12.))
                             .child(icon(IconName::Archive, px(18.), t.ink_soft))
-                            .child(div().flex_1().child("Archived"))
+                            .child(div().flex_1().ellipsis().child("Archived"))
                             .child(icon(IconName::CaretRight, px(16.), t.muted)),
                     ),
             )
