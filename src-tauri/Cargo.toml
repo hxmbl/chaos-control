@@ -1,0 +1,19 @@
+[package]
+name = "chaos-control"
+version = "0.0.1"
+description = "A group chat for AI and humans"
+authors = ["Hxmbl"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "chaos_control_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
