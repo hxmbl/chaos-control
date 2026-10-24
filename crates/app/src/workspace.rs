@@ -16,8 +16,37 @@ use crate::{
 const WIDE_BREAKPOINT: Pixels = px(1200.);
 const LEFT_WIDTH: Pixels = px(258.);
 const RIGHT_WIDTH: Pixels = px(320.);
+/// Gap between the window edge and a floating panel. The sidebars use it on the
+/// sides and the bottom; the composer uses it at the bottom.
 const SIDE_INSET: Pixels = px(12.);
+/// The sidebars start just under the titlebar.
+const SIDE_TOP: Pixels = px(4.);
+/// Breathing room between a sidebar and the centre column.
+const GUTTER: Pixels = px(20.);
+/// The conversation and composer widen with the window between these widths.
+const COLUMN_MIN: Pixels = px(720.);
+const COLUMN_MAX: Pixels = px(960.);
+/// Height kept clear under the conversation for the floating composer.
+const COMPOSER_CLEARANCE: Pixels = px(112.);
 pub const TITLEBAR_HEIGHT: Pixels = px(52.);
+
+/// Where the centre column goes: left and right padding plus its maximum width.
+///
+/// `left`/`right` are the widths the sidebars take from each edge (zero when
+/// hidden). When there's room, both sides reserve the larger of the two so the
+/// conversation and composer stay centred under the titlebar search; when that
+/// would squeeze the column, it centres in the space actually left over.
+fn centre_column(viewport: Pixels, left: Pixels, right: Pixels) -> (Pixels, Pixels, Pixels) {
+    let max_w = (viewport * 0.6).max(COLUMN_MIN).min(COLUMN_MAX);
+    let (l, r) = (left + GUTTER, right + GUTTER);
+    let side = l.max(r);
+    let fits_centred = viewport - side - side >= max_w.min(viewport - l - r);
+    if fits_centred {
+        (side, side, max_w)
+    } else {
+        (l, r, max_w)
+    }
+}
 
 pub struct Workspace {
     titlebar: Entity<Titlebar>,
@@ -61,18 +90,13 @@ impl Render for Workspace {
         let viewport = window.viewport_size();
         let wide = viewport.width >= WIDE_BREAKPOINT;
 
-        // The sidebars float with the wireframe's proportions: ~14% of the window
-        // height above and below, clamped so short windows keep a margin.
-        let side_top = (viewport.height * 0.143 - TITLEBAR_HEIGHT).max(px(4.));
-        let side_bottom = (viewport.height * 0.143).max(px(12.));
-
-        // Centre column. Once the right sidebar shows, both sides reserve the wider
-        // panel's width so search and composer stay mid-window.
-        let (pad_l, pad_r) = if wide {
-            (px(344.), px(344.))
+        let left_space = SIDE_INSET + LEFT_WIDTH;
+        let right_space = if wide {
+            RIGHT_WIDTH + SIDE_INSET
         } else {
-            (px(290.), px(20.))
+            px(0.)
         };
+        let (pad_l, pad_r, column_w) = centre_column(viewport.width, left_space, right_space);
 
         let decorations = window.window_decorations();
 
@@ -104,28 +128,36 @@ impl Render for Workspace {
                             .inset_0()
                             .pl(pad_l)
                             .pr(pad_r)
-                            .pb(px(128.))
-                            .child(cached(&self.conversation)),
+                            .pb(COMPOSER_CLEARANCE)
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w_full()
+                                    .max_w(column_w)
+                                    .child(cached(&self.conversation)),
+                            ),
                     )
                     .child(
                         div()
                             .absolute()
                             .left_0()
                             .right_0()
-                            .bottom(px(24.))
+                            .bottom(SIDE_INSET)
                             .pl(pad_l)
                             .pr(pad_r)
                             .flex()
                             .justify_center()
-                            .child(div().w_full().max_w(px(800.)).child(self.composer.clone())),
+                            .child(div().w_full().max_w(column_w).child(self.composer.clone())),
                     )
                     .child(
                         div()
                             .absolute()
                             .left(SIDE_INSET)
                             .w(LEFT_WIDTH)
-                            .top(side_top)
-                            .bottom(side_bottom)
+                            .top(SIDE_TOP)
+                            .bottom(SIDE_INSET)
                             .child(cached(&self.sidebar)),
                     )
                     .when(wide, |this| {
@@ -134,8 +166,8 @@ impl Render for Workspace {
                                 .absolute()
                                 .right(SIDE_INSET)
                                 .w(RIGHT_WIDTH)
-                                .top(side_top)
-                                .bottom(side_bottom)
+                                .top(SIDE_TOP)
+                                .bottom(SIDE_INSET)
                                 .child(cached(&self.right_sidebar)),
                         )
                     }),

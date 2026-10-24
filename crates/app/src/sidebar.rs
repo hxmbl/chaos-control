@@ -1,8 +1,6 @@
 //! Floating, detached left sidebar: project picker, channels, quick links, settings.
 
-use gpui::{
-    Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, relative, uniform_list,
-};
+use gpui::{Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, uniform_list};
 use model::Channel;
 use ui::{ActiveTheme, Ellipsis, IconName, Tooltip, brand_icon, icon, pill};
 
@@ -94,6 +92,7 @@ impl Render for Sidebar {
 
         div()
             .size_full()
+            .overflow_hidden()
             .flex()
             .flex_col()
             .gap(px(6.))
@@ -117,12 +116,12 @@ impl Render for Sidebar {
             )
             // Channels. Virtualized: a project can collect hundreds of issue channels.
             .child(
+                // Grows with the window, so a tall window shows more channels.
                 section()
                     .flex()
                     .flex_col()
-                    .flex_basis(relative(0.52))
-                    .flex_shrink()
-                    .min_h(px(232.))
+                    .flex_1()
+                    .min_h(px(140.))
                     .child(
                         uniform_list(
                             "channels",
@@ -180,7 +179,6 @@ impl Render for Sidebar {
                         },
                     )),
             )
-            .child(div().flex_1())
             .child(
                 pill("settings", cx)
                     .h(px(44.))

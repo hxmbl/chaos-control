@@ -67,3 +67,8 @@ batched per frame when many agents post at once.
   handles on each edge; when it insists on server decorations, those are skipped.
 - Window: 1440×900 by default, 760×520 minimum. The right sidebar hides below
   1200px of width.
+- Layout: both sidebars float 12px from the window edges and run from just
+  under the titlebar to 12px above the bottom, so they grow with the window
+  (the channel list, catch-up card and mentions take the extra height). The
+  conversation and composer share one centred column that widens with the
+  window, from 720px up to 960px.

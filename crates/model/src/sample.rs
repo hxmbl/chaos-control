@@ -39,9 +39,9 @@ pub fn sample() -> Workspace {
         brand,
         url: s(url),
     };
-    let mention = |id, channel, text: &str| Mention {
+    let mention = |id, agent, channel, text: &str| Mention {
         id: Id(id),
-        agent: OPENCODE,
+        agent,
         channel,
         text: s(text),
     };
@@ -97,23 +97,63 @@ pub fn sample() -> Workspace {
         mentions: vec![
             mention(
                 100,
+                OPENCODE,
                 MAIN,
                 "Hey @Hx. So what's the direction? I've mapped out two approaches for the sync layer and need you to pick one.",
             ),
             mention(
                 101,
+                OPENCODE,
                 STRM_335,
                 "Hey @Hx. Wake up already, we have work to do and the release branch is waiting on your review.",
             ),
             mention(
                 102,
+                OPENCODE,
                 STRM_327,
                 "Hey @Hx. everything you made is failing the new lint rules, so I've queued a fix-up PR for you to look at.",
             ),
             mention(
                 103,
+                OPENCODE,
                 MAIN,
                 "Hey @Hx. Just got your code improved and benchmarked: cold start is down 38% on the M3.",
+            ),
+            mention(
+                104,
+                CLAUDE,
+                STRM_335,
+                "Hey @Hx. The schema migration is ready, but it drops a column, so I'd like a yes before I run it.",
+            ),
+            mention(
+                105,
+                CODEX_REVIEW,
+                STRM_327,
+                "Hey @Hx. Left eleven review comments on the sync PR; three of them are blocking.",
+            ),
+            mention(
+                106,
+                DEVIN,
+                MAIN,
+                "Hey @Hx. Staging is back up. The outage was an expired certificate, now renewed and on auto-renew.",
+            ),
+            mention(
+                107,
+                MISTRAL,
+                STRM_335,
+                "Hey @Hx. I can't reach the design tokens repo; can you add me or point me at a mirror?",
+            ),
+            mention(
+                108,
+                PI,
+                MAIN,
+                "Hey @Hx. Nightly build passed on all three platforms for the first time this week.",
+            ),
+            mention(
+                109,
+                COPILOT,
+                STRM_327,
+                "Hey @Hx. Suggested a smaller fix for the flaky scroll test in the thread, if you want it instead.",
             ),
         ],
     }

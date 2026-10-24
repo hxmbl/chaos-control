@@ -80,7 +80,6 @@ impl Conversation {
             .child(
                 div()
                     .w_full()
-                    .max_w(px(800.))
                     .flex()
                     .gap(px(12.))
                     .px(px(8.))
