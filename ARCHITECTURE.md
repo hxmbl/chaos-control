@@ -128,6 +128,36 @@ macOS and ctrl elsewhere.
 | `enter` | Send | Composer |
 | `cmd/ctrl-Q` | Quit | Anywhere |
 
+Text editing in the composer and search field (`ui::TextInput`; GPUI 0.2.2
+ships no text field, only an example, so these are ours). Single-line fields,
+so "line" means the whole text.
+
+| Action | macOS | Linux / Windows |
+| --- | --- | --- |
+| Move by character / select | `left` `right`, `shift-` | same |
+| Move by word | `alt-left` / `alt-right` | `ctrl-left` / `ctrl-right` |
+| Select by word | `alt-shift-left` / `right` | `ctrl-shift-left` / `right` |
+| Start / end | `cmd-left` / `cmd-right`, `cmd-up` / `cmd-down`, `home` / `end`, `ctrl-a` / `ctrl-e` | `home` / `end`, `ctrl-home` / `ctrl-end` |
+| Select to start / end | `cmd-shift-left` / `right` (and `up` / `down`), `shift-home` / `end` | `shift-home` / `end`, `ctrl-shift-home` / `end` |
+| Delete character | `backspace`, `delete`, `ctrl-h`, `ctrl-d` | `backspace`, `delete` |
+| Delete word | `alt-backspace` / `alt-delete` | `ctrl-backspace` / `ctrl-delete` |
+| Delete to start / end | `cmd-backspace` / `cmd-delete`, `ctrl-k` (to end) | (no common binding) |
+| Select all | `cmd-A` | `ctrl-A` |
+| Copy / cut / paste | `cmd-C` / `X` / `V` | `ctrl-C` / `X` / `V`, `ctrl-insert` / `shift-delete` / `shift-insert` |
+| Undo / redo | `cmd-Z` / `cmd-shift-Z` | `ctrl-Z` / `ctrl-shift-Z`, `ctrl-Y` |
+| Select word / all | double / triple click | same |
+| Emoji & symbols | `ctrl-cmd-space` | (the system's own) |
+
+Words: a run of letters, digits and `_` (accents and emoji join their word),
+or a run of punctuation; spaces are skipped first. Word-right stops at the end
+of the word, as on macOS and GTK (Windows stops at the next word's start).
+Undo groups a burst of typing (or of single deletes) into one step, split by a
+pause over a second, a cursor move or a switch between typing and deleting;
+paste, cut and word/line deletes are always their own step. Sending a message
+or clearing the search empties the history. `ctrl-K` stays search on Linux and
+Windows; on macOS it's the Cocoa kill-to-end key in a text field, since search
+is `cmd-K` there.
+
 Reserved, not bound yet: `cmd/ctrl-F` and `ctrl-shift-P` (also focus the bar
 once it doubles as the command palette), `cmd/ctrl-[` / `cmd/ctrl-]` (back and
 forward through channel history), `cmd/ctrl-B`, `I`, `U` (bold, italic,

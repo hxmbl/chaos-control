@@ -7,6 +7,8 @@
 
 use std::ops::Range;
 
+use std::time::Instant;
+
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
@@ -14,36 +16,56 @@ use gpui::{
     ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
     fill, point, prelude::*, px, relative, size,
 };
-use unicode_segmentation::UnicodeSegmentation as _;
 
-use crate::ActiveTheme;
+use crate::{
+    ActiveTheme,
+    editing::{self, EditKind, History, Snapshot},
+};
 
 actions!(
     text_input,
     [
         Backspace,
         Delete,
+        DeleteWordLeft,
+        DeleteWordRight,
+        DeleteToStart,
+        DeleteToEnd,
         Left,
         Right,
+        WordLeft,
+        WordRight,
         SelectLeft,
         SelectRight,
+        SelectWordLeft,
+        SelectWordRight,
         SelectAll,
         Home,
         End,
+        SelectToStart,
+        SelectToEnd,
         ShowCharacterPalette,
         Paste,
         Cut,
         Copy,
+        Undo,
+        Redo,
         Submit,
     ]
 );
 
 const CONTEXT: &str = "TextInput";
 
+/// The editing keys people expect in any text field on their OS. `secondary`
+/// is cmd on macOS and ctrl elsewhere. A single-line field has one line, so
+/// "line start/end" is the start/end of the text. Up/down are left unbound so
+/// the search field can use them for its results.
 pub(crate) fn bind_keys(cx: &mut App) {
     let ctx = Some(CONTEXT);
+    // Everywhere.
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, ctx),
+        KeyBinding::new("shift-backspace", Backspace, ctx),
         KeyBinding::new("delete", Delete, ctx),
         KeyBinding::new("left", Left, ctx),
         KeyBinding::new("right", Right, ctx),
@@ -51,13 +73,63 @@ pub(crate) fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-right", SelectRight, ctx),
         KeyBinding::new("home", Home, ctx),
         KeyBinding::new("end", End, ctx),
+        KeyBinding::new("shift-home", SelectToStart, ctx),
+        KeyBinding::new("shift-end", SelectToEnd, ctx),
         KeyBinding::new("enter", Submit, ctx),
         KeyBinding::new("secondary-a", SelectAll, ctx),
         KeyBinding::new("secondary-v", Paste, ctx),
         KeyBinding::new("secondary-c", Copy, ctx),
         KeyBinding::new("secondary-x", Cut, ctx),
-        KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, ctx),
+        KeyBinding::new("secondary-z", Undo, ctx),
+        KeyBinding::new("secondary-shift-z", Redo, ctx),
     ]);
+    if cfg!(target_os = "macos") {
+        cx.bind_keys([
+            KeyBinding::new("alt-left", WordLeft, ctx),
+            KeyBinding::new("alt-right", WordRight, ctx),
+            KeyBinding::new("alt-shift-left", SelectWordLeft, ctx),
+            KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
+            KeyBinding::new("cmd-left", Home, ctx),
+            KeyBinding::new("cmd-right", End, ctx),
+            KeyBinding::new("cmd-up", Home, ctx),
+            KeyBinding::new("cmd-down", End, ctx),
+            KeyBinding::new("cmd-shift-left", SelectToStart, ctx),
+            KeyBinding::new("cmd-shift-right", SelectToEnd, ctx),
+            KeyBinding::new("cmd-shift-up", SelectToStart, ctx),
+            KeyBinding::new("cmd-shift-down", SelectToEnd, ctx),
+            KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
+            KeyBinding::new("alt-delete", DeleteWordRight, ctx),
+            KeyBinding::new("cmd-backspace", DeleteToStart, ctx),
+            KeyBinding::new("cmd-delete", DeleteToEnd, ctx),
+            // Cocoa's Emacs-style keys, which every native macOS field has.
+            KeyBinding::new("ctrl-a", Home, ctx),
+            KeyBinding::new("ctrl-e", End, ctx),
+            KeyBinding::new("ctrl-b", Left, ctx),
+            KeyBinding::new("ctrl-f", Right, ctx),
+            KeyBinding::new("ctrl-h", Backspace, ctx),
+            KeyBinding::new("ctrl-d", Delete, ctx),
+            KeyBinding::new("ctrl-k", DeleteToEnd, ctx),
+            KeyBinding::new("ctrl-cmd-space", ShowCharacterPalette, ctx),
+        ]);
+    } else {
+        cx.bind_keys([
+            KeyBinding::new("ctrl-left", WordLeft, ctx),
+            KeyBinding::new("ctrl-right", WordRight, ctx),
+            KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
+            KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
+            KeyBinding::new("ctrl-home", Home, ctx),
+            KeyBinding::new("ctrl-end", End, ctx),
+            KeyBinding::new("ctrl-shift-home", SelectToStart, ctx),
+            KeyBinding::new("ctrl-shift-end", SelectToEnd, ctx),
+            KeyBinding::new("ctrl-backspace", DeleteWordLeft, ctx),
+            KeyBinding::new("ctrl-delete", DeleteWordRight, ctx),
+            KeyBinding::new("ctrl-y", Redo, ctx),
+            // The older CUA clipboard keys, still standard on Windows and Linux.
+            KeyBinding::new("shift-delete", Cut, ctx),
+            KeyBinding::new("ctrl-insert", Copy, ctx),
+            KeyBinding::new("shift-insert", Paste, ctx),
+        ]);
+    }
 }
 
 pub enum TextInputEvent {
@@ -78,6 +150,7 @@ pub struct TextInput {
     /// Where the shaped line started on the last paint (centring and scrolling).
     last_origin_x: Pixels,
     is_selecting: bool,
+    history: History,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -96,6 +169,7 @@ impl TextInput {
             last_bounds: None,
             last_origin_x: px(0.),
             is_selecting: false,
+            history: History::default(),
         }
     }
 
@@ -103,6 +177,21 @@ impl TextInput {
     pub fn centered(mut self) -> Self {
         self.centered = true;
         self
+    }
+
+    /// Switch centring on or off after construction (the search field is
+    /// centred in the titlebar pill and left-aligned once it opens).
+    pub fn set_centered(&mut self, centered: bool, cx: &mut Context<Self>) {
+        if self.centered != centered {
+            self.centered = centered;
+            cx.notify();
+        }
+    }
+
+    /// Selects everything, as cmd/ctrl-K does when search is already open.
+    pub fn select_all_text(&mut self, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+        self.select_to(self.content.len(), cx);
     }
 
     pub fn text(&self) -> &SharedString {
@@ -126,13 +215,18 @@ impl TextInput {
         self.selected_range = 0..0;
         self.selection_reversed = false;
         self.marked_range = None;
+        // A cleared field (a sent message, an emptied search) starts fresh.
+        self.history.clear();
         cx.emit(TextInputEvent::Changed);
         cx.notify();
     }
 
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.move_to(self.previous_boundary(self.cursor_offset()), cx);
+            self.move_to(
+                editing::previous_grapheme(&self.content, self.cursor_offset()),
+                cx,
+            );
         } else {
             self.move_to(self.selected_range.start, cx)
         }
@@ -140,18 +234,55 @@ impl TextInput {
 
     fn right(&mut self, _: &Right, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
-            self.move_to(self.next_boundary(self.selected_range.end), cx);
+            self.move_to(
+                editing::next_grapheme(&self.content, self.selected_range.end),
+                cx,
+            );
         } else {
             self.move_to(self.selected_range.end, cx)
         }
     }
 
+    fn word_left(&mut self, _: &WordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(
+            editing::previous_word_start(&self.content, self.cursor_offset()),
+            cx,
+        );
+    }
+
+    fn word_right(&mut self, _: &WordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(
+            editing::next_word_end(&self.content, self.cursor_offset()),
+            cx,
+        );
+    }
+
     fn select_left(&mut self, _: &SelectLeft, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.previous_boundary(self.cursor_offset()), cx);
+        self.select_to(
+            editing::previous_grapheme(&self.content, self.cursor_offset()),
+            cx,
+        );
     }
 
     fn select_right(&mut self, _: &SelectRight, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(self.next_boundary(self.cursor_offset()), cx);
+        self.select_to(
+            editing::next_grapheme(&self.content, self.cursor_offset()),
+            cx,
+        );
+    }
+
+    fn select_word_left(&mut self, _: &SelectWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(
+            editing::previous_word_start(&self.content, self.cursor_offset()),
+            cx,
+        );
+    }
+
+    fn select_word_right(&mut self, _: &SelectWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(
+            editing::next_word_end(&self.content, self.cursor_offset()),
+            cx,
+        );
     }
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
@@ -167,22 +298,107 @@ impl TextInput {
         self.move_to(self.content.len(), cx);
     }
 
+    fn select_to_start(&mut self, _: &SelectToStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(0, cx);
+    }
+
+    fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_to(self.content.len(), cx);
+    }
+
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
         cx.emit(TextInputEvent::Submit);
     }
 
-    fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.select_to(self.previous_boundary(self.cursor_offset()), cx)
+    /// Deletes the selection, or when there is none, from the cursor to
+    /// `target` (either side of it).
+    fn delete_toward(&mut self, target: usize, kind: EditKind, cx: &mut Context<Self>) {
+        let range = if self.selected_range.is_empty() {
+            let cursor = self.cursor_offset();
+            cursor.min(target)..cursor.max(target)
+        } else {
+            self.selected_range.clone()
+        };
+        if !range.is_empty() {
+            self.edit(range, "", kind, cx);
         }
-        self.replace_text_in_range(None, "", window, cx)
     }
 
-    fn delete(&mut self, _: &Delete, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_range.is_empty() {
-            self.select_to(self.next_boundary(self.cursor_offset()), cx)
+    fn backspace(&mut self, _: &Backspace, _: &mut Window, cx: &mut Context<Self>) {
+        let target = editing::previous_grapheme(&self.content, self.cursor_offset());
+        self.delete_toward(target, EditKind::Delete, cx)
+    }
+
+    fn delete(&mut self, _: &Delete, _: &mut Window, cx: &mut Context<Self>) {
+        let target = editing::next_grapheme(&self.content, self.cursor_offset());
+        self.delete_toward(target, EditKind::Delete, cx)
+    }
+
+    fn delete_word_left(&mut self, _: &DeleteWordLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let target = editing::previous_word_start(&self.content, self.cursor_offset());
+        self.delete_toward(target, EditKind::Other, cx)
+    }
+
+    fn delete_word_right(&mut self, _: &DeleteWordRight, _: &mut Window, cx: &mut Context<Self>) {
+        let target = editing::next_word_end(&self.content, self.cursor_offset());
+        self.delete_toward(target, EditKind::Other, cx)
+    }
+
+    fn delete_to_start(&mut self, _: &DeleteToStart, _: &mut Window, cx: &mut Context<Self>) {
+        self.delete_toward(0, EditKind::Other, cx)
+    }
+
+    fn delete_to_end(&mut self, _: &DeleteToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        self.delete_toward(self.content.len(), EditKind::Other, cx)
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            text: self.content.to_string(),
+            selection: self.selected_range.clone(),
+            reversed: self.selection_reversed,
         }
-        self.replace_text_in_range(None, "", window, cx)
+    }
+
+    fn restore(&mut self, snapshot: Snapshot, cx: &mut Context<Self>) {
+        self.content = snapshot.text.into();
+        self.selected_range = snapshot.selection;
+        self.selection_reversed = snapshot.reversed;
+        self.marked_range = None;
+        cx.emit(TextInputEvent::Changed);
+        cx.notify();
+    }
+
+    fn undo(&mut self, _: &Undo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(previous) = self.history.undo(self.snapshot()) {
+            self.restore(previous, cx);
+        }
+    }
+
+    fn redo(&mut self, _: &Redo, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(next) = self.history.redo(self.snapshot()) {
+            self.restore(next, cx);
+        }
+    }
+
+    /// Every change to the text goes through here, so it lands in the undo
+    /// history. Leaves the cursor after the new text.
+    fn edit(
+        &mut self,
+        range: Range<usize>,
+        new_text: &str,
+        kind: EditKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.history.record(self.snapshot(), kind, Instant::now());
+        self.content =
+            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
+                .into();
+        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
+        self.selection_reversed = false;
+        self.marked_range.take();
+        cx.emit(TextInputEvent::Changed);
+        cx.notify();
     }
 
     fn on_mouse_down(
@@ -192,11 +408,26 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        self.is_selecting = true;
-        if event.modifiers.shift {
-            self.select_to(self.index_for_mouse_position(event.position), cx);
-        } else {
-            self.move_to(self.index_for_mouse_position(event.position), cx)
+        let index = self.index_for_mouse_position(event.position);
+        match event.click_count {
+            // Double click selects the word under the pointer, triple the line.
+            2 => {
+                let word = editing::word_range_at(&self.content, index);
+                self.move_to(word.start, cx);
+                self.select_to(word.end, cx);
+            }
+            n if n >= 3 => {
+                self.move_to(0, cx);
+                self.select_to(self.content.len(), cx);
+            }
+            _ => {
+                self.is_selecting = true;
+                if event.modifiers.shift {
+                    self.select_to(index, cx);
+                } else {
+                    self.move_to(index, cx)
+                }
+            }
         }
     }
 
@@ -219,9 +450,13 @@ impl TextInput {
         window.show_character_palette();
     }
 
-    fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+    fn paste(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            self.replace_text_in_range(None, &text.replace('\n', " "), window, cx);
+            let range = self
+                .marked_range
+                .clone()
+                .unwrap_or(self.selected_range.clone());
+            self.edit(range, &text.replace('\n', " "), EditKind::Other, cx);
         }
     }
 
@@ -233,17 +468,19 @@ impl TextInput {
         }
     }
 
-    fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
+    fn cut(&mut self, _: &Cut, _: &mut Window, cx: &mut Context<Self>) {
         if !self.selected_range.is_empty() {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
-            self.replace_text_in_range(None, "", window, cx)
+            self.edit(self.selected_range.clone(), "", EditKind::Other, cx)
         }
     }
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.selection_reversed = false;
+        self.history.break_group();
         cx.notify()
     }
 
@@ -273,6 +510,7 @@ impl TextInput {
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
+        self.history.break_group();
         if self.selection_reversed {
             self.selected_range.start = offset
         } else {
@@ -317,21 +555,6 @@ impl TextInput {
 
     fn range_from_utf16(&self, range_utf16: &Range<usize>) -> Range<usize> {
         self.offset_from_utf16(range_utf16.start)..self.offset_from_utf16(range_utf16.end)
-    }
-
-    fn previous_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .rev()
-            .find_map(|(idx, _)| (idx < offset).then_some(idx))
-            .unwrap_or(0)
-    }
-
-    fn next_boundary(&self, offset: usize) -> usize {
-        self.content
-            .grapheme_indices(true)
-            .find_map(|(idx, _)| (idx > offset).then_some(idx))
-            .unwrap_or(self.content.len())
     }
 }
 
@@ -382,14 +605,7 @@ impl EntityInputHandler for TextInput {
             .map(|range_utf16| self.range_from_utf16(range_utf16))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
-
-        self.content =
-            (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
-                .into();
-        self.selected_range = range.start + new_text.len()..range.start + new_text.len();
-        self.marked_range.take();
-        cx.emit(TextInputEvent::Changed);
-        cx.notify();
+        self.edit(range, new_text, EditKind::Insert, cx);
     }
 
     fn replace_and_mark_text_in_range(
@@ -406,6 +622,8 @@ impl EntityInputHandler for TextInput {
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
 
+        self.history
+            .record(self.snapshot(), EditKind::Insert, Instant::now());
         self.content =
             (self.content[0..range.start].to_owned() + new_text + &self.content[range.end..])
                 .into();
@@ -684,6 +902,18 @@ impl Render for TextInput {
             .cursor(CursorStyle::IBeam)
             .on_action(cx.listener(Self::backspace))
             .on_action(cx.listener(Self::delete))
+            .on_action(cx.listener(Self::delete_word_left))
+            .on_action(cx.listener(Self::delete_word_right))
+            .on_action(cx.listener(Self::delete_to_start))
+            .on_action(cx.listener(Self::delete_to_end))
+            .on_action(cx.listener(Self::word_left))
+            .on_action(cx.listener(Self::word_right))
+            .on_action(cx.listener(Self::select_word_left))
+            .on_action(cx.listener(Self::select_word_right))
+            .on_action(cx.listener(Self::select_to_start))
+            .on_action(cx.listener(Self::select_to_end))
+            .on_action(cx.listener(Self::undo))
+            .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::select_left))
