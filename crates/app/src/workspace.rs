@@ -18,7 +18,7 @@ use crate::{
         ToggleRightSidebar,
     },
     right_sidebar::RightSidebar,
-    search::{FocusSearch, Search, SearchEvent},
+    search::{FocusSearch, PILL_HEIGHT, Search, SearchEvent},
     sidebar::Sidebar,
     store::ChatStore,
     titlebar::Titlebar,
@@ -116,7 +116,11 @@ impl Workspace {
         let composer = cx.new(|cx| Composer::new(store.clone(), window, cx));
         // After a jump, hand the keyboard back to the composer.
         let jumped = cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
-            SearchEvent::Jumped => this.composer.update(cx, |c, cx| c.focus(window, cx)),
+            SearchEvent::Jumped | SearchEvent::Dismissed => {
+                this.composer.update(cx, |c, cx| c.focus(window, cx))
+            }
+            // Result actions arrive with the command palette.
+            SearchEvent::Action { .. } => {}
         });
 
         Self {
@@ -243,18 +247,17 @@ impl Render for Workspace {
             // Edge hover zones: watch every pointer move (capture phase, so
             // nothing on top can swallow it) and let `Panels` decide.
             .child(self.pointer_watcher(cx))
-            // Search results float over everything, just under the titlebar.
+            // Open search floats over everything, grown out of the titlebar
+            // pill: same top and centre, so it reads as the pill expanding.
             .child(
                 div()
                     .absolute()
-                    .top(TITLEBAR_HEIGHT - px(8.))
+                    .top((TITLEBAR_HEIGHT - PILL_HEIGHT) / 2.)
                     .left_0()
                     .right_0()
-                    .pl(pad_l)
-                    .pr(pad_r)
                     .flex()
                     .justify_center()
-                    .child(div().w_full().max_w(column_w).child(self.search.clone())),
+                    .child(self.search.clone()),
             )
             .map(|this| match decorations {
                 Decorations::Server => this,

@@ -3,14 +3,13 @@
 //! lights sit in the top-left corner, so the left toggle moves past them.
 
 use gpui::{
-    Context, Decorations, Entity, Focusable, MouseButton, Window, WindowControlArea, div,
-    prelude::*, px,
+    Context, Decorations, Entity, MouseButton, Window, WindowControlArea, div, prelude::*, px,
 };
 use ui::{ActiveTheme, IconName, Tooltip, icon};
 
 use crate::{
     panels::{Mode, Panels, Side, ToggleLeftSidebar, ToggleRightSidebar},
-    search::Search,
+    search::{self, Search},
 };
 
 /// Where the left toggle sits on macOS: just right of the traffic lights.
@@ -33,6 +32,8 @@ impl Titlebar {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&panels, |_, _, cx| cx.notify()).detach();
+        // The pill hides while search is open (it has grown into the panel).
+        cx.observe(&search, |_, _, cx| cx.notify()).detach();
         Self {
             panels,
             search,
@@ -44,14 +45,14 @@ impl Titlebar {
 impl Render for Titlebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
-        // Search is 396px wide, shrinking to 46% of the window on narrow sizes.
-        let search_width = (window.viewport_size().width * 0.46).min(px(396.));
+        let search_width = search::pill_width(window.viewport_size().width);
+        let search_open = self.search.read(cx).is_open();
         let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
         let hover_line = t.line_strong;
-        let search_focused = self.search.focus_handle(cx).is_focused(window);
-        let field = self
-            .search
-            .update(cx, |search, cx| search.field(window, cx));
+        let field = (!search_open).then(|| {
+            self.search
+                .update(cx, |search, cx| search.field(window, cx))
+        });
 
         div()
             .id("titlebar")
@@ -87,32 +88,45 @@ impl Render for Titlebar {
                     }
                 }))
             })
-            .child(
-                div()
-                    .id("search")
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .h(px(30.))
-                    .w(search_width)
-                    .rounded_full()
-                    .border_1()
-                    .border_color(t.line)
-                    .when(search_focused, |s| s.border_color(hover_line))
-                    .bg(t.surface)
-                    .text_color(t.ink)
-                    .text_size(px(13.))
-                    .line_height(px(18.))
-                    .hover(move |s| s.border_color(hover_line))
-                    // Clicks on the field must not start a window drag.
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .child(div().absolute().left(px(12.)).child(icon(
-                        IconName::MagnifyingGlassBold,
-                        px(15.),
-                        t.muted,
-                    )))
-                    .child(div().w_full().px(px(32.)).child(field)),
-            )
+            // While search is open the workspace draws the grown panel over
+            // this spot; an empty box keeps the titlebar layout unchanged.
+            .when(search_open, |this| {
+                this.child(div().h(search::PILL_HEIGHT).w(search_width))
+            })
+            .when_some(field, |this, field| {
+                this.child(
+                    div()
+                        .id("search")
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .h(search::PILL_HEIGHT)
+                        .w(search_width)
+                        .rounded_full()
+                        .border_1()
+                        .border_color(t.line)
+                        .bg(t.surface)
+                        .text_color(t.ink)
+                        .text_size(px(13.))
+                        .line_height(px(18.))
+                        .hover(move |s| s.border_color(hover_line))
+                        // A click anywhere on the pill grows it into the search
+                        // panel. It must not start a window drag either.
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.search.update(cx, |s, cx| s.focus(window, cx));
+                            }),
+                        )
+                        .child(div().absolute().left(px(12.)).child(icon(
+                            IconName::MagnifyingGlassBold,
+                            px(15.),
+                            t.muted,
+                        )))
+                        .child(div().w_full().px(px(32.)).child(field)),
+                )
+            })
             .child(self.render_toggles(window, cx))
             .when(client_decorations, |this| {
                 this.child(window_controls(window, cx))

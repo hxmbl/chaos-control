@@ -1,20 +1,32 @@
-//! Titlebar search: the field, the results dropdown and the jump to a hit.
+//! Titlebar search: the field, the panel it grows into and the jump to a hit.
+//!
+//! At rest it is the pill in the titlebar. Focusing it (a click or cmd/ctrl-K)
+//! grows that same pill into the big search panel: one field on top, the
+//! highlighted result as a card with its actions, then the other results.
+//! Closing shrinks it back. The workspace draws the open panel over
+//! everything; the titlebar draws the pill only while it is closed, so the
+//! one `TextInput` is never on screen twice. Opening is explicit (a click on
+//! the pill, cmd/ctrl-K, typing into the field); focus leaving the field for
+//! something else in the window closes it.
 //!
 //! Every keystroke snapshots the store (`ChatStore::search_corpus`, `Arc` clones
 //! only) and runs the `SearchProvider` on a background thread, so a 100k-message
 //! history never stalls typing. A newer query cancels the one in flight. The
 //! provider is a plain substring scan for now; swapping it changes nothing here.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
 };
 
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, MouseButton,
-    SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Pixels, SharedString,
+    Subscription, Task, Window, actions, div, prelude::*, px,
 };
-use model::{Author, SearchHit, SearchProvider, SearchResult};
+use model::{Author, SearchAction, SearchHit, SearchProvider, SearchResult};
 use ui::{
     ActiveTheme, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, icon, pill, truncated,
 };
@@ -29,10 +41,35 @@ pub const KEY_CONTEXT: &str = "Search";
 const LIMIT: usize = 20;
 /// Rows shown under the card before the "…" row hides the rest.
 const COLLAPSED_ROWS: usize = 4;
+/// The pill grows into the panel over this long.
+const GROW: Duration = Duration::from_millis(140);
+/// The titlebar pill: 396px wide, shrinking to 46% of narrow windows.
+pub const PILL_HEIGHT: Pixels = px(30.);
+pub fn pill_width(viewport: Pixels) -> Pixels {
+    (viewport * 0.46).min(px(396.))
+}
+/// The open panel: half the window, between 560 and 760px, never closer than
+/// 24px to either edge.
+fn panel_width(viewport: Pixels) -> Pixels {
+    (viewport * 0.5)
+        .max(px(560.))
+        .min(px(760.))
+        .min(viewport - px(48.))
+}
 
 pub enum SearchEvent {
     /// The user picked a result; the store has already jumped to it.
     Jumped,
+    /// Escape on an empty field or a click outside closed the panel; the
+    /// keyboard should go back to the composer.
+    Dismissed,
+    /// The user picked one of a result's actions. Nothing produces actions
+    /// yet (see `SearchAction`); the workspace will route these.
+    #[allow(dead_code)]
+    Action {
+        hit: SearchHit,
+        action: SearchAction,
+    },
 }
 
 pub struct Search {
@@ -43,7 +80,10 @@ pub struct Search {
     highlighted: usize,
     /// Whether the "…" row was opened to show every result.
     expanded: bool,
+    /// The panel is open (the field has focus).
     open: bool,
+    /// When it last opened, for the grow animation.
+    opened_at: Option<Instant>,
     searching: bool,
     cancel: Arc<AtomicBool>,
     _pending: Option<Task<()>>,
@@ -60,11 +100,31 @@ impl Search {
         cx: &mut Context<Self>,
     ) -> Self {
         let input = cx.new(|cx| TextInput::new("Find anything", cx).centered());
+        let focus = input.focus_handle(cx);
         let subscriptions = vec![
-            cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
-                TextInputEvent::Changed => this.query_changed(cx),
-                TextInputEvent::Submit => this.confirm(this.highlighted, window, cx),
+            // Focus moving elsewhere in the app closes the panel. Not when the
+            // whole window deactivates (switching apps), so it's still there
+            // when the user comes back.
+            cx.on_focus_out(&focus, window, |this, _, window, cx| {
+                if window.is_window_active() {
+                    this.close(cx);
+                }
             }),
+            cx.subscribe_in(
+                &input,
+                window,
+                |this, input, event, window, cx| match event {
+                    TextInputEvent::Changed => {
+                        // Typing into the field always shows the panel.
+                        if !this.open && input.focus_handle(cx).is_focused(window) {
+                            this.open(cx);
+                        } else {
+                            this.query_changed(cx);
+                        }
+                    }
+                    TextInputEvent::Submit => this.confirm(this.highlighted, window, cx),
+                },
+            ),
             // Results point into the store; drop them when the store changes shape.
             cx.observe(&store, |this, _, cx| {
                 if this.open {
@@ -80,6 +140,7 @@ impl Search {
             highlighted: 0,
             expanded: false,
             open: false,
+            opened_at: None,
             searching: false,
             cancel: Arc::new(AtomicBool::new(false)),
             _pending: None,
@@ -87,26 +148,50 @@ impl Search {
         }
     }
 
-    /// cmd/ctrl-K: focus the field and show results for whatever is in it.
-    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.input.focus_handle(cx));
-        self.reopen(cx);
+    pub fn is_open(&self) -> bool {
+        self.open
     }
 
-    /// Show the dropdown again if there is a query to show results for.
-    pub fn reopen(&mut self, cx: &mut Context<Self>) {
-        if !self.open && !self.input.read(cx).text().trim().is_empty() {
-            self.open = true;
-            self.query_changed(cx);
+    /// cmd/ctrl-K: focus the field and open the panel. Pressed again with the
+    /// panel open, it selects the query so typing replaces it.
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open {
+            self.input.update(cx, |input, cx| input.select_all_text(cx));
+        } else {
+            window.focus(&self.input.focus_handle(cx));
+            self.open(cx);
         }
+    }
+
+    /// Grow the pill into the panel (a click on the pill, cmd/ctrl-K, typing).
+    pub fn open(&mut self, cx: &mut Context<Self>) {
+        if self.open {
+            return;
+        }
+        self.open = true;
+        self.opened_at = Some(Instant::now());
+        self.input
+            .update(cx, |input, cx| input.set_centered(false, cx));
+        self.query_changed(cx);
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
         if self.open {
             self.open = false;
+            self.opened_at = None;
             self.cancel.store(true, Ordering::Relaxed);
             self._pending = None;
+            self.input
+                .update(cx, |input, cx| input.set_centered(true, cx));
             cx.notify();
+        }
+    }
+
+    /// Close and hand the keyboard back (Escape, a click outside).
+    fn dismiss_panel(&mut self, cx: &mut Context<Self>) {
+        if self.open {
+            self.close(cx);
+            cx.emit(SearchEvent::Dismissed);
         }
     }
 
@@ -115,16 +200,17 @@ impl Search {
         let query = self.input.read(cx).text().to_string();
         if query.trim().is_empty() {
             self.hits.clear();
-            self.open = false;
             self.searching = false;
             self._pending = None;
             cx.notify();
             return;
         }
 
+        if !self.open {
+            return;
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancel = cancel.clone();
-        self.open = true;
         self.searching = true;
         let corpus = self.store.read(cx).search_corpus();
         let provider = self.provider.clone();
@@ -169,10 +255,10 @@ impl Search {
         }
     }
 
-    /// Escape closes the dropdown; a second Escape clears the query.
+    /// Escape clears the query; on an empty field it closes the panel.
     fn dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
-        if self.open {
-            self.close(cx);
+        if self.input.read(cx).text().is_empty() {
+            self.dismiss_panel(cx);
         } else {
             self.input.update(cx, |input, cx| input.clear(cx));
         }
@@ -191,6 +277,7 @@ impl Search {
     }
 
     /// Wraps the field so up/down/escape reach the search while it has focus.
+    /// The titlebar shows it in the pill while the panel is closed.
     pub fn field(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let this = cx.entity();
         div()
@@ -199,10 +286,6 @@ impl Search {
             .on_action(window.listener_for(&this, Self::select_next))
             .on_action(window.listener_for(&this, Self::select_previous))
             .on_action(window.listener_for(&this, Self::dismiss))
-            .on_mouse_down(
-                MouseButton::Left,
-                window.listener_for(&this, |this, _, _, cx| this.reopen(cx)),
-            )
             .child(self.input.clone())
     }
 
@@ -345,19 +428,64 @@ impl Focusable for Search {
     }
 }
 
+impl Search {
+    /// A result's actions ("New chat", "Ask an agent to the side", …) as rows
+    /// under the card, as in the search mock. Empty until a provider makes them.
+    fn render_actions(&self, cx: &mut Context<Self>) -> Vec<gpui::AnyElement> {
+        let Some(result) = self.hits.get(self.highlighted) else {
+            return Vec::new();
+        };
+        result
+            .actions
+            .iter()
+            .enumerate()
+            .map(|(ix, action)| {
+                let hit = result.hit.clone();
+                let action = action.clone();
+                let label = SharedString::from(action.label.clone());
+                pill(("search-action", ix), cx)
+                    .h(px(38.))
+                    .px(px(14.))
+                    .text_size(px(13.5))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close(cx);
+                        cx.emit(SearchEvent::Action {
+                            hit: hit.clone(),
+                            action: action.clone(),
+                        });
+                    }))
+                    .child(div().flex_1().ellipsis().child(truncated(label)))
+                    .into_any_element()
+            })
+            .collect()
+    }
+}
+
 impl Render for Search {
-    /// The dropdown, shaped after the search sketch: one rounded panel hanging
-    /// from the titlebar with the query line, the highlighted result as a card,
-    /// a divider, then the other results as stacked rows and a slim "…" row when
-    /// there are more. (In the sketch those rows are actions on the card; they
-    /// arrive with the command palette and will use the same rows.) Rendered by
-    /// the workspace over everything else, at the chat column's width.
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The open panel, shaped after the search mock: the titlebar pill grown
+    /// into one rounded panel with the field on top, then the highlighted
+    /// result as a card with its actions, a divider, the other results as
+    /// stacked rows and a slim "…" row when there are more. Rendered by the
+    /// workspace over everything else, centred where the pill is.
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.open {
             return div().into_any_element();
         }
         let t = *cx.theme();
-        let query = self.input.read(cx).text().clone();
+        let viewport = window.viewport_size().width;
+
+        // Grow from the pill's width to the panel's, easing out.
+        let grow = self.opened_at.map_or(1., |at| {
+            (at.elapsed().as_secs_f32() / GROW.as_secs_f32()).min(1.)
+        });
+        if grow < 1. {
+            window.request_animation_frame();
+        }
+        let eased = 1. - (1. - grow).powi(3);
+        let (from, to) = (pill_width(viewport), panel_width(viewport));
+        let width = from + (to - from) * eased;
+
+        let query_empty = self.input.read(cx).text().trim().is_empty();
         let others: Vec<usize> = (0..self.hits.len())
             .filter(|ix| *ix != self.highlighted)
             .collect();
@@ -371,39 +499,28 @@ impl Render for Search {
             .iter()
             .map(|ix| self.render_row(*ix, cx))
             .collect();
+        let actions = self.render_actions(cx);
         let empty = self.hits.is_empty();
         let more = !self.expanded && hidden > 0;
 
-        div()
-            .id("search-results")
-            .occlude()
-            .w_full()
-            .max_h(px(520.))
-            .overflow_y_scroll()
+        let field = self.field(window, cx);
+        let body = div()
             .flex()
             .flex_col()
             .gap(px(6.))
-            .p(px(8.))
-            .rounded(px(18.))
-            .border_1()
-            .border_color(t.line_strong)
-            .bg(t.surface)
-            .shadow(t.float_shadow())
-            .text_color(t.ink)
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close(cx)))
-            // Query line
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .px(px(6.))
-                    .text_size(px(12.))
-                    .text_color(t.muted)
-                    .child(icon(IconName::MagnifyingGlassBold, px(13.), t.muted))
-                    .child(div().flex_1().ellipsis().child(truncated(query))),
-            )
-            .when(empty, |d| {
+            .opacity(eased)
+            .when(query_empty, |d| {
+                d.child(
+                    div()
+                        .px(px(12.))
+                        .pt(px(2.))
+                        .pb(px(8.))
+                        .text_size(px(13.))
+                        .text_color(t.muted)
+                        .child("Search channels and messages"),
+                )
+            })
+            .when(!query_empty && empty, |d| {
                 d.child(
                     div()
                         .px(px(12.))
@@ -418,6 +535,7 @@ impl Render for Search {
                 )
             })
             .when(!empty, |d| d.child(self.render_card(cx)))
+            .when(!actions.is_empty(), |d| d.children(actions))
             .when(!rows.is_empty(), |d| {
                 d.child(
                     div()
@@ -446,7 +564,41 @@ impl Render for Search {
                         .child("…")
                         .child(icon(IconName::CaretDown, px(10.), t.muted)),
                 )
-            })
+            });
+
+        div()
+            .id("search-panel")
+            .occlude()
+            .w(width)
+            .max_h(px(560.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .p(px(4.) * eased)
+            .rounded(px(15.) + px(5.) * eased)
+            .border_1()
+            .border_color(t.line_strong)
+            .bg(t.surface)
+            .shadow(t.float_shadow())
+            .text_color(t.ink)
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_panel(cx)))
+            // The field, where the pill was: icon on the left, query after it.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .flex_none()
+                    .h(PILL_HEIGHT - px(2.) + px(6.) * eased)
+                    .gap(px(8.))
+                    .pl(px(11.))
+                    .pr(px(12.))
+                    .text_size(px(13.) + px(1.) * eased)
+                    .line_height(px(18.))
+                    .child(icon(IconName::MagnifyingGlassBold, px(15.), t.muted))
+                    .child(div().flex_1().min_w_0().child(field)),
+            )
+            .child(body)
             .into_any_element()
     }
 }

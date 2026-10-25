@@ -59,15 +59,29 @@ keystroke takes a `SearchCorpus` snapshot from the store (it clones `Arc`s, not
 messages; `ChannelLog` is copy-on-write) and runs the provider on
 `cx.background_spawn`, so a 100k-message history never blocks typing. A newer
 query sets the previous one's cancel flag and drops its task, so stale results
-never land. Results (channels first, then messages newest first, capped at 20)
-show in one panel hanging from the titlebar at the chat column's width: the
-highlighted result as a card, then the rest as rows, with a "…" row when more
-are hidden. Up/down move, Enter or a click jumps to the channel and scrolls to
-the message, Escape closes. Each `SearchResult` can carry `SearchAction`s for
-the coming command palette (new chat, ask an agent, link in main); none are
-produced yet. Today's provider, `SubstringSearch`, is a plain case-insensitive
-scan; ranking, semantic search or commands can replace it without touching the
-UI.
+never land.
+
+At rest the field is the pill in the titlebar. Focusing it (a click or
+`cmd/ctrl-K`) grows that pill into the search panel over 140ms: the same spot
+and centre, widening to half the window (560 to 760px), with one field on top
+and the results under it. There is never a second input row. Under the field:
+the highlighted result as a card, its actions as rows (as in the mock: "New
+chat", "Ask an agent to the side", "Link this in main"), a divider, the other
+results as rows, and a "…" row when more are hidden (channels first, then
+messages newest first, capped at 20). Up/down move, Enter or a click jumps to
+the channel and scrolls to the message. Escape clears the query, and on an
+empty field closes the panel; a click outside closes it too. Closing hands the
+keyboard back to the composer and turns the panel back into the pill.
+Opening is explicit (a click on the pill, `cmd/ctrl-K`, or typing into the
+field); focus moving elsewhere in the window also closes it, but switching to
+another app doesn't. Only one of pill or panel draws the `TextInput` at a time.
+`cmd/ctrl-K` with the panel already open selects the query.
+
+Each `SearchResult` can carry `SearchAction`s for the coming command palette;
+the panel already draws them and emits `SearchEvent::Action`, but nothing
+produces them yet. Today's provider, `SubstringSearch`, is a plain
+case-insensitive scan; ranking, semantic search or commands can replace it
+without touching the UI.
 
 ## Rendering
 
@@ -163,12 +177,12 @@ macOS and ctrl elsewhere.
 
 | Keys | Does | Where |
 | --- | --- | --- |
-| `cmd/ctrl-K` | Focus search | Anywhere |
+| `cmd/ctrl-K` | Open search (again: select the query) | Anywhere |
 | `cmd/ctrl-alt-[` | Show/hide the left sidebar | Anywhere |
 | `cmd/ctrl-alt-]` | Show/hide the right sidebar | Anywhere |
-| `up` / `down` | Move through results | Search field |
-| `enter` | Jump to the highlighted result | Search field |
-| `escape` | Close results; again to clear | Search field |
+| `up` / `down` | Move through results | Search |
+| `enter` | Jump to the highlighted result | Search |
+| `escape` | Clear the query; on an empty field, close | Search |
 | `enter` | Send | Composer |
 | `cmd/ctrl-Q` | Quit | Anywhere |
 
