@@ -11,7 +11,7 @@ use gpui::{
     Subscription, Window, div, list, prelude::*, px,
 };
 use model::{Author, Id};
-use ui::{ActiveTheme, Ellipsis, IconName, brand_icon, icon};
+use ui::{ActiveTheme, Ellipsis, IconName, brand_icon, icon, truncated};
 
 use crate::store::{ChatStore, StoreEvent};
 
@@ -133,7 +133,7 @@ impl Conversation {
                                             .ellipsis()
                                             .text_size(px(14.))
                                             .font_weight(FontWeight::SEMIBOLD)
-                                            .child(name),
+                                            .child(truncated(name)),
                                     )
                                     .child(
                                         div()
@@ -207,8 +207,11 @@ impl Render for Conversation {
                     .gap(px(8.))
                     .text_center()
                     .child(
+                        // flex_none: the blurb below is measured unwrapped first,
+                        // so the column can come out short and squash its items.
                         div()
                             .size(px(40.))
+                            .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
@@ -219,8 +222,7 @@ impl Render for Conversation {
                     )
                     .child(
                         div()
-                            .max_w_full()
-                            .ellipsis()
+                            .flex_none()
                             .text_size(px(15.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.ink_soft)

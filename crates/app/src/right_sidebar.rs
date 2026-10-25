@@ -6,9 +6,9 @@ use std::time::Duration;
 use gpui::{
     Animation, AnimationExt as _, AnyView, BoxShadow, Context, Entity, FontWeight, Hsla,
     SharedString, StyleRefinement, Window, div, linear_color_stop, linear_gradient, point,
-    prelude::*, px, relative, transparent_black,
+    prelude::*, px, relative,
 };
-use ui::{ActiveTheme, Ellipsis, IconName, Theme, Tooltip, brand_icon, icon, pill};
+use ui::{ActiveTheme, Ellipsis, IconName, Theme, Tooltip, brand_icon, icon, pill, truncated};
 
 use crate::store::ChatStore;
 
@@ -182,7 +182,7 @@ impl Render for RightSidebar {
                                                 div()
                                                     .flex_1()
                                                     .ellipsis()
-                                                    .child(SharedString::from(text)),
+                                                    .child(truncated(SharedString::from(text))),
                                             )
                                     },
                                 )),
@@ -204,7 +204,7 @@ impl Render for RightSidebar {
                             .line_height(px(18.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(t.ink_soft)
-                            .child("Agent Status"),
+                            .child(truncated("Agent Status")),
                     )
                     .child(div().flex().flex_col().gap(px(10.)).children(
                         agents.chunks(4).enumerate().map(|(row, chunk)| {
@@ -295,7 +295,7 @@ impl Render for CatchUp {
                             .line_height(px(20.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(t.ink)
-                            .child("Summarizing what happened while you were gone…"),
+                            .child(truncated("Summarizing what happened while you were gone…")),
                     ),
             )
             .child(
@@ -349,7 +349,9 @@ impl Render for CatchUp {
                             .h(px(24.))
                             .bg(linear_gradient(
                                 180.,
-                                linear_color_stop(transparent_black(), 0.),
+                                // Fade from the card's own colour, not transparent black, which
+                                // would darken the middle of the gradient.
+                                linear_color_stop(t.sunken.opacity(0.), 0.),
                                 linear_color_stop(t.sunken, 1.),
                             )),
                     ),

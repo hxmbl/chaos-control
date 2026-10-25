@@ -15,7 +15,9 @@ use gpui::{
     SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 use model::{Author, SearchHit, SearchProvider, SearchResult};
-use ui::{ActiveTheme, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, icon, pill};
+use ui::{
+    ActiveTheme, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, icon, pill, truncated,
+};
 
 use crate::store::ChatStore;
 
@@ -289,7 +291,7 @@ impl Search {
                             .ellipsis()
                             .text_size(px(15.))
                             .font_weight(FontWeight::MEDIUM)
-                            .child(title),
+                            .child(truncated(title)),
                     )
                     .child(
                         div()
@@ -325,7 +327,7 @@ impl Search {
             .px(px(14.))
             .text_size(px(13.5))
             .on_click(cx.listener(move |this, _, window, cx| this.confirm(ix, window, cx)))
-            .child(div().flex_1().ellipsis().child(line))
+            .child(div().flex_1().ellipsis().child(truncated(line)))
             .child(
                 div()
                     .flex_none()
@@ -399,7 +401,7 @@ impl Render for Search {
                     .text_size(px(12.))
                     .text_color(t.muted)
                     .child(icon(IconName::MagnifyingGlassBold, px(13.), t.muted))
-                    .child(div().flex_1().ellipsis().child(query)),
+                    .child(div().flex_1().ellipsis().child(truncated(query))),
             )
             .when(empty, |d| {
                 d.child(
