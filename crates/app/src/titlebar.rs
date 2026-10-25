@@ -9,9 +9,8 @@ use gpui::{
 use ui::{ActiveTheme, IconName, Tooltip, icon};
 
 use crate::{
-    panels::{Panels, ToggleLeftSidebar, ToggleRightSidebar},
+    panels::{Mode, Panels, Side, ToggleLeftSidebar, ToggleRightSidebar},
     search::Search,
-    workspace::WIDE_BREAKPOINT,
 };
 
 /// Where the left toggle sits on macOS: just right of the traffic lights.
@@ -127,8 +126,19 @@ impl Titlebar {
     fn render_toggles(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
         let panels = self.panels.read(cx);
-        let (left_open, right_open) = (panels.left_open(), panels.right_open());
-        let narrow = window.viewport_size().width < WIDE_BREAKPOINT;
+        let (left_open, right_open) = (panels.docked(Side::Left), panels.docked(Side::Right));
+        let tip = |side: Side, name: &str| -> String {
+            match (panels.docked(side), panels.mode(side)) {
+                (true, _) => format!("Hide {name}"),
+                (false, Mode::Collapsed) => format!("Show {name}"),
+                // Collapsed by the window width: showing it pins it open.
+                (false, _) => format!("Pin {name} open (collapsed to fit the window)"),
+            }
+        };
+        let (left_tip, right_tip) = (
+            tip(Side::Left, "sidebar"),
+            tip(Side::Right, "activity panel"),
+        );
         let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
         let mac_lights = cfg!(target_os = "macos") && !window.is_fullscreen();
 
@@ -160,12 +170,6 @@ impl Titlebar {
                 .child(icon(name, px(17.), if on { t.ink } else { t.muted }))
         };
 
-        let right_tip = match (right_open, narrow) {
-            (_, true) => "Activity panel (hidden below 1200px wide)",
-            (true, false) => "Hide activity panel",
-            (false, false) => "Show activity panel",
-        };
-
         div()
             .absolute()
             .inset_0()
@@ -173,25 +177,19 @@ impl Titlebar {
                 toggle("toggle-left-sidebar", IconName::SidebarLeft, left_open)
                     .top(px(12.))
                     .left(left_x)
-                    .tooltip(Tooltip::text(if left_open {
-                        "Hide sidebar"
-                    } else {
-                        "Show sidebar"
-                    }))
+                    .tooltip(Tooltip::text(left_tip))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(ToggleLeftSidebar), cx)
                     }),
             )
             .child(
-                toggle(
-                    "toggle-right-sidebar",
-                    IconName::SidebarRight,
-                    right_open && !narrow,
-                )
-                .top(px(12.))
-                .right(right_x)
-                .tooltip(Tooltip::text(right_tip))
-                .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleRightSidebar), cx)),
+                toggle("toggle-right-sidebar", IconName::SidebarRight, right_open)
+                    .top(px(12.))
+                    .right(right_x)
+                    .tooltip(Tooltip::text(right_tip))
+                    .on_click(|_, window, cx| {
+                        window.dispatch_action(Box::new(ToggleRightSidebar), cx)
+                    }),
             )
     }
 }

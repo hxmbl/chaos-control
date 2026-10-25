@@ -140,6 +140,30 @@ impl Theme {
         ]
     }
 
+    /// Deeper shadow for a sidebar peeking over the content, so it reads as
+    /// floating above the chat rather than docked beside it.
+    pub fn overlay_shadow(&self) -> Vec<BoxShadow> {
+        let (y, blur) = if self.is_dark() {
+            (16., 44.)
+        } else {
+            (14., 40.)
+        };
+        vec![
+            BoxShadow {
+                color: self.shadow_near,
+                offset: point(px(0.), px(2.)),
+                blur_radius: px(6.),
+                spread_radius: px(0.),
+            },
+            BoxShadow {
+                color: self.shadow_far,
+                offset: point(px(0.), px(y)),
+                blur_radius: px(blur),
+                spread_radius: px(-6.),
+            },
+        ]
+    }
+
     /// Glow colour for an agent's state: green active, purple sleeping, red
     /// unresponsive.
     pub fn agent_state(&self, state: AgentState) -> Hsla {

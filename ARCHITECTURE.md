@@ -97,16 +97,60 @@ UI.
   handles on each edge; when it insists on server decorations, those are skipped.
 - Window: 1440×900 by default, 760×520 minimum.
 - Sidebar toggles: titlebar buttons at either end (the left one just past the
-  macOS traffic lights) and `cmd/ctrl-alt-[` / `cmd/ctrl-alt-]`. The open state is
-  user intent held in an `Entity<Panels>`; toggling slides the panel off its
-  edge over 180ms while the centre column reflows. Below 1200px of width the
-  right sidebar stays hidden whatever its toggle says, and comes back on
-  widening only if it was left open.
+  macOS traffic lights) and `cmd/ctrl-alt-[` / `cmd/ctrl-alt-]`. See Sidebars
+  below for what they do at each width.
 - Layout: both sidebars float 12px from the window edges and run from just
   under the titlebar to 12px above the bottom, so they grow with the window
   (the channel list, catch-up card and mentions take the extra height). The
   conversation and composer share one centred column that widens with the
   window, from 720px up to 960px.
+
+## Sidebars
+
+Both sidebars collapse on their own when the window gets too narrow, Notion
+style, and a collapsed one is never gone: hovering the window edge slides it
+back in over the content. The rules live in `panels.rs` as plain state
+(`plan`, `Peek`, `Panels`) with unit tests; `Workspace` feeds it the window
+size, pointer moves and focus, and draws what `Panels::frame` returns.
+
+Each sidebar has a mode, `Auto` by default:
+
+| Mode | Docked when | Set by |
+| --- | --- | --- |
+| `Auto` | the chat column keeps at least 560px beside it | default; showing a sidebar where it fits |
+| `Pinned` | the column keeps at least 360px | showing a sidebar where it wouldn't fit on its own |
+| `Collapsed` | never (edge peek only) | hiding a docked sidebar |
+
+- Breakpoints (`Auto`, 560px column): both docked from 1202px wide (the old
+  1200px cut-off); below that the right one collapses first; the left one
+  alone needs 870px. With the left one hidden by hand, the right one alone
+  needs 932px. An `Auto` sidebar that collapsed comes back only 24px past its
+  breakpoint, so dragging a window edge across the line doesn't make it flap.
+- Toggle on a docked sidebar: it collapses and stays collapsed at every width
+  (`Collapsed`) until toggled again. Resizing never changes a mode.
+- Toggle on a collapsed or peeking sidebar: it docks now. If it fits it
+  becomes `Auto` (so later narrowing collapses it again); if it doesn't, the
+  user asked for it anyway, so it becomes `Pinned` and stays docked through
+  resizes until hidden. Toggling a peek docks it in place: the panel stays
+  put and only the column slides over.
+- Space: pinned sidebars are placed first, newest pin first, then `Auto`
+  ones, left before right. So pinning the right sidebar on a narrow window
+  tucks the left one away (it comes back when there's room), and when both
+  are pinned but only one fits, the one pinned last wins. The window minimum
+  (760px) always fits one pinned sidebar.
+- Edge peek: a 10px strip at each window edge, starting under the 52px
+  titlebar, so on macOS it never overlaps the traffic lights or the titlebar
+  toggle. Entering it (with no mouse button held, so a text drag off the edge
+  doesn't trigger it) slides the collapsed sidebar in over 140ms as a floating
+  overlay: deeper shadow, no reflow, fully interactive, clicks don't fall
+  through. While open, the panel plus the strip between it and the edge plus
+  12px past its outer edge count as inside, so there is no flicker between
+  zone and panel. Leaving (or the pointer leaving the window) starts a 350ms
+  grace; coming back cancels it. It stays open while keyboard focus is inside
+  it or while something inside holds it (`Panels::set_held`, for menus and
+  popovers); the grace starts when that ends.
+- Motion: docking and collapsing slide the panel off its edge and reflow the
+  column over 180ms (ease-out cubic), reversible mid-slide.
 
 ## Shortcuts
 

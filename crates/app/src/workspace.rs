@@ -1,16 +1,22 @@
 //! Root view: lays out the titlebar, both floating sidebars, the conversation and
 //! the composer, and keeps the theme in step with the OS appearance.
 
+use std::time::Instant;
+
 use gpui::{
-    AnyView, Context, CursorStyle, Decorations, Entity, MouseButton, Pixels, ResizeEdge,
-    StyleRefinement, Subscription, Window, div, prelude::*, px,
+    AnyView, Context, CursorStyle, Decorations, DispatchPhase, Entity, FocusHandle, MouseButton,
+    MouseExitEvent, MouseMoveEvent, Pixels, ResizeEdge, StyleRefinement, Subscription, Window,
+    canvas, div, prelude::*, px,
 };
 use ui::{ActiveTheme, FONT_FAMILY, Theme};
 
 use crate::{
     composer::Composer,
     conversation::Conversation,
-    panels::{Panels, ToggleLeftSidebar, ToggleRightSidebar},
+    panels::{
+        GUTTER, LEFT_WIDTH, Panels, RIGHT_WIDTH, SIDE_INSET, Side, SideFrame, ToggleLeftSidebar,
+        ToggleRightSidebar,
+    },
     right_sidebar::RightSidebar,
     search::{FocusSearch, Search, SearchEvent},
     sidebar::Sidebar,
@@ -18,17 +24,10 @@ use crate::{
     titlebar::Titlebar,
 };
 
-/// Below this window width the right sidebar is hidden, whatever its toggle says.
-pub const WIDE_BREAKPOINT: Pixels = px(1200.);
-const LEFT_WIDTH: Pixels = px(258.);
-const RIGHT_WIDTH: Pixels = px(320.);
-/// Gap between the window edge and a floating panel. The sidebars use it on the
-/// sides and the bottom; the composer uses it at the bottom.
-const SIDE_INSET: Pixels = px(12.);
 /// The sidebars start just under the titlebar.
 const SIDE_TOP: Pixels = px(4.);
-/// Breathing room between a sidebar and the centre column.
-const GUTTER: Pixels = px(20.);
+/// Corner radius of both sidebar panels (their views draw the same).
+const SIDE_RADIUS: Pixels = px(26.);
 /// The conversation and composer widen with the window between these widths.
 const COLUMN_MIN: Pixels = px(720.);
 const COLUMN_MAX: Pixels = px(960.);
@@ -62,7 +61,10 @@ pub struct Workspace {
     right_sidebar: Entity<RightSidebar>,
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
-    _subscriptions: [Subscription; 3],
+    /// Tracks keyboard focus anywhere inside each sidebar, so a peek holds
+    /// open while the user is typing or tabbing in it.
+    side_focus: [FocusHandle; 2],
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Workspace {
@@ -76,7 +78,33 @@ impl Workspace {
         cx.set_global(Theme::for_appearance(window.appearance()));
 
         let panels = cx.new(|_| Panels::new());
+        let viewport = window.viewport_size();
+        panels.update(cx, |p, _| p.layout(viewport, Instant::now()));
         let panels_changed = cx.observe(&panels, |_, _, cx| cx.notify());
+        // Re-apply the collapse rules whenever the window is resized.
+        let resized = cx.observe_window_bounds(window, |this, window, cx| {
+            let viewport = window.viewport_size();
+            this.panels.update(cx, |p, cx| {
+                if p.layout(viewport, Instant::now()) {
+                    cx.notify();
+                }
+            });
+        });
+        let side_focus = [cx.focus_handle(), cx.focus_handle()];
+        let mut focus_subscriptions = Vec::new();
+        for side in [Side::Left, Side::Right] {
+            let handle = &side_focus[side as usize];
+            focus_subscriptions.push(cx.on_focus_in(handle, window, move |this, _, cx| {
+                this.panels
+                    .update(cx, |p, _| p.set_held(side, true, Instant::now()));
+            }));
+            focus_subscriptions.push(cx.on_focus_out(handle, window, move |this, _, _, cx| {
+                this.panels.update(cx, |p, cx| {
+                    p.set_held(side, false, Instant::now());
+                    p.schedule_poll(cx);
+                });
+            }));
+        }
         let search = cx.new(|cx| {
             Search::new(
                 store.clone(),
@@ -99,7 +127,11 @@ impl Workspace {
             right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), cx)),
             conversation: cx.new(|cx| Conversation::new(store.clone(), cx)),
             composer,
-            _subscriptions: [appearance, panels_changed, jumped],
+            side_focus,
+            _subscriptions: [appearance, panels_changed, resized, jumped]
+                .into_iter()
+                .chain(focus_subscriptions)
+                .collect(),
         }
     }
 }
@@ -114,17 +146,15 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
         let viewport = window.viewport_size();
-        let wide = viewport.width >= WIDE_BREAKPOINT;
 
-        // 0 = hidden, 1 = shown; in between while a toggle slides the panel.
-        let (left_shown, right_toggle, sliding) = self.panels.read(cx).progress();
-        let right_shown = if wide { right_toggle } else { 0. };
+        // Docked, collapsed or peeking, and how far through a slide.
+        let ([left, right], sliding) = self.panels.read(cx).frame(Instant::now());
         if sliding {
             window.request_animation_frame();
         }
 
-        let left_space = (SIDE_INSET + LEFT_WIDTH) * left_shown;
-        let right_space = (RIGHT_WIDTH + SIDE_INSET) * right_shown;
+        let left_space = (SIDE_INSET + LEFT_WIDTH) * left.reserve;
+        let right_space = (RIGHT_WIDTH + SIDE_INSET) * right.reserve;
         let (pad_l, pad_r, column_w) = centre_column(viewport.width, left_space, right_space);
 
         let decorations = window.window_decorations();
@@ -133,10 +163,16 @@ impl Render for Workspace {
             .id("workspace")
             .key_context("Workspace")
             .on_action(cx.listener(|this, _: &ToggleLeftSidebar, _, cx| {
-                this.panels.update(cx, |p, cx| p.toggle_left(cx));
+                this.panels.update(cx, |p, cx| {
+                    p.toggle(Side::Left, Instant::now());
+                    cx.notify();
+                });
             }))
             .on_action(cx.listener(|this, _: &ToggleRightSidebar, _, cx| {
-                this.panels.update(cx, |p, cx| p.toggle_right(cx));
+                this.panels.update(cx, |p, cx| {
+                    p.toggle(Side::Right, Instant::now());
+                    cx.notify();
+                });
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
                 this.search.update(cx, |s, cx| s.focus(window, cx));
@@ -190,32 +226,23 @@ impl Render for Workspace {
                             .justify_center()
                             .child(div().w_full().max_w(column_w).child(self.composer.clone())),
                     )
-                    // Hidden sidebars slide off their edge and fade.
-                    .when(left_shown > 0., |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .left(SIDE_INSET - (LEFT_WIDTH + SIDE_INSET) * (1. - left_shown))
-                                .w(LEFT_WIDTH)
-                                .top(SIDE_TOP)
-                                .bottom(SIDE_INSET)
-                                .opacity(left_shown)
-                                .child(cached(&self.sidebar)),
-                        )
+                    // Collapsed sidebars slide off their edge and fade; a peek
+                    // slides one back over the content.
+                    .when(left.shown > 0., |this| {
+                        this.child(self.side_slot(Side::Left, left, cached(&self.sidebar), cx))
                     })
-                    .when(right_shown > 0., |this| {
-                        this.child(
-                            div()
-                                .absolute()
-                                .right(SIDE_INSET - (RIGHT_WIDTH + SIDE_INSET) * (1. - right_shown))
-                                .w(RIGHT_WIDTH)
-                                .top(SIDE_TOP)
-                                .bottom(SIDE_INSET)
-                                .opacity(right_shown)
-                                .child(cached(&self.right_sidebar)),
-                        )
+                    .when(right.shown > 0., |this| {
+                        this.child(self.side_slot(
+                            Side::Right,
+                            right,
+                            cached(&self.right_sidebar),
+                            cx,
+                        ))
                     }),
             )
+            // Edge hover zones: watch every pointer move (capture phase, so
+            // nothing on top can swallow it) and let `Panels` decide.
+            .child(self.pointer_watcher(cx))
             // Search results float over everything, just under the titlebar.
             .child(
                 div()
@@ -242,6 +269,82 @@ impl Render for Workspace {
                     }
                 }
             })
+    }
+}
+
+impl Workspace {
+    /// One sidebar, docked or peeking. A peek floats over the chat with a
+    /// deeper shadow and swallows clicks so nothing underneath reacts.
+    fn side_slot(
+        &self,
+        side: Side,
+        frame: SideFrame,
+        view: AnyView,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let t = *cx.theme();
+        let offset = SIDE_INSET - (side.width() + SIDE_INSET) * (1. - frame.shown);
+        div()
+            .id(match side {
+                Side::Left => "left-sidebar",
+                Side::Right => "right-sidebar",
+            })
+            .absolute()
+            .map(|d| match side {
+                Side::Left => d.left(offset),
+                Side::Right => d.right(offset),
+            })
+            .w(side.width())
+            .top(SIDE_TOP)
+            .bottom(SIDE_INSET)
+            .opacity(frame.shown)
+            .track_focus(&self.side_focus[side as usize])
+            // Clicking a sidebar must not move keyboard focus to the panel
+            // itself (the composer keeps it); fields inside still focus
+            // themselves. Runs after the children's handlers, before the
+            // panel's own focus transfer.
+            .on_any_mouse_down(|_, window, _| window.prevent_default())
+            .when(frame.overlay, |d| {
+                d.occlude().rounded(SIDE_RADIUS).shadow(t.overlay_shadow())
+            })
+            .child(view)
+    }
+
+    /// An invisible full-window canvas that feeds pointer moves and window
+    /// exits to `Panels` for the edge peek.
+    fn pointer_watcher(&self, _: &Context<Self>) -> impl IntoElement {
+        let panels = self.panels.clone();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let on_move = panels.clone();
+                window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    on_move.update(cx, |p, cx| {
+                        let opened =
+                            p.pointer(Some(e.position), e.pressed_button.is_some(), Instant::now());
+                        p.schedule_poll(cx);
+                        if opened {
+                            cx.notify();
+                        }
+                    });
+                });
+                let on_exit = panels.clone();
+                window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    on_exit.update(cx, |p, cx| {
+                        p.pointer(None, false, Instant::now());
+                        p.schedule_poll(cx);
+                    });
+                });
+            },
+        )
+        .absolute()
+        .size_full()
     }
 }
 
