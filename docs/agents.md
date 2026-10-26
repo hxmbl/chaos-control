@@ -218,6 +218,10 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
 
 - `tests/scenarios.rs`, `tests/invariants.rs`: the real engine, store, host and
   ACP adapter against a scripted fake agent, with a manual clock.
+- `tests/cancel.rs`: cancelling a turn (`Core::interrupt` -> `session/cancel`):
+  an in-flight turn settles `Cancelled` with its obligations `unmet` and no
+  fallback, a cancel with no turn running is harmless, the next turn runs
+  normally, and the fake binary answers `cancelled` over real stdio.
 - `tests/mcp.rs`: the chat MCP server over real localhost HTTP, and the bridge.
 - `tests/replay.rs`: recorded transcripts through the real adapter (v1
   claude-agent-acp, v2 claude-agent-acp live, codex-acp needing sign-in), and
