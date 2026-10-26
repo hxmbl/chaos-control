@@ -84,8 +84,24 @@ impl Harness {
         self.fake(handle).observed.lock().unwrap().prompts.clone()
     }
 
+    /// Waits (real time, bounded) until the fake agent has seen `n` prompts.
+    /// A dispatch is recorded before the session opens, so the prompt lands later.
+    pub async fn wait_prompts(&self, handle: &str, n: usize) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let prompts = self.prompts(handle);
+            if prompts.len() >= n || tokio::time::Instant::now() > deadline {
+                return prompts;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     pub async fn say(&self, body: &str) -> Message {
-        self.core.post(self.hx.id, self.main, body, None).await.unwrap()
+        self.core
+            .post(self.hx.id, self.main, body, None)
+            .await
+            .unwrap()
     }
 
     pub async fn say_reply(&self, body: &str, to: MessageId) -> Message {
@@ -126,7 +142,10 @@ impl Harness {
     /// Waits for a message by `author` (None = system).
     pub async fn wait_message(&mut self, what: &str, author: Option<MemberId>) -> Message {
         match self
-            .wait_for(what, |e| matches!(e, CoreEvent::Message(m) if m.author == author))
+            .wait_for(
+                what,
+                |e| matches!(e, CoreEvent::Message(m) if m.author == author),
+            )
             .await
         {
             CoreEvent::Message(m) => m,
@@ -135,11 +154,20 @@ impl Harness {
     }
 
     /// Polls until `pred` holds over the engine (real time, bounded).
-    pub async fn until(&self, what: &str, pred: impl Fn(&rusqlite::Connection) -> bool + Send + Sync + Clone + 'static) {
+    pub async fn until(
+        &self,
+        what: &str,
+        pred: impl Fn(&rusqlite::Connection) -> bool + Send + Sync + Clone + 'static,
+    ) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let p = pred.clone();
-            if self.core.with_engine(move |e, _| p(e.conn())).await.unwrap() {
+            if self
+                .core
+                .with_engine(move |e, _| p(e.conn()))
+                .await
+                .unwrap()
+            {
                 return;
             }
             if tokio::time::Instant::now() > deadline {

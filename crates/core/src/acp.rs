@@ -353,9 +353,14 @@ fn v1_caps(init: &v1::InitializeResponse) -> (Caps, Vec<Arc<str>>, bool) {
     if meta.pointer("/agentCapabilities/_meta/claudeCode/promptQueueing")
         == Some(&serde_json::Value::Bool(true))
     {
-        ext.push(Arc::from("_meta.claudeCode.promptQueueing (vendor queueing)"));
+        ext.push(Arc::from(
+            "_meta.claudeCode.promptQueueing (vendor queueing)",
+        ));
     }
-    if meta.pointer("/agentCapabilities/sessionCapabilities/systemPrompt").is_some() {
+    if meta
+        .pointer("/agentCapabilities/sessionCapabilities/systemPrompt")
+        .is_some()
+    {
         ext.push(Arc::from("sessionCapabilities.systemPrompt (unstable)"));
     }
     (caps, ext, http)
@@ -406,7 +411,9 @@ fn v1_outcome(stop: v1::StopReason) -> TurnOutcome {
 }
 
 /// Picks the agent's own decline option.
-fn v1_decline(req: &v1::RequestPermissionRequest) -> (v1::RequestPermissionResponse, Option<Arc<str>>) {
+fn v1_decline(
+    req: &v1::RequestPermissionRequest,
+) -> (v1::RequestPermissionResponse, Option<Arc<str>>) {
     let pick = req
         .options
         .iter()
@@ -439,7 +446,9 @@ async fn open_v1(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let tracker = Arc::new(Mutex::new(Tracker::default()));
     let events = req.events.clone();
-    tokio::spawn(run_v1(transport, req, pref, tracker, cmd_rx, ready_tx, events));
+    tokio::spawn(run_v1(
+        transport, req, pref, tracker, cmd_rx, ready_tx, events,
+    ));
     let info = ready_rx
         .await
         .map_err(|_| AgentError::new(AgentErrorKind::Transport, "agent exited during setup"))??;
@@ -607,7 +616,9 @@ async fn run_v1(
                         }
                         let sent = conn.send_request(v1::PromptRequest::new(
                             session_id.clone(),
-                            vec![v1::ContentBlock::Text(v1::TextContent::new(text.to_string()))],
+                            vec![v1::ContentBlock::Text(v1::TextContent::new(
+                                text.to_string(),
+                            ))],
                         ));
                         // Handed to the transport: deliver() returns Ok now.
                         let _ = done.send(Ok(()));
@@ -644,7 +655,8 @@ async fn run_v1(
                         });
                     }
                     Cmd::Cancel => {
-                        let _ = conn.send_notification(v1::CancelNotification::new(session_id.clone()));
+                        let _ =
+                            conn.send_notification(v1::CancelNotification::new(session_id.clone()));
                     }
                     Cmd::Close => break,
                 }

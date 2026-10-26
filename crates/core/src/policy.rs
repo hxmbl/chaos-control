@@ -85,7 +85,11 @@ pub struct PolicyState {
 }
 
 fn pair_key(channel: ChannelId, a: MemberId, b: MemberId) -> (ChannelId, MemberId, MemberId) {
-    if a < b { (channel, a, b) } else { (channel, b, a) }
+    if a < b {
+        (channel, a, b)
+    } else {
+        (channel, b, a)
+    }
 }
 
 impl PolicyState {
@@ -102,7 +106,11 @@ impl PolicyState {
             return Damp::Paused;
         }
         let alternates = st.last_from != Some(from);
-        let next = if alternates { st.alternations + 1 } else { st.alternations.max(1) };
+        let next = if alternates {
+            st.alternations + 1
+        } else {
+            st.alternations.max(1)
+        };
         if next > policy.max_alternations {
             st.paused = true;
             return Damp::Trip;
@@ -148,8 +156,7 @@ pub fn parse_mentions(body: &str) -> Vec<String> {
     let chars: Vec<char> = body.chars().collect();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '@' && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_'))
-        {
+        if chars[i] == '@' && (i == 0 || !(chars[i - 1].is_alphanumeric() || chars[i - 1] == '_')) {
             let start = i + 1;
             let mut end = start;
             while end < chars.len()

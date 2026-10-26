@@ -5,12 +5,7 @@
 //! call is a message to the actor, every answer comes back on a channel, and UI
 //! updates arrive as [`CoreEvent`]s.
 
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -252,7 +247,12 @@ impl Core {
     }
 
     /// A human member, created if new, joined to `channel`.
-    pub async fn human(&self, handle: &str, name: &str, channel: ChannelId) -> Result<Member, String> {
+    pub async fn human(
+        &self,
+        handle: &str,
+        name: &str,
+        channel: ChannelId,
+    ) -> Result<Member, String> {
         let (handle, name) = (handle.to_string(), name.to_string());
         self.with_engine(move |e, now| {
             let m = e.ensure_member(MemberKind::Human, &handle, &name)?;
@@ -303,7 +303,12 @@ impl Core {
         .map_err(PostError::Store)?
     }
 
-    pub async fn react(&self, member: MemberId, message: MessageId, emoji: &str) -> Result<(), PostError> {
+    pub async fn react(
+        &self,
+        member: MemberId,
+        message: MessageId,
+        emoji: &str,
+    ) -> Result<(), PostError> {
         let emoji = emoji.to_string();
         self.with_engine(move |e, now| e.react(now, member, message, &emoji))
             .await
@@ -362,8 +367,13 @@ struct AgentEntry {
 }
 
 enum SlotState {
-    Opening { queued: Option<Dispatch> },
-    Ready { session: Arc<dyn AgentSession>, fresh: bool },
+    Opening {
+        queued: Option<Dispatch>,
+    },
+    Ready {
+        session: Arc<dyn AgentSession>,
+        fresh: bool,
+    },
 }
 
 struct Slot {
@@ -449,8 +459,14 @@ impl Actor {
                 error,
             } => {
                 if self.slots.get(&(agent, channel)).map(|s| s.epoch) == Some(epoch) {
-                    self.engine
-                        .delivery_failed(now, agent, channel, batch, error.kind, &error.message);
+                    self.engine.delivery_failed(
+                        now,
+                        agent,
+                        channel,
+                        batch,
+                        error.kind,
+                        &error.message,
+                    );
                 }
             }
             Cmd::Interrupt { agent, channel } => {
@@ -478,7 +494,12 @@ impl Actor {
         }
     }
 
-    fn add_agent(&mut self, spec: AgentSpec, channel: ChannelId, now: Millis) -> Result<Member, String> {
+    fn add_agent(
+        &mut self,
+        spec: AgentSpec,
+        channel: ChannelId,
+        now: Millis,
+    ) -> Result<Member, String> {
         let member = self
             .engine
             .ensure_member(MemberKind::Agent, &spec.handle, &spec.name)
@@ -651,7 +672,8 @@ impl Actor {
         }
         match result {
             Ok(session) => {
-                self.engine.session_opened(now, agent, channel, session.info());
+                self.engine
+                    .session_opened(now, agent, channel, session.info());
                 let slot = self.slots.get_mut(&key).expect("checked");
                 let queued = match std::mem::replace(
                     &mut slot.state,
@@ -671,8 +693,14 @@ impl Actor {
                 let slot = self.slots.remove(&key).expect("checked");
                 self.tokens.revoke(&slot.token);
                 if let SlotState::Opening { queued: Some(d) } = slot.state {
-                    self.engine
-                        .delivery_failed(now, agent, channel, d.batch, error.kind, &error.message);
+                    self.engine.delivery_failed(
+                        now,
+                        agent,
+                        channel,
+                        d.batch,
+                        error.kind,
+                        &error.message,
+                    );
                 }
                 self.engine.session_closed(agent, channel);
             }

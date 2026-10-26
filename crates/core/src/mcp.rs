@@ -22,8 +22,8 @@ use std::{
 use rmcp::{
     ErrorData, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult, PaginatedRequestParams,
-        ServerCapabilities, ServerConfig, Tool,
+        CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     },
     service::{RequestContext, RoleServer},
     transport::streamable_http_server::{
@@ -55,10 +55,7 @@ pub struct Tokens {
 impl Tokens {
     pub fn mint(&self, scope: Scope) -> String {
         let token = random_token();
-        self.map
-            .lock()
-            .expect("lock")
-            .insert(token.clone(), scope);
+        self.map.lock().expect("lock").insert(token.clone(), scope);
         token
     }
 
@@ -140,35 +137,43 @@ pub fn tools() -> Vec<Tool> {
         Tool::new(
             "chat_search",
             "Search messages in channels you are a member of (case-insensitive substring), newest first.",
-            schema(json!({"type": "object", "required": ["query"], "properties": {
-                "query": {"type": "string"},
-                "channel": {"type": "string"},
-                "limit": {"type": "integer", "minimum": 1, "maximum": 20}
-            }})),
+            schema(
+                json!({"type": "object", "required": ["query"], "properties": {
+                    "query": {"type": "string"},
+                    "channel": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 20}
+                }}),
+            ),
         ),
         Tool::new(
             "chat_send",
             "Post a message to the channel as yourself. Set reply_to to the id of the message you are answering. client_request_id makes retries safe: the same id returns the original message instead of posting twice.",
-            schema(json!({"type": "object", "required": ["body", "client_request_id"], "properties": {
-                "body": {"type": "string"},
-                "reply_to": {"type": "integer", "description": "Message id you are replying to."},
-                "client_request_id": {"type": "string"}
-            }})),
+            schema(
+                json!({"type": "object", "required": ["body", "client_request_id"], "properties": {
+                    "body": {"type": "string"},
+                    "reply_to": {"type": "integer", "description": "Message id you are replying to."},
+                    "client_request_id": {"type": "string"}
+                }}),
+            ),
         ),
         Tool::new(
             "chat_react",
             "React to a message. ✅ or 👍 answers a message you owe a reply to; 👀 means you're on it (you still owe the reply).",
-            schema(json!({"type": "object", "required": ["message_id", "emoji"], "properties": {
-                "message_id": {"type": "integer"},
-                "emoji": {"type": "string"}
-            }})),
+            schema(
+                json!({"type": "object", "required": ["message_id", "emoji"], "properties": {
+                    "message_id": {"type": "integer"},
+                    "emoji": {"type": "string"}
+                }}),
+            ),
         ),
         Tool::new(
             "chat_status",
             "Set (or clear with null) a one-line status shown next to your name, e.g. \"running tests\". Never posted to the chat.",
-            schema(json!({"type": "object", "required": ["text"], "properties": {
-                "text": {"type": ["string", "null"]}
-            }})),
+            schema(
+                json!({"type": "object", "required": ["text"], "properties": {
+                    "text": {"type": ["string", "null"]}
+                }}),
+            ),
         ),
     ]
 }
@@ -245,7 +250,8 @@ pub fn call_tool(
     match name {
         "chat_context" => {
             let c = engine.conn();
-            let me = store::member(c, scope.agent)?.ok_or_else(|| ToolError("unknown agent".into()))?;
+            let me =
+                store::member(c, scope.agent)?.ok_or_else(|| ToolError("unknown agent".into()))?;
             let ch = store::channel(c, scope.channel)?
                 .ok_or_else(|| ToolError("not_found: no such channel".into()))?;
             let cursor = store::cursor(c, scope.agent, scope.channel)?;
@@ -253,7 +259,8 @@ pub fn call_tool(
             let members: Vec<Value> = store::members_of(c, scope.channel)?
                 .into_iter()
                 .map(|m| {
-                    let mut v = json!({"handle": m.handle, "name": m.name, "kind": m.kind.as_str()});
+                    let mut v =
+                        json!({"handle": m.handle, "name": m.name, "kind": m.kind.as_str()});
                     if m.kind == MemberKind::Agent {
                         let s = engine.status(m.id, scope.channel);
                         v["presence"] = json!({"glow": s.glow, "status": s.presence});
@@ -281,7 +288,13 @@ pub fn call_tool(
                     .ok_or_else(|| ToolError("not_found: no such message".into()))?;
                 let half = limit / 2;
                 let mut v = store::messages_before(c, channel, m.seq, half)?;
-                v.extend(store::messages_between(c, channel, m.seq - 1, head, limit - v.len())?);
+                v.extend(store::messages_between(
+                    c,
+                    channel,
+                    m.seq - 1,
+                    head,
+                    limit - v.len(),
+                )?);
                 (v, false)
             } else if let Some(before) = arg_u64(args, "before_seq") {
                 let after = arg_u64(args, "after_seq").unwrap_or(0);
@@ -290,7 +303,10 @@ pub fn call_tool(
                 (v, false)
             } else {
                 let after = arg_u64(args, "after_seq").unwrap_or(cursor.read_through);
-                (store::messages_between(c, channel, after, head, limit)?, true)
+                (
+                    store::messages_between(c, channel, after, head, limit)?,
+                    true,
+                )
             };
             let last = messages.last().map(|m| m.seq);
             let views: Vec<Value> = messages.iter().map(|m| message_view(c, m)).collect();
@@ -507,9 +523,9 @@ pub fn post_json(
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| std::io::Error::other("only http:// URLs are supported"))?;
-    let (host, path) = rest.split_once('/').map_or((rest, "/".to_string()), |(h, p)| {
-        (h, format!("/{p}"))
-    });
+    let (host, path) = rest
+        .split_once('/')
+        .map_or((rest, "/".to_string()), |(h, p)| (h, format!("/{p}")));
     let mut stream = TcpStream::connect(host)?;
     stream.set_read_timeout(Some(Duration::from_secs(300)))?;
     let version = protocol_version
@@ -562,7 +578,10 @@ Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             let mut crlf = String::new();
             reader.read_line(&mut crlf)?;
         }
-    } else if let Some(len) = headers.get("content-length").and_then(|v| v.parse::<usize>().ok()) {
+    } else if let Some(len) = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         raw.resize(len, 0);
         reader.read_exact(&mut raw)?;
     } else {

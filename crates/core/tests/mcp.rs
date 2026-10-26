@@ -36,7 +36,11 @@ async fn six_tools_scoped_to_the_session_and_revoked_on_close() {
     let reply = h.wait_message("reply", Some(bot.id)).await;
     assert_eq!(reply.reply_to, Some(ping.id));
     let spoof = h.wait_message("second send", Some(bot.id)).await;
-    assert_eq!(spoof.author, Some(bot.id), "author comes from the token, never the args");
+    assert_eq!(
+        spoof.author,
+        Some(bot.id),
+        "author comes from the token, never the args"
+    );
     h.quiesce().await;
     let results = h.fake("bot").observed.lock().unwrap().tool_results.clone();
     let ctx = results[0].as_ref().unwrap();
@@ -47,8 +51,17 @@ async fn six_tools_scoped_to_the_session_and_revoked_on_close() {
     let search = results[2].as_ref().unwrap();
     assert_eq!(search["hits"].as_array().unwrap().len(), 2);
     let send = results[4].as_ref().unwrap();
-    assert!(send["notes"][0].as_str().unwrap().contains("@everyone is not available"));
-    assert_eq!(reply.mentions, Vec::new(), "@everyone from an agent mentions nobody");
+    assert!(
+        send["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("@everyone is not available")
+    );
+    assert_eq!(
+        reply.mentions,
+        Vec::new(),
+        "@everyone from an agent mentions nobody"
+    );
 
     // The token the fake got is the session's; after an idle close it is dead.
     let sessions = h.fake("bot").observed.lock().unwrap().sessions.clone();
@@ -75,11 +88,16 @@ async fn six_tools_scoped_to_the_session_and_revoked_on_close() {
 async fn stdio_bridge_round_trips_json_rpc() {
     let mut h = Harness::new().await;
     let bot = h
-        .agent("bot", script(json!({"turns": [{"steps": [{"gate": "hold"}, {"text": "done"}]}]})))
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [{"gate": "hold"}, {"text": "done"}]}]})),
+        )
         .await;
     h.say("@bot hold on").await;
     h.until("session open", |c| {
-        c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0)).unwrap() == 1
+        c.query_row("SELECT COUNT(*) FROM sessions", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+            == 1
     })
     .await;
     let sessions = h.fake("bot").observed.lock().unwrap().sessions.clone();
@@ -106,8 +124,15 @@ async fn stdio_bridge_round_trips_json_rpc() {
     })
     .await
     .unwrap();
-    let lines: Vec<serde_json::Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-    assert_eq!(lines.len(), 3, "one answer per request, none for the notification: {out}");
+    let lines: Vec<serde_json::Value> = out
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(
+        lines.len(),
+        3,
+        "one answer per request, none for the notification: {out}"
+    );
     assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 6);
     assert_eq!(lines[2]["result"]["isError"], json!(false));
     let m = h.wait_message("bridged post", Some(bot.id)).await;
@@ -121,14 +146,26 @@ async fn chat_send_is_rate_limited_per_agent() {
     let sends: Vec<_> = (0..7)
         .map(|i| json!({"mcp": {"tool": "chat_send", "args": {"body": format!("post {i}"), "client_request_id": format!("p{i}")}}}))
         .collect();
-    let bot = h.agent("bot", script(json!({"turns": [{"steps": sends}]}))).await;
+    let bot = h
+        .agent("bot", script(json!({"turns": [{"steps": sends}]})))
+        .await;
     h.say("@bot spam a bit").await;
     h.until("settled", |c| {
-        c.query_row("SELECT COUNT(*) FROM batches WHERE state = 'settled'", [], |r| r.get::<_, i64>(0)).unwrap() == 1
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
     })
     .await;
     let results = h.fake("bot").observed.lock().unwrap().tool_results.clone();
     assert!(results[..6].iter().all(|r| r.is_ok()));
-    assert!(results[6].as_ref().unwrap_err().contains("rate_limited"), "{:?}", results[6]);
+    assert!(
+        results[6].as_ref().unwrap_err().contains("rate_limited"),
+        "{:?}",
+        results[6]
+    );
     assert_eq!(h.by(bot.id).await.len(), 6);
 }

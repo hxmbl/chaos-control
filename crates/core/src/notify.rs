@@ -33,10 +33,7 @@ fn clip(body: &str, max: usize) -> (String, bool) {
 
 fn line(c: &Connection, m: &Message, max: usize) -> String {
     let (body, cut) = clip(&m.body, max);
-    let reply = m
-        .reply_to
-        .map(|r| format!(" ↩ id:{r}"))
-        .unwrap_or_default();
+    let reply = m.reply_to.map(|r| format!(" ↩ id:{r}")).unwrap_or_default();
     let cut = if cut {
         format!(" [truncated; chat_read around={} for all of it]", m.id)
     } else {
@@ -61,7 +58,9 @@ pub fn compose(
     batch: BatchId,
     window_to: Seq,
 ) -> rusqlite::Result<String> {
-    let ch = store::channel(c, channel)?.map(|c| c.name).unwrap_or_default();
+    let ch = store::channel(c, channel)?
+        .map(|c| c.name)
+        .unwrap_or_default();
     let cursor = store::cursor(c, agent, channel)?;
     let triggers = store::batch_triggers(c, batch)?;
     let mut trigger_msgs = Vec::new();
@@ -92,7 +91,10 @@ pub fn compose(
     let unread = store::messages_between(c, channel, unread_from, window_to, 10_000)?;
     let unread_total = unread.len();
     // Unread that mention this agent first, then the rest, newest first.
-    let (mine, rest): (Vec<_>, Vec<_>) = unread.into_iter().rev().partition(|m| m.mentions.contains(&agent));
+    let (mine, rest): (Vec<_>, Vec<_>) = unread
+        .into_iter()
+        .rev()
+        .partition(|m| m.mentions.contains(&agent));
     for m in mine.into_iter().chain(rest) {
         if picked.len() >= MAX_CONTEXT_MESSAGES || chars >= MAX_CONTEXT_CHARS {
             break;
@@ -164,9 +166,15 @@ pub fn compose(
 }
 
 /// Room norms, sent once at the start of a session.
-pub fn orientation(c: &Connection, agent: MemberId, channel: ChannelId) -> rusqlite::Result<String> {
+pub fn orientation(
+    c: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+) -> rusqlite::Result<String> {
     let me = store::member(c, agent)?;
-    let ch = store::channel(c, channel)?.map(|c| c.name).unwrap_or_default();
+    let ch = store::channel(c, channel)?
+        .map(|c| c.name)
+        .unwrap_or_default();
     let members: Vec<String> = store::members_of(c, channel)?
         .into_iter()
         .filter(|m| m.id != agent)
@@ -181,6 +189,10 @@ How this room works:\n\
 - You are woken when someone mentions you (@{handle}) or replies to you. Reply to what was asked, briefly. If someone else is already on it, add only what's new or stay quiet.\n\
 - Mention others with @handle only when you need them. @everyone is not available to agents.\n\
 - Chaos Control never approves permission requests for you; if a tool needs approval it will be declined.\n",
-        if members.is_empty() { "just you".to_string() } else { members.join(", ") }
+        if members.is_empty() {
+            "just you".to_string()
+        } else {
+            members.join(", ")
+        }
     ))
 }

@@ -26,7 +26,9 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 
 fn fixture(name: &str) -> Vec<Value> {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name);
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
     std::fs::read_to_string(path)
         .unwrap()
         .lines()
@@ -48,12 +50,15 @@ fn replay_transport(
         while let Some(line) = to_agent_rx.next().await {
             let msg: Value = serde_json::from_str(&line).unwrap();
             captured.lock().unwrap().push(msg.clone());
-            let (Some(method), Some(id)) = (msg.get("method").and_then(Value::as_str), msg.get("id")) else {
+            let (Some(method), Some(id)) =
+                (msg.get("method").and_then(Value::as_str), msg.get("id"))
+            else {
                 continue;
             };
-            let Some(pos) = frames.iter().position(|f| {
-                f["dir"] == "out" && f["frame"]["method"] == method
-            }) else {
+            let Some(pos) = frames
+                .iter()
+                .position(|f| f["dir"] == "out" && f["frame"]["method"] == method)
+            else {
                 let err = json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "not in fixture"}});
                 let _ = to_client_tx.send(err.to_string()).await;
                 continue;
@@ -68,7 +73,8 @@ fn replay_transport(
                     continue;
                 }
                 let mut frame = f["frame"].clone();
-                let is_answer = frame.get("id") == Some(&recorded_id) && frame.get("method").is_none();
+                let is_answer =
+                    frame.get("id") == Some(&recorded_id) && frame.get("method").is_none();
                 if answered && frame.get("method").is_none() {
                     break; // an answer to a later request
                 }
@@ -86,7 +92,13 @@ fn replay_transport(
     ))
 }
 
-async fn open_replay(name: &str) -> (Result<Arc<dyn AgentSession>, AgentError>, Vec<Value>, Option<u16>) {
+async fn open_replay(
+    name: &str,
+) -> (
+    Result<Arc<dyn AgentSession>, AgentError>,
+    Vec<Value>,
+    Option<u16>,
+) {
     let frames = fixture(name);
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let c = captured.clone();
@@ -123,25 +135,48 @@ async fn v1_only_agent_replays_to_v1_with_honest_caps() {
     let info = session.info();
     assert_eq!(&*info.protocol, "acp/v1");
     assert_eq!(version, Some(1));
-    assert!(info.caps.contains(Caps::CHAT_TOOLS_HTTP | Caps::CHAT_TOOLS_STDIO | Caps::INTERRUPT | Caps::RESUME));
-    assert!(!info.caps.contains(Caps::STEER), "vendor steering is not assumed");
-    assert!(!info.caps.contains(Caps::QUEUE), "vendor queueing is not assumed");
+    assert!(
+        info.caps.contains(
+            Caps::CHAT_TOOLS_HTTP | Caps::CHAT_TOOLS_STDIO | Caps::INTERRUPT | Caps::RESUME
+        )
+    );
+    assert!(
+        !info.caps.contains(Caps::STEER),
+        "vendor steering is not assumed"
+    );
+    assert!(
+        !info.caps.contains(Caps::QUEUE),
+        "vendor queueing is not assumed"
+    );
     let ext = info.unused_extensions.join(", ");
-    assert!(ext.contains("steering") && ext.contains("promptQueueing"), "{ext}");
+    assert!(
+        ext.contains("steering") && ext.contains("promptQueueing"),
+        "{ext}"
+    );
     assert_eq!(info.chat_tools, ChatToolsTransport::Http);
     assert_eq!(&*info.native_ref, "9eaac4b7-4e93-41f6-8ea3-a07e98948960");
     // We offered the v2 draft first, then reconnected with v1.
-    let inits: Vec<&Value> = sent.iter().filter(|f| f["method"] == "initialize").collect();
+    let inits: Vec<&Value> = sent
+        .iter()
+        .filter(|f| f["method"] == "initialize")
+        .collect();
     assert_eq!(inits.len(), 2);
     assert_eq!(inits[0]["params"]["protocolVersion"], json!(2));
     assert_eq!(inits[1]["params"]["protocolVersion"], json!(1));
-    assert_eq!(inits[1]["params"]["clientCapabilities"]["terminal"], json!(false), "no terminal offered");
+    assert_eq!(
+        inits[1]["params"]["clientCapabilities"]["terminal"],
+        json!(false),
+        "no terminal offered"
+    );
     let new = sent.iter().find(|f| f["method"] == "session/new").unwrap();
     let servers = new["params"]["mcpServers"].as_array().unwrap();
     assert_eq!(servers.len(), 1);
     assert_eq!(servers[0]["type"], json!("http"));
     assert_eq!(servers[0]["headers"][0]["value"], json!("Bearer t0ken"));
-    assert!(sent.iter().all(|f| f["method"] != "session/set_mode"), "never touches permission modes");
+    assert!(
+        sent.iter().all(|f| f["method"] != "session/set_mode"),
+        "never touches permission modes"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -154,22 +189,36 @@ async fn claude_agent_acp_selects_v2_and_a_signed_out_turn_goes_red() {
     assert!(info.caps.contains(Caps::CHAT_TOOLS_HTTP));
     assert!(!info.caps.contains(Caps::STEER) && !info.caps.contains(Caps::QUEUE));
     assert_eq!(info.chat_tools, ChatToolsTransport::Http);
-    let inits: Vec<&Value> = sent.iter().filter(|f| f["method"] == "initialize").collect();
+    let inits: Vec<&Value> = sent
+        .iter()
+        .filter(|f| f["method"] == "initialize")
+        .collect();
     assert_eq!(inits.len(), 1, "no fallback needed");
     session.close().await;
 
     // Through the runtime: accepted (prompt response), then `idle` with an
     // `error` stop "Authentication required": red, one note, no reply, no retry.
     let clock = ManualClock::new(T0);
-    let (core, _events) = Core::start(HostConfig::default(), clock.clone()).await.unwrap();
+    let (core, _events) = Core::start(HostConfig::default(), clock.clone())
+        .await
+        .unwrap();
     let main = core.channel("main").await.unwrap().id;
     let hx = core.human("hx", "Hx", main).await.unwrap();
     let frames = fixture("claude-agent-acp-0.97.0-v2-live.ndjson");
-    let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport("replay".into(), move || {
-        replay_transport(frames.clone(), Arc::default())
-    }))));
+    let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
+        "replay".into(),
+        move || replay_transport(frames.clone(), Arc::default()),
+    ))));
     let claude = core
-        .add_agent(AgentSpec { handle: "claude".into(), name: "Claude".into(), adapter, cwd: None }, main)
+        .add_agent(
+            AgentSpec {
+                handle: "claude".into(),
+                name: "Claude".into(),
+                adapter,
+                cwd: None,
+            },
+            main,
+        )
         .await
         .unwrap();
     let ping = core.post(hx.id, main, "@claude hello", None).await.unwrap();
@@ -186,19 +235,35 @@ async fn claude_agent_acp_selects_v2_and_a_signed_out_turn_goes_red() {
     clock.advance(60_000);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let history = core.history(main, 100).await.unwrap();
-    assert!(history.iter().all(|m| m.author != Some(claude.id)), "no reply, no fallback");
-    let notes: Vec<_> = history.iter().filter(|m| m.origin == Origin::System).collect();
+    assert!(
+        history.iter().all(|m| m.author != Some(claude.id)),
+        "no reply, no fallback"
+    );
+    let notes: Vec<_> = history
+        .iter()
+        .filter(|m| m.origin == Origin::System)
+        .collect();
     assert_eq!(notes.len(), 1);
-    assert!(notes[0].body.contains("needs to be signed in"), "{}", notes[0].body);
+    assert!(
+        notes[0].body.contains("needs to be signed in"),
+        "{}",
+        notes[0].body
+    );
     let (state, attempts): (String, i64) = core
         .with_engine(|e, _| {
             e.conn()
-                .query_row("SELECT state, attempts FROM batches", [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .query_row("SELECT state, attempts FROM batches", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
                 .unwrap()
         })
         .await
         .unwrap();
-    assert_eq!((state.as_str(), attempts), ("failed", 1), "accepted, so never re-sent");
+    assert_eq!(
+        (state.as_str(), attempts),
+        ("failed", 1),
+        "accepted, so never re-sent"
+    );
     let _ = ping;
 }
 
@@ -211,13 +276,16 @@ async fn codex_acp_auth_required_turns_the_agent_red() {
 
     // Through the runtime: red immediately, no retry loop.
     let clock = ManualClock::new(T0);
-    let (core, _events) = Core::start(HostConfig::default(), clock.clone()).await.unwrap();
+    let (core, _events) = Core::start(HostConfig::default(), clock.clone())
+        .await
+        .unwrap();
     let main = core.channel("main").await.unwrap().id;
     let hx = core.human("hx", "Hx", main).await.unwrap();
     let frames = fixture("codex-acp-0.16.0.ndjson");
-    let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport("replay".into(), move || {
-        replay_transport(frames.clone(), Arc::default())
-    }))));
+    let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
+        "replay".into(),
+        move || replay_transport(frames.clone(), Arc::default()),
+    ))));
     let codex = core
         .add_agent(
             AgentSpec {
@@ -244,7 +312,11 @@ async fn codex_acp_auth_required_turns_the_agent_red() {
     clock.advance(60_000);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let attempts: i64 = core
-        .with_engine(|e, _| e.conn().query_row("SELECT attempts FROM batches", [], |r| r.get(0)).unwrap())
+        .with_engine(|e, _| {
+            e.conn()
+                .query_row("SELECT attempts FROM batches", [], |r| r.get(0))
+                .unwrap()
+        })
         .await
         .unwrap();
     assert_eq!(attempts, 1, "auth failures are not retried");
@@ -288,11 +360,16 @@ async fn fake_agent_binary_over_real_stdio() {
         )
         .await
         .unwrap();
-    let ping = core.post(hx.id, main, "@bin are you a real process?", None).await.unwrap();
+    let ping = core
+        .post(hx.id, main, "@bin are you a real process?", None)
+        .await
+        .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     let reply = loop {
         match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(chaos_core::engine::CoreEvent::Message(m))) if m.author == Some(bot.id) => break m,
+            Ok(Some(chaos_core::engine::CoreEvent::Message(m))) if m.author == Some(bot.id) => {
+                break m;
+            }
             Ok(Some(_)) => {}
             other => panic!("no reply: {other:?}"),
         }
@@ -301,8 +378,16 @@ async fn fake_agent_binary_over_real_stdio() {
     assert_eq!(&*reply.body, "hello from a real process");
     core.shutdown().await;
     let frames = std::fs::read_to_string(&record).unwrap();
-    assert!(frames.lines().any(|l| l.contains("\"dir\":\"out\"") && l.contains("session/prompt")));
-    assert!(frames.lines().any(|l| l.contains("\"dir\":\"in\"") && l.contains("tool_call")));
+    assert!(
+        frames
+            .lines()
+            .any(|l| l.contains("\"dir\":\"out\"") && l.contains("session/prompt"))
+    );
+    assert!(
+        frames
+            .lines()
+            .any(|l| l.contains("\"dir\":\"in\"") && l.contains("tool_call"))
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -348,9 +433,14 @@ async fn live_acp_agent_handshake_and_first_turn() {
         )
         .await
         .unwrap();
-    core.post(hx.id, main, "@live reply with the word pong using chat_send", None)
-        .await
-        .unwrap();
+    core.post(
+        hx.id,
+        main,
+        "@live reply with the word pong using chat_send",
+        None,
+    )
+    .await
+    .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
     let mut last = None;
     loop {

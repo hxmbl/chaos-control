@@ -8,7 +8,9 @@
 //! agent). codex-acp 0.16.0 answers v1.
 //!
 //! Acceptance point: the `session/prompt` response (v2 acknowledges acceptance
-//! there). The turn ends at the next `state_update` of kind `idle`.
+//! there), or an earlier `state_update` (`running` or `idle`) for the in-flight
+//! turn, since the response is awaited on another task and the agent's updates
+//! can overtake it. The turn ends at the next `state_update` of kind `idle`.
 
 use std::sync::{Arc, Mutex};
 
@@ -101,7 +103,9 @@ fn mcp_servers(kind: ChatToolsTransport, ep: &ChatToolsEndpoint) -> Vec<v2::McpS
     }
 }
 
-fn decline(req: &v2::RequestPermissionRequest) -> (v2::RequestPermissionResponse, Option<Arc<str>>) {
+fn decline(
+    req: &v2::RequestPermissionRequest,
+) -> (v2::RequestPermissionResponse, Option<Arc<str>>) {
     let pick = req
         .options
         .iter()
@@ -145,7 +149,9 @@ pub(crate) async fn open(
     let events = req.events.clone();
     let cwd = req.cwd.clone();
     let endpoint = req.chat_tools.clone();
-    tokio::spawn(run(transport, cwd, endpoint, pref, tracker, cmd_rx, ready_tx, events));
+    tokio::spawn(run(
+        transport, cwd, endpoint, pref, tracker, cmd_rx, ready_tx, events,
+    ));
     match ready_rx.await {
         Ok(Ready::Session(info)) => Ok(Arc::new(V2Session { info, cmd: cmd_tx })),
         Ok(Ready::Fallback) => Err(V2Open::Fallback),
@@ -201,9 +207,18 @@ async fn run(
                         v2::SessionUpdate::ToolCallUpdate(_) if t.turn.is_some() => {
                             t.text.clear();
                         }
+                        // The agent went `running` on our prompt: that is acceptance
+                        // too. The prompt response is handled on another task, so a
+                        // fast agent's state updates can overtake it.
+                        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => {
+                            out.extend(t.accept());
+                        }
                         v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle))
-                            if t.accepted =>
+                            if t.turn.is_some() =>
                         {
+                            // `idle` after our prompt means the agent took it, even if
+                            // the response has not been seen yet: never re-send it.
+                            out.extend(t.accept());
                             if let Some(turn) = t.turn.take() {
                                 // An `error` stop is a failed turn (e.g. claude-agent-acp
                                 // signed out: -32000 "Authentication required").
@@ -219,10 +234,16 @@ async fn run(
                                             };
                                             AgentError::new(kind, err.message.clone())
                                         }
-                                        None => AgentError::new(AgentErrorKind::Protocol, "turn failed"),
+                                        None => {
+                                            AgentError::new(AgentErrorKind::Protocol, "turn failed")
+                                        }
                                     };
                                     t.text.clear();
-                                    out.push(AgentEvent::TurnFailed { turn, accepted: true, error });
+                                    out.push(AgentEvent::TurnFailed {
+                                        turn,
+                                        accepted: true,
+                                        error,
+                                    });
                                 } else {
                                     out.push(AgentEvent::TurnEnded {
                                         turn,
@@ -303,7 +324,10 @@ async fn run(
                 caps,
                 protocol: Arc::from("acp/v2-draft"),
                 native_ref: Arc::from(session_id.to_string()),
-                agent_name: Some(Arc::from(format!("{} {}", init.info.name, init.info.version))),
+                agent_name: Some(Arc::from(format!(
+                    "{} {}",
+                    init.info.name, init.info.version
+                ))),
                 unused_extensions: Vec::new(),
                 chat_tools,
             }));
@@ -323,7 +347,9 @@ async fn run(
                         };
                         let sent = conn.send_request(v2::PromptRequest::new(
                             session_id.clone(),
-                            vec![v2::ContentBlock::Text(v2::TextContent::new(text.to_string()))],
+                            vec![v2::ContentBlock::Text(v2::TextContent::new(
+                                text.to_string(),
+                            ))],
                         ));
                         let _ = done.send(Ok(()));
                         let t = t_main.clone();
@@ -353,7 +379,9 @@ async fn run(
                         });
                     }
                     Cmd::Cancel => {
-                        let _ = conn.send_notification(v2::CancelSessionNotification::new(session_id.clone()));
+                        let _ = conn.send_notification(v2::CancelSessionNotification::new(
+                            session_id.clone(),
+                        ));
                     }
                     Cmd::Close => break,
                 }

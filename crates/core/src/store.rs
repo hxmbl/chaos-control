@@ -195,10 +195,9 @@ impl Store {
     }
 
     fn migrate(&mut self) -> Result<()> {
-        let version: usize = self
-            .conn
-            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?
-            as usize;
+        let version: usize =
+            self.conn
+                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
         for (ix, sql) in MIGRATIONS.iter().enumerate().skip(version) {
             let tx = self.conn.transaction()?;
             tx.execute_batch(sql)?;
@@ -371,8 +370,7 @@ pub fn join(
 
 // ---------- messages ----------
 
-const MESSAGE_COLS: &str =
-    "id, channel_id, seq, author_id, origin, body, reply_to, hop, sent_at";
+const MESSAGE_COLS: &str = "id, channel_id, seq, author_id, origin, body, reply_to, hop, sent_at";
 
 fn message_from_row(r: &Row<'_>) -> Result<Message> {
     Ok(Message {
@@ -390,8 +388,9 @@ fn message_from_row(r: &Row<'_>) -> Result<Message> {
 }
 
 fn with_mentions(c: &Connection, mut m: Message) -> Result<Message> {
-    let mut stmt =
-        c.prepare_cached("SELECT member_id FROM mentions WHERE message_id = ?1 ORDER BY member_id")?;
+    let mut stmt = c.prepare_cached(
+        "SELECT member_id FROM mentions WHERE message_id = ?1 ORDER BY member_id",
+    )?;
     m.mentions = stmt
         .query_map([m.id.0], |r| Ok(MemberId(r.get(0)?)))?
         .collect::<Result<_>>()?;
@@ -610,7 +609,12 @@ pub fn cursor(c: &Connection, agent: MemberId, channel: ChannelId) -> Result<Cur
 
 /// Moves `delivered_through` (and `read_through` with it) forward to `seq`.
 /// Never moves a cursor backwards.
-pub fn advance_delivered(c: &Connection, agent: MemberId, channel: ChannelId, seq: Seq) -> Result<()> {
+pub fn advance_delivered(
+    c: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+    seq: Seq,
+) -> Result<()> {
     c.execute(
         "INSERT INTO cursors (agent_id, channel_id, delivered_through, read_through)
          VALUES (?1, ?2, ?3, ?3)
@@ -658,7 +662,11 @@ pub fn batch(c: &Connection, id: BatchId) -> Result<Option<BatchRow>> {
     .optional()
 }
 
-pub fn pending_batch(c: &Connection, agent: MemberId, channel: ChannelId) -> Result<Option<BatchRow>> {
+pub fn pending_batch(
+    c: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+) -> Result<Option<BatchRow>> {
     c.query_row(
         &format!(
             "SELECT {BATCH_COLS} FROM batches WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'pending'"
@@ -756,10 +764,7 @@ pub fn requeue_batch(c: &Connection, id: BatchId) -> Result<()> {
         )?;
         c.execute("DELETE FROM batches WHERE id = ?1", [p.id.0])?;
     }
-    c.execute(
-        "UPDATE batches SET state = 'pending' WHERE id = ?1",
-        [id.0],
-    )?;
+    c.execute("UPDATE batches SET state = 'pending' WHERE id = ?1", [id.0])?;
     Ok(())
 }
 
@@ -888,7 +893,13 @@ pub fn recover(c: &Connection, now: Millis) -> Result<Vec<(MemberId, ChannelId)>
         for t in open_obligations(c, b)? {
             resolve_obligation(c, t, ObligationState::Unmet, None, "app_restart")?;
         }
-        set_batch_state(c, b, BatchState::Failed, now, Some("app restarted mid-turn"))?;
+        set_batch_state(
+            c,
+            b,
+            BatchState::Failed,
+            now,
+            Some("app restarted mid-turn"),
+        )?;
     }
     let dispatched: Vec<BatchId> = {
         let mut stmt = c.prepare("SELECT id FROM batches WHERE state = 'dispatched'")?;
@@ -1038,12 +1049,20 @@ mod tests {
             let m1 = insert_message(c, &msg(ch.id, hx.id, "one"))?;
             let m2 = insert_message(c, &msg(ch.id, hx.id, "two"))?;
             let b1 = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t1 = TriggerId { agent: bot.id, channel: ch.id, message: m1.id };
+            let t1 = TriggerId {
+                agent: bot.id,
+                channel: ch.id,
+                message: m1.id,
+            };
             insert_trigger(c, t1, WakeReason::Mention, 0, b1.id, 0)?;
             insert_obligation(c, t1)?;
             dispatch_batch(c, b1.id, 1)?;
             let b2 = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t2 = TriggerId { agent: bot.id, channel: ch.id, message: m2.id };
+            let t2 = TriggerId {
+                agent: bot.id,
+                channel: ch.id,
+                message: m2.id,
+            };
             insert_trigger(c, t2, WakeReason::Mention, 0, b2.id, 0)?;
             insert_obligation(c, t2)?;
             requeue_batch(c, b1.id)?;
@@ -1062,13 +1081,29 @@ mod tests {
         s.tx::<_, rusqlite::Error>(|c| {
             let m = insert_message(c, &msg(ch.id, hx.id, "@claude hi"))?;
             let b = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t = TriggerId { agent: bot.id, channel: ch.id, message: m.id };
+            let t = TriggerId {
+                agent: bot.id,
+                channel: ch.id,
+                message: m.id,
+            };
             assert!(insert_trigger(c, t, WakeReason::Mention, 0, b.id, 0)?);
             assert!(!insert_trigger(c, t, WakeReason::Mention, 0, b.id, 0)?);
             assert!(insert_obligation(c, t)?);
             assert!(!insert_obligation(c, t)?);
-            assert!(resolve_obligation(c, t, ObligationState::Satisfied, None, "send")?);
-            assert!(!resolve_obligation(c, t, ObligationState::Fallback, None, "fallback")?);
+            assert!(resolve_obligation(
+                c,
+                t,
+                ObligationState::Satisfied,
+                None,
+                "send"
+            )?);
+            assert!(!resolve_obligation(
+                c,
+                t,
+                ObligationState::Fallback,
+                None,
+                "fallback"
+            )?);
             Ok(())
         })
         .unwrap();
@@ -1085,7 +1120,11 @@ mod tests {
             join(c, ch.id, &late, 20, 0)?;
             assert_eq!(cursor(c, late.id, ch.id)?.read_through, 10);
             advance_delivered(c, late.id, ch.id, 5)?;
-            assert_eq!(cursor(c, late.id, ch.id)?.delivered_through, 10, "never backwards");
+            assert_eq!(
+                cursor(c, late.id, ch.id)?.delivered_through,
+                10,
+                "never backwards"
+            );
             Ok(())
         })
         .unwrap();

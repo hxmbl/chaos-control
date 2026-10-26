@@ -191,10 +191,16 @@ impl Engine {
         handle: &str,
         name: &str,
     ) -> rusqlite::Result<Member> {
-        self.store.tx(|c| store::ensure_member(c, kind, handle, name))
+        self.store
+            .tx(|c| store::ensure_member(c, kind, handle, name))
     }
 
-    pub fn join(&mut self, channel: ChannelId, member: &Member, now: Millis) -> rusqlite::Result<()> {
+    pub fn join(
+        &mut self,
+        channel: ChannelId,
+        member: &Member,
+        now: Millis,
+    ) -> rusqlite::Result<()> {
         let backfill = self.policy.join_backfill;
         self.store
             .tx(|c| store::join(c, channel, member, backfill, now))?;
@@ -239,14 +245,22 @@ impl Engine {
         } else if busy {
             rt.status
                 .clone()
-                .or_else(|| rt.activity.clone().map(|a| Arc::from(format!("working: {a}"))))
+                .or_else(|| {
+                    rt.activity
+                        .clone()
+                        .map(|a| Arc::from(format!("working: {a}")))
+                })
                 .or_else(|| rt.note.clone())
                 .or_else(|| Some(Arc::from("working")))
         } else if rt.retry_at.is_some() {
             Some(Arc::from(format!(
                 "retrying delivery ({} failed {})",
                 rt.failures,
-                if rt.failures == 1 { "attempt" } else { "attempts" }
+                if rt.failures == 1 {
+                    "attempt"
+                } else {
+                    "attempts"
+                }
             )))
         } else {
             rt.note.clone().or_else(|| rt.status.clone())
@@ -344,7 +358,9 @@ impl Engine {
             for m in &message.mentions {
                 self.pstate.human_addressed(req.channel, *m);
             }
-            if let Some(parent) = message.reply_to.and_then(|r| store::message(self.conn(), r).ok().flatten())
+            if let Some(parent) = message
+                .reply_to
+                .and_then(|r| store::message(self.conn(), r).ok().flatten())
                 && let Some(a) = parent.author
             {
                 self.pstate.human_addressed(req.channel, a);
@@ -381,7 +397,9 @@ impl Engine {
                 }
                 continue;
             }
-            if let Some(m) = members.iter().find(|m| m.handle.eq_ignore_ascii_case(&handle))
+            if let Some(m) = members
+                .iter()
+                .find(|m| m.handle.eq_ignore_ascii_case(&handle))
                 && m.id != author.id
                 && !out.contains(&m.id)
             {
@@ -452,7 +470,13 @@ impl Engine {
         }
         if let Some(t) = target {
             self.store.tx::<_, PostError>(|c| {
-                store::resolve_obligation(c, t, ObligationState::Satisfied, Some(message.id), "send")?;
+                store::resolve_obligation(
+                    c,
+                    t,
+                    ObligationState::Satisfied,
+                    Some(message.id),
+                    "send",
+                )?;
                 Ok(())
             })?;
         }
@@ -483,7 +507,10 @@ impl Engine {
         };
         let mut woken = Vec::new();
         let mut trip_notice = None;
-        for target in members.iter().filter(|m| m.kind == MemberKind::Agent && m.id != author.id) {
+        for target in members
+            .iter()
+            .filter(|m| m.kind == MemberKind::Agent && m.id != author.id)
+        {
             let reason = if message.mentions.contains(&target.id) {
                 WakeReason::Mention
             } else if reply_parent_author == Some(target.id) {
@@ -558,7 +585,9 @@ impl Engine {
     /// tests). Existing triggers are no-ops, so this never wakes twice.
     pub fn retrigger(&mut self, now: Millis, message: MessageId) -> Result<(), PostError> {
         let m = store::message(self.conn(), message)?.ok_or(PostError::UnknownMessage)?;
-        let Some(author) = m.author.and_then(|a| store::member(self.conn(), a).ok().flatten())
+        let Some(author) = m
+            .author
+            .and_then(|a| store::member(self.conn(), a).ok().flatten())
         else {
             return Ok(());
         };
@@ -592,7 +621,8 @@ impl Engine {
                 },
             )?)
         })?;
-        self.effects.push(Effect::Event(CoreEvent::Message(m.clone())));
+        self.effects
+            .push(Effect::Event(CoreEvent::Message(m.clone())));
         Ok(m)
     }
 
@@ -653,7 +683,12 @@ impl Engine {
         self.publish_status(agent, channel);
     }
 
-    fn try_pump(&mut self, now: Millis, agent: MemberId, channel: ChannelId) -> Result<(), PostError> {
+    fn try_pump(
+        &mut self,
+        now: Millis,
+        agent: MemberId,
+        channel: ChannelId,
+    ) -> Result<(), PostError> {
         let rt = self.rt.entry((agent, channel)).or_default();
         if rt.red.is_some() || rt.failures >= self.policy.max_failures {
             return Ok(());
@@ -676,7 +711,13 @@ impl Engine {
         });
         if !needs_delivery {
             self.store.tx::<_, PostError>(|c| {
-                store::set_batch_state(c, pending.id, BatchState::Settled, now, Some("answered before delivery"))?;
+                store::set_batch_state(
+                    c,
+                    pending.id,
+                    BatchState::Settled,
+                    now,
+                    Some("answered before delivery"),
+                )?;
                 Ok(())
             })?;
             return Ok(());
@@ -705,7 +746,13 @@ impl Engine {
     }
 
     /// The host opened a session.
-    pub fn session_opened(&mut self, now: Millis, agent: MemberId, channel: ChannelId, info: &SessionInfo) {
+    pub fn session_opened(
+        &mut self,
+        now: Millis,
+        agent: MemberId,
+        channel: ChannelId,
+        info: &SessionInfo,
+    ) {
         let _ = self.store.tx(|c| {
             store::record_session(c, agent, channel, &info.protocol, &info.native_ref, now)
         });
@@ -739,7 +786,13 @@ impl Engine {
         self.not_accepted(now, agent, channel, batch, kind, error);
     }
 
-    pub fn agent_event(&mut self, now: Millis, agent: MemberId, channel: ChannelId, event: AgentEvent) {
+    pub fn agent_event(
+        &mut self,
+        now: Millis,
+        agent: MemberId,
+        channel: ChannelId,
+        event: AgentEvent,
+    ) {
         match event {
             AgentEvent::Accepted { turn } => self.accepted(now, agent, channel, turn),
             AgentEvent::Activity { label } => {
@@ -750,7 +803,14 @@ impl Engine {
                 turn,
                 title,
                 declined_with,
-            } => self.permission_declined(now, agent, channel, turn, &title, declined_with.as_deref()),
+            } => self.permission_declined(
+                now,
+                agent,
+                channel,
+                turn,
+                &title,
+                declined_with.as_deref(),
+            ),
             AgentEvent::TurnEnded {
                 turn,
                 outcome,
@@ -880,7 +940,10 @@ impl Engine {
             // Never retried: it can't succeed until someone signs in.
             rt.red = Some(Arc::from(format!("needs sign-in: {error}")));
         } else if rt.failures >= max {
-            rt.red = Some(Arc::from(format!("not responding: {} failures ({error})", rt.failures)));
+            rt.red = Some(Arc::from(format!(
+                "not responding: {} failures ({error})",
+                rt.failures
+            )));
         } else {
             rt.retry_at = Some(now + self.policy.backoff(rt.failures));
         }
@@ -983,7 +1046,13 @@ impl Engine {
                 let echo = *echo;
                 self.store.tx::<_, PostError>(|c| {
                     for t in &open {
-                        store::resolve_obligation(c, *t, ObligationState::Satisfied, Some(echo), "send_echo")?;
+                        store::resolve_obligation(
+                            c,
+                            *t,
+                            ObligationState::Satisfied,
+                            Some(echo),
+                            "send_echo",
+                        )?;
                     }
                     Ok(())
                 })?;
@@ -1015,7 +1084,13 @@ impl Engine {
                         },
                     )?;
                     for t in still_open {
-                        store::resolve_obligation(c, t, ObligationState::Fallback, Some(m.id), "fallback")?;
+                        store::resolve_obligation(
+                            c,
+                            t,
+                            ObligationState::Fallback,
+                            Some(m.id),
+                            "fallback",
+                        )?;
                     }
                     Ok(Some(m))
                 })?;
@@ -1044,7 +1119,8 @@ impl Engine {
         rt.status = None;
         rt.idle_since = Some(now);
         if let Some((m, author)) = fallback_message {
-            self.effects.push(Effect::Event(CoreEvent::Message(m.clone())));
+            self.effects
+                .push(Effect::Event(CoreEvent::Message(m.clone())));
             self.create_triggers(now, &m, &author, false)?;
         }
         Ok(())
@@ -1069,7 +1145,9 @@ impl Engine {
     pub fn tick(&mut self, now: Millis) {
         let keys: Vec<_> = self.rt.keys().copied().collect();
         for (agent, channel) in keys {
-            let due_retry = self.rt[&(agent, channel)].retry_at.is_some_and(|t| t <= now);
+            let due_retry = self.rt[&(agent, channel)]
+                .retry_at
+                .is_some_and(|t| t <= now);
             if due_retry {
                 self.rt.get_mut(&(agent, channel)).expect("key").retry_at = None;
                 self.pump(now, agent, channel);
@@ -1096,6 +1174,8 @@ impl Engine {
     // ---------- reads for tools ----------
 
     pub fn advance_read(&mut self, agent: MemberId, channel: ChannelId, seq: Seq) {
-        let _ = self.store.tx(|c| store::advance_read(c, agent, channel, seq));
+        let _ = self
+            .store
+            .tx(|c| store::advance_read(c, agent, channel, seq));
     }
 }

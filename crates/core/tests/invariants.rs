@@ -14,7 +14,10 @@ struct Lcg(u64);
 
 impl Lcg {
     fn next(&mut self, n: u64) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (self.0 >> 33) % n
     }
 }
@@ -82,9 +85,15 @@ async fn run(seed: u64) {
     let history = h.history().await;
     for ping in &pings {
         let obligations = h
-            .count_param("SELECT COUNT(*) FROM obligations WHERE message_id = ?1", ping.0)
+            .count_param(
+                "SELECT COUNT(*) FROM obligations WHERE message_id = ?1",
+                ping.0,
+            )
             .await;
-        assert!(obligations <= 1, "seed {seed}: ping {ping} has {obligations} obligations");
+        assert!(
+            obligations <= 1,
+            "seed {seed}: ping {ping} has {obligations} obligations"
+        );
         let replies: Vec<&Message> = history
             .iter()
             .filter(|m| m.author == Some(bot.id) && m.reply_to == Some(*ping))
@@ -95,23 +104,42 @@ async fn run(seed: u64) {
             replies.len()
         );
         let state = h.obligation(bot.id, *ping).await;
-        assert_ne!(state, Some(ObligationState::Open), "seed {seed}: obligation left open");
+        assert_ne!(
+            state,
+            Some(ObligationState::Open),
+            "seed {seed}: obligation left open"
+        );
         if state == Some(ObligationState::Fallback) {
             // Answered by the batch's single fallback message, which replies to
             // the newest open trigger of that batch (maybe this one).
             let by = h
-                .count_param("SELECT COALESCE(resolved_by, 0) FROM obligations WHERE message_id = ?1", ping.0)
+                .count_param(
+                    "SELECT COALESCE(resolved_by, 0) FROM obligations WHERE message_id = ?1",
+                    ping.0,
+                )
                 .await;
-            let fallback = history.iter().find(|m| m.id.0 == by).expect("resolving message exists");
+            let fallback = history
+                .iter()
+                .find(|m| m.id.0 == by)
+                .expect("resolving message exists");
             assert_eq!(fallback.origin, Origin::Fallback, "seed {seed}");
             assert_eq!(fallback.author, Some(bot.id), "seed {seed}");
         }
     }
     // One delivery per batch, never a re-send after acceptance.
-    let batches = h.count("SELECT COUNT(*) FROM batches WHERE state = 'settled' AND attempts = 1").await;
+    let batches = h
+        .count("SELECT COUNT(*) FROM batches WHERE state = 'settled' AND attempts = 1")
+        .await;
     let all = h.count("SELECT COUNT(*) FROM batches").await;
-    assert_eq!(batches, all, "seed {seed}: every batch delivered exactly once");
-    assert_eq!(h.prompts("bot").len() as i64, all, "seed {seed}: prompts == batches");
+    assert_eq!(
+        batches, all,
+        "seed {seed}: every batch delivered exactly once"
+    );
+    assert_eq!(
+        h.prompts("bot").len() as i64,
+        all,
+        "seed {seed}: prompts == batches"
+    );
 }
 
 impl Harness {

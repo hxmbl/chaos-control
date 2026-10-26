@@ -149,7 +149,9 @@ impl FakeAgent {
             .builder()
             .name("fake-acp-agent")
             .on_receive_request(
-                async move |req: v1::InitializeRequest, responder: Responder<v1::InitializeResponse>, _cx| {
+                async move |req: v1::InitializeRequest,
+                            responder: Responder<v1::InitializeResponse>,
+                            _cx| {
                     let _ = &me1;
                     let mut caps = v1::AgentCapabilities::new();
                     caps.mcp_capabilities = v1::McpCapabilities::new().http(me1.script.mcp_http);
@@ -163,7 +165,9 @@ impl FakeAgent {
                 acp::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: v1::NewSessionRequest, responder: Responder<v1::NewSessionResponse>, _cx| {
+                async move |req: v1::NewSessionRequest,
+                            responder: Responder<v1::NewSessionResponse>,
+                            _cx| {
                     me2.observed
                         .lock()
                         .expect("lock")
@@ -183,14 +187,19 @@ impl FakeAgent {
                             *mcp2.lock().expect("lock") = Some((h.url.clone(), token));
                         }
                     }
-                    let id = format!("fake-session-{}", me2.observed.lock().expect("lock").sessions.len());
+                    let id = format!(
+                        "fake-session-{}",
+                        me2.observed.lock().expect("lock").sessions.len()
+                    );
                     *sid2.lock().expect("lock") = id.clone();
                     responder.respond(v1::NewSessionResponse::new(id))
                 },
                 acp::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: v1::PromptRequest, responder: Responder<v1::PromptResponse>, cx| {
+                async move |req: v1::PromptRequest,
+                            responder: Responder<v1::PromptResponse>,
+                            cx| {
                     let text: String = req
                         .prompt
                         .iter()
@@ -267,7 +276,11 @@ impl FakeAgent {
                         .unwrap_or_else(|e| Err(e.to_string())),
                         None => Err("no chat MCP server was injected".to_string()),
                     };
-                    self.observed.lock().expect("lock").tool_results.push(result);
+                    self.observed
+                        .lock()
+                        .expect("lock")
+                        .tool_results
+                        .push(result);
                 }
                 Step::Permission(title) => {
                     let call = v1::ToolCallUpdate::new(
@@ -291,11 +304,15 @@ impl FakeAgent {
                         ],
                     );
                     let outcome = cx.send_request(req).block_task().await;
-                    self.observed.lock().expect("lock").permission_outcomes.push(
-                        outcome
-                            .map(|o| serde_json::to_value(o).unwrap_or_default())
-                            .unwrap_or_else(|e| Value::String(e.to_string())),
-                    );
+                    self.observed
+                        .lock()
+                        .expect("lock")
+                        .permission_outcomes
+                        .push(
+                            outcome
+                                .map(|o| serde_json::to_value(o).unwrap_or_default())
+                                .unwrap_or_else(|e| Value::String(e.to_string())),
+                        );
                 }
                 Step::Gate(name) => {
                     if !self.is_binary {
