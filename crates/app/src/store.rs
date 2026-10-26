@@ -6,7 +6,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use chaos_core::{engine::CoreEvent, types as core};
+use chaos_core::{engine::CoreEvent, types as ct};
 use gpui::{Context, EventEmitter, Task};
 use model::{
     Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, ReplyRef, SearchCorpus,
@@ -47,7 +47,7 @@ struct Attached {
     /// The app channel core's main channel shows in.
     channel: Id,
     /// Core message id -> index in that channel's log (dedups history vs events).
-    seen: HashMap<core::MessageId, usize>,
+    seen: HashMap<ct::MessageId, usize>,
     _events: Task<()>,
 }
 
@@ -256,7 +256,7 @@ impl ChatStore {
                     return;
                 }
                 let author = match m.author {
-                    _ if m.origin == core::Origin::System => Author::System,
+                    _ if m.origin == ct::Origin::System => Author::System,
                     None => Author::System,
                     Some(id) if attached.link.agents.iter().any(|a| a.member == id) => {
                         Author::Agent(agent_id(id))
@@ -285,9 +285,9 @@ impl ChatStore {
                 let id = agent_id(status.agent);
                 if let Some(agent) = self.workspace.agents.iter_mut().find(|a| a.id == id) {
                     agent.state = match status.glow {
-                        core::Glow::Active => AgentState::Active,
-                        core::Glow::Sleeping => AgentState::Sleeping,
-                        core::Glow::Unresponsive => AgentState::Unresponsive,
+                        ct::Glow::Active => AgentState::Active,
+                        ct::Glow::Sleeping => AgentState::Sleeping,
+                        ct::Glow::Unresponsive => AgentState::Unresponsive,
                     };
                     agent.presence = status.presence.clone();
                     cx.notify();
@@ -328,11 +328,11 @@ impl ChatStore {
     }
 }
 
-fn agent_id(member: core::MemberId) -> Id {
+fn agent_id(member: ct::MemberId) -> Id {
     Id(CORE_AGENT_BASE.saturating_add(member.0 as u32))
 }
 
-fn core_message_id(id: Id) -> Option<core::MessageId> {
+fn core_message_id(id: Id) -> Option<ct::MessageId> {
     id.0.checked_sub(CORE_MESSAGE_BASE)
-        .map(|n| core::MessageId(i64::from(n)))
+        .map(|n| ct::MessageId(i64::from(n)))
 }

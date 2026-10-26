@@ -424,9 +424,7 @@ impl ServerHandler for ChatServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
-        let mut result = ListToolsResult::default();
-        result.tools = tools();
-        Ok(result)
+        Ok(ListToolsResult::with_all_items(tools()))
     }
 
     async fn call_tool(
