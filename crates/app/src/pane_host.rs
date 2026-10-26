@@ -204,7 +204,7 @@ impl PaneHost {
             Author::Agent(id) => ws
                 .agent(id)
                 .map(|a| icon(brand_icon(a.brand), px(14.), t.ink_soft).into_any_element()),
-            Author::Human => None,
+            Author::Human | Author::System => None,
         };
         let minutes = sent_at / 60;
         div()

@@ -339,6 +339,7 @@ impl Search {
                     .map_or("unknown".into(), |c| c.name.clone());
                 let who = match author {
                     Author::Human => "Hx".into(),
+                    Author::System => "Chaos Control".into(),
                     Author::Agent(id) => ws.agent(*id).map_or("Agent".into(), |a| a.name.clone()),
                 };
                 let minutes = sent_at / 60;

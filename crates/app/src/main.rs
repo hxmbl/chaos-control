@@ -1,5 +1,6 @@
 //! Chaos Control: a group chat for a project's AI agents and the people running it.
 
+mod agents;
 mod composer;
 mod conversation;
 mod pane_host;
@@ -20,6 +21,18 @@ use gpui::{
 actions!(chaos_control, [Quit]);
 
 fn main() {
+    // `chaos-control mcp-bridge`: the stdio MCP server agents start when they
+    // can't take our chat tools over HTTP. URL and token arrive in the env.
+    if std::env::args().nth(1).as_deref() == Some("mcp-bridge") {
+        if let Err(err) = chaos_core::mcp::bridge_main() {
+            eprintln!("chaos-control mcp-bridge: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // The agent runtime, when an agents.json exists (see agents.rs).
+    let core = agents::start();
+
     Application::new()
         .with_assets(ui::Assets)
         .run(|cx: &mut App| {
@@ -53,7 +66,10 @@ fn main() {
             .detach();
 
             let store = cx.new(|_| store::ChatStore::new(model::sample()));
-            store.update(cx, |store, cx| store.load_sample_history(cx));
+            match core {
+                Some(link) => store.update(cx, |store, cx| store.attach_core(link, cx)),
+                None => store.update(cx, |store, cx| store.load_sample_history(cx)),
+            }
             if let Some(count) = demo_message_count() {
                 store.update(cx, |store, cx| store.load_demo_history(count, cx));
             }

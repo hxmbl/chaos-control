@@ -33,6 +33,7 @@ pub fn sample() -> Workspace {
         name: s(name),
         brand,
         state,
+        presence: None,
     };
     let link = |label: &str, brand, url: &str| QuickLink {
         label: s(label),

@@ -91,6 +91,14 @@ impl Conversation {
                     .into_any_element(),
                 "Hx".into(),
             ),
+            Author::System => (
+                div()
+                    .text_size(px(11.))
+                    .text_color(t.ink_soft)
+                    .child("·")
+                    .into_any_element(),
+                "Chaos Control".into(),
+            ),
         };
 
         div()

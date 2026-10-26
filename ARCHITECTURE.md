@@ -19,6 +19,9 @@ immediate-mode elements) instead of a webview.
   `RightSidebar` (+ `CatchUp`), `Conversation`, `Composer`, laid out by the
   root `Workspace` view, plus `PaneHost` (what the pane shows) and the
   `AppSettings` global.
+- `core` (`chaos-core`): the agent runtime. SQLite store, delivery engine,
+  room policy, the ACP adapter and the chat MCP server. No GPUI: the app is one
+  client of it. See [docs/agents.md](docs/agents.md).
 
 ## Agent state
 
@@ -31,6 +34,31 @@ hardcodes one:
 | `Active` | green | Running and ready to read and reply. |
 | `Sleeping` | purple | Idle; needs a ping before it picks anything up. |
 | `Unresponsive` | red | Missing or not answering. |
+
+Beside the state, `Agent::presence` holds one line from the runtime ("working:
+running tests", "needs sign-in: ...", "wanted to run X, declined").
+`Agent::status_line()` joins them for the Agent Status tooltip. Core reports
+both through `CoreEvent::Agent`; presence is never part of the chat log.
+
+## Agents
+
+When an `agents.json` exists, `main.rs` starts `chaos-core` in-process on its
+own two-thread tokio runtime (`agents::start`) and hands the link to
+`ChatStore::attach_core`. From then on #main is core's `main` channel:
+
+- composer posts in #main go to `Core::post` and appear when core reports them
+  back (`CoreEvent::Message`), so the log only ever shows what core stored;
+- `ChatStore::apply_core_event` maps core messages onto `model::Message`
+  (agents to `Author::Agent`, runtime notices to `Author::System`, replies to
+  `ReplyRef`) and glow/presence onto the agent's pill;
+- history is loaded once at attach and deduplicated against the event stream
+  by core message id;
+- the same binary is the stdio MCP bridge for agents that can't take HTTP:
+  `chaos-control mcp-bridge` (URL and token in its environment).
+
+Other channels stay local until core grows channel management. The delivery,
+batching, obligation and permission rules are in
+[docs/agents.md](docs/agents.md).
 
 ## State
 
@@ -49,9 +77,8 @@ token by token. Incoming messages (one or a batch) go through
 `ChatStore::append`, which pushes onto that channel's `ChannelLog` and emits
 `Appended`. If that channel is on screen, `Conversation` calls
 `ListState::splice(len..len, n)`, so only the new rows are measured; history
-already laid out is left alone. When a backend exists, it receives on a
-background task and hands finished messages to `append` on the main thread,
-batched per frame when many agents post at once.
+already laid out is left alone. Core's events are received on a GPUI task and
+handed to `append` on the main thread (see Agents above).
 
 ## Search
 

@@ -30,6 +30,8 @@ Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
 crates/app     the binary: window, root layout and views
 crates/ui      theme, bundled fonts and icons, hand-built components
 crates/model   plain data types and sample data, no UI dependencies
+crates/core    the agent runtime (chaos-core): store, delivery, ACP, chat MCP
+docs/          design notes (docs/agents.md: agents in the room)
 assets/        fonts and SVG icons compiled into the binary, with their licences
 ```
 
