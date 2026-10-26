@@ -228,9 +228,12 @@ pub fn sample_history() -> (Id, Vec<Message>) {
         ),
         (
             Author::Agent(CODEX_REVIEW),
-            "Agree on the order. I'll hold my review comments on the sync PR until the resolver doc lands.",
+            "Agree on the order. I'll hold my review comments on the sync PR until the resolver doc lands. Worth a skim before the branch cut, too.",
         ),
-        (Author::Human, "Read the documentation for once maybe."),
+        (
+            Author::Human,
+            "Fair. I'll actually read the docs this time.",
+        ),
     ];
     let messages = lines
         .into_iter()
