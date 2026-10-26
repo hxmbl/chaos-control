@@ -230,6 +230,18 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
     cargo test -p chaos-core --test replay live -- --ignored --nocapture
   ```
 
+- The `fake-acp-agent` binary passes the v1 suite of the ACP Test
+  Compatibility Kit ([acp-tck](https://github.com/agentclientprotocol/acp-tck),
+  experimental). It is v1-only, so the v2 suite stops at version mismatch.
+  The script needs a sleep so `session/cancel` lands mid-turn:
+
+  ```sh
+  echo '{"turns":[{"steps":[{"text":"Working"},{"tool_call":"Look"},{"sleep_ms":3000},{"text":"Done"}]}]}' > /tmp/tck.json
+  cargo build -p chaos-core --bin fake-acp-agent
+  cd ../acp-tck && uv run acp-tck --protocol-version 1 \
+    --agent-env FAKE_ACP_SCRIPT=/tmp/tck.json -- <target>/debug/fake-acp-agent
+  ```
+
 ## Verified and not yet verified
 
 - **Live:** claude-agent-acp 0.97.0, signed out, over v2: initialize, version

@@ -18,7 +18,7 @@ use agent_client_protocol::{
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 /// What the agent does, prompt by prompt.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -117,6 +117,9 @@ pub struct FakeAgent {
     /// Signalled by `Step::Exit` in-process.
     pub kill: Arc<Notify>,
     pub is_binary: bool,
+    /// The session of the latest `session/cancel`; a turn in flight on that
+    /// session ends with `cancelled`.
+    cancel: Arc<watch::Sender<Option<v1::SessionId>>>,
 }
 
 impl FakeAgent {
@@ -127,6 +130,7 @@ impl FakeAgent {
             observed: Arc::default(),
             kill: Arc::default(),
             is_binary: false,
+            cancel: Arc::new(watch::channel(None).0),
         }
     }
 
@@ -142,9 +146,8 @@ impl FakeAgent {
     /// The agent side as a connectable component.
     pub fn component(self) -> impl ConnectTo<Client> {
         let mcp: Arc<Mutex<Option<(String, String)>>> = Arc::default();
-        let session_id = Arc::new(Mutex::new(String::new()));
         let (me1, me2, me3, me4) = (self.clone(), self.clone(), self.clone(), self.clone());
-        let (mcp2, sid2, sid3) = (mcp.clone(), session_id.clone(), session_id.clone());
+        let mcp2 = mcp.clone();
         Agent
             .builder()
             .name("fake-acp-agent")
@@ -191,7 +194,6 @@ impl FakeAgent {
                         "fake-session-{}",
                         me2.observed.lock().expect("lock").sessions.len()
                     );
-                    *sid2.lock().expect("lock") = id.clone();
                     responder.respond(v1::NewSessionResponse::new(id))
                 },
                 acp::on_receive_request!(),
@@ -216,7 +218,7 @@ impl FakeAgent {
                     let turn = me3.turn(n);
                     let me = me3.clone();
                     let mcp = mcp.clone();
-                    let sid = sid3.lock().expect("lock").clone();
+                    let sid = req.session_id.clone();
                     tokio::spawn(async move {
                         me.run_turn(turn, n, text, sid, mcp, responder, cx).await;
                     });
@@ -225,8 +227,9 @@ impl FakeAgent {
                 acp::on_receive_request!(),
             )
             .on_receive_notification(
-                async move |_n: v1::CancelNotification, _cx| {
+                async move |n: v1::CancelNotification, _cx| {
                     me4.observed.lock().expect("lock").cancels += 1;
+                    me4.cancel.send_replace(Some(n.session_id));
                     Ok(())
                 },
                 acp::on_receive_notification!(),
@@ -239,14 +242,55 @@ impl FakeAgent {
         turn: Turn,
         n: usize,
         prompt: String,
-        sid: String,
+        session: v1::SessionId,
         mcp: Arc<Mutex<Option<(String, String)>>>,
         responder: Responder<v1::PromptResponse>,
         cx: acp::ConnectionTo<Client>,
     ) {
-        let trigger = owed_trigger(&prompt);
-        let session = v1::SessionId::new(sid);
-        for step in turn.steps {
+        // Subscribe before the first step so a cancel that lands at any point
+        // in the turn is seen.
+        let mut cancels = self.cancel.subscribe();
+        cancels.mark_unchanged();
+        let mine = session.clone();
+        let cancelled = async move {
+            while cancels.changed().await.is_ok() {
+                if cancels.borrow_and_update().as_ref() == Some(&mine) {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await
+        };
+        let ending = tokio::select! {
+            e = self.clone().steps(turn.steps, n, &prompt, session, mcp, &cx) => e,
+            () = cancelled => Ending::Stop(v1::StopReason::Cancelled),
+        };
+        let stop = match ending {
+            Ending::Stop(stop) => stop,
+            Ending::Error(msg) => {
+                let _ = responder.respond_with_error(acp::Error::new(-32603, msg));
+                return;
+            }
+            Ending::Dropped => return,
+            Ending::Done => match turn.stop.as_deref() {
+                Some("cancelled") => v1::StopReason::Cancelled,
+                Some("refusal") => v1::StopReason::Refusal,
+                _ => v1::StopReason::EndTurn,
+            },
+        };
+        let _ = responder.respond(v1::PromptResponse::new(stop));
+    }
+
+    async fn steps(
+        self,
+        steps: Vec<Step>,
+        n: usize,
+        prompt: &str,
+        session: v1::SessionId,
+        mcp: Arc<Mutex<Option<(String, String)>>>,
+        cx: &acp::ConnectionTo<Client>,
+    ) -> Ending {
+        let trigger = owed_trigger(prompt);
+        for step in steps {
             match step {
                 Step::Text(t) => {
                     let _ = cx.send_notification(v1::SessionNotification::new(
@@ -320,10 +364,7 @@ impl FakeAgent {
                     }
                 }
                 Step::SleepMs(ms) => tokio::time::sleep(std::time::Duration::from_millis(ms)).await,
-                Step::Error(msg) => {
-                    let _ = responder.respond_with_error(acp::Error::new(-32603, msg));
-                    return;
-                }
+                Step::Error(msg) => return Ending::Error(msg),
                 Step::Exit => {
                     if self.is_binary {
                         std::process::exit(3);
@@ -331,17 +372,22 @@ impl FakeAgent {
                     // Wakes the running connection only; no permit is stored, so
                     // the next run of the agent starts clean.
                     self.kill.notify_waiters();
-                    return;
+                    return Ending::Dropped;
                 }
             }
         }
-        let stop = match turn.stop.as_deref() {
-            Some("cancelled") => v1::StopReason::Cancelled,
-            Some("refusal") => v1::StopReason::Refusal,
-            _ => v1::StopReason::EndTurn,
-        };
-        let _ = responder.respond(v1::PromptResponse::new(stop));
+        Ending::Done
     }
+}
+
+/// How a turn's steps ended.
+enum Ending {
+    /// Ran every step; answer with the turn's scripted stop reason.
+    Done,
+    Stop(v1::StopReason),
+    Error(String),
+    /// Exited or dropped the connection without answering.
+    Dropped,
 }
 
 fn owed_trigger(prompt: &str) -> Option<String> {
