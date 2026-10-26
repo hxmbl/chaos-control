@@ -7,8 +7,9 @@
 //!   unit-tested. It remembers where keyboard focus was when the pane opened,
 //!   hands it back on close, and times the open and close animations.
 //! - [`Pane`]: the element. A red close dot pinned into the top-left corner
-//!   (traffic-light sized, with a hover glyph), an optional large title under
-//!   it or a custom header beside it, a scrollable body that
+//!   (traffic-light sized, with a hover glyph) with a header row beside it,
+//!   like a macOS title bar: the title (or a custom header such as search's
+//!   field) centred on the dot, then a scrollable body that
 //!   takes any element, and optional full-width quick-action rows under a thin
 //!   divider. It closes on the dot, on Escape and on a click outside, and it
 //!   never moves: it sits where its host puts it.
@@ -354,10 +355,32 @@ pub const CLOSE_INSET: Pixels = px(12.);
 pub const CLOSE_SLOP: Pixels = px(7.);
 /// The sheet's content padding left and right.
 const PAD_X: Pixels = px(18.);
-/// Top padding with a title: the title starts just under the dot.
-const PAD_TOP_TITLE: Pixels = px(30.);
-/// Height of a custom header row, centred on the dot.
+/// The sheet's border. Padding and absolute offsets both start inside it.
+const BORDER: Pixels = px(1.);
+/// Top padding with neither title nor header: the body clears the dot.
+const PAD_TOP_BARE: Pixels = px(30.);
+/// Height of the header row (title or custom header), centred on the dot.
 const HEADER_H: Pixels = px(30.);
+/// The title, on the dot's row: smaller than a page heading so the row stays
+/// compact, still clearly the pane's title.
+pub const TITLE_SIZE: Pixels = px(17.);
+const TITLE_LINE: Pixels = px(22.);
+/// Gap between the dot's visual right edge and the title.
+pub const TITLE_GAP: Pixels = px(9.);
+/// Gap between the dot's visual right edge and a custom header (search's
+/// field, which has its own icon to lead with).
+const HEADER_GAP: Pixels = px(12.);
+
+/// Top padding that centres a [`HEADER_H`] row on the dot.
+fn header_pad_top() -> Pixels {
+    CLOSE_INSET + CLOSE_DOT / 2. - HEADER_H / 2. - BORDER
+}
+
+/// Left margin, inside the content padding, that starts the header row `gap`
+/// past the dot's visual right edge.
+fn header_margin_left(gap: Pixels) -> Pixels {
+    CLOSE_INSET + CLOSE_DOT + gap - PAD_X - BORDER
+}
 
 impl RenderOnce for Pane {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -383,8 +406,8 @@ impl RenderOnce for Pane {
             .group(group.clone())
             .absolute()
             // Absolute offsets start inside the 1px border.
-            .top(CLOSE_INSET - CLOSE_SLOP - px(1.))
-            .left(CLOSE_INSET - CLOSE_SLOP - px(1.))
+            .top(CLOSE_INSET - CLOSE_SLOP - BORDER)
+            .left(CLOSE_INSET - CLOSE_SLOP - BORDER)
             .size(CLOSE_DOT + CLOSE_SLOP * 2.)
             .flex()
             .items_center()
@@ -415,39 +438,41 @@ impl RenderOnce for Pane {
                     ),
             );
 
-        // A title goes under the dot, at the normal content padding; a custom
-        // header sits on the dot's row, starting just past its hit area.
-        let has_header = self.header.is_some();
+        // The dot's row, like a macOS title bar: the title (or a custom
+        // header) centred on the dot and starting just past it. The body
+        // follows straight under the row.
+        let row = |gap: Pixels| {
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(HEADER_H)
+                .min_w_0()
+                .ml(header_margin_left(gap))
+        };
         let header = match (self.header, self.title) {
-            (Some(header), _) => Some(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .h(HEADER_H)
-                    .min_w_0()
-                    .ml(CLOSE_INSET + CLOSE_DOT + CLOSE_SLOP - PAD_X + px(4.))
-                    .child(div().flex_1().min_w_0().child(header)),
-            ),
+            (Some(header), _) => {
+                Some(row(HEADER_GAP).child(div().flex_1().min_w_0().child(header)))
+            }
             (None, Some(title)) => Some(
-                div().flex().flex_none().min_w_0().child(
+                row(TITLE_GAP).child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .ellipsis()
-                        .text_size(px(21.))
-                        .line_height(px(28.))
-                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(TITLE_SIZE)
+                        .line_height(TITLE_LINE)
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(t.ink)
                         .child(truncated(title)),
                 ),
             ),
             (None, None) => None,
         };
-        // Header row centred on the dot; otherwise clear the dot.
-        let pad_top = if has_header {
-            CLOSE_INSET + CLOSE_DOT / 2. - HEADER_H / 2.
+        let pad_top = if header.is_some() {
+            header_pad_top()
         } else {
-            PAD_TOP_TITLE
+            PAD_TOP_BARE
         };
 
         let has_actions = !self.actions.is_empty();
@@ -766,9 +791,41 @@ mod tests {
         assert_eq!(CLOSE_INSET, px(12.));
         assert_eq!(CLOSE_SLOP, px(7.));
         assert!(
-            PAD_TOP_TITLE > CLOSE_INSET + CLOSE_DOT,
-            "the title starts below the dot"
+            PAD_TOP_BARE > CLOSE_INSET + CLOSE_DOT,
+            "a pane with no header row starts its body below the dot"
         );
         assert!(CLOSE_DURATION >= Duration::from_millis(120) && CLOSE_DURATION <= OPEN_DURATION);
+    }
+
+    /// The header row sits on the dot's row like a macOS title bar, measured
+    /// from the sheet's outer edge (border included).
+    #[test]
+    fn title_shares_the_dot_row() {
+        let dot_top = CLOSE_INSET;
+        let dot_centre = dot_top + CLOSE_DOT / 2.;
+        let row_top = BORDER + header_pad_top();
+        assert_eq!(
+            row_top + HEADER_H / 2.,
+            dot_centre,
+            "row centred on the dot"
+        );
+        assert!(row_top >= px(0.));
+        assert!(TITLE_LINE <= HEADER_H);
+
+        let dot_right = CLOSE_INSET + CLOSE_DOT;
+        let title_left = BORDER + PAD_X + header_margin_left(TITLE_GAP);
+        assert_eq!(title_left - dot_right, TITLE_GAP);
+        assert!(TITLE_GAP >= px(8.) && TITLE_GAP <= px(10.));
+        assert!(
+            title_left >= dot_right + CLOSE_SLOP,
+            "the title clears the dot's hit area"
+        );
+        let header_left = BORDER + PAD_X + header_margin_left(HEADER_GAP);
+        assert_eq!(header_left - dot_right, HEADER_GAP);
+
+        assert!(
+            TITLE_SIZE >= px(15.) && TITLE_SIZE < px(21.),
+            "compact but a title"
+        );
     }
 }

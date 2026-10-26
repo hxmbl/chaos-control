@@ -125,8 +125,10 @@ never moves and there is never more than one.
   `PaneActionKind`), so the agent runtime can open a pane by building one and
   calling `PaneHost::open`. The UI only decides how each body looks.
 - **Element and state.** `ui::Pane` is the element: a red macOS-style close dot
-  at the top left (an × shows on hover), a large title or a custom header, a
-  scrollable body that takes any element, and full-width rounded quick-action
+  at the top left (12px, 12px from the corner; an × shows on hover) with a
+  header row beside it like a macOS title bar: the title (17px semibold,
+  9px past the dot, ellipsis when narrow) or a custom header such as search's
+  field, centred on the dot. Then a scrollable body that takes any element, and full-width rounded quick-action
   rows under a thin divider. `ui::PaneState` is the bookkeeping, unit-tested
   without a window: it remembers what had focus when the pane opened and hands
   it back on close; opening over an open pane swaps the content in place (no
