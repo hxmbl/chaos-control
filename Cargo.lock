@@ -944,8 +944,12 @@ dependencies = [
 name = "chaos-control"
 version = "0.0.1"
 dependencies = [
+ "chaos-core",
  "gpui",
  "model",
+ "serde",
+ "serde_json",
+ "tokio",
  "ui",
 ]
 

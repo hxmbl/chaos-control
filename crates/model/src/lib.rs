@@ -87,6 +87,19 @@ pub struct Agent {
     pub name: Arc<str>,
     pub brand: Brand,
     pub state: AgentState,
+    /// One line from the runtime for the Agent Status tooltip ("running tests",
+    /// "declined a permission request"). Never part of the chat log.
+    pub presence: Option<Arc<str>>,
+}
+
+impl Agent {
+    /// "Claude Code: Active · running tests", for the Agent Status tooltip.
+    pub fn status_line(&self) -> String {
+        match &self.presence {
+            Some(p) if !p.is_empty() => format!("{}: {} · {}", self.name, self.state.label(), p),
+            _ => format!("{}: {}", self.name, self.state.label()),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -109,6 +122,9 @@ pub struct Mention {
 pub enum Author {
     Agent(Id),
     Human,
+    /// A runtime notice (an agent declined a permission request, a paused
+    /// agent-to-agent exchange). Shown quietly; never wakes anyone.
+    System,
 }
 
 /// One complete message. Agents post a message once their response is done;
@@ -205,6 +221,15 @@ mod tests {
                 "mention points at a known channel"
             );
         }
+    }
+
+    #[test]
+    fn status_line_adds_presence_when_there_is_one() {
+        let mut a = sample().agents[0].clone();
+        a.presence = None;
+        assert_eq!(a.status_line(), format!("{}: {}", a.name, a.state.label()));
+        a.presence = Some(Arc::from("running tests"));
+        assert!(a.status_line().ends_with(" · running tests"));
     }
 
     #[test]

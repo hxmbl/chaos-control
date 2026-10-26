@@ -60,7 +60,7 @@ impl Render for RightSidebar {
         let agents: Vec<_> = ws
             .agents
             .iter()
-            .map(|a| (a.brand, a.state, format!("{}: {}", a.name, a.state.label())))
+            .map(|a| (a.brand, a.state, a.status_line()))
             .collect();
         let count = mention_rows.len();
         let open = self.mentions_open;

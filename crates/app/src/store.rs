@@ -6,8 +6,19 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use gpui::{Context, EventEmitter};
-use model::{Author, ChannelLog, CorpusChannel, Id, Message, ReplyRef, SearchCorpus, Workspace};
+use chaos_core::{engine::CoreEvent, types as core};
+use gpui::{Context, EventEmitter, Task};
+use model::{
+    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, ReplyRef, SearchCorpus,
+    Workspace,
+};
+
+use crate::agents::CoreLink;
+
+/// Model ids for things that come from core sit above these, clear of the
+/// sample data and local echoes.
+const CORE_AGENT_BASE: u32 = 100_000;
+const CORE_MESSAGE_BASE: u32 = 0x4000_0000;
 
 pub enum StoreEvent {
     /// The selected channel changed.
@@ -27,6 +38,17 @@ pub struct ChatStore {
     logs: HashMap<Id, ChannelLog>,
     selected: Id,
     next_message_id: u32,
+    core: Option<Attached>,
+}
+
+/// Core behind #main (see `agents.rs`).
+struct Attached {
+    link: CoreLink,
+    /// The app channel core's main channel shows in.
+    channel: Id,
+    /// Core message id -> index in that channel's log (dedups history vs events).
+    seen: HashMap<core::MessageId, usize>,
+    _events: Task<()>,
 }
 
 impl EventEmitter<StoreEvent> for ChatStore {}
@@ -44,6 +66,7 @@ impl ChatStore {
             logs,
             selected,
             next_message_id: 1_000_000,
+            core: None,
         }
     }
 
@@ -118,7 +141,9 @@ impl ChatStore {
         }
     }
 
-    /// Local echo for the composer until there is somewhere to send to.
+    /// Sends a composer message. #main goes through core when it is attached
+    /// (the message shows up when core reports it back); everything else is a
+    /// local echo until there is somewhere to send to.
     pub fn post_from_human(
         &mut self,
         body: &str,
@@ -127,6 +152,24 @@ impl ChatStore {
     ) {
         let body = body.trim();
         if body.is_empty() {
+            return;
+        }
+        if let Some(attached) = &self.core
+            && attached.channel == self.selected
+        {
+            let core = attached.link.core.clone();
+            let (author, channel) = (attached.link.human, attached.link.main);
+            let reply = reply_to.and_then(|r| core_message_id(r.message));
+            let body = body.to_string();
+            cx.spawn(async move |this, cx| {
+                if let Err(e) = core.post(author, channel, &body, reply).await {
+                    this.update(cx, |store, cx| {
+                        store.system_note(&format!("Not sent: {e}"), cx)
+                    })
+                    .ok();
+                }
+            })
+            .detach();
             return;
         }
         let id = Id(self.next_message_id);
@@ -145,6 +188,134 @@ impl ChatStore {
         self.append(self.selected, vec![message], cx);
     }
 
+    /// Puts core behind #main: its agents join Agent Status, its history
+    /// replaces the sample conversation, and its events flow in from here on.
+    pub fn attach_core(&mut self, mut link: CoreLink, cx: &mut Context<Self>) {
+        for a in &link.agents {
+            self.workspace.agents.push(Agent {
+                id: agent_id(a.member),
+                name: a.name.clone(),
+                brand: a.brand,
+                state: AgentState::Sleeping,
+                presence: None,
+            });
+        }
+        let channel = self
+            .workspace
+            .channels
+            .iter()
+            .find(|c| c.project_wide)
+            .unwrap_or(&self.workspace.channels[0])
+            .id;
+        let mut events = link.events.take();
+        let core = link.core.clone();
+        let main = link.main;
+        let task = cx.spawn(async move |this, cx| {
+            match core.history(main, 200).await {
+                Ok(history) => {
+                    let ok = this.update(cx, |store, cx| {
+                        for m in history {
+                            store.apply_core_event(CoreEvent::Message(m), cx);
+                        }
+                    });
+                    if ok.is_err() {
+                        return;
+                    }
+                }
+                Err(e) => eprintln!("chaos-control: could not load #main history: {e}"),
+            }
+            let Some(events) = events.as_mut() else {
+                return;
+            };
+            while let Some(event) = events.recv().await {
+                if this
+                    .update(cx, |store, cx| store.apply_core_event(event, cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.core = Some(Attached {
+            link,
+            channel,
+            seen: HashMap::new(),
+            _events: task,
+        });
+        cx.notify();
+    }
+
+    /// Folds one core event into the app's state.
+    pub fn apply_core_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        match event {
+            CoreEvent::Message(m) => {
+                if m.channel != attached.link.main || attached.seen.contains_key(&m.id) {
+                    return;
+                }
+                let author = match m.author {
+                    _ if m.origin == core::Origin::System => Author::System,
+                    None => Author::System,
+                    Some(id) if attached.link.agents.iter().any(|a| a.member == id) => {
+                        Author::Agent(agent_id(id))
+                    }
+                    Some(_) => Author::Human,
+                };
+                let channel = attached.channel;
+                let reply_to = m.reply_to.and_then(|r| {
+                    let ix = *attached.seen.get(&r)?;
+                    self.logs.get(&channel)?.get(ix).map(ReplyRef::to)
+                });
+                let message = Message {
+                    id: Id(CORE_MESSAGE_BASE.saturating_add(m.id.0 as u32)),
+                    author,
+                    sent_at: m.sent_at / 1000,
+                    body: m.body.clone(),
+                    reply_to,
+                };
+                let ix = self.logs.get(&channel).map_or(0, |l| l.len());
+                if let Some(attached) = &mut self.core {
+                    attached.seen.insert(m.id, ix);
+                }
+                self.append(channel, vec![message], cx);
+            }
+            CoreEvent::Agent(status) => {
+                let id = agent_id(status.agent);
+                if let Some(agent) = self.workspace.agents.iter_mut().find(|a| a.id == id) {
+                    agent.state = match status.glow {
+                        core::Glow::Active => AgentState::Active,
+                        core::Glow::Sleeping => AgentState::Sleeping,
+                        core::Glow::Unresponsive => AgentState::Unresponsive,
+                    };
+                    agent.presence = status.presence.clone();
+                    cx.notify();
+                }
+            }
+            // The model has no reactions yet.
+            CoreEvent::Reaction { .. } => {}
+        }
+    }
+
+    /// A local notice in the selected channel (e.g. a post core refused).
+    fn system_note(&mut self, body: &str, cx: &mut Context<Self>) {
+        let id = Id(self.next_message_id);
+        self.next_message_id += 1;
+        let sent_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let message = Message {
+            id,
+            author: Author::System,
+            sent_at,
+            body: Arc::from(body),
+            reply_to: None,
+        };
+        self.append(self.selected, vec![message], cx);
+    }
+
     /// The sample conversation in #main (see `model::sample_history`).
     pub fn load_sample_history(&mut self, cx: &mut Context<Self>) {
         let (channel, messages) = model::sample_history();
@@ -155,4 +326,13 @@ impl ChatStore {
         let main = self.workspace.channels[0].id;
         self.append(main, model::demo_history(count).collect(), cx);
     }
+}
+
+fn agent_id(member: core::MemberId) -> Id {
+    Id(CORE_AGENT_BASE.saturating_add(member.0 as u32))
+}
+
+fn core_message_id(id: Id) -> Option<core::MessageId> {
+    id.0.checked_sub(CORE_MESSAGE_BASE)
+        .map(|n| core::MessageId(i64::from(n)))
 }

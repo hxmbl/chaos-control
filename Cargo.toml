@@ -16,6 +16,7 @@ rust-version = "1.88"
 gpui = "=0.2.2"
 unicode-segmentation = "1.12"
 model = { path = "crates/model" }
+chaos-core = { path = "crates/core" }
 ui = { path = "crates/ui" }
 
 [workspace.lints.clippy]
