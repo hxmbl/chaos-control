@@ -5,7 +5,7 @@
 //! long message and the sidebar's Settings today, the agent runtime later.
 //! One pane at a time; opening another swaps the content in place. Closing
 //! (the close dot, Escape, a click outside) hands the keyboard back to
-//! whatever had it before the pane opened.
+//! whatever had it before the pane opened, while the pane fades out.
 
 use std::time::{Duration, Instant};
 
@@ -66,12 +66,12 @@ impl PaneHost {
         cx.notify();
     }
 
-    /// Closes the pane and restores focus. The restore waits a beat and only
+    /// Closes the pane (it fades out, taking no input) and restores focus. The restore waits a beat and only
     /// happens if the pane still has the keyboard: when a click outside both
     /// closed the pane and focused something (the search pill, the
     /// composer), that click wins.
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(restore) = self.state.close() else {
+        let Some(restore) = self.state.close(Instant::now()) else {
             return;
         };
         cx.notify();
@@ -90,7 +90,7 @@ impl PaneHost {
     /// Closes without touching focus, for when something else is taking the
     /// keyboard on purpose (cmd/ctrl-K opening search).
     pub fn close_quietly(&mut self, cx: &mut Context<Self>) {
-        if self.state.close().is_some() {
+        if self.state.close(Instant::now()).is_some() {
             cx.notify();
         }
     }
@@ -123,15 +123,16 @@ impl PaneHost {
     }
 
     /// The pane, ready to drop into the workspace's pane layer, or `None`
-    /// while closed. `max_width` comes from [`pane_frame`].
+    /// once closed and faded out. `max_width` comes from [`pane_frame`].
     pub fn render_overlay(
         &mut self,
         max_width: Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let content = self.state.content()?.clone();
         let now = Instant::now();
+        let content = self.state.shown(now)?.clone();
+        let closing = !self.state.is_open();
         if self.state.animating(now) {
             window.request_animation_frame();
         }
@@ -156,6 +157,7 @@ impl PaneHost {
         let pane = Pane::new(("pane", self.state.generation() as usize))
             .focus(&self.focus)
             .progress(self.state.progress(now))
+            .closing(closing)
             .max_width(max_width)
             .title(title)
             .on_close(move |window, cx| close.update(cx, |this, cx| this.close(window, cx)))

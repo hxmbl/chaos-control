@@ -5,9 +5,10 @@
 //!
 //! - [`PaneState`]: plain open/close/focus bookkeeping with no window, so it is
 //!   unit-tested. It remembers where keyboard focus was when the pane opened,
-//!   hands it back on close, and times the open animation.
-//! - [`Pane`]: the element. A red close dot (top left, macOS-like, with a hover
-//!   glyph), an optional large title or a custom header, a scrollable body that
+//!   hands it back on close, and times the open and close animations.
+//! - [`Pane`]: the element. A red close dot pinned into the top-left corner
+//!   (traffic-light sized, with a hover glyph), an optional large title under
+//!   it or a custom header beside it, a scrollable body that
 //!   takes any element, and optional full-width quick-action rows under a thin
 //!   divider. It closes on the dot, on Escape and on a click outside, and it
 //!   never moves: it sits where its host puts it.
@@ -33,6 +34,8 @@ actions!(pane, [ClosePane]);
 pub const KEY_CONTEXT: &str = "Pane";
 /// The fade/scale-in, matching the search grow and the sidebar peek.
 pub const OPEN_DURATION: Duration = Duration::from_millis(140);
+/// The fade/scale-out on close, a touch quicker than the open.
+pub const CLOSE_DURATION: Duration = Duration::from_millis(130);
 
 pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys([KeyBinding::new("escape", ClosePane, Some(KEY_CONTEXT))]);
@@ -40,9 +43,16 @@ pub(crate) fn bind_keys(cx: &mut App) {
 
 /// Open/close state for one pane slot, generic over what it shows (`C`) and
 /// the focus token to hand back (`F`, a `FocusHandle` in the app).
+///
+/// Closing is two steps: [`PaneState::close`] ends the pane at once (it is no
+/// longer open, its content no longer answers actions, focus is handed back)
+/// and keeps the content only to draw the fade-out, which [`PaneState::shown`]
+/// returns until [`CLOSE_DURATION`] has passed. Opening during the fade picks
+/// the animation up from where the fade had got to.
 #[derive(Debug)]
 pub struct PaneState<C, F> {
     open: Option<Opened<C, F>>,
+    closing: Option<Closing<C>>,
     /// Bumped on every open or content swap, so the body's scroll position
     /// (keyed by element id) starts at the top for new content.
     generation: u64,
@@ -52,16 +62,40 @@ pub struct PaneState<C, F> {
 struct Opened<C, F> {
     content: C,
     return_focus: Option<F>,
+    /// When the open animation started, shifted back when it resumes a fade
+    /// so the curve continues from the visible progress.
     opened_at: Instant,
+}
+
+#[derive(Debug)]
+struct Closing<C> {
+    content: C,
+    closed_at: Instant,
+    /// Visible progress when the close began (below 1 when closed mid-open).
+    from: f32,
 }
 
 impl<C, F> Default for PaneState<C, F> {
     fn default() -> Self {
         Self {
             open: None,
+            closing: None,
             generation: 0,
         }
     }
+}
+
+fn ease_out(t: f32) -> f32 {
+    1. - (1. - t.clamp(0., 1.)).powi(3)
+}
+
+/// The `t` at which [`ease_out`] reaches `p`.
+fn ease_out_inverse(p: f32) -> f32 {
+    1. - (1. - p.clamp(0., 1.)).cbrt()
+}
+
+fn fraction(since: Instant, now: Instant, of: Duration) -> f32 {
+    (now.saturating_duration_since(since).as_secs_f32() / of.as_secs_f32()).min(1.)
 }
 
 impl<C, F> PaneState<C, F> {
@@ -69,16 +103,37 @@ impl<C, F> PaneState<C, F> {
         Self::default()
     }
 
+    /// Open and interactive. False while the close fade plays.
     pub fn is_open(&self) -> bool {
         self.open.is_some()
     }
 
+    /// Whether the close fade is still playing at `now`.
+    pub fn is_closing(&self, now: Instant) -> bool {
+        self.open.is_none()
+            && self
+                .closing
+                .as_ref()
+                .is_some_and(|c| now.saturating_duration_since(c.closed_at) < CLOSE_DURATION)
+    }
+
+    /// The open pane's content. `None` while closing, so actions can't run.
     pub fn content(&self) -> Option<&C> {
         self.open.as_ref().map(|o| &o.content)
     }
 
     pub fn content_mut(&mut self) -> Option<&mut C> {
         self.open.as_mut().map(|o| &mut o.content)
+    }
+
+    /// What to draw at `now`: the open content, or the closing content until
+    /// its fade has finished.
+    pub fn shown(&self, now: Instant) -> Option<&C> {
+        match &self.open {
+            Some(open) => Some(&open.content),
+            None if self.is_closing(now) => self.closing.as_ref().map(|c| &c.content),
+            None => None,
+        }
     }
 
     pub fn generation(&self) -> u64 {
@@ -89,41 +144,56 @@ impl<C, F> PaneState<C, F> {
     ///
     /// Opening over an open pane swaps the content in place: no second
     /// animation, and focus still returns to where it was before the first
-    /// pane, not to the pane being replaced.
+    /// pane, not to the pane being replaced. Opening during the close fade
+    /// starts a fresh pane whose open animation resumes from the fade's
+    /// current progress, so nothing jumps.
     pub fn open(&mut self, content: C, focused: Option<F>, now: Instant) {
         self.generation += 1;
         match &mut self.open {
             Some(open) => open.content = content,
             None => {
+                let resume = self.progress(now);
+                self.closing = None;
+                let back = OPEN_DURATION.mul_f32(ease_out_inverse(resume));
                 self.open = Some(Opened {
                     content,
                     return_focus: focused,
-                    opened_at: now,
+                    opened_at: now.checked_sub(back).unwrap_or(now),
                 })
             }
         }
     }
 
-    /// Closes the pane. `None` when it was already closed; otherwise the
-    /// focus to restore (itself `None` when nothing had focus before).
-    pub fn close(&mut self) -> Option<Option<F>> {
-        self.open.take().map(|o| o.return_focus)
+    /// Closes the pane and starts the fade-out. `None` when it was already
+    /// closed (or closing); otherwise the focus to restore (itself `None`
+    /// when nothing had focus before).
+    pub fn close(&mut self, now: Instant) -> Option<Option<F>> {
+        let from = self.progress(now);
+        let open = self.open.take()?;
+        self.closing = Some(Closing {
+            content: open.content,
+            closed_at: now,
+            from,
+        });
+        Some(open.return_focus)
     }
 
-    /// 0..1 through the open animation, eased out (cubic). 1 when settled.
+    /// 0..1 visible amount (opacity, scale): eased out (cubic) up to 1 over
+    /// [`OPEN_DURATION`] while opening, back down to 0 over
+    /// [`CLOSE_DURATION`] while closing. 0 when nothing is shown.
     pub fn progress(&self, now: Instant) -> f32 {
-        let Some(open) = &self.open else {
-            return 0.;
-        };
-        let t = (now.saturating_duration_since(open.opened_at).as_secs_f32()
-            / OPEN_DURATION.as_secs_f32())
-        .min(1.);
-        1. - (1. - t).powi(3)
+        if let Some(open) = &self.open {
+            return ease_out(fraction(open.opened_at, now, OPEN_DURATION));
+        }
+        match &self.closing {
+            Some(c) => c.from * (1. - ease_out(fraction(c.closed_at, now, CLOSE_DURATION))),
+            None => 0.,
+        }
     }
 
-    /// Whether the open animation still needs frames.
+    /// Whether an open or close animation still needs frames.
     pub fn animating(&self, now: Instant) -> bool {
-        self.is_open() && self.progress(now) < 1.
+        (self.is_open() && self.progress(now) < 1.) || self.is_closing(now)
     }
 }
 
@@ -159,6 +229,7 @@ pub struct Pane {
     id: ElementId,
     focus: Option<FocusHandle>,
     progress: f32,
+    closing: bool,
     max_width: Pixels,
     scrim: bool,
     anchor_top: bool,
@@ -177,6 +248,7 @@ impl Pane {
             id: id.into(),
             focus: None,
             progress: 1.,
+            closing: false,
             max_width: px(960.),
             scrim: true,
             anchor_top: false,
@@ -199,6 +271,13 @@ impl Pane {
     /// 0..1 open progress (from [`PaneState::progress`]): fades and scales in.
     pub fn progress(mut self, progress: f32) -> Self {
         self.progress = progress.clamp(0., 1.);
+        self
+    }
+
+    /// The pane is fading out: it draws but takes no clicks, keys or focus
+    /// changes, so whatever is behind it works straight away.
+    pub fn closing(mut self, closing: bool) -> Self {
+        self.closing = closing;
         self
     }
 
@@ -227,8 +306,8 @@ impl Pane {
         self
     }
 
-    /// Something other than a title next to the close dot (search puts its
-    /// field here). Replaces the title.
+    /// Something other than a title, on the close dot's row beside it
+    /// (search puts its field here). Replaces the title.
     pub fn header(mut self, header: impl IntoElement) -> Self {
         self.header = Some(header.into_any_element());
         self
@@ -267,6 +346,18 @@ const CLOSE_RED: u32 = 0xff5f57;
 const CLOSE_RIM: u32 = 0xe2463f;
 const CLOSE_GLYPH: u32 = 0x4d0000;
 const RADIUS: Pixels = px(22.);
+/// The close dot: macOS traffic-light diameter.
+pub const CLOSE_DOT: Pixels = px(12.);
+/// How far the dot sits from the pane's top and left edges.
+pub const CLOSE_INSET: Pixels = px(12.);
+/// Extra hit area around the dot on every side (hover shows the glyph).
+pub const CLOSE_SLOP: Pixels = px(7.);
+/// The sheet's content padding left and right.
+const PAD_X: Pixels = px(18.);
+/// Top padding with a title: the title starts just under the dot.
+const PAD_TOP_TITLE: Pixels = px(30.);
+/// Height of a custom header row, centred on the dot.
+const HEADER_H: Pixels = px(30.);
 
 impl RenderOnce for Pane {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
@@ -283,43 +374,63 @@ impl RenderOnce for Pane {
         let close_key = close.clone();
         let close_dot = close.clone();
 
+        let closing = self.closing;
         let group: SharedString = "pane-close".into();
+        // The hit area: the dot plus CLOSE_SLOP all round, pinned so the dot
+        // itself lands CLOSE_INSET from the top and left edges.
         let dot = div()
             .id("pane-close")
             .group(group.clone())
-            .size(px(14.))
-            .flex_none()
+            .absolute()
+            // Absolute offsets start inside the 1px border.
+            .top(CLOSE_INSET - CLOSE_SLOP - px(1.))
+            .left(CLOSE_INSET - CLOSE_SLOP - px(1.))
+            .size(CLOSE_DOT + CLOSE_SLOP * 2.)
             .flex()
             .items_center()
             .justify_center()
-            .rounded_full()
-            .border_1()
-            .border_color(rgb(CLOSE_RIM))
-            .bg(rgb(CLOSE_RED))
-            .cursor_pointer()
-            .on_click(move |_, window, cx| {
-                cx.stop_propagation();
-                close_dot(window, cx)
+            .when(!closing, |d| {
+                d.cursor_pointer().on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    close_dot(window, cx)
+                })
             })
             .child(
-                div().invisible().group_hover(group, |s| s.visible()).child(
-                    svg()
-                        .path(IconName::X.path())
-                        .size(px(9.))
-                        .text_color(rgb(CLOSE_GLYPH)),
-                ),
+                div()
+                    .size(CLOSE_DOT)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(CLOSE_RIM))
+                    .bg(rgb(CLOSE_RED))
+                    .child(
+                        div().invisible().group_hover(group, |s| s.visible()).child(
+                            svg()
+                                .path(IconName::X.path())
+                                .size(px(8.))
+                                .text_color(rgb(CLOSE_GLYPH)),
+                        ),
+                    ),
             );
 
-        let header = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(12.))
-            .min_w_0()
-            .child(dot)
-            .map(|d| match (self.header, self.title) {
-                (Some(header), _) => d.child(div().flex_1().min_w_0().child(header)),
-                (None, Some(title)) => d.child(
+        // A title goes under the dot, at the normal content padding; a custom
+        // header sits on the dot's row, starting just past its hit area.
+        let has_header = self.header.is_some();
+        let header = match (self.header, self.title) {
+            (Some(header), _) => Some(
+                div()
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .h(HEADER_H)
+                    .min_w_0()
+                    .ml(CLOSE_INSET + CLOSE_DOT + CLOSE_SLOP - PAD_X + px(4.))
+                    .child(div().flex_1().min_w_0().child(header)),
+            ),
+            (None, Some(title)) => Some(
+                div().flex().flex_none().min_w_0().child(
                     div()
                         .flex_1()
                         .ellipsis()
@@ -329,8 +440,15 @@ impl RenderOnce for Pane {
                         .text_color(t.ink)
                         .child(truncated(title)),
                 ),
-                (None, None) => d,
-            });
+            ),
+            (None, None) => None,
+        };
+        // Header row centred on the dot; otherwise clear the dot.
+        let pad_top = if has_header {
+            CLOSE_INSET + CLOSE_DOT / 2. - HEADER_H / 2.
+        } else {
+            PAD_TOP_TITLE
+        };
 
         let has_actions = !self.actions.is_empty();
         let rows = self.actions.into_iter().map(|a| {
@@ -346,32 +464,38 @@ impl RenderOnce for Pane {
                 .rounded(px(12.))
                 .bg(glass.well)
                 .hover(|s| s.bg(glass.well_hover))
-                .cursor_pointer()
                 .text_size(px(14.))
                 .text_color(t.ink)
-                .on_click(move |_, window, cx| on_click(window, cx))
+                .when(!closing, |d| {
+                    d.cursor_pointer()
+                        .on_click(move |_, window, cx| on_click(window, cx))
+                })
                 .child(div().flex_1().ellipsis().child(truncated(a.label)))
         });
 
         let sheet = div()
             .id(self.id.clone())
-            .occlude()
             .when_some(self.focus, |d, focus| d.track_focus(&focus))
-            .key_context(KEY_CONTEXT)
-            .on_action(move |_: &ClosePane, window, cx| close_key(window, cx))
-            .on_mouse_down_out(move |_, window, cx| close_out(window, cx))
+            // While fading out it only draws: clicks go through to what is
+            // behind it and keys go wherever focus was handed back to.
+            .when(!closing, |d| {
+                d.occlude()
+                    .key_context(KEY_CONTEXT)
+                    .on_action(move |_: &ClosePane, window, cx| close_key(window, cx))
+                    .on_mouse_down_out(move |_, window, cx| close_out(window, cx))
+            })
             .relative()
             .w_full()
-            // Scale in: a touch narrower and lower at the start.
+            // Scale in (and back out on close): a touch narrower and lower.
             .max_w(self.max_width * (0.96 + 0.04 * p))
             .mt(px(10.) * (1. - p))
             .max_h_full()
             .flex()
             .flex_col()
             .gap(px(14.))
-            .pt(px(16.))
+            .pt(pad_top)
             .pb(px(if has_actions { 12. } else { 18. }))
-            .px(px(18.))
+            .px(PAD_X)
             .rounded(RADIUS)
             .border_1()
             .border_color(glass.border)
@@ -389,7 +513,7 @@ impl RenderOnce for Pane {
                     .h(px(1.))
                     .bg(glass.highlight),
             )
-            .child(header)
+            .children(header)
             .child(
                 div()
                     .id("pane-body")
@@ -399,7 +523,6 @@ impl RenderOnce for Pane {
                     .flex()
                     .flex_col()
                     .gap(px(10.))
-                    .pl(px(26.))
                     .pr(px(4.))
                     .text_size(px(15.))
                     .line_height(px(23.))
@@ -423,7 +546,9 @@ impl RenderOnce for Pane {
                         )
                         .children(rows),
                 )
-            });
+            })
+            // Last, so it paints and hit-tests above the header and body.
+            .child(dot);
 
         div()
             .absolute()
@@ -444,7 +569,7 @@ impl RenderOnce for Pane {
                         .id("pane-scrim")
                         .absolute()
                         .inset_0()
-                        .occlude()
+                        .when(!closing, |d| d.occlude())
                         .bg(glass.scrim.opacity(p)),
                 )
             })
@@ -485,20 +610,21 @@ mod tests {
         let now = Instant::now();
         let mut s = State::new();
         assert!(!s.is_open());
-        assert_eq!(s.close(), None, "closing a closed pane does nothing");
+        assert_eq!(s.close(now), None, "closing a closed pane does nothing");
         s.open("message", Some(7), now);
         assert!(s.is_open());
         assert_eq!(s.content(), Some(&"message"));
-        assert_eq!(s.close(), Some(Some(7)));
+        assert_eq!(s.close(now), Some(Some(7)));
         assert!(!s.is_open());
-        assert_eq!(s.close(), None);
+        assert_eq!(s.close(now), None);
     }
 
     #[test]
     fn nothing_focused_means_nothing_to_restore() {
+        let now = Instant::now();
         let mut s = State::new();
-        s.open("settings", None, Instant::now());
-        assert_eq!(s.close(), Some(None));
+        s.open("settings", None, now);
+        assert_eq!(s.close(now), Some(None));
     }
 
     #[test]
@@ -510,7 +636,7 @@ mod tests {
         // still go back to where the user was before the first one.
         s.open("second", Some(2), now + Duration::from_millis(500));
         assert_eq!(s.content(), Some(&"second"));
-        assert_eq!(s.close(), Some(Some(1)));
+        assert_eq!(s.close(now), Some(Some(1)));
     }
 
     #[test]
@@ -550,5 +676,99 @@ mod tests {
         );
         assert_eq!(s.progress(now + OPEN_DURATION), 1.);
         assert!(!s.animating(now + OPEN_DURATION));
+    }
+
+    #[test]
+    fn close_fades_out_over_130ms_and_stops_taking_input() {
+        let now = Instant::now();
+        let mut s = State::new();
+        s.open("x", Some(3), now);
+        let settled = now + OPEN_DURATION;
+        assert_eq!(s.progress(settled), 1.);
+        // Focus comes back the moment the close starts, not after the fade.
+        assert_eq!(s.close(settled), Some(Some(3)));
+        assert!(!s.is_open(), "not interactive while fading");
+        assert_eq!(s.content(), None, "actions can't reach closing content");
+        assert_eq!(s.shown(settled), Some(&"x"), "still drawn");
+        assert!(s.is_closing(settled));
+        assert!(s.animating(settled));
+        assert_eq!(s.progress(settled), 1.);
+        let mid = s.progress(settled + CLOSE_DURATION / 2);
+        assert!(mid > 0. && mid < 0.5, "eases out: mostly gone halfway");
+        let done = settled + CLOSE_DURATION;
+        assert_eq!(s.progress(done), 0.);
+        assert!(!s.is_closing(done));
+        assert!(!s.animating(done));
+        assert_eq!(s.shown(done), None, "gone once the fade ends");
+        assert_eq!(s.close(done), None, "closing twice does nothing");
+    }
+
+    #[test]
+    fn close_mid_open_fades_from_where_it_got_to() {
+        let now = Instant::now();
+        let mut s = State::new();
+        s.open("x", None, now);
+        let at = now + OPEN_DURATION / 4;
+        let visible = s.progress(at);
+        assert!(visible > 0. && visible < 1.);
+        s.close(at);
+        assert_eq!(s.progress(at), visible, "no jump to fully open");
+        assert!(s.progress(at + CLOSE_DURATION / 3) < visible);
+        assert_eq!(s.progress(at + CLOSE_DURATION), 0.);
+    }
+
+    #[test]
+    fn reopening_mid_close_resumes_without_a_jump() {
+        let now = Instant::now();
+        let mut s = State::new();
+        s.open("first", Some(1), now);
+        let closed = now + OPEN_DURATION;
+        s.close(closed);
+        let at = closed + CLOSE_DURATION / 3;
+        let visible = s.progress(at);
+        assert!(visible > 0. && visible < 1.);
+        let generation = s.generation();
+        // Focus is back on 1 by now, so the new pane remembers 1 (or
+        // whatever has it at this point).
+        s.open("second", Some(4), at);
+        assert!(s.is_open());
+        assert!(!s.is_closing(at));
+        assert_eq!(s.content(), Some(&"second"));
+        assert_eq!(s.shown(at), Some(&"second"));
+        assert!(s.generation() > generation, "fresh scroll for new content");
+        assert!(
+            (s.progress(at) - visible).abs() < 1e-3,
+            "open picks up from the fade: {} vs {visible}",
+            s.progress(at)
+        );
+        assert!(s.animating(at));
+        assert!(s.progress(at + OPEN_DURATION / 4) > visible);
+        assert_eq!(s.progress(at + OPEN_DURATION), 1.);
+        assert_eq!(s.close(at + OPEN_DURATION), Some(Some(4)));
+    }
+
+    #[test]
+    fn reopening_after_the_fade_plays_the_full_open() {
+        let now = Instant::now();
+        let mut s = State::new();
+        s.open("a", None, now);
+        let closed = now + OPEN_DURATION;
+        s.close(closed);
+        let later = closed + CLOSE_DURATION * 2;
+        s.open("b", None, later);
+        assert_eq!(s.progress(later), 0.);
+        assert_eq!(s.progress(later + OPEN_DURATION), 1.);
+    }
+
+    #[test]
+    fn close_dot_is_traffic_light_sized_in_the_corner() {
+        assert_eq!(CLOSE_DOT, px(12.));
+        assert_eq!(CLOSE_INSET, px(12.));
+        assert_eq!(CLOSE_SLOP, px(7.));
+        assert!(
+            PAD_TOP_TITLE > CLOSE_INSET + CLOSE_DOT,
+            "the title starts below the dot"
+        );
+        assert!(CLOSE_DURATION >= Duration::from_millis(120) && CLOSE_DURATION <= OPEN_DURATION);
     }
 }

@@ -478,7 +478,7 @@ impl Search {
 
 impl Search {
     /// Search in the pane (the experiment): the field takes the title's place
-    /// next to the close dot, results fill the body, and the highlighted
+    /// beside the close dot, results fill the body, and the highlighted
     /// result's actions are the quick actions, led by "Go to …". Same
     /// provider, keys and jump as the dropdown. `None` unless search is open
     /// in pane mode.
@@ -576,7 +576,7 @@ impl Search {
                         },
                     ))
                 } else {
-                    pane.child(div().ml(px(-12.)).child(self.render_card(cx)))
+                    pane.child(div().ml(px(-6.)).child(self.render_card(cx)))
                         .children(rows)
                 }
             });
