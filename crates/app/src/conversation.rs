@@ -10,13 +10,17 @@ use gpui::{
     AnyElement, Context, Entity, FontWeight, ListAlignment, ListOffset, ListState, SharedString,
     Subscription, Window, div, list, prelude::*, px,
 };
-use model::{Author, Id};
+use model::{Author, Id, PaneContent, pane};
 use ui::{ActiveTheme, Ellipsis, IconName, brand_icon, icon, truncated};
 
-use crate::store::{ChatStore, StoreEvent};
+use crate::{
+    pane_host::PaneHost,
+    store::{ChatStore, StoreEvent},
+};
 
 pub struct Conversation {
     store: Entity<ChatStore>,
+    pane: Entity<PaneHost>,
     channel: Id,
     list: ListState,
     /// Message picked in search, tinted until the channel changes.
@@ -25,7 +29,7 @@ pub struct Conversation {
 }
 
 impl Conversation {
-    pub fn new(store: Entity<ChatStore>, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<ChatStore>, pane: Entity<PaneHost>, cx: &mut Context<Self>) -> Self {
         let channel = store.read(cx).selected();
         let count = store.read(cx).log(channel).map_or(0, |l| l.len());
         let subscription = cx.subscribe(&store, |this, store, event, cx| match event {
@@ -57,6 +61,7 @@ impl Conversation {
         });
         Self {
             store,
+            pane,
             channel,
             list: ListState::new(count, ListAlignment::Bottom, px(600.)),
             highlighted: None,
@@ -143,15 +148,122 @@ impl Conversation {
                                             .child(clock(message.sent_at)),
                                     ),
                             )
-                            .child(
-                                // Long messages wrap; they are never clipped.
-                                div()
-                                    .w_full()
-                                    .min_w_0()
-                                    .whitespace_normal()
-                                    .text_color(t.ink_soft)
-                                    .child(SharedString::from(message.body.clone())),
-                            ),
+                            .when_some(message.reply_to.as_ref(), |d, reply| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .min_w_0()
+                                        .mt(px(2.))
+                                        .pl(px(8.))
+                                        .border_l_2()
+                                        .border_color(t.line_strong)
+                                        .text_size(px(13.))
+                                        .line_height(px(18.))
+                                        .text_color(t.muted)
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(SharedString::from(pane::author_name(
+                                                    store.workspace(),
+                                                    reply.author,
+                                                ))),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .ellipsis()
+                                                .child(truncated(reply.quote.clone())),
+                                        ),
+                                )
+                            })
+                            .map(|d| {
+                                if pane::is_long(&message.body) {
+                                    d.child(self.render_collapsed(ix, message, cx))
+                                } else {
+                                    // Messages wrap; they are never clipped.
+                                    d.child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .whitespace_normal()
+                                            .text_color(t.ink_soft)
+                                            .child(SharedString::from(message.body.clone())),
+                                    )
+                                }
+                            }),
+                    ),
+            )
+            .into_any_element()
+    }
+}
+
+impl Conversation {
+    /// A long message's first lines, ending in "…", with "Open" to read it in
+    /// full in the pane (see `model::pane::is_long` for the threshold).
+    fn render_collapsed(&self, ix: usize, message: &model::Message, cx: &gpui::App) -> AnyElement {
+        let t = *cx.theme();
+        let preview = pane::preview(&message.body);
+        let lines = preview.lines().map(|line| {
+            div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .child(SharedString::from(line.to_string()))
+        });
+        let content = PaneContent::LongMessage {
+            channel: self.channel,
+            index: ix,
+            message: message.clone(),
+        };
+        let pane = self.pane.clone();
+        let words = message.body.split_whitespace().count();
+        let hover = t.hover;
+        div()
+            .w_full()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .text_color(t.ink_soft)
+            .children(lines)
+            .child(
+                div()
+                    .mt(px(6.))
+                    .flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .child(
+                        div()
+                            .id(("open-message", ix))
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .gap(px(6.))
+                            .h(px(28.))
+                            .px(px(12.))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(t.line_strong)
+                            .bg(t.surface)
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(t.ink)
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(hover))
+                            .on_click(move |_, window, cx| {
+                                pane.update(cx, |p, cx| p.open(content.clone(), window, cx));
+                            })
+                            .child("Open")
+                            .child(icon(IconName::CaretRight, px(12.), t.muted)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(t.muted)
+                            .child(SharedString::from(format!("{words} words"))),
                     ),
             )
             .into_any_element()

@@ -13,6 +13,7 @@ use ui::{ActiveTheme, FONT_FAMILY, Theme};
 use crate::{
     composer::Composer,
     conversation::Conversation,
+    pane_host::{PaneEvent, PaneHost, pane_frame},
     panels::{
         GUTTER, LEFT_WIDTH, Panels, RIGHT_WIDTH, SIDE_INSET, Side, SideFrame, ToggleLeftSidebar,
         ToggleRightSidebar,
@@ -55,6 +56,7 @@ fn centre_column(viewport: Pixels, left: Pixels, right: Pixels) -> (Pixels, Pixe
 
 pub struct Workspace {
     panels: Entity<Panels>,
+    pane: Entity<PaneHost>,
     search: Entity<Search>,
     titlebar: Entity<Titlebar>,
     sidebar: Entity<Sidebar>,
@@ -114,6 +116,20 @@ impl Workspace {
             )
         });
         let composer = cx.new(|cx| Composer::new(store.clone(), window, cx));
+        let pane = cx.new(|cx| PaneHost::new(store.clone(), cx));
+        let pane_events =
+            cx.subscribe_in(&pane, window, |this, _, event, window, cx| match event {
+                PaneEvent::Reply(reply) => this
+                    .composer
+                    .update(cx, |c, cx| c.set_reply(reply.clone(), window, cx)),
+                PaneEvent::ClosedWithoutFocus => {
+                    this.composer.update(cx, |c, cx| c.focus(window, cx))
+                }
+                // Attachments, reviews and drafts arrive with the agent runtime.
+                PaneEvent::Action(_) => {}
+            });
+        // The pane layer is drawn here, so redraw when it opens or closes.
+        let pane_changed = cx.observe(&pane, |_, _, cx| cx.notify());
         // After a jump, hand the keyboard back to the composer.
         let jumped = cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
             SearchEvent::Jumped | SearchEvent::Dismissed => {
@@ -127,15 +143,23 @@ impl Workspace {
             titlebar: cx.new(|cx| Titlebar::new(panels.clone(), search.clone(), window, cx)),
             panels,
             search,
-            sidebar: cx.new(|cx| Sidebar::new(store.clone(), cx)),
+            sidebar: cx.new(|cx| Sidebar::new(store.clone(), pane.clone(), cx)),
             right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), cx)),
-            conversation: cx.new(|cx| Conversation::new(store.clone(), cx)),
+            conversation: cx.new(|cx| Conversation::new(store.clone(), pane.clone(), cx)),
+            pane,
             composer,
             side_focus,
-            _subscriptions: [appearance, panels_changed, resized, jumped]
-                .into_iter()
-                .chain(focus_subscriptions)
-                .collect(),
+            _subscriptions: [
+                appearance,
+                panels_changed,
+                resized,
+                jumped,
+                pane_events,
+                pane_changed,
+            ]
+            .into_iter()
+            .chain(focus_subscriptions)
+            .collect(),
         }
     }
 }
@@ -179,6 +203,8 @@ impl Render for Workspace {
                 });
             }))
             .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                // One pane at a time: search takes over from an open pane.
+                this.pane.update(cx, |p, cx| p.close_quietly(cx));
                 this.search.update(cx, |s, cx| s.focus(window, cx));
             }))
             .size_full()
@@ -230,6 +256,17 @@ impl Render for Workspace {
                             .justify_center()
                             .child(div().w_full().max_w(column_w).child(self.composer.clone())),
                     )
+                    // The pane: between the docked sidebars, under the
+                    // titlebar, above the composer. Peeking sidebars (below)
+                    // still slide in over it.
+                    .children(self.pane_layer(
+                        viewport.width,
+                        left_space,
+                        right_space,
+                        column_w,
+                        window,
+                        cx,
+                    ))
                     // Collapsed sidebars slide off their edge and fade; a peek
                     // slides one back over the content.
                     .when(left.shown > 0., |this| {
@@ -276,6 +313,32 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// The open pane (whatever `PaneHost` shows) in the box it may use. Its scrim covers that box, not the sidebars or the
+    /// composer, so both stay one click away.
+    fn pane_layer(
+        &self,
+        viewport: Pixels,
+        left_space: Pixels,
+        right_space: Pixels,
+        column: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement + use<>> {
+        let (left, right, max_width) = pane_frame(viewport, left_space, right_space, column);
+        let pane = self
+            .pane
+            .update(cx, |p, cx| p.render_overlay(max_width, window, cx))?;
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left(left)
+                .right(right)
+                .bottom(COMPOSER_CLEARANCE)
+                .child(pane),
+        )
+    }
+
     /// One sidebar, docked or peeking. A peek floats over the chat with a
     /// deeper shadow and swallows clicks so nothing underneath reacts.
     fn side_slot(

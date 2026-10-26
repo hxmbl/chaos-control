@@ -1,22 +1,23 @@
 //! Floating, detached left sidebar: project picker, channels, quick links, settings.
 
 use gpui::{Context, Entity, FontWeight, SharedString, Window, div, prelude::*, px, uniform_list};
-use model::Channel;
+use model::{Channel, PaneContent};
 use ui::{ActiveTheme, Ellipsis, IconName, Tooltip, brand_icon, icon, pill, truncated};
 
-use crate::store::ChatStore;
+use crate::{pane_host::PaneHost, store::ChatStore};
 
 /// Channel pill height plus the gap below it; `uniform_list` needs one fixed row height.
 const CHANNEL_ROW: f32 = 36. + 6.;
 
 pub struct Sidebar {
     store: Entity<ChatStore>,
+    pane: Entity<PaneHost>,
 }
 
 impl Sidebar {
-    pub fn new(store: Entity<ChatStore>, cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Entity<ChatStore>, pane: Entity<PaneHost>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        Self { store }
+        Self { store, pane }
     }
 
     fn render_channel(
@@ -184,6 +185,10 @@ impl Render for Sidebar {
                     .h(px(44.))
                     .gap(px(10.))
                     .px(px(14.))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.pane
+                            .update(cx, |p, cx| p.open(PaneContent::Settings, window, cx));
+                    }))
                     .child(icon(IconName::GearSix, px(19.), t.ink_soft))
                     .child("Settings"),
             )

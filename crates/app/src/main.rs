@@ -2,6 +2,7 @@
 
 mod composer;
 mod conversation;
+mod pane_host;
 mod panels;
 mod right_sidebar;
 mod search;
@@ -50,6 +51,7 @@ fn main() {
             .detach();
 
             let store = cx.new(|_| store::ChatStore::new(model::sample()));
+            store.update(cx, |store, cx| store.load_sample_history(cx));
             if let Some(count) = demo_message_count() {
                 store.update(cx, |store, cx| store.load_demo_history(count, cx));
             }

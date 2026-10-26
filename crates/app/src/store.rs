@@ -7,7 +7,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use gpui::{Context, EventEmitter};
-use model::{Author, ChannelLog, CorpusChannel, Id, Message, SearchCorpus, Workspace};
+use model::{Author, ChannelLog, CorpusChannel, Id, Message, ReplyRef, SearchCorpus, Workspace};
 
 pub enum StoreEvent {
     /// The selected channel changed.
@@ -119,7 +119,12 @@ impl ChatStore {
     }
 
     /// Local echo for the composer until there is somewhere to send to.
-    pub fn post_from_human(&mut self, body: &str, cx: &mut Context<Self>) {
+    pub fn post_from_human(
+        &mut self,
+        body: &str,
+        reply_to: Option<ReplyRef>,
+        cx: &mut Context<Self>,
+    ) {
         let body = body.trim();
         if body.is_empty() {
             return;
@@ -135,9 +140,15 @@ impl ChatStore {
             author: Author::Human,
             sent_at,
             body: Arc::from(body),
-            reply_to: None,
+            reply_to,
         };
         self.append(self.selected, vec![message], cx);
+    }
+
+    /// The sample conversation in #main (see `model::sample_history`).
+    pub fn load_sample_history(&mut self, cx: &mut Context<Self>) {
+        let (channel, messages) = model::sample_history();
+        self.append(channel, messages, cx);
     }
 
     pub fn load_demo_history(&mut self, count: usize, cx: &mut Context<Self>) {

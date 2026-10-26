@@ -12,11 +12,12 @@ immediate-mode elements) instead of a webview.
   unit-test. Strings are `Arc<str>`, which turn into GPUI `SharedString`s
   without copying.
 - `ui`: the theme (light and dark, following the OS), bundled assets and the
-  few components the shell needs (pill, icon, tooltip, text input). Hand-built
-  to match the design rather than pulling in a component kit.
+  few components the shell needs (pill, icon, tooltip, text input, the pane
+  and its glass). Hand-built to match the design rather than pulling in a
+  component kit.
 - `app`: the binary. One view per region: `Titlebar`, `Sidebar`,
   `RightSidebar` (+ `CatchUp`), `Conversation`, `Composer`, laid out by the
-  root `Workspace` view.
+  root `Workspace` view, plus `PaneHost` (what the pane shows).
 
 ## Agent state
 
@@ -82,6 +83,66 @@ the panel already draws them and emits `SearchEvent::Action`, but nothing
 produces them yet. Today's provider, `SubstringSearch`, is a plain
 case-insensitive scan; ranking, semantic search or commands can replace it
 without touching the UI.
+
+## The pane
+
+A fixed, translucent glass overlay that shows what you need or what you
+clicked on without taking you away from the chat behind it: long messages
+today, settings, and later attachments, reviews and long messages to send. It
+never moves and there is never more than one.
+
+- **Content is model data.** `model::PaneContent` (GPUI-free) says what is
+  shown: `LongMessage`, `Attachment`, `Settings`, `Review`, `Compose`,
+  `Search`. Each knows its title and its quick actions (`PaneAction` /
+  `PaneActionKind`), so the agent runtime can open a pane by building one and
+  calling `PaneHost::open`. The UI only decides how each body looks.
+- **Element and state.** `ui::Pane` is the element: a red macOS-style close dot
+  at the top left (an × shows on hover), a large title or a custom header, a
+  scrollable body that takes any element, and full-width rounded quick-action
+  rows under a thin divider. `ui::PaneState` is the bookkeeping, unit-tested
+  without a window: it remembers what had focus when the pane opened and hands
+  it back on close; opening over an open pane swaps the content in place (no
+  second animation, focus still returns to where it was before the first).
+- **Closing.** The close dot, Escape (`Pane` key context) and a click
+  outside. Focus goes back to whatever had it, unless the click that closed
+  the pane focused something itself (the search pill, the composer), which
+  wins; with nothing to go back to, the composer gets it.
+- **Where it sits.** `pane_frame` (in `pane_host.rs`): between the docked
+  sidebars, from under the titlebar to just above the composer, centred on the
+  window like the chat column when that clears both sidebars, as wide as the
+  column + 160px (at most 1120px), and simply the space left on a narrow
+  window. It reflows as sidebars dock, collapse or slide; a peeking sidebar
+  slides in over it. Tall content scrolls inside the body; short content
+  makes a short pane.
+- **Motion.** 140ms fade and scale-in (ease-out cubic), the same timing as the
+  search grow and the sidebar peek. Closing is instant.
+- **The glass, faked.** gpui 0.2.2 has no backdrop blur, so `ui::Glass`
+  (`glass.rs`, `Theme::glass`) builds it from a translucent fill that is a
+  touch lighter at the top (a linear gradient, about 94% to 90% opaque), a
+  scrim over the area behind the pane that knocks the chat back the way a blur
+  would (light: the canvas colour at 42%; dark: black at 38%), a hairline
+  border, a 1px bright highlight along the top inner edge, and a soft, wide
+  two-layer shadow. The scrim covers only the pane's box, never the sidebars
+  or the composer. All of it lives in `Glass`: when GPUI gets a real backdrop
+  blur, add it there, lower the fill's alpha and drop the scrim.
+
+### Long messages
+
+A message over 600 characters or 8 lines (`model::pane::is_long`) shows
+collapsed in the chat: its first 4 lines or 320 characters, cut between words
+and ending in "…" (`model::pane::preview`), then an "Open" button and a word
+count. "Open" shows it in full in the pane, with the author and time, and two
+quick actions: **Reply** closes the pane and puts a reply reference ("Replying
+to Claude Code: …", cancellable) above the composer field; the sent message
+carries a `ReplyRef` snapshot (author + one quoted line), drawn as a quote line
+above its body, so drawing a reply never searches the log. **Copy** copies the
+text and reads "Copied" for a moment.
+
+### Settings
+
+The left sidebar's Settings opens the settings pane: appearance (follows the
+OS), the long-message rule, shortcuts, and placeholders for agents and
+notifications.
 
 ## Rendering
 
@@ -183,6 +244,7 @@ macOS and ctrl elsewhere.
 | `up` / `down` | Move through results | Search |
 | `enter` | Jump to the highlighted result | Search |
 | `escape` | Clear the query; on an empty field, close | Search |
+| `escape` | Close the pane | Pane |
 | `enter` | Send | Composer |
 | `cmd/ctrl-Q` | Quit | Anywhere |
 
