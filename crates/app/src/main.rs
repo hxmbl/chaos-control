@@ -11,14 +11,14 @@ mod titlebar;
 mod workspace;
 
 use gpui::{
-    App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations,
-    WindowOptions, actions, point, prelude::*, px, size,
+    App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions,
+    actions, point, prelude::*, px, size,
 };
 
 actions!(chaos_control, [Quit]);
 
 fn main() {
-    Application::new()
+    gpui_platform::application()
         .with_assets(ui::Assets)
         .run(|cx: &mut App| {
             if let Err(err) = ui::load_fonts(cx) {
@@ -42,7 +42,7 @@ fn main() {
                 KeyBinding::new("up", search::SelectPrevious, Some(search::KEY_CONTEXT)),
                 KeyBinding::new("escape", search::Dismiss, Some(search::KEY_CONTEXT)),
             ]);
-            cx.on_window_closed(|cx| {
+            cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();
                 }

@@ -11,9 +11,12 @@ publish = false
 rust-version = "1.88"
 
 [workspace.dependencies]
-# GPUI, Zed's UI framework. Pinned to the latest crates.io release so CI and
-# local builds resolve the same thing; bump deliberately.
-gpui = "=0.2.2"
+# GPUI, Zed's UI framework, from gpui-unofficial: automated crates.io builds of
+# Zed's own gpui crates, versioned after the Zed release they come from. The
+# library target is still `gpui`; apps start through the platform facade,
+# aliased as `gpui_platform` as upstream does. Pinned exactly; bump deliberately.
+gpui = { package = "gpui-unofficial", version = "=1.25.3" }
+gpui_platform = { package = "gpui-platform-gpui-unofficial", version = "=1.25.3" }
 unicode-segmentation = "1.12"
 model = { path = "crates/model" }
 ui = { path = "crates/ui" }

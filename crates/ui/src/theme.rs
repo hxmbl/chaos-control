@@ -130,12 +130,14 @@ impl Theme {
                 offset: point(px(0.), px(1.)),
                 blur_radius: px(2.),
                 spread_radius: px(0.),
+                inset: false,
             },
             BoxShadow {
                 color: self.shadow_far,
                 offset: point(px(0.), px(y)),
                 blur_radius: px(blur),
                 spread_radius: px(-12.),
+                inset: false,
             },
         ]
     }
@@ -154,12 +156,14 @@ impl Theme {
                 offset: point(px(0.), px(2.)),
                 blur_radius: px(6.),
                 spread_radius: px(0.),
+                inset: false,
             },
             BoxShadow {
                 color: self.shadow_far,
                 offset: point(px(0.), px(y)),
                 blur_radius: px(blur),
                 spread_radius: px(-6.),
+                inset: false,
             },
         ]
     }
@@ -189,12 +193,14 @@ impl Theme {
                 offset: point(px(0.), px(y)),
                 blur_radius: px(blur),
                 spread_radius: px(spread),
+                inset: false,
             },
             BoxShadow {
                 color: glow.opacity(a2),
                 offset: point(px(0.), px(2.)),
                 blur_radius: px(0.),
                 spread_radius: px(-1.),
+                inset: false,
             },
         ]
     }

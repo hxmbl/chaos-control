@@ -18,7 +18,7 @@ fn placeholder(store: &ChatStore) -> String {
 impl Composer {
     pub fn new(store: Entity<ChatStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| TextInput::new(placeholder(store.read(cx)), cx));
-        window.focus(&input.focus_handle(cx));
+        window.focus(&input.focus_handle(cx), cx);
         let subscriptions = [
             cx.subscribe(&input, |this, _, event, cx| match event {
                 TextInputEvent::Submit => this.send(cx),
@@ -40,7 +40,7 @@ impl Composer {
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.input.focus_handle(cx));
+        window.focus(&self.input.focus_handle(cx), cx);
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {

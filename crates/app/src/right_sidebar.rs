@@ -81,8 +81,8 @@ impl Render for RightSidebar {
             // It and the mentions share whatever height the window gives them.
             .child(
                 div()
-                    .flex_grow()
-                    .flex_shrink()
+                    .flex_grow_1()
+                    .flex_shrink_1()
                     .flex_basis(px(260.))
                     .min_h(px(120.))
                     .child(
@@ -97,8 +97,8 @@ impl Render for RightSidebar {
                     .gap(px(6.))
                     .p(px(6.))
                     .when(open, |s| {
-                        s.flex_grow()
-                            .flex_shrink()
+                        s.flex_grow_1()
+                            .flex_shrink_1()
                             .flex_basis(px(MENTION_ROW * 3. + 50.))
                             .min_h(px(MENTION_ROW + 50.))
                             .max_h(px(MENTION_ROW * count as f32 + 50.))
@@ -334,6 +334,7 @@ impl Render for CatchUp {
                                                 offset: point(px(0.), px(0.)),
                                                 blur_radius: px(4.),
                                                 spread_radius: px(0.),
+                                                inset: false,
                                             }])
                                         },
                                     )

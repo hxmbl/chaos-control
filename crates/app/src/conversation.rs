@@ -129,7 +129,7 @@ impl Conversation {
                                     .min_w_0()
                                     .child(
                                         div()
-                                            .flex_shrink()
+                                            .flex_shrink_1()
                                             .ellipsis()
                                             .text_size(px(14.))
                                             .font_weight(FontWeight::SEMIBOLD)

@@ -2,7 +2,8 @@
 
 use gpui::{
     App, AvailableSpace, Bounds, Element, ElementId, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, Pixels, ShapedLine, SharedString, Size, Style, Styled, Window, px, size,
+    IntoElement, LayoutId, Pixels, ShapedLine, SharedString, Size, Style, Styled, TextAlign,
+    TruncateFrom, Window, px, size,
 };
 
 /// Text that stays on one line and ends in "…" when its box is too narrow.
@@ -96,18 +97,26 @@ impl Element for Truncated {
     ) -> Self::PrepaintState {
         let style = window.text_style();
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let mut runs = vec![style.to_run(self.text.len())];
+        let runs = vec![style.to_run(self.text.len())];
         let line = window
             .text_system()
             .shape_line(self.text.clone(), font_size, &runs, None);
         if line.width <= bounds.size.width + px(0.5) {
             return Some(line);
         }
-        let cut = cx
-            .text_system()
-            .line_wrapper(style.font(), font_size)
-            .truncate_line(self.text.clone(), bounds.size.width, "…", &mut runs);
-        Some(window.text_system().shape_line(cut, font_size, &runs, None))
+        let mut wrapper = cx.text_system().line_wrapper(style.font(), font_size);
+        let (cut, cut_runs) = wrapper.truncate_line(
+            self.text.clone(),
+            bounds.size.width,
+            "…",
+            &runs,
+            TruncateFrom::End,
+        );
+        Some(
+            window
+                .text_system()
+                .shape_line(cut, font_size, &cut_runs, None),
+        )
     }
 
     fn paint(
@@ -121,8 +130,15 @@ impl Element for Truncated {
         cx: &mut App,
     ) {
         if let Some(line) = line.take() {
-            line.paint(bounds.origin, window.line_height(), window, cx)
-                .ok();
+            line.paint(
+                bounds.origin,
+                window.line_height(),
+                TextAlign::Left,
+                None,
+                window,
+                cx,
+            )
+            .ok();
         }
     }
 }

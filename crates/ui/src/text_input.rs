@@ -13,8 +13,8 @@ use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, size,
+    ShapedLine, SharedString, Style, TextAlign, TextRun, TruncateFrom, UTF16Selection,
+    UnderlineStyle, Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 
 use crate::{
@@ -407,7 +407,7 @@ impl TextInput {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         let index = self.index_for_mouse_position(event.position);
         match event.click_count {
             // Double click selects the word under the pointer, triple the line.
@@ -775,20 +775,23 @@ impl Element for TextElement {
         };
 
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let mut runs = runs;
         let mut line =
             window
                 .text_system()
                 .shape_line(display_text.clone(), font_size, &runs, None);
         // A placeholder that does not fit ends in "…" rather than being clipped.
         if input.content.is_empty() && line.width > bounds.size.width {
-            let truncated = cx
-                .text_system()
-                .line_wrapper(style.font(), font_size)
-                .truncate_line(display_text, bounds.size.width, "…", &mut runs);
+            let mut wrapper = cx.text_system().line_wrapper(style.font(), font_size);
+            let (truncated, truncated_runs) = wrapper.truncate_line(
+                display_text,
+                bounds.size.width,
+                "…",
+                &runs,
+                TruncateFrom::End,
+            );
             line = window
                 .text_system()
-                .shape_line(truncated, font_size, &runs, None);
+                .shape_line(truncated, font_size, &truncated_runs, None);
         }
 
         // Centre short text; once it overflows, scroll so the cursor stays visible.
@@ -872,6 +875,8 @@ impl Element for TextElement {
             line.paint(
                 point(prepaint.origin_x, bounds.top()),
                 window.line_height(),
+                TextAlign::Left,
+                None,
                 window,
                 cx,
             )

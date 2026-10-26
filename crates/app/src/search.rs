@@ -158,7 +158,7 @@ impl Search {
         if self.open {
             self.input.update(cx, |input, cx| input.select_all_text(cx));
         } else {
-            window.focus(&self.input.focus_handle(cx));
+            window.focus(&self.input.focus_handle(cx), cx);
             self.open(cx);
         }
     }
@@ -370,7 +370,7 @@ impl Search {
                     ))
                     .child(
                         div()
-                            .flex_shrink()
+                            .flex_shrink_1()
                             .ellipsis()
                             .text_size(px(15.))
                             .font_weight(FontWeight::MEDIUM)

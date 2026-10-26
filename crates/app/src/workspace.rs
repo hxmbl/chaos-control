@@ -4,9 +4,9 @@
 use std::time::Instant;
 
 use gpui::{
-    AnyView, Context, CursorStyle, Decorations, DispatchPhase, Entity, FocusHandle, MouseButton,
-    MouseExitEvent, MouseMoveEvent, Pixels, ResizeEdge, StyleRefinement, Subscription, Window,
-    canvas, div, prelude::*, px,
+    AnyElement, AnyView, Context, CursorStyle, Decorations, DispatchPhase, Entity, FocusHandle,
+    MouseButton, MouseExitEvent, MouseMoveEvent, Pixels, ResizeEdge, StyleRefinement, Subscription,
+    Window, canvas, div, prelude::*, px,
 };
 use ui::{ActiveTheme, FONT_FAMILY, Theme};
 
@@ -142,8 +142,10 @@ impl Workspace {
 
 /// Wraps a child view so it only re-renders when it is notified itself, not every
 /// time something else in the window changes (an animation, a hover elsewhere).
-fn cached<V: 'static + gpui::Render>(view: &Entity<V>) -> AnyView {
-    AnyView::from(view.clone()).cached(StyleRefinement::default().size_full())
+fn cached<V: 'static + gpui::Render>(view: &Entity<V>) -> AnyElement {
+    AnyView::from(view.clone())
+        .cached(StyleRefinement::default().size_full())
+        .into_any_element()
 }
 
 impl Render for Workspace {
@@ -282,7 +284,7 @@ impl Workspace {
         &self,
         side: Side,
         frame: SideFrame,
-        view: AnyView,
+        view: AnyElement,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let t = *cx.theme();
