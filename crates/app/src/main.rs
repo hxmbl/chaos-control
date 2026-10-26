@@ -6,6 +6,7 @@ mod pane_host;
 mod panels;
 mod right_sidebar;
 mod search;
+mod settings;
 mod sidebar;
 mod store;
 mod titlebar;
@@ -26,6 +27,7 @@ fn main() {
                 eprintln!("chaos-control: could not load bundled fonts: {err:#}");
             }
             ui::init(cx);
+            settings::init(cx);
 
             cx.on_action(|_: &Quit, cx| cx.quit());
             // Shortcuts stay conventional (see "Shortcuts" in ARCHITECTURE.md): a

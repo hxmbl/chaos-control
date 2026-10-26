@@ -5,7 +5,7 @@
 use gpui::{
     Context, Decorations, Entity, MouseButton, Window, WindowControlArea, div, prelude::*, px,
 };
-use ui::{ActiveTheme, IconName, Tooltip, icon};
+use ui::{ActiveTheme, Ellipsis, IconName, Tooltip, icon, truncated};
 
 use crate::{
     panels::{Mode, Panels, Side, ToggleLeftSidebar, ToggleRightSidebar},
@@ -47,6 +47,7 @@ impl Render for Titlebar {
         let t = *cx.theme();
         let search_width = search::pill_width(window.viewport_size().width);
         let search_open = self.search.read(cx).is_open();
+        let search_in_pane = Search::in_pane(cx);
         let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
         let hover_line = t.line_strong;
         let field = (!search_open).then(|| {
@@ -90,8 +91,37 @@ impl Render for Titlebar {
             })
             // While search is open the workspace draws the grown panel over
             // this spot; an empty box keeps the titlebar layout unchanged.
-            .when(search_open, |this| {
+            .when(search_open && !search_in_pane, |this| {
                 this.child(div().h(search::PILL_HEIGHT).w(search_width))
+            })
+            // Search in the pane: the field lives in the pane, so the pill
+            // stays put as a quiet stand-in showing the query.
+            .when(search_open && search_in_pane, |this| {
+                let query = self.search.read(cx).query(cx);
+                let empty = query.is_empty();
+                this.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap(px(8.))
+                        .h(search::PILL_HEIGHT)
+                        .w(search_width)
+                        .px(px(12.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(t.line_strong)
+                        .bg(t.sunken)
+                        .text_size(px(13.))
+                        .line_height(px(18.))
+                        .text_color(t.muted)
+                        .child(icon(IconName::MagnifyingGlassBold, px(15.), t.muted))
+                        .child(div().min_w_0().ellipsis().child(truncated(if empty {
+                            "Searching in the pane".into()
+                        } else {
+                            query
+                        }))),
+                )
             })
             .when_some(field, |this, field| {
                 this.child(

@@ -313,7 +313,8 @@ impl Render for Workspace {
 }
 
 impl Workspace {
-    /// The open pane (whatever `PaneHost` shows) in the box it may use. Its scrim covers that box, not the sidebars or the
+    /// The open pane (search in pane mode, or whatever `PaneHost` shows) in
+    /// the box it may use. Its scrim covers that box, not the sidebars or the
     /// composer, so both stay one click away.
     fn pane_layer(
         &self,
@@ -326,8 +327,12 @@ impl Workspace {
     ) -> Option<impl IntoElement + use<>> {
         let (left, right, max_width) = pane_frame(viewport, left_space, right_space, column);
         let pane = self
-            .pane
-            .update(cx, |p, cx| p.render_overlay(max_width, window, cx))?;
+            .search
+            .update(cx, |s, cx| s.render_pane(max_width, window, cx))
+            .or_else(|| {
+                self.pane
+                    .update(cx, |p, cx| p.render_overlay(max_width, window, cx))
+            })?;
         Some(
             div()
                 .absolute()

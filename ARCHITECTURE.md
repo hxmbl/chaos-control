@@ -17,7 +17,8 @@ immediate-mode elements) instead of a webview.
   component kit.
 - `app`: the binary. One view per region: `Titlebar`, `Sidebar`,
   `RightSidebar` (+ `CatchUp`), `Conversation`, `Composer`, laid out by the
-  root `Workspace` view, plus `PaneHost` (what the pane shows).
+  root `Workspace` view, plus `PaneHost` (what the pane shows) and the
+  `AppSettings` global.
 
 ## Agent state
 
@@ -141,8 +142,22 @@ text and reads "Copied" for a moment.
 ### Settings
 
 The left sidebar's Settings opens the settings pane: appearance (follows the
-OS), the long-message rule, shortcuts, and placeholders for agents and
-notifications.
+OS), the search-in-pane switch, the long-message rule, shortcuts, and
+placeholders for agents and notifications. `model::Settings` lives in the
+`AppSettings` global, in memory only until there is a storage layer.
+
+### Search in the pane (experiment)
+
+Off by default; turn it on in Settings or start with `CHAOS_SEARCH_IN_PANE=1`.
+Search then opens in the pane instead of the dropdown, anchored to the top of the pane's area so it
+grows downwards as results arrive: the field takes the
+title's place next to the close dot, results fill the body (the highlighted one
+as a card), and the highlighted result's actions are the quick actions, led by
+"Go to message" / "Go to channel". It is the same `Search` entity, provider,
+cancellation, keys and jump as the dropdown; only the drawing changes. The
+titlebar keeps a quiet stand-in pill showing the query while the field is in
+the pane. Escape still clears the query first, then closes. cmd/ctrl-K closes
+any other open pane first, so there is still only one.
 
 ## Rendering
 

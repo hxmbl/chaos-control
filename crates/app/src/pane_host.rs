@@ -14,9 +14,9 @@ use gpui::{
     SharedString, Task, Window, div, prelude::*, px,
 };
 use model::{Author, PaneActionKind, PaneContent, ReplyRef, pane::author_name};
-use ui::{ActiveTheme, IconName, Pane, PaneState, QuickAction, brand_icon, icon};
+use ui::{ActiveTheme, IconName, Pane, PaneState, QuickAction, brand_icon, icon, switch};
 
-use crate::store::ChatStore;
+use crate::{settings, store::ChatStore};
 
 /// How long "Copy" reads "Copied".
 const COPIED_FOR: Duration = Duration::from_millis(1400);
@@ -223,6 +223,7 @@ impl PaneHost {
 
     fn settings_rows(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = *cx.theme();
+        let search_in_pane = settings::get(cx).search_in_pane;
         let appearance = if t.is_dark() { "Dark" } else { "Light" };
         let row = |label: &'static str, about: SharedString| {
             div()
@@ -278,6 +279,21 @@ impl PaneHost {
             row(
                 "Appearance",
                 format!("Follows your system. Currently {appearance}.").into(),
+            )
+            .into_any_element(),
+            row(
+                "Search in the pane",
+                "Experiment: search results open in this pane instead of the dropdown.".into(),
+            )
+            .child(
+                switch("search-in-pane", search_in_pane, cx).on_click(cx.listener(
+                    |_, _, window, cx| {
+                        settings::update(cx, |s| s.search_in_pane = !s.search_in_pane);
+                        // Search reads the flag while rendering.
+                        window.refresh();
+                        cx.notify();
+                    },
+                )),
             )
             .into_any_element(),
             row(

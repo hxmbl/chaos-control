@@ -26,12 +26,15 @@ use gpui::{
     App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Pixels, SharedString,
     Subscription, Task, Window, actions, div, prelude::*, px,
 };
-use model::{Author, SearchAction, SearchHit, SearchProvider, SearchResult};
+use model::{
+    Author, PaneActionKind, PaneContent, SearchAction, SearchHit, SearchProvider, SearchResult,
+};
 use ui::{
-    ActiveTheme, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, icon, pill, truncated,
+    ActiveTheme, Ellipsis, IconName, Pane, QuickAction, TextInput, TextInputEvent, Tooltip, icon,
+    pill, truncated,
 };
 
-use crate::store::ChatStore;
+use crate::{settings, store::ChatStore};
 
 actions!(search, [FocusSearch, SelectNext, SelectPrevious, Dismiss]);
 
@@ -150,6 +153,18 @@ impl Search {
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// The search-in-pane experiment (Settings, off by default): results open
+    /// in the glass pane instead of the dropdown.
+    pub fn in_pane(cx: &App) -> bool {
+        settings::get(cx).search_in_pane
+    }
+
+    /// The current query, for the titlebar's stand-in pill while the field is
+    /// in the pane.
+    pub fn query(&self, cx: &App) -> SharedString {
+        self.input.read(cx).text().clone()
     }
 
     /// cmd/ctrl-K: focus the field and open the panel. Pressed again with the
@@ -461,6 +476,114 @@ impl Search {
     }
 }
 
+impl Search {
+    /// Search in the pane (the experiment): the field takes the title's place
+    /// next to the close dot, results fill the body, and the highlighted
+    /// result's actions are the quick actions, led by "Go to …". Same
+    /// provider, keys and jump as the dropdown. `None` unless search is open
+    /// in pane mode.
+    pub fn render_pane(
+        &mut self,
+        max_width: Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.open || !Self::in_pane(cx) {
+            return None;
+        }
+        let t = *cx.theme();
+        let progress = self.opened_at.map_or(1., |at| {
+            (at.elapsed().as_secs_f32() / GROW.as_secs_f32()).min(1.)
+        });
+        if progress < 1. {
+            window.request_animation_frame();
+        }
+        let eased = 1. - (1. - progress).powi(3);
+
+        let query = self.input.read(cx).text().clone();
+        let content = PaneContent::Search {
+            query: Arc::from(query.as_ref()),
+            results: self.hits.clone(),
+            highlighted: self.highlighted,
+        };
+        let this = cx.entity();
+        let actions: Vec<QuickAction> = content
+            .actions()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, action)| {
+                let this = this.clone();
+                let hit = self.hits.get(self.highlighted).map(|r| r.hit.clone());
+                let highlighted = self.highlighted;
+                QuickAction::new(("search-pane-action", ix), action.label.clone(), {
+                    move |window, cx| {
+                        let kind = action.kind.clone();
+                        this.update(cx, |this, cx| match kind {
+                            PaneActionKind::Custom(id) => {
+                                let label = action.label.clone();
+                                this.close(cx);
+                                if let Some(hit) = hit.clone() {
+                                    cx.emit(SearchEvent::Action {
+                                        hit,
+                                        action: SearchAction { id, label },
+                                    });
+                                }
+                            }
+                            _ => this.confirm(highlighted, window, cx),
+                        })
+                    }
+                })
+            })
+            .collect();
+
+        let empty = self.hits.is_empty();
+        let rows: Vec<gpui::AnyElement> = (0..self.hits.len())
+            .filter(|ix| *ix != self.highlighted)
+            .map(|ix| self.render_row(ix, cx))
+            .collect();
+        let field = self.field(window, cx);
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(10.))
+            .h(px(30.))
+            .text_size(px(18.))
+            .line_height(px(24.))
+            .child(icon(IconName::MagnifyingGlassBold, px(17.), t.muted))
+            .child(div().flex_1().min_w_0().child(field));
+        let close = cx.entity();
+        let pane = Pane::new("search-pane")
+            .anchor_top()
+            .progress(eased)
+            .max_width(max_width)
+            .header(header)
+            .on_close(move |_, cx| close.update(cx, |this, cx| this.dismiss_panel(cx)))
+            .actions(actions)
+            .map(|pane| {
+                if query.trim().is_empty() {
+                    pane.child(
+                        div()
+                            .text_size(px(13.5))
+                            .text_color(t.muted)
+                            .child("Search channels and messages"),
+                    )
+                } else if empty {
+                    pane.child(div().text_size(px(13.5)).text_color(t.muted).child(
+                        if self.searching {
+                            "Searching…"
+                        } else {
+                            "No matches"
+                        },
+                    ))
+                } else {
+                    pane.child(div().ml(px(-12.)).child(self.render_card(cx)))
+                        .children(rows)
+                }
+            });
+        Some(pane.into_any_element())
+    }
+}
+
 impl Render for Search {
     /// The open panel, shaped after the search mock: the titlebar pill grown
     /// into one rounded panel with the field on top, then the highlighted
@@ -468,7 +591,8 @@ impl Render for Search {
     /// stacked rows and a slim "…" row when there are more. Rendered by the
     /// workspace over everything else, centred where the pill is.
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.open {
+        // In pane mode the workspace draws `render_pane` in the pane layer.
+        if !self.open || Self::in_pane(cx) {
             return div().into_any_element();
         }
         let t = *cx.theme();
