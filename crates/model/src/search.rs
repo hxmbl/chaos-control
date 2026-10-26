@@ -229,6 +229,7 @@ mod tests {
             author: Author::Human,
             sent_at,
             body: Arc::from(body),
+            reply_to: None,
         }
     }
 

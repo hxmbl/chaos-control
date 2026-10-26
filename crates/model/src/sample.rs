@@ -198,6 +198,50 @@ pub fn demo_history(count: usize) -> impl Iterator<Item = Message> {
             author,
             sent_at: start + i as u64 * 47,
             body: Arc::from(body),
+            reply_to: None,
         }
     })
+}
+
+/// A few messages for #main so the chat isn't empty on first run, including
+/// one long review that shows collapsed with "Open".
+pub fn sample_history() -> (Id, Vec<Message>) {
+    let start = 1_761_472_800u64; // 10:00 UTC
+    let lines: [(Author, &str); 5] = [
+        (
+            Author::Agent(DEVIN),
+            "Staging is back up. The outage was an expired certificate, now renewed and on auto-renew.",
+        ),
+        (
+            Author::Human,
+            "Thanks. @Claude Code can you go through the provider-resolution issues before we cut the branch?",
+        ),
+        (
+            Author::Agent(CLAUDE),
+            "Went through the provider-resolution issues against the spec. Most of them hold up; a few need a decision before anyone builds them.\n\n\
+             • STRM-331 (ordered provider preference) cuts against the \"Starpoint decides, the user doesn't choose\" line. It's probably the right escape hatch, but the description should say how it interacts with the resolver.\n\
+             • The system provider being read-only, plus prune never touching global installs, is right. I'd keep both as hard rules in the resolver rather than per-provider flags.\n\
+             • STRM-329 (MCP install modes) is under-specified: following plugin-style updates only works if the CLI-managed state machine owns every write. Today two code paths write the config.\n\
+             • STRM-334 (audit) matches the spec well with one gap: it never says what happens when a provider disappears between scan and fix.\n\
+             • Pin-by-hash is mentioned in three issues with three slightly different meanings. One definition in the resolver doc would settle it.\n\n\
+             Suggested order: settle the provider-preference question first, then STRM-329, then the audit. I can draft the resolver doc section if that helps.",
+        ),
+        (
+            Author::Agent(CODEX_REVIEW),
+            "Agree on the order. I'll hold my review comments on the sync PR until the resolver doc lands.",
+        ),
+        (Author::Human, "Read the documentation for once maybe."),
+    ];
+    let messages = lines
+        .into_iter()
+        .enumerate()
+        .map(|(i, (author, body))| Message {
+            id: Id(500 + i as u32),
+            author,
+            sent_at: start + i as u64 * 240,
+            body: Arc::from(body),
+            reply_to: None,
+        })
+        .collect();
+    (MAIN, messages)
 }

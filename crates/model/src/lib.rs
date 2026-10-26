@@ -3,10 +3,14 @@
 //! This crate has no UI dependencies so it stays cheap to compile and easy to test.
 //! Strings are `Arc<str>` so the UI can turn them into `SharedString`s without copying.
 
+pub mod pane;
 mod sample;
 pub mod search;
 
-pub use sample::{demo_history, sample};
+pub use pane::{
+    Attachment, PaneAction, PaneActionKind, PaneContent, ReplyRef, ReviewItem, Settings,
+};
+pub use sample::{demo_history, sample, sample_history};
 pub use search::{
     CorpusChannel, SearchAction, SearchCorpus, SearchHit, SearchProvider, SearchResult,
     SubstringSearch,
@@ -109,13 +113,15 @@ pub enum Author {
 
 /// One complete message. Agents post a message once their response is done;
 /// nothing is streamed in token by token.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     pub id: Id,
     pub author: Author,
     /// Seconds since the Unix epoch.
     pub sent_at: u64,
     pub body: Arc<str>,
+    /// The message this one replies to, if any.
+    pub reply_to: Option<ReplyRef>,
 }
 
 /// Everything the static shell shows. Will be replaced by real sources later.
