@@ -950,7 +950,9 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml 0.8.23",
  "ui",
+ "uuid",
 ]
 
 [[package]]

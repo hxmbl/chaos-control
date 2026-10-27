@@ -1,5 +1,5 @@
-//! Durable state in SQLite: channels, members, messages, cursors, triggers,
-//! batches and reply obligations.
+//! Durable state in SQLite: projects, channels, members, messages, cursors,
+//! triggers, batches and reply obligations.
 //!
 //! The schema carries the invariants the runtime relies on, so a logic bug
 //! fails loudly instead of double-delivering:
@@ -16,6 +16,13 @@
 //!   obligation per trigger.
 //! - At most one fallback reply per (agent, trigger message) (partial unique
 //!   index on `messages`).
+//! - Every channel belongs to a project; names and `::N` ordinals are unique
+//!   within it (`UNIQUE(project_id, name)`, `UNIQUE(project_id, ordinal)`).
+//! - Joining a channel needs membership of its project: a trigger on
+//!   `memberships` aborts with `not_a_project_member` otherwise, so no code
+//!   path can skip the check.
+//! - One folder maps to at most one project (partial unique index on
+//!   `projects.root_path`).
 
 use std::{path::Path, sync::Arc};
 
@@ -27,7 +34,8 @@ pub type Result<T> = rusqlite::Result<T>;
 
 /// Ordered migrations. `PRAGMA user_version` records how many have run; add new
 /// ones at the end, never edit old ones.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[
+    r#"
 CREATE TABLE channels (
     id          INTEGER PRIMARY KEY,
     name        TEXT NOT NULL UNIQUE,
@@ -129,7 +137,63 @@ CREATE TABLE sessions (
     opened_at   INTEGER NOT NULL,
     PRIMARY KEY (agent_id, channel_id)
 );
-"#];
+"#,
+    // 2: projects. Channels move under a project (uniqueness from `name` to
+    // `(project_id, name)`, which needs a table rebuild; channel ids are kept,
+    // so messages, cursors, batches, triggers, obligations and sessions are
+    // untouched). Existing channels go into one project named "Imported" with
+    // a fresh UUID, and their members become its members.
+    r#"
+CREATE TABLE projects (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    root_path   TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX projects_one_per_root
+    ON projects (root_path) WHERE root_path IS NOT NULL;
+CREATE TABLE project_members (
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    member_id   INTEGER NOT NULL REFERENCES members(id),
+    joined_at   INTEGER NOT NULL,
+    PRIMARY KEY (project_id, member_id)
+);
+INSERT INTO projects (id, name, root_path, created_at)
+SELECT lower(hex(randomblob(4)) || '-' || hex(randomblob(2)) || '-4'
+             || substr(hex(randomblob(2)), 2) || '-'
+             || substr('89ab', 1 + (abs(random()) % 4), 1)
+             || substr(hex(randomblob(2)), 2) || '-' || hex(randomblob(6))),
+       'Imported', NULL, (SELECT MIN(created_at) FROM channels)
+WHERE EXISTS (SELECT 1 FROM channels);
+CREATE TABLE channels_v2 (
+    id          INTEGER PRIMARY KEY,
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    name        TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL CHECK (ordinal > 0),
+    created_at  INTEGER NOT NULL,
+    UNIQUE (project_id, name),
+    UNIQUE (project_id, ordinal)
+);
+INSERT INTO channels_v2 (id, project_id, name, ordinal, created_at)
+SELECT c.id, (SELECT id FROM projects), c.name,
+       ROW_NUMBER() OVER (ORDER BY c.id), c.created_at
+FROM channels c;
+DROP TABLE channels;
+ALTER TABLE channels_v2 RENAME TO channels;
+INSERT INTO project_members (project_id, member_id, joined_at)
+SELECT c.project_id, s.member_id, MIN(s.joined_at)
+FROM memberships s JOIN channels c ON c.id = s.channel_id
+GROUP BY c.project_id, s.member_id;
+CREATE TRIGGER memberships_need_project BEFORE INSERT ON memberships
+WHEN NOT EXISTS (
+    SELECT 1 FROM project_members pm JOIN channels c ON c.project_id = pm.project_id
+    WHERE c.id = NEW.channel_id AND pm.member_id = NEW.member_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'not_a_project_member');
+END;
+"#,
+];
 
 pub struct Store {
     conn: Connection,
@@ -198,9 +262,36 @@ impl Store {
         let version: usize =
             self.conn
                 .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
-        for (ix, sql) in MIGRATIONS.iter().enumerate().skip(version) {
+        if version >= MIGRATIONS.len() {
+            return Ok(());
+        }
+        // A table rebuild (migration 2) drops a table other tables point at,
+        // which SQLite only allows with foreign keys off. The pragma is a
+        // no-op inside a transaction, so it is set around them; each
+        // migration then proves nothing dangles before it commits.
+        self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        let result = self.run_migrations(version);
+        self.conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        result
+    }
+
+    fn run_migrations(&mut self, from: usize) -> Result<()> {
+        for (ix, sql) in MIGRATIONS.iter().enumerate().skip(from) {
             let tx = self.conn.transaction()?;
             tx.execute_batch(sql)?;
+            let dangling: i64 =
+                tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                    r.get(0)
+                })?;
+            if dangling > 0 {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                    Some(format!(
+                        "migration {} would leave {dangling} dangling foreign keys",
+                        ix + 1
+                    )),
+                ));
+            }
             tx.execute_batch(&format!("PRAGMA user_version = {}", ix + 1))?;
             tx.commit()?;
         }
@@ -229,47 +320,192 @@ impl Store {
     }
 }
 
+// ---------- projects ----------
+
+const PROJECT_COLS: &str = "id, name, root_path, created_at";
+
+fn project_from_row(r: &Row<'_>) -> Result<Project> {
+    let id: String = r.get(0)?;
+    Ok(Project {
+        id: ProjectId::parse(&id).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("bad project id {id:?}").into(),
+            )
+        })?,
+        name: Arc::from(r.get::<_, String>(1)?),
+        root_path: r.get::<_, Option<String>>(2)?.map(Arc::from),
+        created_at: r.get::<_, i64>(3)? as Millis,
+    })
+}
+
+/// Creates the project if its id is new, else refreshes its display name.
+/// With a `root`, records it as the folder the project was last seen in; a
+/// folder belongs to one project, so any other project that claimed it lets
+/// go of it. Never touches channels, members or history.
+pub fn ensure_project(
+    c: &Connection,
+    id: &ProjectId,
+    name: &str,
+    root: Option<&str>,
+    now: Millis,
+) -> Result<Project> {
+    if let Some(root) = root {
+        c.execute(
+            "UPDATE projects SET root_path = NULL WHERE root_path = ?1 AND id != ?2",
+            params![root, id.as_str()],
+        )?;
+    }
+    c.execute(
+        "INSERT INTO projects (id, name, root_path, created_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(id) DO UPDATE SET
+            name = excluded.name,
+            root_path = COALESCE(excluded.root_path, projects.root_path)",
+        params![id.as_str(), name, root, now as i64],
+    )?;
+    project(c, id).map(|p| p.expect("just upserted"))
+}
+
+pub fn project(c: &Connection, id: &ProjectId) -> Result<Option<Project>> {
+    c.query_row(
+        &format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"),
+        [id.as_str()],
+        project_from_row,
+    )
+    .optional()
+}
+
+/// The project last opened from `root`, if any.
+pub fn project_by_root(c: &Connection, root: &str) -> Result<Option<Project>> {
+    c.query_row(
+        &format!("SELECT {PROJECT_COLS} FROM projects WHERE root_path = ?1"),
+        [root],
+        project_from_row,
+    )
+    .optional()
+}
+
+/// Every project, oldest first.
+pub fn projects(c: &Connection) -> Result<Vec<Project>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at, id"
+    ))?;
+    stmt.query_map([], project_from_row)?.collect()
+}
+
+/// Changes a project's display name only; its id, channels and history stay.
+pub fn rename_project(c: &Connection, id: &ProjectId, name: &str) -> Result<bool> {
+    Ok(c.execute(
+        "UPDATE projects SET name = ?2 WHERE id = ?1",
+        params![id.as_str(), name],
+    )? == 1)
+}
+
+/// Makes `member` a member of `project` (the permission to join its
+/// channels). Returns whether it was new.
+pub fn join_project(
+    c: &Connection,
+    project: &ProjectId,
+    member: MemberId,
+    now: Millis,
+) -> Result<bool> {
+    Ok(c.execute(
+        "INSERT OR IGNORE INTO project_members (project_id, member_id, joined_at)
+         VALUES (?1, ?2, ?3)",
+        params![project.as_str(), member.0, now as i64],
+    )? == 1)
+}
+
+pub fn is_project_member(c: &Connection, project: &ProjectId, member: MemberId) -> Result<bool> {
+    c.query_row(
+        "SELECT 1 FROM project_members WHERE project_id = ?1 AND member_id = ?2",
+        params![project.as_str(), member.0],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+}
+
 // ---------- channels & members ----------
 
-pub fn ensure_channel(c: &Connection, name: &str, now: Millis) -> Result<Channel> {
+const CHANNEL_COLS: &str = "id, project_id, name, ordinal";
+
+fn channel_from_row(r: &Row<'_>) -> Result<Channel> {
+    let project: String = r.get(1)?;
+    Ok(Channel {
+        id: ChannelId(r.get(0)?),
+        project: ProjectId::parse(&project).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                format!("bad project id {project:?}").into(),
+            )
+        })?,
+        name: Arc::from(r.get::<_, String>(2)?),
+        ordinal: r.get::<_, i64>(3)?.clamp(1, u32::MAX as i64) as u32,
+    })
+}
+
+/// The channel called `name` in `project`, created (with the project's next
+/// `::N` ordinal) if it doesn't exist. The project must exist.
+pub fn ensure_channel(
+    c: &Connection,
+    project: &ProjectId,
+    name: &str,
+    now: Millis,
+) -> Result<Channel> {
+    let name = name.trim_start_matches('#');
     c.execute(
-        "INSERT INTO channels (name, created_at) VALUES (?1, ?2) ON CONFLICT(name) DO NOTHING",
-        params![name, now as i64],
+        "INSERT INTO channels (project_id, name, ordinal, created_at)
+         VALUES (?1, ?2,
+                 (SELECT COALESCE(MAX(ordinal), 0) + 1 FROM channels WHERE project_id = ?1),
+                 ?3)
+         ON CONFLICT(project_id, name) DO NOTHING",
+        params![project.as_str(), name, now as i64],
     )?;
-    c.query_row(
-        "SELECT id, name FROM channels WHERE name = ?1",
-        [name],
-        |r| {
-            Ok(Channel {
-                id: ChannelId(r.get(0)?),
-                name: Arc::from(r.get::<_, String>(1)?),
-            })
-        },
-    )
+    channel_in_project(c, project, name).map(|ch| ch.expect("just ensured"))
 }
 
 pub fn channel(c: &Connection, id: ChannelId) -> Result<Option<Channel>> {
-    c.query_row("SELECT id, name FROM channels WHERE id = ?1", [id.0], |r| {
-        Ok(Channel {
-            id: ChannelId(r.get(0)?),
-            name: Arc::from(r.get::<_, String>(1)?),
-        })
-    })
+    c.query_row(
+        &format!("SELECT {CHANNEL_COLS} FROM channels WHERE id = ?1"),
+        [id.0],
+        channel_from_row,
+    )
     .optional()
 }
 
-pub fn channel_by_name(c: &Connection, name: &str) -> Result<Option<Channel>> {
+/// Looks a channel up by name within one project. There is deliberately no
+/// global by-name lookup: two projects can each have a #main.
+pub fn channel_in_project(
+    c: &Connection,
+    project: &ProjectId,
+    name: &str,
+) -> Result<Option<Channel>> {
     c.query_row(
-        "SELECT id, name FROM channels WHERE name = ?1",
-        [name.trim_start_matches('#')],
-        |r| {
-            Ok(Channel {
-                id: ChannelId(r.get(0)?),
-                name: Arc::from(r.get::<_, String>(1)?),
-            })
-        },
+        &format!("SELECT {CHANNEL_COLS} FROM channels WHERE project_id = ?1 AND name = ?2"),
+        params![project.as_str(), name.trim_start_matches('#')],
+        channel_from_row,
     )
     .optional()
+}
+
+/// A project's channels in `::N` order.
+pub fn channels_in_project(c: &Connection, project: &ProjectId) -> Result<Vec<Channel>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {CHANNEL_COLS} FROM channels WHERE project_id = ?1 ORDER BY ordinal"
+    ))?;
+    stmt.query_map([project.as_str()], channel_from_row)?
+        .collect()
+}
+
+/// Changes a channel's name only; its id, `::N` and history stay.
+pub fn rename_channel(c: &Connection, id: ChannelId, name: &str) -> Result<bool> {
+    Ok(c.execute(
+        "UPDATE channels SET name = ?2 WHERE id = ?1",
+        params![id.0, name.trim_start_matches('#')],
+    )? == 1)
 }
 
 fn member_from_row(r: &Row<'_>) -> Result<Member> {
@@ -319,18 +555,15 @@ pub fn members_of(c: &Connection, channel: ChannelId) -> Result<Vec<Member>> {
     stmt.query_map([channel.0], member_from_row)?.collect()
 }
 
-pub fn channels_of(c: &Connection, member: MemberId) -> Result<Vec<Channel>> {
+/// The channels of `project` that `member` belongs to, in `::N` order.
+pub fn channels_of(c: &Connection, member: MemberId, project: &ProjectId) -> Result<Vec<Channel>> {
     let mut stmt = c.prepare_cached(
-        "SELECT c.id, c.name FROM channels c JOIN memberships s ON s.channel_id = c.id
-         WHERE s.member_id = ?1 ORDER BY c.id",
+        "SELECT c.id, c.project_id, c.name, c.ordinal
+         FROM channels c JOIN memberships s ON s.channel_id = c.id
+         WHERE s.member_id = ?1 AND c.project_id = ?2 ORDER BY c.ordinal",
     )?;
-    stmt.query_map([member.0], |r| {
-        Ok(Channel {
-            id: ChannelId(r.get(0)?),
-            name: Arc::from(r.get::<_, String>(1)?),
-        })
-    })?
-    .collect()
+    stmt.query_map(params![member.0, project.as_str()], channel_from_row)?
+        .collect()
 }
 
 pub fn is_member(c: &Connection, channel: ChannelId, member: MemberId) -> Result<bool> {
@@ -346,6 +579,9 @@ pub fn is_member(c: &Connection, channel: ChannelId, member: MemberId) -> Result
 /// Adds `member` to `channel`. For an agent joining for the first time, its
 /// cursor starts `backfill` messages before the head, so its first wake shows
 /// the last `backfill` messages as unread context. Returns whether it was new.
+///
+/// Fails with `not_a_project_member` (see [`is_not_a_project_member`]) unless
+/// `member` already belongs to the channel's project ([`join_project`]).
 pub fn join(
     c: &Connection,
     channel: ChannelId,
@@ -366,6 +602,12 @@ pub fn join(
         )?;
     }
     Ok(added)
+}
+
+/// Whether `e` is the schema refusing a channel join for lack of project
+/// membership.
+pub fn is_not_a_project_member(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("not_a_project_member"))
 }
 
 // ---------- messages ----------
@@ -936,13 +1178,23 @@ pub fn record_session(
 mod tests {
     use super::*;
 
+    const P1: &str = "0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59";
+    const P2: &str = "5f0c9d1a-7b2e-4e8f-a1c3-9d8e7f6a5b4c";
+
+    fn pid(s: &str) -> ProjectId {
+        ProjectId::parse(s).unwrap()
+    }
+
     fn setup() -> (Store, Channel, Member, Member) {
         let mut s = Store::open_in_memory().unwrap();
         let (ch, hx, bot) = s
             .tx::<_, rusqlite::Error>(|c| {
-                let ch = ensure_channel(c, "main", 0)?;
+                let p = ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
+                let ch = ensure_channel(c, &p.id, "main", 0)?;
                 let hx = ensure_member(c, MemberKind::Human, "hx", "Hx")?;
                 let bot = ensure_member(c, MemberKind::Agent, "claude", "Claude")?;
+                join_project(c, &p.id, hx.id, 0)?;
+                join_project(c, &p.id, bot.id, 0)?;
                 join(c, ch.id, &hx, 20, 0)?;
                 join(c, ch.id, &bot, 20, 0)?;
                 Ok((ch, hx, bot))
@@ -981,13 +1233,15 @@ mod tests {
         let id = {
             let mut s = Store::open(&path).unwrap();
             s.tx::<_, rusqlite::Error>(|c| {
-                let ch = ensure_channel(c, "main", 0)?;
+                ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
+                let ch = ensure_channel(c, &pid(P1), "main", 0)?;
                 insert_message(c, &msg(ch.id, MemberId(1), "x")).map(|m| m.id)
             })
             .ok();
             let s2 = &mut s;
             s2.tx::<_, rusqlite::Error>(|c| {
-                let ch = ensure_channel(c, "main", 0)?;
+                ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
+                let ch = ensure_channel(c, &pid(P1), "main", 0)?;
                 let hx = ensure_member(c, MemberKind::Human, "hx", "Hx")?;
                 insert_message(c, &msg(ch.id, hx.id, "hello")).map(|m| m.id)
             })
@@ -1004,7 +1258,7 @@ mod tests {
     fn seq_is_per_channel_and_gapless_while_ids_are_global() {
         let (mut s, ch, hx, _) = setup();
         let other = s
-            .tx::<_, rusqlite::Error>(|c| ensure_channel(c, "STRM-1", 0))
+            .tx::<_, rusqlite::Error>(|c| ensure_channel(c, &ch.project, "STRM-1", 0))
             .unwrap();
         let (a, b, c2) = s
             .tx::<_, rusqlite::Error>(|c| {
@@ -1117,6 +1371,7 @@ mod tests {
                 insert_message(c, &msg(ch.id, hx.id, &format!("m{i}")))?;
             }
             let late = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
+            join_project(c, &ch.project, late.id, 0)?;
             join(c, ch.id, &late, 20, 0)?;
             assert_eq!(cursor(c, late.id, ch.id)?.read_through, 10);
             advance_delivered(c, late.id, ch.id, 5)?;
@@ -1128,5 +1383,234 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    #[test]
+    fn two_projects_can_each_have_a_main() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.tx::<_, rusqlite::Error>(|c| {
+            ensure_project(c, &pid(P1), "Starpoint", Some("/src/starpoint"), 0)?;
+            ensure_project(c, &pid(P2), "Everything", Some("/src/everything"), 0)?;
+            let a = ensure_channel(c, &pid(P1), "main", 0)?;
+            let b = ensure_channel(c, &pid(P2), "#main", 0)?;
+            assert_ne!(a.id, b.id);
+            assert_eq!((a.ordinal, b.ordinal), (1, 1), "::N counts per project");
+            assert_eq!(&*b.name, "main");
+            assert_eq!(ensure_channel(c, &pid(P1), "main", 5)?.id, a.id);
+            let next = ensure_channel(c, &pid(P2), "STRM-184", 0)?;
+            assert_eq!(next.ordinal, 2);
+            assert_eq!(channel_in_project(c, &pid(P1), "main")?.unwrap().id, a.id);
+            assert_eq!(channel_in_project(c, &pid(P2), "main")?.unwrap().id, b.id);
+            assert!(channel_in_project(c, &pid(P1), "STRM-184")?.is_none());
+            let names: Vec<_> = channels_in_project(c, &pid(P2))?
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            assert_eq!(names, vec![Arc::from("main"), Arc::from("STRM-184")]);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn joining_a_channel_needs_project_membership() {
+        let (mut s, ch, _, _) = setup();
+        s.tx::<_, rusqlite::Error>(|c| {
+            let other = ensure_project(c, &pid(P2), "Other", None, 0)?;
+            let elsewhere = ensure_channel(c, &other.id, "main", 0)?;
+            let codex = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
+            let err = join(c, ch.id, &codex, 20, 0).unwrap_err();
+            assert!(is_not_a_project_member(&err), "{err}");
+            assert!(!is_member(c, ch.id, codex.id)?);
+            join_project(c, &ch.project, codex.id, 0)?;
+            assert!(join(c, ch.id, &codex, 20, 0)?);
+            // Membership of one project grants nothing in another.
+            let err = join(c, elsewhere.id, &codex, 20, 0).unwrap_err();
+            assert!(is_not_a_project_member(&err), "{err}");
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn renaming_changes_the_name_only() {
+        let (mut s, ch, hx, _) = setup();
+        s.tx::<_, rusqlite::Error>(|c| {
+            let m = insert_message(c, &msg(ch.id, hx.id, "before"))?;
+            assert!(rename_channel(c, ch.id, "#general")?);
+            assert!(rename_project(c, &ch.project, "Starpoint 2")?);
+            let renamed = channel(c, ch.id)?.unwrap();
+            assert_eq!((renamed.id, renamed.ordinal), (ch.id, ch.ordinal));
+            assert_eq!(&*renamed.name, "general");
+            assert_eq!(
+                project(c, &ch.project)?.unwrap().name.as_ref(),
+                "Starpoint 2"
+            );
+            assert_eq!(message(c, m.id)?.unwrap().channel, ch.id);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_folder_belongs_to_one_project() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.tx::<_, rusqlite::Error>(|c| {
+            ensure_project(c, &pid(P1), "Old", Some("/src/x"), 0)?;
+            assert_eq!(project_by_root(c, "/src/x")?.unwrap().id, pid(P1));
+            // Seen again without a root: the root is kept.
+            ensure_project(c, &pid(P1), "Old", None, 1)?;
+            assert_eq!(project_by_root(c, "/src/x")?.unwrap().id, pid(P1));
+            // Another project opened from the same folder takes it over.
+            ensure_project(c, &pid(P2), "New", Some("/src/x"), 2)?;
+            assert_eq!(project_by_root(c, "/src/x")?.unwrap().id, pid(P2));
+            assert_eq!(project(c, &pid(P1))?.unwrap().root_path, None);
+            assert_eq!(projects(c)?.len(), 2);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn project_ids_must_be_uuids() {
+        assert!(ProjectId::parse("not-a-uuid").is_none());
+        assert!(ProjectId::parse("0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a5").is_none());
+        let p = ProjectId::parse("{0B7E4F0E-2A51-4C4B-9A6E-3F1D2C3B4A59}").unwrap();
+        assert_eq!(p.as_str(), P1);
+    }
+
+    /// Every row of `table` as text, ordered, so two snapshots compare exactly.
+    fn dump(c: &Connection, table: &str, cols: &str) -> Vec<String> {
+        let mut stmt = c
+            .prepare(&format!("SELECT {cols} FROM {table} ORDER BY {cols}"))
+            .unwrap();
+        let n = stmt.column_count();
+        stmt.query_map([], |r| {
+            Ok((0..n)
+                .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
+                .collect::<Vec<_>>()
+                .join("|"))
+        })
+        .unwrap()
+        .collect::<Result<_>>()
+        .unwrap()
+    }
+
+    /// The tables migration 2 must leave exactly as they were.
+    const UNTOUCHED: &[(&str, &str)] = &[
+        ("members", "id, kind, handle, name"),
+        ("memberships", "channel_id, member_id, joined_at"),
+        (
+            "messages",
+            "id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at",
+        ),
+        ("mentions", "message_id, member_id"),
+        ("reactions", "message_id, member_id, emoji, created_at"),
+        (
+            "cursors",
+            "agent_id, channel_id, delivered_through, read_through",
+        ),
+        (
+            "batches",
+            "id, agent_id, channel_id, state, attempts, window_to, created_at, accepted_at, settled_at, outcome",
+        ),
+        (
+            "triggers",
+            "agent_id, channel_id, message_id, reason, hop, batch_id, created_at",
+        ),
+        (
+            "obligations",
+            "agent_id, channel_id, message_id, state, resolved_by, resolved_kind",
+        ),
+        (
+            "sessions",
+            "agent_id, channel_id, protocol, native_ref, opened_at",
+        ),
+    ];
+
+    #[test]
+    fn a_v1_database_migrates_keeping_every_id_and_row() {
+        let dir = std::env::temp_dir().join(format!("cc-store-v1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v1.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        // A database exactly as v1 left it, with a row in every table.
+        let before: Vec<Vec<String>> = {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.execute_batch(
+                r#"
+                PRAGMA user_version = 1;
+                INSERT INTO channels (id, name, created_at) VALUES (3, 'main', 100), (7, 'STRM-1', 200);
+                INSERT INTO members (id, kind, handle, name) VALUES
+                    (1, 'human', 'hx', 'Hx'), (2, 'agent', 'claude', 'Claude'), (5, 'agent', 'codex', 'Codex');
+                INSERT INTO memberships VALUES (3, 1, 10), (3, 2, 11), (7, 1, 12), (7, 5, 13);
+                INSERT INTO messages (id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at) VALUES
+                    (10, 3, 1, 1, 'composer', '@claude hi', NULL, 0, NULL, NULL, 1000),
+                    (11, 3, 2, 2, 'chat_tool', 'hello', 10, 1, 4, 'r1', 1001),
+                    (12, 7, 1, 1, 'composer', 'other room', NULL, 0, NULL, NULL, 1002);
+                INSERT INTO mentions VALUES (10, 2);
+                INSERT INTO reactions VALUES (11, 1, '👍', 1003);
+                INSERT INTO cursors VALUES (2, 3, 2, 2), (5, 7, 0, 1);
+                INSERT INTO batches (id, agent_id, channel_id, state, attempts, window_to, created_at, accepted_at, settled_at, outcome)
+                    VALUES (4, 2, 3, 'settled', 1, 1, 1000, 1000, 1001, 'end_turn');
+                INSERT INTO triggers VALUES (2, 3, 10, 'mention', 0, 4, 1000);
+                INSERT INTO obligations VALUES (2, 3, 10, 'satisfied', 11, 'send');
+                INSERT INTO sessions VALUES (2, 3, 'acp', 'sess-1', 1000);
+                "#,
+            )
+            .unwrap();
+            UNTOUCHED
+                .iter()
+                .map(|(t, cols)| dump(&conn, t, cols))
+                .collect()
+        };
+
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let c = s.conn();
+        let after: Vec<Vec<String>> = UNTOUCHED.iter().map(|(t, cols)| dump(c, t, cols)).collect();
+        assert_eq!(before, after, "migration 2 must not touch these tables");
+
+        let all = projects(c).unwrap();
+        assert_eq!(all.len(), 1);
+        let imported = all[0].clone();
+        assert_eq!(imported.name.as_ref(), "Imported");
+        assert_eq!(imported.root_path, None);
+        assert_eq!(imported.created_at, 100);
+        let chans = channels_in_project(c, &imported.id).unwrap();
+        let got: Vec<_> = chans
+            .iter()
+            .map(|c| (c.id.0, &*c.name, c.ordinal))
+            .collect();
+        assert_eq!(got, vec![(3, "main", 1), (7, "STRM-1", 2)]);
+        for m in [1, 2, 5] {
+            assert!(is_project_member(c, &imported.id, MemberId(m)).unwrap());
+        }
+        let fk: i64 = c
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk, 0);
+        let fk_on: i64 = c
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_on, 1, "foreign keys are back on after migrating");
+        drop(s);
+
+        // Reopening runs nothing again: same single project, same UUID.
+        let s = Store::open(&path).unwrap();
+        let again = projects(s.conn()).unwrap();
+        assert_eq!(again, vec![imported]);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fresh_database_has_no_imported_project() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(projects(s.conn()).unwrap().is_empty());
     }
 }

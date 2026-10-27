@@ -12,12 +12,80 @@ const CHANNEL_ROW: f32 = 36. + 6.;
 pub struct Sidebar {
     store: Entity<ChatStore>,
     pane: Entity<PaneHost>,
+    /// The project picker's list is showing.
+    picker_open: bool,
 }
 
 impl Sidebar {
     pub fn new(store: Entity<ChatStore>, pane: Entity<PaneHost>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        Self { store, pane }
+        Self {
+            store,
+            pane,
+            picker_open: false,
+        }
+    }
+
+    /// The picker's list: every project (from core when it runs, else the
+    /// sample), the open one highlighted. A window shows the project of the
+    /// folder it was launched from, so the others are listed with their
+    /// folders rather than switched to here.
+    fn render_projects(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let t = *cx.theme();
+        let entries = self.store.read(cx).workspace().projects.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .p(px(6.))
+            .rounded(px(21.))
+            .border_1()
+            .border_color(t.line)
+            .bg(t.sunken)
+            .children(entries.into_iter().enumerate().map(|(ix, entry)| {
+                let path = entry.path.clone();
+                pill(("project-entry", ix), cx)
+                    .h(px(44.))
+                    .px(px(12.))
+                    .flex_col()
+                    .items_start()
+                    .justify_center()
+                    .when(entry.current, |p| {
+                        p.border_color(t.line_strong)
+                            .bg(t.selected)
+                            .font_weight(FontWeight::SEMIBOLD)
+                    })
+                    .when(!entry.current, |p| {
+                        p.tooltip(Tooltip::text(match &path {
+                            Some(path) => format!("Launch Chaos Control in {path} to open it"),
+                            None => "Not linked to a folder on this computer".to_string(),
+                        }))
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.picker_open = false;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w_full()
+                            .ellipsis()
+                            .text_size(px(14.))
+                            .line_height(px(18.))
+                            .child(truncated(SharedString::from(entry.name.clone()))),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .ellipsis()
+                            .text_size(px(12.))
+                            .line_height(px(16.))
+                            .font_weight(FontWeight::NORMAL)
+                            .text_color(t.muted)
+                            .child(truncated(SharedString::from(
+                                path.unwrap_or_else(|| "No folder".into()),
+                            ))),
+                    )
+            }))
     }
 
     fn render_channel(
@@ -110,11 +178,26 @@ impl Render for Sidebar {
                     .gap(px(8.))
                     .px(px(14.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .tooltip(Tooltip::text("Switch project"))
+                    .tooltip(Tooltip::text("Projects"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.picker_open = !this.picker_open;
+                        cx.notify();
+                    }))
                     .child(div().text_size(px(16.)).child(project_emoji))
                     .child(div().flex_1().ellipsis().child(truncated(project_name)))
-                    .child(icon(IconName::CaretDown, px(16.), t.muted)),
+                    .child(icon(
+                        if self.picker_open {
+                            IconName::CaretUp
+                        } else {
+                            IconName::CaretDown
+                        },
+                        px(16.),
+                        t.muted,
+                    )),
             )
+            .when(self.picker_open, |this| {
+                this.child(self.render_projects(cx))
+            })
             // Channels. Virtualized: a project can collect hundreds of issue channels.
             .child(
                 // Grows with the window, so a tall window shows more channels.

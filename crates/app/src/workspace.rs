@@ -139,6 +139,13 @@ impl Workspace {
             SearchEvent::Action { .. } => {}
         });
 
+        // A launch-time project identity question (see `project.rs`) opens
+        // straight away; the project shown until it's answered is the one
+        // this folder had before.
+        if let Some(question) = store.read(cx).pending_identity() {
+            pane.update(cx, |p, cx| p.open(question, window, cx));
+        }
+
         Self {
             titlebar: cx.new(|cx| Titlebar::new(panels.clone(), search.clone(), window, cx)),
             panels,

@@ -70,10 +70,60 @@ pub struct Member {
     pub name: Arc<str>,
 }
 
+/// A project's stable identity: a lowercase UUID, as written in a folder's
+/// `.chaos/project.toml`. Text rather than an integer because it is minted
+/// outside the database (by the app, or by whoever shared the file).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ProjectId(Arc<str>);
+
+impl ProjectId {
+    /// Accepts a UUID in its usual 8-4-4-4-12 hex form (any case, optional
+    /// braces) and normalises it to lowercase. Anything else is refused, so a
+    /// hand-edited file can't smuggle arbitrary text in as a key.
+    pub fn parse(s: &str) -> Option<ProjectId> {
+        let s = s.trim().trim_start_matches('{').trim_end_matches('}');
+        let groups: Vec<&str> = s.split('-').collect();
+        let lens = [8, 4, 4, 4, 12];
+        let ok = groups.len() == lens.len()
+            && groups
+                .iter()
+                .zip(lens)
+                .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()));
+        ok.then(|| ProjectId(Arc::from(s.to_ascii_lowercase())))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A project: a folder's chat. Channels and memberships belong to one; agents
+/// themselves are global (see `ARCHITECTURE.md`, Storage model).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Project {
+    pub id: ProjectId,
+    /// Display name. Renaming changes only this.
+    pub name: Arc<str>,
+    /// The folder this project was last opened from, if any.
+    pub root_path: Option<Arc<str>>,
+    pub created_at: Millis,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct Channel {
     pub id: ChannelId,
+    pub project: ProjectId,
     pub name: Arc<str>,
+    /// Position within its project, from 1, in creation order; never reused and
+    /// unchanged by renames. Shown as `::N` in the header.
+    pub ordinal: u32,
 }
 
 /// Where a message came from.

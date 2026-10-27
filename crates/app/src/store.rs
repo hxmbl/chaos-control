@@ -4,20 +4,24 @@
 //! sharing data by cloning it around. Each event says exactly what changed, so a
 //! view only re-renders (or re-measures list rows) for the part it shows.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use chaos_core::{engine::CoreEvent, types as ct};
 use gpui::{Context, EventEmitter, Task};
 use model::{
-    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, ReplyRef, SearchCorpus,
-    Workspace,
+    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PaneActionKind, PaneContent,
+    ProjectEntry, ProjectQuestion, ReplyRef, SearchCorpus, Workspace,
 };
 
-use crate::agents::CoreLink;
+use crate::{
+    agents::{self, CoreLink, OpenProject},
+    project::{self, Confirm, Question, Target},
+};
 
 /// Model ids for things that come from core sit above these, clear of the
 /// sample data and local echoes.
 const CORE_AGENT_BASE: u32 = 100_000;
+const CORE_CHANNEL_BASE: u32 = 0x2000_0000;
 const CORE_MESSAGE_BASE: u32 = 0x4000_0000;
 
 pub enum StoreEvent {
@@ -48,6 +52,8 @@ struct Attached {
     channel: Id,
     /// Core message id -> index in that channel's log (dedups history vs events).
     seen: HashMap<ct::MessageId, usize>,
+    /// An unanswered project-identity question (see `project::decide`).
+    confirm: Option<Confirm>,
     _events: Task<()>,
 }
 
@@ -158,7 +164,7 @@ impl ChatStore {
             && attached.channel == self.selected
         {
             let core = attached.link.core.clone();
-            let (author, channel) = (attached.link.human, attached.link.main);
+            let (author, channel) = (attached.link.human, attached.link.main());
             let reply = reply_to.and_then(|r| core_message_id(r.message));
             let body = body.to_string();
             cx.spawn(async move |this, cx| {
@@ -188,8 +194,10 @@ impl ChatStore {
         self.append(self.selected, vec![message], cx);
     }
 
-    /// Puts core behind #main: its agents join Agent Status, its history
-    /// replaces the sample conversation, and its events flow in from here on.
+    /// Puts core behind the launch project: its channels replace the sample
+    /// ones (each project has its own #main), the picker lists core's
+    /// projects, its agents join Agent Status, #main's history loads and its
+    /// events flow in from here on.
     pub fn attach_core(&mut self, mut link: CoreLink, cx: &mut Context<Self>) {
         for a in &link.agents {
             self.workspace.agents.push(Agent {
@@ -200,16 +208,11 @@ impl ChatStore {
                 presence: None,
             });
         }
-        let channel = self
-            .workspace
-            .channels
-            .iter()
-            .find(|c| c.project_wide)
-            .unwrap_or(&self.workspace.channels[0])
-            .id;
+        let channel = self.show_project(&link.open, &link.folder, cx);
+        let confirm = link.confirm.take();
         let mut events = link.events.take();
         let core = link.core.clone();
-        let main = link.main;
+        let main = link.main();
         let task = cx.spawn(async move |this, cx| {
             match core.history(main, 200).await {
                 Ok(history) => {
@@ -240,9 +243,155 @@ impl ChatStore {
             link,
             channel,
             seen: HashMap::new(),
+            confirm,
             _events: task,
         });
         cx.notify();
+    }
+
+    /// Shows `open` as the workspace's project: header, picker and channels.
+    /// Every shown channel starts with an empty log (history reloads), and
+    /// #main is selected. Returns #main's app id.
+    fn show_project(&mut self, open: &OpenProject, folder: &Path, cx: &mut Context<Self>) -> Id {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let shown_path = |root: Option<&str>| {
+            root.map(|r| Arc::from(project::display_path(Path::new(r), home.as_deref())))
+        };
+        let p = &open.project;
+        let path = shown_path(p.root_path.as_deref())
+            .or_else(|| Some(Arc::from(project::display_path(folder, home.as_deref()))));
+        self.workspace.project = model::Project {
+            id: Id(0),
+            name: p.name.clone(),
+            emoji: Arc::from(monogram(&p.name)),
+            path,
+        };
+        self.workspace.projects = open
+            .all
+            .iter()
+            .map(|q| ProjectEntry {
+                name: q.name.clone(),
+                path: shown_path(q.root_path.as_deref()),
+                current: q.id == p.id,
+            })
+            .collect();
+        self.workspace.channels = open
+            .channels
+            .iter()
+            .map(|c| model::Channel {
+                id: channel_id(c.id),
+                name: c.name.clone(),
+                ordinal: Some(c.ordinal),
+                linear_issue: None,
+                unread: false,
+                project_wide: c.id == open.main.id,
+            })
+            .collect();
+        for c in &self.workspace.channels {
+            self.logs.insert(c.id, ChannelLog::default());
+        }
+        let main = channel_id(open.main.id);
+        self.selected = main;
+        cx.emit(StoreEvent::Selected);
+        cx.notify();
+        main
+    }
+
+    /// The project-identity question to put in the pane, if one is waiting.
+    pub fn pending_identity(&self) -> Option<PaneContent> {
+        let c = self.core.as_ref()?.confirm.as_ref()?;
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        Some(PaneContent::ProjectIdentity(ProjectQuestion {
+            copied_from: match &c.question {
+                Question::Changed => None,
+                Question::CopiedFrom { root } => Some(Arc::from(project::display_path(
+                    Path::new(root),
+                    home.as_deref(),
+                ))),
+            },
+            current: Arc::from(c.current.name.as_str()),
+            proposed: Arc::from(c.proposed.name.as_str()),
+            proposed_id: Arc::from(c.proposed.id.as_str()),
+        }))
+    }
+
+    /// The user's answer to the identity question. Nothing about the folder's
+    /// project changed before this.
+    pub fn answer_identity(&mut self, answer: &PaneActionKind, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let Some(confirm) = attached.confirm.take() else {
+            return;
+        };
+        match answer {
+            // Stay, and make the file name what is open so it stops asking.
+            PaneActionKind::KeepProject => agents::keep(&attached.link.folder, &confirm.current),
+            // Open what the file names; the file already says so.
+            PaneActionKind::UseProposedProject => self.switch_to(confirm.proposed, false, cx),
+            PaneActionKind::NewProject => {
+                let target = Target {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    name: confirm.proposed.name,
+                };
+                self.switch_to(target, true, cx);
+            }
+            _ => attached.confirm = Some(confirm),
+        }
+    }
+
+    fn switch_to(&mut self, target: Target, write_file: bool, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        let link = &attached.link;
+        let core = link.core.clone();
+        let folder = link.folder.clone();
+        let members = std::iter::once(link.human)
+            .chain(link.agents.iter().map(|a| a.member))
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let opened =
+                agents::switch_project(core.clone(), folder, target, write_file, members).await;
+            let main = match opened {
+                Ok(open) => {
+                    let main = open.main.id;
+                    let ok = this.update(cx, |store, cx| store.opened(open, cx));
+                    if ok.is_err() {
+                        return;
+                    }
+                    main
+                }
+                Err(e) => {
+                    this.update(cx, |store, cx| {
+                        store.system_note(&format!("Could not open that project: {e}"), cx)
+                    })
+                    .ok();
+                    return;
+                }
+            };
+            if let Ok(history) = core.history(main, 200).await {
+                this.update(cx, |store, cx| {
+                    for m in history {
+                        store.apply_core_event(CoreEvent::Message(m), cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A switch finished: show the new project.
+    fn opened(&mut self, open: OpenProject, cx: &mut Context<Self>) {
+        let Some(mut attached) = self.core.take() else {
+            return;
+        };
+        let folder = attached.link.folder.clone();
+        attached.channel = self.show_project(&open, &folder, cx);
+        attached.seen.clear();
+        attached.link.open = open;
+        self.core = Some(attached);
     }
 
     /// Folds one core event into the app's state.
@@ -252,7 +401,7 @@ impl ChatStore {
         };
         match event {
             CoreEvent::Message(m) => {
-                if m.channel != attached.link.main || attached.seen.contains_key(&m.id) {
+                if m.channel != attached.link.main() || attached.seen.contains_key(&m.id) {
                     return;
                 }
                 let author = match m.author {
@@ -326,6 +475,17 @@ impl ChatStore {
         let main = self.workspace.channels[0].id;
         self.append(main, model::demo_history(count).collect(), cx);
     }
+}
+
+fn channel_id(channel: ct::ChannelId) -> Id {
+    Id(CORE_CHANNEL_BASE.saturating_add(channel.0 as u32))
+}
+
+/// The picker's badge for a project without an emoji: its first letter.
+fn monogram(name: &str) -> String {
+    name.chars()
+        .find(|c| c.is_alphanumeric())
+        .map_or_else(|| "#".to_string(), |c| c.to_uppercase().collect())
 }
 
 fn agent_id(member: ct::MemberId) -> Id {

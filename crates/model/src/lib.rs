@@ -8,7 +8,8 @@ mod sample;
 pub mod search;
 
 pub use pane::{
-    Attachment, PaneAction, PaneActionKind, PaneContent, ReplyRef, ReviewItem, Settings,
+    Attachment, PaneAction, PaneActionKind, PaneContent, ProjectQuestion, ReplyRef, ReviewItem,
+    Settings,
 };
 pub use sample::{demo_history, sample, sample_history};
 pub use search::{
@@ -27,12 +28,27 @@ pub struct Project {
     pub id: Id,
     pub name: Arc<str>,
     pub emoji: Arc<str>,
+    /// The folder it was opened from, as shown in the header
+    /// (`~/Projects/starpoint`).
+    pub path: Option<Arc<str>>,
+}
+
+/// One row of the project picker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectEntry {
+    pub name: Arc<str>,
+    pub path: Option<Arc<str>>,
+    /// The project this window shows.
+    pub current: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Channel {
     pub id: Id,
     pub name: Arc<str>,
+    /// Position within the project (`::N` in the header): creation order,
+    /// stable across renames. `None` for channels that only exist locally.
+    pub ordinal: Option<u32>,
     /// Optional link to a Linear issue. Issues never become channels on their own.
     pub linear_issue: Option<Arc<str>>,
     pub unread: bool,
@@ -144,6 +160,8 @@ pub struct Message {
 #[derive(Clone, Debug)]
 pub struct Workspace {
     pub project: Project,
+    /// Every project the picker lists, the current one included.
+    pub projects: Vec<ProjectEntry>,
     pub channels: Vec<Channel>,
     pub quick_links: Vec<QuickLink>,
     pub agents: Vec<Agent>,

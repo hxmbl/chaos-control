@@ -115,6 +115,16 @@ impl PaneHost {
                 }));
                 cx.notify();
             }
+            (
+                PaneActionKind::KeepProject
+                | PaneActionKind::UseProposedProject
+                | PaneActionKind::NewProject,
+                Some(PaneContent::ProjectIdentity(_)),
+            ) => {
+                self.store
+                    .update(cx, |store, cx| store.answer_identity(&kind, cx));
+                self.close(window, cx);
+            }
             _ => {
                 self.close(window, cx);
                 cx.emit(PaneEvent::Action(kind));
@@ -192,6 +202,7 @@ impl PaneHost {
             PaneContent::Compose { draft, .. } => pane.children(paragraphs(draft)),
             // Search draws its own pane (see `Search::render_pane`).
             PaneContent::Search { .. } => pane,
+            PaneContent::ProjectIdentity(q) => pane.children(paragraphs(&identity_text(q))),
         };
         Some(pane.into_any_element())
     }
@@ -354,6 +365,28 @@ fn paragraphs(text: &str) -> Vec<AnyElement> {
         gap = false;
     }
     out
+}
+
+/// The body of the project-identity pane. Says what is open, what the file
+/// asks for, and that nothing switched on its own.
+fn identity_text(q: &model::ProjectQuestion) -> String {
+    let short: String = q.proposed_id.chars().take(8).collect();
+    match &q.copied_from {
+        None => format!(
+            "This folder's .chaos/project.toml now names a different project, {} ({short}…), \
+             not {}, the one Chaos Control opened here before.\n\
+             {} is still open. Nothing switches until you choose: using the new one shows \
+             its channels and history in this folder; a new project starts empty.",
+            q.proposed, q.current, q.current
+        ),
+        Some(path) => format!(
+            "This folder's .chaos/project.toml names {} ({short}…), which is open from {path}, \
+             and that folder still claims it. So this looks like a copy, and Chaos Control \
+             opened a separate project here to keep the two chats apart.\n\
+             Use {} here too only if both folders should share one chat on this computer.",
+            q.proposed, q.proposed
+        ),
+    }
 }
 
 fn human_size(bytes: u64) -> String {

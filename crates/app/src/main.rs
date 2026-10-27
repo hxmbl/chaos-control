@@ -5,6 +5,7 @@ mod composer;
 mod conversation;
 mod pane_host;
 mod panels;
+mod project;
 mod right_sidebar;
 mod search;
 mod settings;

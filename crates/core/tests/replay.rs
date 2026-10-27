@@ -202,7 +202,7 @@ async fn claude_agent_acp_selects_v2_and_a_signed_out_turn_goes_red() {
     let (core, _events) = Core::start(HostConfig::default(), clock.clone())
         .await
         .unwrap();
-    let main = core.channel("main").await.unwrap().id;
+    let main = common::main_channel(&core).await.id;
     let hx = core.human("hx", "Hx", main).await.unwrap();
     let frames = fixture("claude-agent-acp-0.97.0-v2-live.ndjson");
     let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
@@ -279,7 +279,7 @@ async fn codex_acp_auth_required_turns_the_agent_red() {
     let (core, _events) = Core::start(HostConfig::default(), clock.clone())
         .await
         .unwrap();
-    let main = core.channel("main").await.unwrap().id;
+    let main = common::main_channel(&core).await.id;
     let hx = core.human("hx", "Hx", main).await.unwrap();
     let frames = fixture("codex-acp-0.16.0.ndjson");
     let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
@@ -340,7 +340,7 @@ async fn fake_agent_binary_over_real_stdio() {
     let _ = std::fs::remove_file(&record);
     let clock = ManualClock::new(T0);
     let (core, mut events) = Core::start(HostConfig::default(), clock).await.unwrap();
-    let main = core.channel("main").await.unwrap().id;
+    let main = common::main_channel(&core).await.id;
     let hx = core.human("hx", "Hx", main).await.unwrap();
     let adapter = Arc::new(AcpAdapter::new(Arc::new(SpawnTransport {
         command: PathBuf::from(env!("CARGO_BIN_EXE_fake-acp-agent")),
@@ -413,7 +413,7 @@ async fn live_acp_agent_handshake_and_first_turn() {
     }
     let clock = Arc::new(chaos_core::host::SystemClock);
     let (core, mut events) = Core::start(HostConfig::default(), clock).await.unwrap();
-    let main = core.channel("main").await.unwrap().id;
+    let main = common::main_channel(&core).await.id;
     let hx = core.human("hx", "Hx", main).await.unwrap();
     let adapter = Arc::new(AcpAdapter::new(Arc::new(SpawnTransport {
         command,

@@ -21,9 +21,10 @@ fn s(text: &str) -> Arc<str> {
 
 /// The workspace from the wireframe: one project, three channels, eight agents.
 pub fn sample() -> Workspace {
-    let channel = |id, name: &str, linear: bool, unread| Channel {
+    let channel = |id: Id, name: &str, linear: bool, unread| Channel {
         id,
         name: s(name),
+        ordinal: Some(id.0),
         linear_issue: linear.then(|| s(name)),
         unread,
         project_wide: id == MAIN,
@@ -52,7 +53,13 @@ pub fn sample() -> Workspace {
             id: Id(0),
             name: s("Starpoint"),
             emoji: s("⭐"),
+            path: Some(s("~/Projects/starpoint")),
         },
+        projects: vec![ProjectEntry {
+            name: s("Starpoint"),
+            path: Some(s("~/Projects/starpoint")),
+            current: true,
+        }],
         channels: vec![
             channel(MAIN, "main", false, false),
             channel(STRM_335, "STRM-335", true, false),
