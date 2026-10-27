@@ -194,6 +194,26 @@ impl Engine {
             .tx(|c| store::ensure_project(c, id, name, root, now))
     }
 
+    /// See [`store::adopt_import`].
+    pub fn adopt_import(
+        &mut self,
+        id: &ProjectId,
+        name: &str,
+        root: &str,
+    ) -> rusqlite::Result<Option<Project>> {
+        self.store.tx(|c| store::adopt_import(c, id, name, root))
+    }
+
+    /// See [`store::forget_empty_project`]. Also drops any runtime state for
+    /// the deleted channels. Returns whether the project went.
+    pub fn forget_empty_project(&mut self, id: &ProjectId) -> rusqlite::Result<bool> {
+        let Some(gone) = self.store.tx(|c| store::forget_empty_project(c, id))? else {
+            return Ok(false);
+        };
+        self.rt.retain(|(_, ch), _| !gone.contains(ch));
+        Ok(true)
+    }
+
     /// The channel `name` in `project`, created if new. The project must exist.
     pub fn ensure_channel(
         &mut self,

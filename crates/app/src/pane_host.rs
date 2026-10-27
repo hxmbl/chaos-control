@@ -118,7 +118,8 @@ impl PaneHost {
             (
                 PaneActionKind::KeepProject
                 | PaneActionKind::UseProposedProject
-                | PaneActionKind::NewProject,
+                | PaneActionKind::NewProject
+                | PaneActionKind::AdoptImported,
                 Some(PaneContent::ProjectIdentity(_)),
             ) => {
                 self.store
@@ -371,20 +372,27 @@ fn paragraphs(text: &str) -> Vec<AnyElement> {
 /// asks for, and that nothing switched on its own.
 fn identity_text(q: &model::ProjectQuestion) -> String {
     let short: String = q.proposed_id.chars().take(8).collect();
-    match &q.copied_from {
-        None => format!(
+    match &q.kind {
+        model::ProjectQuestionKind::Changed => format!(
             "This folder's .chaos/project.toml now names a different project, {} ({short}…), \
              not {}, the one Chaos Control opened here before.\n\
              {} is still open. Nothing switches until you choose: using the new one shows \
              its channels and history in this folder; a new project starts empty.",
             q.proposed, q.current, q.current
         ),
-        Some(path) => format!(
+        model::ProjectQuestionKind::CopiedFrom(path) => format!(
             "This folder's .chaos/project.toml names {} ({short}…), which is open from {path}, \
              and that folder still claims it. So this looks like a copy, and Chaos Control \
              opened a separate project here to keep the two chats apart.\n\
              Use {} here too only if both folders should share one chat on this computer.",
             q.proposed, q.proposed
+        ),
+        model::ProjectQuestionKind::Imported => format!(
+            "Chaos Control kept your channels and history from before projects, but they \
+             aren't tied to any folder yet, so this folder opened a fresh, empty #main.\n\
+             Use them here and they become this folder's project, named {}. That history can live \
+             in one folder only. Start fresh keeps this new project and stops asking here.",
+            q.proposed
         ),
     }
 }

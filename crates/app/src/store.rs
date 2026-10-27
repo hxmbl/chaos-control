@@ -10,7 +10,7 @@ use chaos_core::{engine::CoreEvent, types as ct};
 use gpui::{Context, EventEmitter, Task};
 use model::{
     Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PaneActionKind, PaneContent,
-    ProjectEntry, ProjectQuestion, ReplyRef, SearchCorpus, Workspace,
+    ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus, Workspace,
 };
 
 use crate::{
@@ -43,6 +43,14 @@ pub struct ChatStore {
     selected: Id,
     next_message_id: u32,
     core: Option<Attached>,
+}
+
+/// How [`ChatStore::switch_to`] opens the project.
+enum Switch {
+    /// Open this project (writing the folder's file if `true`).
+    Open(Target, bool),
+    /// Adopt the unclaimed pre-project history as this folder's project.
+    Adopt(Target),
 }
 
 /// Core behind #main (see `agents.rs`).
@@ -302,12 +310,12 @@ impl ChatStore {
         let c = self.core.as_ref()?.confirm.as_ref()?;
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         Some(PaneContent::ProjectIdentity(ProjectQuestion {
-            copied_from: match &c.question {
-                Question::Changed => None,
-                Question::CopiedFrom { root } => Some(Arc::from(project::display_path(
-                    Path::new(root),
-                    home.as_deref(),
-                ))),
+            kind: match &c.question {
+                Question::Changed => ProjectQuestionKind::Changed,
+                Question::CopiedFrom { root } => ProjectQuestionKind::CopiedFrom(Arc::from(
+                    project::display_path(Path::new(root), home.as_deref()),
+                )),
+                Question::Imported => ProjectQuestionKind::Imported,
             },
             current: Arc::from(c.current.name.as_str()),
             proposed: Arc::from(c.proposed.name.as_str()),
@@ -326,21 +334,37 @@ impl ChatStore {
         };
         match answer {
             // Stay, and make the file name what is open so it stops asking.
+            // For the import question this is "Start fresh".
             PaneActionKind::KeepProject => agents::keep(&attached.link.folder, &confirm.current),
-            // Open what the file names; the file already says so.
-            PaneActionKind::UseProposedProject => self.switch_to(confirm.proposed, false, cx),
+            // Open what the file names; the file already says so. A copy's
+            // separate project was only a placeholder: it goes if still empty.
+            PaneActionKind::UseProposedProject => {
+                let forget = match confirm.question {
+                    Question::CopiedFrom { .. } => Some(confirm.current.id.clone()),
+                    _ => None,
+                };
+                self.switch_to(Switch::Open(confirm.proposed, false), forget, cx)
+            }
             PaneActionKind::NewProject => {
                 let target = Target {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: confirm.proposed.name,
                 };
-                self.switch_to(target, true, cx);
+                self.switch_to(Switch::Open(target, true), None, cx);
+            }
+            // Give this folder the pre-project history; the fresh project
+            // opened meanwhile goes if nothing was said in it.
+            PaneActionKind::AdoptImported if confirm.question == Question::Imported => {
+                let forget = Some(confirm.current.id.clone());
+                self.switch_to(Switch::Adopt(confirm.proposed), forget, cx)
             }
             _ => attached.confirm = Some(confirm),
         }
     }
 
-    fn switch_to(&mut self, target: Target, write_file: bool, cx: &mut Context<Self>) {
+    /// Opens another project in this folder, then deletes `forget` (the
+    /// project that was open) if the switch left it empty and folderless.
+    fn switch_to(&mut self, how: Switch, forget: Option<String>, cx: &mut Context<Self>) {
         let Some(attached) = &self.core else {
             return;
         };
@@ -351,11 +375,25 @@ impl ChatStore {
             .chain(link.agents.iter().map(|a| a.member))
             .collect();
         cx.spawn(async move |this, cx| {
-            let opened =
-                agents::switch_project(core.clone(), folder, target, write_file, members).await;
+            let opened = match how {
+                Switch::Open(target, write_file) => {
+                    agents::switch_project(core.clone(), folder, target, write_file, members).await
+                }
+                Switch::Adopt(target) => {
+                    agents::adopt_import(core.clone(), folder, target, members).await
+                }
+            };
             let main = match opened {
                 Ok(open) => {
                     let main = open.main.id;
+                    if let Some(id) = forget.filter(|id| *id != open.project.id.to_string()) {
+                        agents::forget_placeholder(&core, &id).await;
+                    }
+                    // The picker re-reads projects so a forgotten one is gone.
+                    let open = match core.projects().await {
+                        Ok(all) => OpenProject { all, ..open },
+                        Err(_) => open,
+                    };
                     let ok = this.update(cx, |store, cx| store.opened(open, cx));
                     if ok.is_err() {
                         return;

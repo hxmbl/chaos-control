@@ -168,15 +168,26 @@ pub enum PaneContent {
 /// What the project-identity pane asks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectQuestion {
-    /// `None`: a folder the app knows now names a different project.
-    /// `Some(path)`: the file names a project open from `path`, which still
-    /// claims it, so this folder is a copy.
-    pub copied_from: Option<Arc<str>>,
+    pub kind: ProjectQuestionKind,
     /// What is open now.
     pub current: Arc<str>,
     /// What the file names, and its id.
     pub proposed: Arc<str>,
     pub proposed_id: Arc<str>,
+}
+
+/// Which identity question it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProjectQuestionKind {
+    /// A folder the app knows now names a different project.
+    Changed,
+    /// The file names a project open from this path, which still claims it,
+    /// so this folder is a copy.
+    CopiedFrom(Arc<str>),
+    /// A new folder, while history from before projects is still unclaimed.
+    /// `current` is the fresh project; `proposed` is that history, under the
+    /// name it takes if adopted.
+    Imported,
 }
 
 /// The quick actions panes offer. `Custom` carries an id the opener handles.
@@ -202,6 +213,8 @@ pub enum PaneActionKind {
     UseProposedProject,
     /// Project identity: start a new project for this folder.
     NewProject,
+    /// Project identity: adopt the unclaimed pre-project history here.
+    AdoptImported,
 }
 
 /// A full-width row along the bottom of the pane.
@@ -243,9 +256,10 @@ impl PaneContent {
                 Arc::from(format!("Message #{channel}"))
             }
             PaneContent::Search { .. } => Arc::from("Search"),
-            PaneContent::ProjectIdentity(q) => Arc::from(match q.copied_from {
-                None => "This folder's project changed",
-                Some(_) => "This folder looks like a copy",
+            PaneContent::ProjectIdentity(q) => Arc::from(match q.kind {
+                ProjectQuestionKind::Changed => "This folder's project changed",
+                ProjectQuestionKind::CopiedFrom(_) => "This folder looks like a copy",
+                ProjectQuestionKind::Imported => "Earlier history found",
             }),
         }
     }
@@ -268,18 +282,23 @@ impl PaneContent {
                 PaneAction::new(Send, "Send"),
                 PaneAction::new(Discard, "Discard draft"),
             ],
-            PaneContent::ProjectIdentity(q) => match q.copied_from {
-                None => vec![
+            PaneContent::ProjectIdentity(q) => match q.kind {
+                ProjectQuestionKind::Changed => vec![
                     PaneAction::new(KeepProject, "Keep current"),
                     PaneAction::new(UseProposedProject, "Use the new one"),
                     PaneAction::new(NewProject, "Treat as a new project"),
                 ],
-                Some(_) => vec![
+                ProjectQuestionKind::CopiedFrom(_) => vec![
                     PaneAction::new(KeepProject, "Keep it separate"),
                     PaneAction {
                         kind: UseProposedProject,
                         label: Arc::from(format!("Use {} here too", q.proposed)),
                     },
+                ],
+                ProjectQuestionKind::Imported => vec![
+                    PaneAction::new(AdoptImported, "Use my earlier history here"),
+                    // Keeps the fresh project and writes its file.
+                    PaneAction::new(KeepProject, "Start fresh"),
                 ],
             },
             PaneContent::Search {
@@ -340,7 +359,7 @@ mod tests {
     #[test]
     fn project_identity_offers_the_three_answers() {
         let q = ProjectQuestion {
-            copied_from: None,
+            kind: ProjectQuestionKind::Changed,
             current: Arc::from("starpoint"),
             proposed: Arc::from("everything"),
             proposed_id: Arc::from("5f0c9d1a-7b2e-4e8f-a1c3-9d8e7f6a5b4c"),
@@ -356,11 +375,26 @@ mod tests {
             ]
         );
         let copy = PaneContent::ProjectIdentity(ProjectQuestion {
-            copied_from: Some(Arc::from("~/src/everything")),
-            ..q
+            kind: ProjectQuestionKind::CopiedFrom(Arc::from("~/src/everything")),
+            ..q.clone()
         });
         assert_eq!(copy.actions().len(), 2);
         assert_eq!(&*copy.title(&sample()), "This folder looks like a copy");
+        let imported = PaneContent::ProjectIdentity(ProjectQuestion {
+            kind: ProjectQuestionKind::Imported,
+            ..q
+        });
+        let actions = imported.actions();
+        assert_eq!(
+            actions.iter().map(|a| a.label.clone()).collect::<Vec<_>>(),
+            vec![
+                Arc::from("Use my earlier history here"),
+                Arc::from("Start fresh")
+            ]
+        );
+        assert_eq!(actions[0].kind, PaneActionKind::AdoptImported);
+        assert_eq!(actions[1].kind, PaneActionKind::KeepProject);
+        assert_eq!(&*imported.title(&sample()), "Earlier history found");
     }
 
     #[test]

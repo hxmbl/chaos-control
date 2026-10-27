@@ -23,6 +23,8 @@
 //!   path can skip the check.
 //! - One folder maps to at most one project (partial unique index on
 //!   `projects.root_path`).
+//! - The migrated "Imported" project is adoptable by one folder, once, and
+//!   only while it has no folder (`adopt_import`'s guarded update).
 
 use std::{path::Path, sync::Arc};
 
@@ -192,6 +194,16 @@ WHEN NOT EXISTS (
 BEGIN
     SELECT RAISE(ABORT, 'not_a_project_member');
 END;
+"#,
+    // 3: the "Imported" project from migration 2 can be adopted once by a
+    // folder (`adopt_import`). `unclaimed_import` marks it until then; nothing
+    // else ever sets it, so a project that merely lost its folder to another
+    // project is never offered.
+    r#"
+ALTER TABLE projects ADD COLUMN unclaimed_import INTEGER NOT NULL DEFAULT 0
+    CHECK (unclaimed_import IN (0, 1));
+UPDATE projects SET unclaimed_import = 1
+WHERE root_path IS NULL AND name = 'Imported';
 "#,
 ];
 
@@ -392,6 +404,113 @@ pub fn projects(c: &Connection) -> Result<Vec<Project>> {
         "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at, id"
     ))?;
     stmt.query_map([], project_from_row)?.collect()
+}
+
+/// The project migration 2 made from pre-project history, if no folder has
+/// adopted it yet. Never one with a folder: a live root is not up for grabs.
+pub fn unclaimed_import(c: &Connection) -> Result<Option<Project>> {
+    c.query_row(
+        &format!(
+            "SELECT {PROJECT_COLS} FROM projects
+             WHERE unclaimed_import = 1 AND root_path IS NULL
+             ORDER BY created_at, id LIMIT 1"
+        ),
+        [],
+        project_from_row,
+    )
+    .optional()
+}
+
+/// Gives the unclaimed import (`id`) the folder `root` and the display name
+/// `name`, and marks it claimed, so it is never offered again. Refuses
+/// (`Ok(None)`) unless `id` is still an unclaimed import with no folder. Any
+/// project that held `root` before (the empty one opened while the user was
+/// asked) lets go of it, as in [`ensure_project`]. Channels, members and
+/// history are untouched.
+pub fn adopt_import(
+    c: &Connection,
+    id: &ProjectId,
+    name: &str,
+    root: &str,
+) -> Result<Option<Project>> {
+    let claimable = c
+        .query_row(
+            "SELECT 1 FROM projects
+             WHERE id = ?1 AND unclaimed_import = 1 AND root_path IS NULL",
+            [id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !claimable {
+        return Ok(None);
+    }
+    c.execute(
+        "UPDATE projects SET root_path = NULL WHERE root_path = ?1 AND id != ?2",
+        params![root, id.as_str()],
+    )?;
+    c.execute(
+        "UPDATE projects SET root_path = ?2, name = ?3, unclaimed_import = 0
+         WHERE id = ?1 AND unclaimed_import = 1 AND root_path IS NULL",
+        params![id.as_str(), root, name],
+    )?;
+    project(c, id)
+}
+
+/// Whether any channel of `project` has a message.
+pub fn project_has_messages(c: &Connection, project: &ProjectId) -> Result<bool> {
+    c.query_row(
+        "SELECT 1 FROM messages m JOIN channels ch ON ch.id = m.channel_id
+         WHERE ch.project_id = ?1 LIMIT 1",
+        [project.as_str()],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+}
+
+/// Deletes `project` and its channels if nothing was ever said there, it has
+/// no folder and it isn't the unclaimed import. Returns the deleted channel
+/// ids, or `None` when it kept the project. For the placeholder a folder opened
+/// while its identity question was open, once the answer moved elsewhere.
+pub fn forget_empty_project(c: &Connection, project: &ProjectId) -> Result<Option<Vec<ChannelId>>> {
+    let forgettable = c
+        .query_row(
+            "SELECT 1 FROM projects
+             WHERE id = ?1 AND root_path IS NULL AND unclaimed_import = 0",
+            [project.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !forgettable || project_has_messages(c, project)? {
+        return Ok(None);
+    }
+    let channels: Vec<ChannelId> = channels_in_project(c, project)?
+        .into_iter()
+        .map(|ch| ch.id)
+        .collect();
+    // Messages hang everything else (mentions, reactions, triggers,
+    // obligations) off a message, and there are none.
+    for table in ["sessions", "cursors", "batches", "memberships"] {
+        c.execute(
+            &format!(
+                "DELETE FROM {table} WHERE channel_id IN
+                 (SELECT id FROM channels WHERE project_id = ?1)"
+            ),
+            [project.as_str()],
+        )?;
+    }
+    c.execute(
+        "DELETE FROM channels WHERE project_id = ?1",
+        [project.as_str()],
+    )?;
+    c.execute(
+        "DELETE FROM project_members WHERE project_id = ?1",
+        [project.as_str()],
+    )?;
+    c.execute("DELETE FROM projects WHERE id = ?1", [project.as_str()])?;
+    Ok(Some(channels))
 }
 
 /// Changes a project's display name only; its id, channels and history stay.
@@ -1612,5 +1731,116 @@ mod tests {
     fn a_fresh_database_has_no_imported_project() {
         let s = Store::open_in_memory().unwrap();
         assert!(projects(s.conn()).unwrap().is_empty());
+        assert!(unclaimed_import(s.conn()).unwrap().is_none());
+    }
+
+    /// A v1 database with one channel and one message, migrated.
+    fn migrated_v1() -> Store {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.execute_batch(
+            r#"
+            PRAGMA user_version = 1;
+            INSERT INTO channels (id, name, created_at) VALUES (3, 'main', 100);
+            INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx');
+            INSERT INTO memberships VALUES (3, 1, 10);
+            INSERT INTO messages (id, channel_id, seq, author_id, origin, body, sent_at)
+                VALUES (10, 3, 1, 1, 'composer', 'from before projects', 1000);
+            "#,
+        )
+        .unwrap();
+        Store::init(conn).unwrap()
+    }
+
+    #[test]
+    fn adopting_the_import_gives_it_the_folder_once() {
+        let mut s = migrated_v1();
+        s.tx::<_, rusqlite::Error>(|c| {
+            let imported = unclaimed_import(c)?.expect("migration 2 made one");
+            assert_eq!(imported.name.as_ref(), "Imported");
+            // The placeholder opened while the user was asked holds the folder.
+            ensure_project(c, &pid(P1), "starpoint", Some("/src/starpoint"), 2000)?;
+            let placeholder = ensure_channel(c, &pid(P1), "main", 2000)?;
+
+            let adopted =
+                adopt_import(c, &imported.id, "starpoint", "/src/starpoint")?.expect("adoptable");
+            assert_eq!(adopted.id, imported.id, "same UUID, same history");
+            assert_eq!(adopted.name.as_ref(), "starpoint");
+            assert_eq!(adopted.root_path.as_deref(), Some("/src/starpoint"));
+            assert_eq!(
+                project_by_root(c, "/src/starpoint")?.unwrap().id,
+                imported.id
+            );
+            assert_eq!(project(c, &pid(P1))?.unwrap().root_path, None);
+            let main = channel_in_project(c, &imported.id, "main")?.unwrap();
+            assert_eq!(main.id, ChannelId(3), "channel ids are kept");
+            assert!(project_has_messages(c, &imported.id)?);
+
+            // Claimed: never offered or adoptable again, even from elsewhere.
+            assert!(unclaimed_import(c)?.is_none());
+            assert!(adopt_import(c, &imported.id, "other", "/src/other")?.is_none());
+            assert_eq!(
+                project(c, &imported.id)?.unwrap().root_path.as_deref(),
+                Some("/src/starpoint")
+            );
+
+            // The empty placeholder goes; the adopted project never does.
+            assert_eq!(
+                forget_empty_project(c, &pid(P1))?,
+                Some(vec![placeholder.id])
+            );
+            assert!(project(c, &pid(P1))?.is_none());
+            assert_eq!(forget_empty_project(c, &imported.id)?, None);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_project_with_a_folder_is_never_adoptable() {
+        let mut s = migrated_v1();
+        s.tx::<_, rusqlite::Error>(|c| {
+            let imported = unclaimed_import(c)?.unwrap();
+            // A project that had a folder and lost it is not an import.
+            ensure_project(c, &pid(P1), "Old", Some("/src/x"), 0)?;
+            ensure_project(c, &pid(P2), "New", Some("/src/x"), 1)?;
+            assert_eq!(project(c, &pid(P1))?.unwrap().root_path, None);
+            assert!(adopt_import(c, &pid(P1), "x", "/src/y")?.is_none());
+            assert!(adopt_import(c, &pid(P2), "x", "/src/y")?.is_none());
+            // An import that somehow has a folder is not offered either.
+            c.execute(
+                "UPDATE projects SET root_path = '/src/live' WHERE id = ?1",
+                [imported.id.as_str()],
+            )?;
+            assert!(unclaimed_import(c)?.is_none());
+            assert!(adopt_import(c, &imported.id, "x", "/src/y")?.is_none());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn only_empty_unrooted_projects_are_forgotten() {
+        let (mut s, ch, hx, _) = setup();
+        s.tx::<_, rusqlite::Error>(|c| {
+            // `setup`'s project has no folder but has a message: kept.
+            insert_message(c, &msg(ch.id, hx.id, "keep me"))?;
+            assert_eq!(forget_empty_project(c, &ch.project)?, None);
+            // Empty but rooted: kept.
+            ensure_project(c, &pid(P2), "Copy", Some("/src/copy"), 0)?;
+            let main = ensure_channel(c, &pid(P2), "main", 0)?;
+            join_project(c, &pid(P2), hx.id, 0)?;
+            join(c, main.id, &hx, 20, 0)?;
+            assert_eq!(forget_empty_project(c, &pid(P2))?, None);
+            // Empty and unrooted (another project took the folder): forgotten,
+            // memberships and all.
+            ensure_project(c, &ch.project, "Starpoint", Some("/src/copy"), 1)?;
+            assert_eq!(forget_empty_project(c, &pid(P2))?, Some(vec![main.id]));
+            assert!(project(c, &pid(P2))?.is_none());
+            assert!(!is_member(c, main.id, hx.id)?);
+            assert!(!is_project_member(c, &pid(P2), hx.id)?);
+            Ok(())
+        })
+        .unwrap();
     }
 }

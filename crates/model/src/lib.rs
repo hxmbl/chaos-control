@@ -8,8 +8,8 @@ mod sample;
 pub mod search;
 
 pub use pane::{
-    Attachment, PaneAction, PaneActionKind, PaneContent, ProjectQuestion, ReplyRef, ReviewItem,
-    Settings,
+    Attachment, PaneAction, PaneActionKind, PaneContent, ProjectQuestion, ProjectQuestionKind,
+    ReplyRef, ReviewItem, Settings,
 };
 pub use sample::{demo_history, sample, sample_history};
 pub use search::{
