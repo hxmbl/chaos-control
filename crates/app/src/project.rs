@@ -73,6 +73,12 @@ pub struct Inputs<'a> {
     pub folder_name: &'a str,
     /// A freshly minted UUID, used if a new project is needed.
     pub fresh_id: &'a str,
+    /// The project migration 2 made from pre-project history, if no folder
+    /// has adopted it yet (`Core::unclaimed_import`).
+    pub unclaimed_import: Option<&'a Known>,
+    /// Whether `by_root` has no messages at all (the placeholder opened while
+    /// an earlier import question went unanswered).
+    pub by_root_is_empty: bool,
 }
 
 /// The project to open now.
@@ -92,6 +98,10 @@ pub enum Question {
     /// exists, so this is a copy rather than a move. We opened a separate
     /// project for this folder.
     CopiedFrom { root: String },
+    /// A folder with no file and nothing (or only an empty placeholder) in
+    /// core, while history from before projects is still unclaimed. A fresh
+    /// project is open; the user may adopt the old history here instead.
+    Imported,
 }
 
 /// A pending identity question, shown in the pane.
@@ -124,6 +134,9 @@ pub enum Case {
     /// Unknown folder, a UUID core knows from a folder that still exists and
     /// still claims it: a copy. A separate project opens and the user is asked.
     Copied,
+    /// No file, an unknown folder (or one whose project is still empty) and
+    /// unclaimed pre-project history: open fresh and offer the history.
+    OfferImport,
 }
 
 /// The outcome.
@@ -150,24 +163,41 @@ pub fn decide(i: &Inputs<'_>) -> Plan {
         id: k.id.clone(),
         name: k.name.clone(),
     };
+    // Only a missing file: an unreadable one can't record the answer (and is
+    // never overwritten). Only an import with no folder: a live root is never
+    // up for adoption.
+    let import = i
+        .unclaimed_import
+        .filter(|k| k.root.is_none() && matches!(i.file, FileState::Missing));
     let Some(file) = file else {
-        return match i.by_root {
-            Some(known) => Plan {
-                case: Case::Relink,
-                open: target(known),
-                write_file: may_write,
-                confirm: None,
-            },
-            None => Plan {
-                case: Case::Create,
-                open: Target {
+        if let Some(import) = import {
+            let current = match i.by_root {
+                None => Target {
                     id: i.fresh_id.to_string(),
                     name: i.folder_name.to_string(),
                 },
-                write_file: may_write,
-                confirm: None,
-            },
-        };
+                Some(k) if i.by_root_is_empty && k.id != import.id => target(k),
+                Some(_) => return relink_or_create(i, may_write),
+            };
+            return Plan {
+                case: Case::OfferImport,
+                open: current.clone(),
+                // Not yet: the answer is what writes the file. "Start fresh"
+                // writes it for `current`, so this folder never asks again.
+                write_file: false,
+                confirm: Some(Confirm {
+                    question: Question::Imported,
+                    current,
+                    // Adopted, it takes the folder's name ("Imported" says
+                    // nothing once it lives somewhere).
+                    proposed: Target {
+                        id: import.id.clone(),
+                        name: i.folder_name.to_string(),
+                    },
+                }),
+            };
+        }
+        return relink_or_create(i, may_write);
     };
     let from_file = Target {
         id: file.id.clone(),
@@ -225,6 +255,31 @@ pub fn decide(i: &Inputs<'_>) -> Plan {
                     }),
                 }
             }
+        },
+    }
+}
+
+/// No usable file and nothing to offer: relink to what core knows about the
+/// folder, or start a new project named after it.
+fn relink_or_create(i: &Inputs<'_>, may_write: bool) -> Plan {
+    match i.by_root {
+        Some(known) => Plan {
+            case: Case::Relink,
+            open: Target {
+                id: known.id.clone(),
+                name: known.name.clone(),
+            },
+            write_file: may_write,
+            confirm: None,
+        },
+        None => Plan {
+            case: Case::Create,
+            open: Target {
+                id: i.fresh_id.to_string(),
+                name: i.folder_name.to_string(),
+            },
+            write_file: may_write,
+            confirm: None,
         },
     }
 }
@@ -430,7 +485,92 @@ mod tests {
             other_root_still_claims_it: false,
             folder_name: "starpoint",
             fresh_id: FRESH,
+            unclaimed_import: None,
+            by_root_is_empty: false,
         }
+    }
+
+    const IMPORTED: &str = "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f";
+
+    fn imported() -> Known {
+        Known {
+            id: IMPORTED.into(),
+            name: "Imported".into(),
+            root: None,
+        }
+    }
+
+    #[test]
+    fn a_new_folder_is_offered_the_unclaimed_import() {
+        let imp = imported();
+        let mut i = inputs(&FileState::Missing, None, None);
+        i.unclaimed_import = Some(&imp);
+        let plan = decide(&i);
+        assert_eq!(plan.case, Case::OfferImport);
+        assert_eq!(plan.open.id, FRESH, "starts fresh until the user answers");
+        assert!(!plan.write_file, "the answer writes the file");
+        let c = plan.confirm.unwrap();
+        assert_eq!(c.question, Question::Imported);
+        assert_eq!(c.current.id, FRESH);
+        assert_eq!(c.proposed.id, IMPORTED);
+        assert_eq!(
+            c.proposed.name, "starpoint",
+            "adopted, it takes the folder's name"
+        );
+    }
+
+    #[test]
+    fn an_unanswered_offer_is_made_again_while_the_placeholder_is_empty() {
+        let imp = imported();
+        let placeholder = known(A, "starpoint", "/src/starpoint");
+        let mut i = inputs(&FileState::Missing, Some(&placeholder), None);
+        i.unclaimed_import = Some(&imp);
+        i.by_root_is_empty = true;
+        let plan = decide(&i);
+        assert_eq!(plan.case, Case::OfferImport);
+        assert_eq!(plan.open.id, A, "keeps the placeholder, no second project");
+        assert_eq!(plan.confirm.unwrap().current.id, A);
+        // Once something was said there, the folder is just known.
+        i.by_root_is_empty = false;
+        let plan = decide(&i);
+        assert_eq!(plan.case, Case::Relink);
+        assert!(plan.confirm.is_none());
+    }
+
+    #[test]
+    fn the_import_is_never_offered_once_the_folder_has_a_file() {
+        let imp = imported();
+        // "Start fresh" wrote the file: it matches, so nothing is asked.
+        let k = known(A, "starpoint", "/src/starpoint");
+        let f = file(A, "starpoint");
+        let mut i = inputs(&f, Some(&k), Some(&k));
+        i.unclaimed_import = Some(&imp);
+        i.by_root_is_empty = true;
+        assert_eq!(decide(&i).case, Case::Match);
+        assert!(decide(&i).confirm.is_none());
+        // A cloned repo's file with an unknown UUID: its own project.
+        let f = file(B, "everything");
+        let mut i = inputs(&f, None, None);
+        i.unclaimed_import = Some(&imp);
+        assert_eq!(decide(&i).case, Case::Unknown);
+        // An unreadable file can't record an answer: no offer.
+        let f = FileState::Unusable("version 2".into());
+        let mut i = inputs(&f, None, None);
+        i.unclaimed_import = Some(&imp);
+        assert_eq!(decide(&i).case, Case::Create);
+    }
+
+    #[test]
+    fn a_project_with_a_live_root_is_never_offered() {
+        let rooted = Known {
+            root: Some("/src/elsewhere".into()),
+            ..imported()
+        };
+        let mut i = inputs(&FileState::Missing, None, None);
+        i.unclaimed_import = Some(&rooted);
+        let plan = decide(&i);
+        assert_eq!(plan.case, Case::Create);
+        assert!(plan.confirm.is_none());
     }
 
     #[test]

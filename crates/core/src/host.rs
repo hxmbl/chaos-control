@@ -276,6 +276,45 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// The migrated "Imported" project, while no folder has adopted it. Never
+    /// a project with a folder.
+    pub async fn unclaimed_import(&self) -> Result<Option<Project>, String> {
+        self.with_engine(|e, _| crate::store::unclaimed_import(e.conn()))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Makes the unclaimed import `id` the project of the folder `root`,
+    /// named `name`, once. Fails if `id` is not (or no longer) an unclaimed
+    /// import without a folder. Grants no one anything.
+    pub async fn adopt_import(
+        &self,
+        id: ProjectId,
+        name: &str,
+        root: &str,
+    ) -> Result<Project, String> {
+        let (name, root) = (name.to_string(), root.to_string());
+        self.with_engine(move |e, _| e.adopt_import(&id, &name, &root))
+            .await?
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "that history is no longer available to adopt".to_string())
+    }
+
+    /// Whether anything was ever said in `id`'s channels.
+    pub async fn project_has_messages(&self, id: ProjectId) -> Result<bool, String> {
+        self.with_engine(move |e, _| crate::store::project_has_messages(e.conn(), &id))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Deletes `id` if it has no folder, no messages and isn't the unclaimed
+    /// import (see `store::forget_empty_project`). Returns whether it went.
+    pub async fn forget_empty_project(&self, id: ProjectId) -> Result<bool, String> {
+        self.with_engine(move |e, _| e.forget_empty_project(&id))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     /// Renames a project. Its id, channels and history stay.
     pub async fn rename_project(&self, id: ProjectId, name: &str) -> Result<(), String> {
         let name = name.to_string();

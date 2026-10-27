@@ -329,6 +329,15 @@ async fn plan_for(core: &Core, folder: &Path) -> Result<Plan, String> {
             );
         }
     }
+    // Pre-project history is only offered to a folder with no file.
+    let unclaimed_import = match &file {
+        FileState::Missing => core.unclaimed_import().await?.map(|p| known(&p)),
+        _ => None,
+    };
+    let by_root_is_empty = match (&by_root, &unclaimed_import) {
+        (Some(k), Some(_)) => !core.project_has_messages(parse_id(&k.id)?).await?,
+        _ => false,
+    };
     let fresh = uuid::Uuid::new_v4().to_string();
     let name = project::folder_name(folder);
     let plan = project::decide(&project::Inputs {
@@ -338,6 +347,8 @@ async fn plan_for(core: &Core, folder: &Path) -> Result<Plan, String> {
         other_root_still_claims_it,
         folder_name: &name,
         fresh_id: &fresh,
+        unclaimed_import: unclaimed_import.as_ref(),
+        by_root_is_empty,
     });
     Ok(plan)
 }
@@ -398,6 +409,33 @@ pub async fn switch_project(
         core.join(m, main.id).await?;
     }
     describe(&core, project).await
+}
+
+/// Adopts the unclaimed pre-project history (`target`) as this folder's
+/// project: core gives it the folder and `target`'s name (refusing if it has
+/// a folder or was claimed meanwhile), then it opens like any switch and the
+/// file is written with its UUID.
+pub async fn adopt_import(
+    core: Core,
+    folder: PathBuf,
+    target: Target,
+    members: Vec<MemberId>,
+) -> Result<OpenProject, String> {
+    let root = project::root_key(&folder);
+    core.adopt_import(parse_id(&target.id)?, &target.name, &root)
+        .await?;
+    switch_project(core, folder, target, true, members).await
+}
+
+/// Deletes `id` if it is an empty placeholder left without a folder by a
+/// switch (see `Core::forget_empty_project`). Anything with a message stays.
+pub async fn forget_placeholder(core: &Core, id: &str) {
+    let Ok(id) = parse_id(id) else {
+        return;
+    };
+    if let Err(e) = core.forget_empty_project(id).await {
+        eprintln!("chaos-control: could not remove an empty project: {e}");
+    }
 }
 
 /// Rewrites the folder's file to name `target` (keeping what is open).

@@ -103,6 +103,9 @@ into one project named "Imported" (fresh UUID, no folder) holding every
 existing channel, with each channel's members as project members. Migrations
 run with foreign keys off around them (SQLite can't drop a referenced table
 otherwise) and each checks `pragma_foreign_key_check` before it commits.
+Migration 3 adds `projects.unclaimed_import`, set only on that "Imported"
+project, so it can be adopted by one folder, once (see Relinking imported
+history below).
 
 **`::N`.** A channel's ordinal is assigned when it is created: the project's
 highest so far plus one, starting at 1 (so a new project's #main is `::1`).
@@ -126,11 +129,25 @@ unit-tested as a pure function):
 | --- | --- | --- |
 | missing (or unreadable) | this folder | relink: open that project, rewrite the file |
 | missing (or unreadable) | nothing | new project, fresh UUID, named after the folder |
+| missing | nothing (or an empty project), with the "Imported" project unclaimed | fresh project open; ask: Use my earlier history here / Start fresh |
 | UUID X | this folder as X | open X; the file's name is the display name |
 | UUID X | this folder as Y | keep Y open and ask in the pane: Keep current / Use the new one / Treat as a new project |
 | UUID X | nothing about X | new local project under X (a cloned repo that shared its file) |
 | UUID X | X, from a folder that is gone | it moved: open X here |
 | UUID X | X, from a folder that still claims it | a copy: open a separate project and ask (Keep it separate / Use X here too) |
+
+**Relinking imported history.** A folder with no file and no project of its
+own (or only an empty one from an earlier unanswered ask), while the
+"Imported" project is still unclaimed and has no folder, opens a fresh
+project and asks in the pane: *Use my earlier history here* adopts the
+import (`Core::adopt_import`: it takes this folder as its root and the
+folder's name, the file is written with its UUID, the flag clears, and the
+empty fresh project is deleted) or *Start fresh* writes the file for the
+fresh project, so this folder never asks again. Only an unrooted, unclaimed
+import is ever offered or adoptable; a project that just lost its folder to
+another one is not. "Use X here too" on the copy question likewise deletes
+the separate project it opened if nothing was said there
+(`Core::forget_empty_project`).
 
 A file the app can't read (bad TOML, a future `version`, an id that isn't a
 UUID) is never overwritten. Nothing switches before the user answers; "Keep
