@@ -181,8 +181,40 @@ impl Engine {
 
     // ---------- setup ----------
 
-    pub fn ensure_channel(&mut self, name: &str, now: Millis) -> rusqlite::Result<Channel> {
-        self.store.tx(|c| store::ensure_channel(c, name, now))
+    /// See [`store::ensure_project`]: creates the project or refreshes its
+    /// name and last-seen folder. Grants nobody anything.
+    pub fn ensure_project(
+        &mut self,
+        id: &ProjectId,
+        name: &str,
+        root: Option<&str>,
+        now: Millis,
+    ) -> rusqlite::Result<Project> {
+        self.store
+            .tx(|c| store::ensure_project(c, id, name, root, now))
+    }
+
+    /// The channel `name` in `project`, created if new. The project must exist.
+    pub fn ensure_channel(
+        &mut self,
+        project: &ProjectId,
+        name: &str,
+        now: Millis,
+    ) -> rusqlite::Result<Channel> {
+        self.store
+            .tx(|c| store::ensure_channel(c, project, name, now))
+    }
+
+    /// Makes `member` a member of `project`, which is what lets it join the
+    /// project's channels.
+    pub fn join_project(
+        &mut self,
+        project: &ProjectId,
+        member: MemberId,
+        now: Millis,
+    ) -> rusqlite::Result<bool> {
+        self.store
+            .tx(|c| store::join_project(c, project, member, now))
     }
 
     pub fn ensure_member(
@@ -294,9 +326,13 @@ impl Engine {
             return Err(PostError::Empty);
         }
         let author = store::member(self.conn(), req.author)?.ok_or(PostError::NotMember)?;
-        store::channel(self.conn(), req.channel)?.ok_or(PostError::UnknownChannel)?;
+        let channel = store::channel(self.conn(), req.channel)?.ok_or(PostError::UnknownChannel)?;
         if !store::is_member(self.conn(), req.channel, author.id)? {
-            if author.kind == MemberKind::Human {
+            // A human posting joins the channel, but only inside a project
+            // they already belong to: posting never grants project access.
+            if author.kind == MemberKind::Human
+                && store::is_project_member(self.conn(), &channel.project, author.id)?
+            {
                 let backfill = self.policy.join_backfill;
                 self.store
                     .tx(|c| store::join(c, req.channel, &author, backfill, now))?;

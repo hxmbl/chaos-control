@@ -28,13 +28,28 @@ pub struct Harness {
 
 pub const T0: Millis = 1_000_000;
 
+/// The project every harness runs in.
+pub const PROJECT: &str = "0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59";
+
+pub fn project_id() -> ProjectId {
+    ProjectId::parse(PROJECT).unwrap()
+}
+
+/// The test project's #main (project created if new).
+pub async fn main_channel(core: &Core) -> Channel {
+    core.ensure_project(project_id(), "Test", None)
+        .await
+        .unwrap();
+    core.channel(&project_id(), "main").await.unwrap()
+}
+
 impl Harness {
     pub async fn new() -> Self {
         let clock = ManualClock::new(T0);
         let (core, events) = Core::start(HostConfig::default(), clock.clone())
             .await
             .expect("core starts");
-        let main = core.channel("main").await.unwrap().id;
+        let main = main_channel(&core).await.id;
         let hx = core.human("hx", "Hx", main).await.unwrap();
         Harness {
             core,

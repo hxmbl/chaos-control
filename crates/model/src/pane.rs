@@ -160,6 +160,23 @@ pub enum PaneContent {
         results: Vec<SearchResult>,
         highlighted: usize,
     },
+    /// The launch folder's `.chaos/project.toml` disagrees with what the app
+    /// remembers about the folder. Nothing switches until the user answers.
+    ProjectIdentity(ProjectQuestion),
+}
+
+/// What the project-identity pane asks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectQuestion {
+    /// `None`: a folder the app knows now names a different project.
+    /// `Some(path)`: the file names a project open from `path`, which still
+    /// claims it, so this folder is a copy.
+    pub copied_from: Option<Arc<str>>,
+    /// What is open now.
+    pub current: Arc<str>,
+    /// What the file names, and its id.
+    pub proposed: Arc<str>,
+    pub proposed_id: Arc<str>,
 }
 
 /// The quick actions panes offer. `Custom` carries an id the opener handles.
@@ -179,6 +196,12 @@ pub enum PaneActionKind {
     OpenResult,
     /// One of a search result's own actions (`SearchAction::id`).
     Custom(Arc<str>),
+    /// Project identity: keep what is open and make the folder's file say so.
+    KeepProject,
+    /// Project identity: open the project the file names.
+    UseProposedProject,
+    /// Project identity: start a new project for this folder.
+    NewProject,
 }
 
 /// A full-width row along the bottom of the pane.
@@ -220,6 +243,10 @@ impl PaneContent {
                 Arc::from(format!("Message #{channel}"))
             }
             PaneContent::Search { .. } => Arc::from("Search"),
+            PaneContent::ProjectIdentity(q) => Arc::from(match q.copied_from {
+                None => "This folder's project changed",
+                Some(_) => "This folder looks like a copy",
+            }),
         }
     }
 
@@ -241,6 +268,20 @@ impl PaneContent {
                 PaneAction::new(Send, "Send"),
                 PaneAction::new(Discard, "Discard draft"),
             ],
+            PaneContent::ProjectIdentity(q) => match q.copied_from {
+                None => vec![
+                    PaneAction::new(KeepProject, "Keep current"),
+                    PaneAction::new(UseProposedProject, "Use the new one"),
+                    PaneAction::new(NewProject, "Treat as a new project"),
+                ],
+                Some(_) => vec![
+                    PaneAction::new(KeepProject, "Keep it separate"),
+                    PaneAction {
+                        kind: UseProposedProject,
+                        label: Arc::from(format!("Use {} here too", q.proposed)),
+                    },
+                ],
+            },
             PaneContent::Search {
                 results,
                 highlighted,
@@ -294,6 +335,32 @@ mod tests {
             body: Arc::from(body),
             reply_to: None,
         }
+    }
+
+    #[test]
+    fn project_identity_offers_the_three_answers() {
+        let q = ProjectQuestion {
+            copied_from: None,
+            current: Arc::from("starpoint"),
+            proposed: Arc::from("everything"),
+            proposed_id: Arc::from("5f0c9d1a-7b2e-4e8f-a1c3-9d8e7f6a5b4c"),
+        };
+        let pane = PaneContent::ProjectIdentity(q.clone());
+        let labels: Vec<_> = pane.actions().into_iter().map(|a| a.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                Arc::from("Keep current"),
+                Arc::from("Use the new one"),
+                Arc::from("Treat as a new project")
+            ]
+        );
+        let copy = PaneContent::ProjectIdentity(ProjectQuestion {
+            copied_from: Some(Arc::from("~/src/everything")),
+            ..q
+        });
+        assert_eq!(copy.actions().len(), 2);
+        assert_eq!(&*copy.title(&sample()), "This folder looks like a copy");
     }
 
     #[test]

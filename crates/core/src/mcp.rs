@@ -4,7 +4,9 @@
 //! Six tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
 //! `chat_react`, `chat_status`. Every call is scoped by a bearer token minted
 //! for one session (agent x channel) and revoked when that session closes. The
-//! author of a post is taken from the token, never from the arguments.
+//! author of a post is taken from the token, never from the arguments. Channel
+//! names and message ids resolve only inside the session channel's project:
+//! anything in another project answers `not_found`, as if it didn't exist.
 //!
 //! Served over streamable HTTP on `127.0.0.1` (stateless, JSON responses) by
 //! `rmcp`. The bridge (`chaos-control mcp-bridge`) reads newline-delimited
@@ -127,7 +129,7 @@ pub fn tools() -> Vec<Tool> {
             "chat_read",
             "Read messages. Default: forward from your read position (this advances it). Use after_seq / before_seq / around (a message id) to page.",
             schema(json!({"type": "object", "properties": {
-                "channel": {"type": "string", "description": "Channel name; defaults to this session's channel."},
+                "channel": {"type": "string", "description": "Channel name in this project; defaults to this session's channel."},
                 "after_seq": {"type": "integer", "minimum": 0},
                 "before_seq": {"type": "integer", "minimum": 1},
                 "around": {"type": "integer", "description": "A message id to centre on."},
@@ -136,7 +138,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "chat_search",
-            "Search messages in channels you are a member of (case-insensitive substring), newest first.",
+            "Search messages in this project's channels you are a member of (case-insensitive substring), newest first.",
             schema(
                 json!({"type": "object", "required": ["query"], "properties": {
                     "query": {"type": "string"},
@@ -223,11 +225,21 @@ fn arg_u64(args: &Value, key: &str) -> Option<u64> {
     args.get(key).and_then(Value::as_u64)
 }
 
+/// The project the session's channel belongs to. Every name an agent passes
+/// resolves inside it, so a channel in another project doesn't exist as far as
+/// the agent can tell.
+fn scope_project(engine: &Engine, scope: Scope) -> Result<ProjectId, ToolError> {
+    Ok(store::channel(engine.conn(), scope.channel)?
+        .ok_or_else(|| ToolError("not_found: no such channel".into()))?
+        .project)
+}
+
 fn channel_arg(engine: &Engine, scope: Scope, args: &Value) -> Result<ChannelId, ToolError> {
     match args.get("channel").and_then(Value::as_str) {
         None => Ok(scope.channel),
         Some(name) => {
-            let ch = store::channel_by_name(engine.conn(), name)?
+            let project = scope_project(engine, scope)?;
+            let ch = store::channel_in_project(engine.conn(), &project, name)?
                 .ok_or_else(|| ToolError("not_found: no such channel".into()))?;
             if store::is_member(engine.conn(), ch.id, scope.agent)? {
                 Ok(ch.id)
@@ -271,6 +283,7 @@ pub fn call_tool(
             Ok(json!({
                 "me": {"handle": me.handle, "name": me.name},
                 "channel": {"name": ch.name, "head_seq": head},
+                "project": store::project(c, &ch.project)?.map(|p| json!({"name": p.name})),
                 "members": members,
                 "cursor": {"delivered_through": cursor.delivered_through, "read_through": cursor.read_through},
                 "norms": "Speak with chat_send (reply_to the message you answer). React ✅ when no words are needed. Mention people only when you need them; no @everyone.",
@@ -330,7 +343,8 @@ pub fn call_tool(
             let channels: Vec<ChannelId> = if args.get("channel").is_some() {
                 vec![channel_arg(engine, scope, args)?]
             } else {
-                store::channels_of(engine.conn(), scope.agent)?
+                let project = scope_project(engine, scope)?;
+                store::channels_of(engine.conn(), scope.agent, &project)?
                     .into_iter()
                     .map(|c| c.id)
                     .collect()
@@ -386,6 +400,15 @@ pub fn call_tool(
                 .and_then(Value::as_str)
                 .filter(|e| !e.trim().is_empty())
                 .ok_or_else(|| ToolError("emoji is required".into()))?;
+            // Only messages in this session's project: an id from another
+            // project reads as unknown, like a channel name would.
+            let project = scope_project(engine, scope)?;
+            let in_scope = store::message(engine.conn(), MessageId(id as i64))?
+                .and_then(|m| store::channel(engine.conn(), m.channel).ok().flatten())
+                .is_some_and(|ch| ch.project == project);
+            if !in_scope {
+                return Err(PostError::UnknownMessage.into());
+            }
             engine.react(now, scope.agent, MessageId(id as i64), emoji.trim())?;
             Ok(json!({"ok": true}))
         }

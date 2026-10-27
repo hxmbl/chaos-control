@@ -17,8 +17,8 @@ immediate-mode elements) instead of a webview.
   component kit.
 - `app`: the binary. One view per region: `Titlebar`, `Sidebar`,
   `RightSidebar` (+ `CatchUp`), `Conversation`, `Composer`, laid out by the
-  root `Workspace` view, plus `PaneHost` (what the pane shows) and the
-  `AppSettings` global.
+  root `Workspace` view, plus `PaneHost` (what the pane shows), the
+  `AppSettings` global and `project` (which project the launch folder is).
 - `core` (`chaos-core`): the agent runtime. SQLite store, delivery engine,
   room policy, the ACP adapter and the chat MCP server. No GPUI: the app is one
   client of it. See [docs/agents.md](docs/agents.md).
@@ -43,8 +43,10 @@ both through `CoreEvent::Agent`; presence is never part of the chat log.
 ## Agents
 
 When an `agents.json` exists, `main.rs` starts `chaos-core` in-process on its
-own two-thread tokio runtime (`agents::start`) and hands the link to
-`ChatStore::attach_core`. From then on #main is core's `main` channel:
+own two-thread tokio runtime (`agents::start`), works out the launch folder's
+project (see Storage model below) and hands the link to
+`ChatStore::attach_core`. From then on the sidebar shows that project's
+channels from core and #main is the project's own `main` channel:
 
 - composer posts in #main go to `Core::post` and appear when core reports them
   back (`CoreEvent::Message`), so the log only ever shows what core stored;
@@ -56,9 +58,103 @@ own two-thread tokio runtime (`agents::start`) and hands the link to
 - the same binary is the stdio MCP bridge for agents that can't take HTTP:
   `chaos-control mcp-bridge` (URL and token in its environment).
 
-Other channels stay local until core grows channel management. The delivery,
-batching, obligation and permission rules are in
-[docs/agents.md](docs/agents.md).
+Only #main is wired to post through core so far; other channels arrive with
+channel management. The delivery, batching, obligation and permission rules are
+in [docs/agents.md](docs/agents.md).
+
+## Storage model
+
+The folder Chaos Control is launched from is the project. A project contains
+channels; each channel is a persistent group conversation.
+
+**Identity travels with the folder; state stays in the app.**
+
+| What | Where | Keyed by |
+| --- | --- | --- |
+| Project id (UUID) and display name | `<folder>/.chaos/project.toml` | n/a |
+| Projects, channels, messages, project and channel membership, cursors, delivery state, sessions | `<data>/core.sqlite` | project UUID, channel id |
+| Agent definitions (command, model, persona) | `<data>/agents.json` | handle (global) |
+
+`<data>` is the app data directory (see Agents above). The file holds nothing
+else, so no chat state ever lands in a repository, and agents working in the
+folder can't edit membership or history by editing files.
+
+```toml
+# Chaos Control project identity. ...
+version = 1
+id = "0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59"
+name = "starpoint"
+```
+
+**Ownership.** Agents (`members`) are global. Membership is per project
+(`project_members`) and per channel (`memberships`). Channels belong to one
+project: names are unique within it (two projects can each have a #main), and
+each channel has a per-project ordinal, its `::N`. Cursors, batches, triggers,
+obligations and sessions hang off channel ids as before.
+
+**Schema (core migration 2).** `projects (id TEXT UUID, name, root_path,
+created_at)`, where `root_path` is the folder it was last opened from and one
+folder maps to at most one project. `channels` gains `project_id` and
+`ordinal`, with `UNIQUE(project_id, name)` and `UNIQUE(project_id, ordinal)`;
+moving uniqueness off `name` is a SQLite table rebuild that keeps every
+channel id, so messages, cursors, obligations and sessions are untouched.
+`project_members (project_id, member_id, joined_at)`. A v1 database migrates
+into one project named "Imported" (fresh UUID, no folder) holding every
+existing channel, with each channel's members as project members. Migrations
+run with foreign keys off around them (SQLite can't drop a referenced table
+otherwise) and each checks `pragma_foreign_key_check` before it commits.
+
+**`::N`.** A channel's ordinal is assigned when it is created: the project's
+highest so far plus one, starting at 1 (so a new project's #main is `::1`).
+It is never reused and renaming doesn't change it. Imported channels are
+numbered in their original id order. The header (top of the chat column)
+shows it under the channel name:
+
+```text
+# main
+~/Projects/everything ::1
+```
+
+**Renaming** changes the display name only, for projects (edit `name` in
+`project.toml`, or `rename_project`) and channels (`rename_channel`): ids,
+ordinals and history stay.
+
+**Trust rules.** `project.toml` is a hint, never a key (`project::decide`,
+unit-tested as a pure function):
+
+| The folder's file | What core knows | Result |
+| --- | --- | --- |
+| missing (or unreadable) | this folder | relink: open that project, rewrite the file |
+| missing (or unreadable) | nothing | new project, fresh UUID, named after the folder |
+| UUID X | this folder as X | open X; the file's name is the display name |
+| UUID X | this folder as Y | keep Y open and ask in the pane: Keep current / Use the new one / Treat as a new project |
+| UUID X | nothing about X | new local project under X (a cloned repo that shared its file) |
+| UUID X | X, from a folder that is gone | it moved: open X here |
+| UUID X | X, from a folder that still claims it | a copy: open a separate project and ask (Keep it separate / Use X here too) |
+
+A file the app can't read (bad TOML, a future `version`, an id that isn't a
+UUID) is never overwritten. Nothing switches before the user answers; "Keep
+current" rewrites the file to name what is open, so it stops asking.
+
+Permissions are enforced in core, not by where files sit:
+
+- joining a channel needs membership of its project, checked by a trigger on
+  `memberships`, so no code path can skip it (`not_a_project_member`);
+- posting never grants it: a human posting joins a channel only inside a
+  project they already belong to;
+- an agent's chat tools resolve channel names, searches and message ids only
+  inside its session's project; anything else answers `not_found`;
+- granting is explicit and only the host does it (`Core::human`,
+  `Core::add_agent`, `Core::join_project`); the app grants the person at the
+  keyboard and the agents in `agents.json` the launch project.
+
+**Git.** `.chaos/` is appended once to the repository's `.git/info/exclude`
+(found by walking up; a worktree's `.git` file is followed to the common git
+dir), never to `.gitignore`. A shared UUID is shared identity, not a shared
+chat: each install keeps its own database until a sync layer exists.
+
+Not built yet: the "Share project identity" action (committing
+`project.toml` on purpose), sync, and a permission editor.
 
 ## State
 

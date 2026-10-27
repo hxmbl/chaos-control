@@ -284,8 +284,80 @@ fn clock(secs: u64) -> SharedString {
     format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60).into()
 }
 
+/// The channel header, Discord style:
+///
+/// ```text
+/// # main
+/// ~/Projects/everything ::1
+/// ```
+///
+/// `::N` is the channel's number within its project (creation order, never
+/// reused, unchanged by renames). Channels that only exist locally have no
+/// number and show the path alone.
+fn header(
+    channel: &model::Channel,
+    project: &model::Project,
+    t: &ui::Theme,
+) -> impl IntoElement + use<> {
+    let place: SharedString = match (&project.path, channel.ordinal) {
+        (Some(path), Some(n)) => format!("{path} ::{n}").into(),
+        (Some(path), None) => path.to_string().into(),
+        (None, Some(n)) => format!("{} ::{n}", project.name).into(),
+        (None, None) => project.name.to_string().into(),
+    };
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .px(px(4.))
+        .pt(px(10.))
+        .pb(px(8.))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.))
+                .text_size(px(17.))
+                .line_height(px(24.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(t.ink)
+                .child(icon(IconName::HashBold, px(17.), t.ink))
+                .child(
+                    div()
+                        .min_w_0()
+                        .ellipsis()
+                        .child(truncated(SharedString::from(channel.name.clone()))),
+                ),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .ellipsis()
+                .text_size(px(12.))
+                .line_height(px(16.))
+                .text_color(t.muted)
+                .child(truncated(place)),
+        )
+}
+
 impl Render for Conversation {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
+        let store = self.store.read(cx);
+        let channel = store.selected_channel();
+        let header = header(channel, &store.workspace().project, &t);
+        let body = self.render_body(cx);
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(header)
+            .child(div().flex_1().min_h_0().child(body))
+    }
+}
+
+impl Conversation {
+    fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = *cx.theme();
         let store = self.store.read(cx);
         let channel = store.selected_channel();

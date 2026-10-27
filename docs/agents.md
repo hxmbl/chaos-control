@@ -195,8 +195,12 @@ else `<data>/agents.json`, where `<data>` is `$CHAOS_CONTROL_DATA`, else
 `~/Library/Application Support/Chaos Control` on macOS or
 `$XDG_DATA_HOME/chaos-control` (`~/.local/share/chaos-control`) elsewhere. The
 database is `<data>/core.sqlite`. Without the file the app runs on sample data
-as before. With it, #main is core's `main` channel: composer posts go through
-core, and configured agents join Agent Status.
+as before. With it, #main is the launch folder's project's own `main` channel
+(each project has one; see "Storage model" in `ARCHITECTURE.md`): composer
+posts go through core, and configured agents are granted that project and
+join Agent Status. An agent's chat tools only see channels and messages of the
+project its session's channel belongs to; a name or id from another project
+answers `not_found`.
 
 ```json
 {

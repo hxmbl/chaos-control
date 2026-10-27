@@ -13,6 +13,11 @@
 //! - agents file: `$CHAOS_CONTROL_AGENTS`, else `<data>/agents.json`;
 //! - database: `<data>/core.sqlite`.
 //!
+//! Core runs the launch folder's project (see `project.rs`): its id comes
+//! from `.chaos/project.toml`, and the human and every agent are granted that
+//! project and joined to its own #main. Other projects' channels stay out of
+//! reach of this run's agents.
+//!
 //! `agents.json`:
 //!
 //! ```json
@@ -33,18 +38,24 @@
 //! `chat_tools` is `"auto"` (HTTP when the agent offers it, else the stdio
 //! bridge) or `"stdio"` (always `chaos-control mcp-bridge`).
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chaos_core::{
     acp::{AcpAdapter, ChatToolsPreference, SpawnTransport},
     adapter::BridgeCommand,
     engine::CoreEvent,
     host::{AgentSpec, Core, HostConfig, SystemClock},
-    types::{ChannelId, MemberId},
+    types::{Channel, ChannelId, MemberId, Project, ProjectId},
 };
 use model::Brand;
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::project::{self, Confirm, FileState, Known, Plan, Target};
 
 #[derive(Debug, Deserialize)]
 pub struct AgentsConfig {
@@ -106,17 +117,40 @@ pub struct LinkedAgent {
     pub brand: Brand,
 }
 
+/// The project this run shows, as core has it.
+#[derive(Clone, Debug)]
+pub struct OpenProject {
+    pub project: Project,
+    /// Its #main, behind the app's #main.
+    pub main: Channel,
+    /// All its channels, in `::N` order.
+    pub channels: Vec<Channel>,
+    /// Every project core knows, for the picker.
+    pub all: Vec<Project>,
+}
+
 /// A running core plus what the app needs to talk to it.
 pub struct CoreLink {
     pub core: Core,
-    /// Core's channel behind the app's #main.
-    pub main: ChannelId,
+    /// The launch folder (the project's root).
+    pub folder: PathBuf,
+    pub open: OpenProject,
+    /// An identity question for the user (see `project::decide`), if the
+    /// folder's file disagreed with what core remembers.
+    pub confirm: Option<Confirm>,
     /// The human at this keyboard.
     pub human: MemberId,
     pub agents: Vec<LinkedAgent>,
     pub events: Option<UnboundedReceiver<CoreEvent>>,
     /// Keeps core's tasks alive for as long as the app holds the link.
     _runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl CoreLink {
+    /// Core's channel behind the app's #main.
+    pub fn main(&self) -> ChannelId {
+        self.open.main.id
+    }
 }
 
 pub fn data_dir() -> PathBuf {
@@ -201,9 +235,12 @@ pub fn start_with(config: AgentsConfig) -> Result<CoreLink, String> {
         default_cwd: std::env::current_dir().unwrap_or_else(|_| data.clone()),
         ..HostConfig::default()
     };
-    let (core, events, main, human, agents) = runtime.block_on(async {
+    let folder = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
+    let (core, events, open, confirm, human, agents) = runtime.block_on(async {
         let (core, events) = Core::start(host, Arc::new(SystemClock)).await?;
-        let main = core.channel("main").await?.id;
+        let plan = plan_for(&core, &folder).await?;
+        let project = apply_plan(&core, &folder, &plan.open, plan.write_file).await?;
+        let main = core.channel(&project.id, "main").await?.id;
         let human = core
             .human(&config.human.handle, &config.human.name, main)
             .await?
@@ -240,16 +277,137 @@ pub fn start_with(config: AgentsConfig) -> Result<CoreLink, String> {
                 brand: parse_brand(a.brand.as_deref()),
             });
         }
-        Ok::<_, String>((core, events, main, human, agents))
+        let open = describe(&core, project).await?;
+        Ok::<_, String>((core, events, open, plan.confirm, human, agents))
     })?;
     Ok(CoreLink {
         core,
-        main,
+        folder,
+        open,
+        confirm,
         human,
         agents,
         events: Some(events),
         _runtime: Arc::new(runtime),
     })
+}
+
+fn known(p: &Project) -> Known {
+    Known {
+        id: p.id.to_string(),
+        name: p.name.to_string(),
+        root: p.root_path.as_deref().map(str::to_string),
+    }
+}
+
+fn parse_id(id: &str) -> Result<ProjectId, String> {
+    ProjectId::parse(id).ok_or_else(|| format!("{id:?} is not a project id"))
+}
+
+/// Reads the folder's `.chaos/project.toml`, asks core what it knows about
+/// the folder and the file's UUID, and decides (see `project::decide`).
+async fn plan_for(core: &Core, folder: &Path) -> Result<Plan, String> {
+    let file = project::read(folder, |s| ProjectId::parse(s).map(|p| p.to_string()));
+    if let FileState::Unusable(why) = &file {
+        eprintln!(
+            "chaos-control: ignoring {} ({why}); it is left as it is",
+            project::file_path(folder).display()
+        );
+    }
+    let root = project::root_key(folder);
+    let by_root = core.project_by_root(&root).await?.map(|p| known(&p));
+    let mut by_file_id = None;
+    let mut other_root_still_claims_it = false;
+    if let FileState::Present(f) = &file {
+        by_file_id = core.project(parse_id(&f.id)?).await?.map(|p| known(&p));
+        if let Some(other) = by_file_id.as_ref().and_then(|k| k.root.clone())
+            && other != root
+        {
+            other_root_still_claims_it = matches!(
+                project::read(Path::new(&other), |s| ProjectId::parse(s).map(|p| p.to_string())),
+                FileState::Present(o) if o.id == f.id
+            );
+        }
+    }
+    let fresh = uuid::Uuid::new_v4().to_string();
+    let name = project::folder_name(folder);
+    let plan = project::decide(&project::Inputs {
+        file: &file,
+        by_root: by_root.as_ref(),
+        by_file_id: by_file_id.as_ref(),
+        other_root_still_claims_it,
+        folder_name: &name,
+        fresh_id: &fresh,
+    });
+    Ok(plan)
+}
+
+/// Records `target` in core as this folder's project, writes the file when
+/// asked and keeps `.chaos/` out of git. Grants nobody anything.
+async fn apply_plan(
+    core: &Core,
+    folder: &Path,
+    target: &Target,
+    write_file: bool,
+) -> Result<Project, String> {
+    let root = project::root_key(folder);
+    let project = core
+        .ensure_project(parse_id(&target.id)?, &target.name, Some(&root))
+        .await?;
+    if write_file && let Err(e) = project::write(folder, target) {
+        eprintln!(
+            "chaos-control: could not write {}: {e}",
+            project::file_path(folder).display()
+        );
+    }
+    if folder.join(project::DIR).is_dir()
+        && let Err(e) = project::exclude_from_git(folder)
+    {
+        eprintln!("chaos-control: could not add .chaos/ to .git/info/exclude: {e}");
+    }
+    Ok(project)
+}
+
+/// The project's #main, its channels and the picker list.
+async fn describe(core: &Core, project: Project) -> Result<OpenProject, String> {
+    let main = core.channel(&project.id, "main").await?;
+    let channels = core.channels(&project.id).await?;
+    let all = core.projects().await?;
+    Ok(OpenProject {
+        project,
+        main,
+        channels,
+        all,
+    })
+}
+
+/// Opens `target` as this folder's project in a running core (the user's
+/// answer to an identity question): records it, grants the human and the
+/// agents the project, joins them to its #main and describes it.
+pub async fn switch_project(
+    core: Core,
+    folder: PathBuf,
+    target: Target,
+    write_file: bool,
+    members: Vec<MemberId>,
+) -> Result<OpenProject, String> {
+    let project = apply_plan(&core, &folder, &target, write_file).await?;
+    let main = core.channel(&project.id, "main").await?;
+    for m in members {
+        core.join_project(&project.id, m).await?;
+        core.join(m, main.id).await?;
+    }
+    describe(&core, project).await
+}
+
+/// Rewrites the folder's file to name `target` (keeping what is open).
+pub fn keep(folder: &Path, target: &Target) {
+    if let Err(e) = project::write(folder, target) {
+        eprintln!(
+            "chaos-control: could not write {}: {e}",
+            project::file_path(folder).display()
+        );
+    }
 }
 
 #[cfg(test)]

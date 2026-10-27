@@ -239,14 +239,103 @@ impl Core {
         wait.await.map_err(|_| GONE.to_string())
     }
 
-    pub async fn channel(&self, name: &str) -> Result<Channel, String> {
-        let name = name.to_string();
-        self.with_engine(move |e, now| e.ensure_channel(&name, now))
+    /// Creates the project `id` or refreshes its display name and the folder
+    /// it was last seen in (`root`). Deciding *which* id a folder gets, and
+    /// asking the user when that changes, is the caller's job; this grants
+    /// no one access to anything.
+    pub async fn ensure_project(
+        &self,
+        id: ProjectId,
+        name: &str,
+        root: Option<&str>,
+    ) -> Result<Project, String> {
+        let (name, root) = (name.to_string(), root.map(str::to_string));
+        self.with_engine(move |e, now| e.ensure_project(&id, &name, root.as_deref(), now))
             .await?
             .map_err(|e| e.to_string())
     }
 
-    /// A human member, created if new, joined to `channel`.
+    pub async fn project(&self, id: ProjectId) -> Result<Option<Project>, String> {
+        self.with_engine(move |e, _| crate::store::project(e.conn(), &id))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// The project last opened from `root`, if any.
+    pub async fn project_by_root(&self, root: &str) -> Result<Option<Project>, String> {
+        let root = root.to_string();
+        self.with_engine(move |e, _| crate::store::project_by_root(e.conn(), &root))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Every project, oldest first.
+    pub async fn projects(&self) -> Result<Vec<Project>, String> {
+        self.with_engine(|e, _| crate::store::projects(e.conn()))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Renames a project. Its id, channels and history stay.
+    pub async fn rename_project(&self, id: ProjectId, name: &str) -> Result<(), String> {
+        let name = name.to_string();
+        self.with_engine(move |e, _| crate::store::rename_project(e.conn(), &id, &name))
+            .await?
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// The channel `name` in `project`, created if new. Channel names are
+    /// only unique within a project.
+    pub async fn channel(&self, project: &ProjectId, name: &str) -> Result<Channel, String> {
+        let (project, name) = (project.clone(), name.to_string());
+        self.with_engine(move |e, now| e.ensure_channel(&project, &name, now))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// A project's channels, in `::N` order.
+    pub async fn channels(&self, project: &ProjectId) -> Result<Vec<Channel>, String> {
+        let project = project.clone();
+        self.with_engine(move |e, _| crate::store::channels_in_project(e.conn(), &project))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Renames a channel. Its id, `::N` and history stay.
+    pub async fn rename_channel(&self, channel: ChannelId, name: &str) -> Result<(), String> {
+        let name = name.to_string();
+        self.with_engine(move |e, _| crate::store::rename_channel(e.conn(), channel, &name))
+            .await?
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Grants `member` membership of `project` (the permission to join its
+    /// channels).
+    pub async fn join_project(&self, project: &ProjectId, member: MemberId) -> Result<(), String> {
+        let project = project.clone();
+        self.with_engine(move |e, now| e.join_project(&project, member, now))
+            .await?
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Joins `member` to `channel`. Refused (`not_a_project_member`) unless
+    /// the member already belongs to the channel's project.
+    pub async fn join(&self, member: MemberId, channel: ChannelId) -> Result<(), String> {
+        self.with_engine(move |e, now| {
+            let m = crate::store::member(e.conn(), member)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            e.join(channel, &m, now)
+        })
+        .await?
+        .map_err(|e| e.to_string())
+    }
+
+    /// A human member, created if new, made a member of `channel`'s project
+    /// and joined to `channel`. Calling this is the host granting that
+    /// person the project (the person at the keyboard, for the app).
     pub async fn human(
         &self,
         handle: &str,
@@ -256,6 +345,9 @@ impl Core {
         let (handle, name) = (handle.to_string(), name.to_string());
         self.with_engine(move |e, now| {
             let m = e.ensure_member(MemberKind::Human, &handle, &name)?;
+            let ch = crate::store::channel(e.conn(), channel)?
+                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+            e.join_project(&ch.project, m.id, now)?;
             e.join(channel, &m, now)?;
             Ok::<_, rusqlite::Error>(m)
         })
@@ -265,6 +357,9 @@ impl Core {
 
     /// Adds an agent to `channel` (joins it with the backfill cursor and runs
     /// the adapter's probe). No session starts until the agent is woken.
+    ///
+    /// This is the host's explicit grant: the agent also becomes a member of
+    /// the channel's project. Nothing an agent does can reach this path.
     pub async fn add_agent(&self, spec: AgentSpec, channel: ChannelId) -> Result<Member, String> {
         let (reply, wait) = oneshot::channel();
         self.tx
@@ -503,6 +598,13 @@ impl Actor {
         let member = self
             .engine
             .ensure_member(MemberKind::Agent, &spec.handle, &spec.name)
+            .map_err(|e| e.to_string())?;
+        let project = crate::store::channel(self.engine.conn(), channel)
+            .map_err(|e| e.to_string())?
+            .ok_or("no such channel")?
+            .project;
+        self.engine
+            .join_project(&project, member.id, now)
             .map_err(|e| e.to_string())?;
         self.engine
             .join(channel, &member, now)

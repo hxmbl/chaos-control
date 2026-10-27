@@ -3,7 +3,7 @@
 
 mod common;
 
-use chaos_core::mcp;
+use chaos_core::{mcp, types::ProjectId};
 use common::*;
 use serde_json::json;
 
@@ -168,4 +168,113 @@ async fn chat_send_is_rate_limited_per_agent() {
         results[6]
     );
     assert_eq!(h.by(bot.id).await.len(), 6);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_names_resolve_only_inside_the_sessions_project() {
+    let mut h = Harness::new().await;
+    let bot = h.agent("bot", script(json!({"turns": []}))).await;
+    let core = h.core.clone();
+    // A second project with its own #main and a channel only it has. The bot
+    // and hx are members there too, so only the project boundary separates
+    // them.
+    let other = ProjectId::parse("5f0c9d1a-7b2e-4e8f-a1c3-9d8e7f6a5b4c").unwrap();
+    core.ensure_project(other.clone(), "Other", None)
+        .await
+        .unwrap();
+    let other_main = core.channel(&other, "main").await.unwrap();
+    let only_there = core.channel(&other, "secret").await.unwrap();
+    core.human("hx", "Hx", other_main.id).await.unwrap();
+    core.join_project(&other, bot.id).await.unwrap();
+    core.join(bot.id, other_main.id).await.unwrap();
+    core.join(bot.id, only_there.id).await.unwrap();
+    let theirs = core
+        .post(h.hx.id, only_there.id, "deploy keys are in the vault", None)
+        .await
+        .unwrap();
+    core.post(
+        h.hx.id,
+        other_main.id,
+        "deploy from the other project",
+        None,
+    )
+    .await
+    .unwrap();
+    h.say("deploy went out").await;
+
+    let scope = mcp::Scope {
+        agent: bot.id,
+        channel: h.main,
+        epoch: 0,
+    };
+    // "main" is this project's #main, never the other one.
+    let read = core
+        .tool(
+            scope,
+            "chat_read",
+            json!({"channel": "main", "after_seq": 0}),
+        )
+        .await
+        .unwrap();
+    let bodies: Vec<_> = read["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["body"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(bodies, vec!["deploy went out"]);
+    // A channel that exists only in the other project doesn't exist here.
+    for tool in ["chat_read", "chat_search"] {
+        let err = core
+            .tool(scope, tool, json!({"channel": "secret", "query": "deploy"}))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with("not_found"), "{tool}: {err}");
+    }
+    // Search across "all my channels" stays inside the project.
+    let search = core
+        .tool(scope, "chat_search", json!({"query": "deploy"}))
+        .await
+        .unwrap();
+    let hits = search["hits"].as_array().unwrap();
+    assert_eq!(hits.len(), 1, "{search}");
+    assert_eq!(hits[0]["channel"], json!("main"));
+    // Message ids from the other project read as unknown too.
+    let err = core
+        .tool(
+            scope,
+            "chat_react",
+            json!({"message_id": theirs.id.0, "emoji": "👀"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("unknown message") || err.contains("no such message"),
+        "{err}"
+    );
+    let ctx = core.tool(scope, "chat_context", json!({})).await.unwrap();
+    assert_eq!(ctx["project"]["name"], json!("Test"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn joining_a_channel_requires_project_membership() {
+    let h = Harness::new().await;
+    let core = h.core.clone();
+    let other = ProjectId::parse("5f0c9d1a-7b2e-4e8f-a1c3-9d8e7f6a5b4c").unwrap();
+    core.ensure_project(other.clone(), "Other", None)
+        .await
+        .unwrap();
+    let other_main = core.channel(&other, "main").await.unwrap();
+    // hx belongs to the test project only.
+    let err = core.join(h.hx.id, other_main.id).await.unwrap_err();
+    assert!(err.contains("not_a_project_member"), "{err}");
+    // Posting doesn't sneak a human in either.
+    let err = core
+        .post(h.hx.id, other_main.id, "let me in", None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a member"), "{err}");
+    core.join_project(&other, h.hx.id).await.unwrap();
+    core.join(h.hx.id, other_main.id).await.unwrap();
+    core.post(h.hx.id, other_main.id, "in", None).await.unwrap();
 }
