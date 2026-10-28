@@ -109,9 +109,9 @@ pub const TOOL_NAMES: [&str; 8] = [
     "chat_search",
     "chat_send",
     "chat_react",
-    "chat_status",
     "chat_refuse",
     "chat_dissent",
+    "chat_status",
 ];
 
 fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
