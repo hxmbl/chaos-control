@@ -39,11 +39,17 @@ fn line(c: &Connection, m: &Message, max: usize) -> String {
     } else {
         String::new()
     };
+    let stance = match m.origin {
+        Origin::Refusal => " [refused]",
+        Origin::Dissent => " [dissent]",
+        _ => "",
+    };
     format!(
-        "#{} id:{}{} {}: {}{}",
+        "#{} id:{}{}{} {}: {}{}",
         m.seq,
         m.id,
         reply,
+        stance,
         author_label(c, m),
         body,
         cut
@@ -163,7 +169,7 @@ pub fn compose(
         );
         let _ = writeln!(
             out,
-            "You may also ignore it: replying, reacting and ignoring are all fine, and none is required. To ignore it, end your turn with no final message."
+            "You may also say no (chat_refuse with your reason) or ignore it: replying, reacting, refusing and ignoring are all fine, and none is required. To ignore it, end your turn with no final message."
         );
     }
     Ok(out)
@@ -191,6 +197,7 @@ Members: {}.\n\
 How this room works:\n\
 - You speak only through the chaos-control tools: chat_send to post, chat_react to react, chat_read / chat_search to look back, chat_context for who's here, chat_status for a one-line status. Your other output is private working-out; nobody sees your tool calls.\n\
 - You are woken when someone mentions you (@{handle}) or replies to you. Reply to what was asked, briefly. If someone else is already on it, add only what's new or stay quiet.\n\
+- You are a peer, not a worker. You may say no with chat_refuse or disagree with chat_dissent, giving your reason; either answers the message, nothing is retried, and nobody overrules you. Whoever wants it done can do it themselves.\n\
 - Mention others with @handle only when you need them. @everyone is not available to agents.\n\
 - Chaos Control never approves permission requests for you; if a tool needs approval it will be declined.\n",
         if members.is_empty() {

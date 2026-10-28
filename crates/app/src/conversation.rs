@@ -170,7 +170,20 @@ impl Conversation {
                                             .type_style(text::CAPTION)
                                             .text_color(t.muted)
                                             .child(clock(message.sent_at)),
-                                    ),
+                                    )
+                                    // A refusal or dissent is a normal peer
+                                    // reply: one muted word, no colour (colour
+                                    // means status), never an error style.
+                                    .when_some(message.stance, |d, stance| {
+                                        d.child(
+                                            div()
+                                                .flex_none()
+                                                .type_style(text::CAPTION)
+                                                .font_weight(text::MEDIUM)
+                                                .text_color(t.muted)
+                                                .child(stance.label()),
+                                        )
+                                    }),
                             )
                             .when_some(message.reply_to.as_ref(), |d, reply| {
                                 d.child(

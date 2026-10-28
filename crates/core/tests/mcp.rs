@@ -133,7 +133,10 @@ async fn stdio_bridge_round_trips_json_rpc() {
         3,
         "one answer per request, none for the notification: {out}"
     );
-    assert_eq!(lines[1]["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(
+        lines[1]["result"]["tools"].as_array().unwrap().len(),
+        mcp::TOOL_NAMES.len()
+    );
     assert_eq!(lines[2]["result"]["isError"], json!(false));
     let m = h.wait_message("bridged post", Some(bot.id)).await;
     assert_eq!(&*m.body, "via the bridge");

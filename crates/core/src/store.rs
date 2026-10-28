@@ -228,6 +228,40 @@ FROM obligations;
 DROP TABLE obligations;
 ALTER TABLE obligations_v2 RENAME TO obligations;
 "#,
+    // 5: refusal and dissent as peer actions (STRM-343). Obligations gain the
+    // `refused` state (table rebuild for the CHECK, rows copied as they are),
+    // and `stances` records who said no or disagreed, on what, with which
+    // model and why. One stance per message that states it.
+    r#"
+CREATE TABLE obligations_v3 (
+    agent_id       INTEGER NOT NULL,
+    channel_id     INTEGER NOT NULL,
+    message_id     INTEGER NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN ('open', 'satisfied', 'fallback', 'unmet', 'ignored', 'refused')),
+    resolved_by    INTEGER REFERENCES messages(id),
+    resolved_kind  TEXT,
+    PRIMARY KEY (agent_id, channel_id, message_id),
+    FOREIGN KEY (agent_id, channel_id, message_id)
+        REFERENCES triggers (agent_id, channel_id, message_id)
+);
+INSERT INTO obligations_v3 SELECT agent_id, channel_id, message_id, state, resolved_by, resolved_kind
+FROM obligations;
+DROP TABLE obligations;
+ALTER TABLE obligations_v3 RENAME TO obligations;
+CREATE TABLE stances (
+    message_id  INTEGER PRIMARY KEY NOT NULL REFERENCES messages(id),
+    channel_id  INTEGER NOT NULL REFERENCES channels(id),
+    kind        TEXT NOT NULL CHECK (kind IN ('refusal', 'dissent')),
+    member_id   INTEGER NOT NULL REFERENCES members(id),
+    target_id   INTEGER NOT NULL REFERENCES messages(id),
+    reason      TEXT NOT NULL,
+    model       TEXT,
+    runtime     TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX stances_by_channel ON stances (channel_id, message_id);
+CREATE INDEX stances_by_target ON stances (target_id);
+"#,
 ];
 
 pub struct Store {
@@ -1285,6 +1319,67 @@ pub fn open_obligations(c: &Connection, batch: BatchId) -> Result<Vec<TriggerId>
     .collect()
 }
 
+// ---------- stances ----------
+
+const STANCE_COLS: &str =
+    "message_id, channel_id, kind, member_id, target_id, reason, model, runtime, created_at";
+
+fn stance_from_row(r: &Row<'_>) -> Result<Stance> {
+    Ok(Stance {
+        message: MessageId(r.get(0)?),
+        channel: ChannelId(r.get(1)?),
+        kind: StanceKind::parse(&r.get::<_, String>(2)?),
+        member: MemberId(r.get(3)?),
+        target: MessageId(r.get(4)?),
+        reason: Arc::from(r.get::<_, String>(5)?),
+        model: r.get::<_, Option<String>>(6)?.map(Arc::from),
+        runtime: r.get::<_, Option<String>>(7)?.map(Arc::from),
+        created_at: r.get::<_, i64>(8)? as Millis,
+    })
+}
+
+/// Records a stance. A second record for the same message is a no-op (the
+/// `chat_*` request-id dedup can hand back an existing message).
+pub fn insert_stance(c: &Connection, s: &Stance) -> Result<()> {
+    c.execute(
+        &format!("INSERT OR IGNORE INTO stances ({STANCE_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"),
+        params![
+            s.message.0,
+            s.channel.0,
+            s.kind.as_str(),
+            s.member.0,
+            s.target.0,
+            &*s.reason,
+            s.model.as_deref(),
+            s.runtime.as_deref(),
+            s.created_at as i64
+        ],
+    )?;
+    Ok(())
+}
+
+/// The stance a message states, if it states one.
+pub fn stance(c: &Connection, message: MessageId) -> Result<Option<Stance>> {
+    c.query_row(
+        &format!("SELECT {STANCE_COLS} FROM stances WHERE message_id = ?1"),
+        [message.0],
+        stance_from_row,
+    )
+    .optional()
+}
+
+/// The newest `limit` stances in a channel, oldest first.
+pub fn recent_stances(c: &Connection, channel: ChannelId, limit: usize) -> Result<Vec<Stance>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {STANCE_COLS} FROM stances WHERE channel_id = ?1 ORDER BY message_id DESC LIMIT ?2"
+    ))?;
+    let mut v = stmt
+        .query_map(params![channel.0, limit as i64], stance_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    v.reverse();
+    Ok(v)
+}
+
 /// Resolves an obligation only if it is still open. Returns whether it changed.
 pub fn resolve_obligation(
     c: &Connection,
@@ -1840,6 +1935,75 @@ mod tests {
             obligation_state(c, t).unwrap(),
             Some(ObligationState::Ignored)
         );
+        let fk: i64 = c
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk, 0);
+    }
+
+    #[test]
+    fn a_v4_database_gains_stances_and_the_refused_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        for m in &MIGRATIONS[..4] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.execute_batch(
+            r#"
+            PRAGMA user_version = 4;
+            INSERT INTO projects (id, name, root_path, created_at) VALUES
+                ('0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'P', NULL, 1);
+            INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES
+                (3, '0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'main', 1, 1);
+            INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx'), (2, 'agent', 'bot', 'Bot');
+            INSERT INTO messages (id, channel_id, seq, author_id, origin, body, sent_at) VALUES
+                (10, 3, 1, 1, 'composer', '@bot hi', 1000),
+                (11, 3, 2, 2, 'refusal', 'no', 1001);
+            INSERT INTO batches (id, agent_id, channel_id, state, created_at) VALUES (4, 2, 3, 'settled', 1000);
+            INSERT INTO triggers VALUES (2, 3, 10, 'mention', 0, 4, 1000);
+            INSERT INTO obligations VALUES (2, 3, 10, 'ignored', NULL, 'ignored');
+            "#,
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let c = s.conn();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let t = TriggerId {
+            agent: MemberId(2),
+            channel: ChannelId(3),
+            message: MessageId(10),
+        };
+        assert_eq!(
+            obligation_state(c, t).unwrap(),
+            Some(ObligationState::Ignored),
+            "rows copied as they are"
+        );
+        c.execute(
+            "UPDATE obligations SET state = 'refused' WHERE message_id = 10",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            obligation_state(c, t).unwrap(),
+            Some(ObligationState::Refused)
+        );
+        let st = Stance {
+            message: MessageId(11),
+            channel: ChannelId(3),
+            kind: StanceKind::Refusal,
+            member: MemberId(2),
+            target: MessageId(10),
+            reason: Arc::from("no"),
+            model: Some(Arc::from("m")),
+            runtime: None,
+            created_at: 1001,
+        };
+        insert_stance(c, &st).unwrap();
+        insert_stance(c, &st).unwrap();
+        assert_eq!(stance(c, MessageId(11)).unwrap(), Some(st.clone()));
+        assert_eq!(recent_stances(c, ChannelId(3), 10).unwrap(), vec![st]);
+        assert_eq!(stance(c, MessageId(10)).unwrap(), None);
         let fk: i64 = c
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)

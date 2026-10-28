@@ -139,6 +139,13 @@ pub enum Origin {
     Fallback,
     /// A runtime notice ("Pausing @a and @b ..."). Never wakes anyone.
     System,
+    /// A member declined what a message asked of them (`chat_refuse`). A
+    /// legitimate reply: it answers a reply obligation as `refused`. The
+    /// details (who, model, reasoning) are a [`Stance`] row.
+    Refusal,
+    /// A member disagreed with a message (`chat_dissent`). Answers a reply
+    /// obligation like any reply; recorded as a [`Stance`] row.
+    Dissent,
 }
 
 impl Origin {
@@ -148,6 +155,8 @@ impl Origin {
             Origin::ChatTool => "chat_tool",
             Origin::Fallback => "fallback",
             Origin::System => "system",
+            Origin::Refusal => "refusal",
+            Origin::Dissent => "dissent",
         }
     }
 
@@ -156,6 +165,8 @@ impl Origin {
             "chat_tool" => Origin::ChatTool,
             "fallback" => Origin::Fallback,
             "system" => Origin::System,
+            "refusal" => Origin::Refusal,
+            "dissent" => Origin::Dissent,
             _ => Origin::Composer,
         }
     }
@@ -293,6 +304,9 @@ pub enum ObligationState {
     /// The agent finished its turn without replying or reacting: it read the
     /// ping and chose to let it go. Legitimate, never retried, not owed.
     Ignored,
+    /// The agent said no (`chat_refuse`). A legitimate answer: never a
+    /// failure, never retried, no fallback reply.
+    Refused,
 }
 
 impl ObligationState {
@@ -303,6 +317,7 @@ impl ObligationState {
             ObligationState::Fallback => "fallback",
             ObligationState::Unmet => "unmet",
             ObligationState::Ignored => "ignored",
+            ObligationState::Refused => "refused",
         }
     }
 
@@ -312,6 +327,7 @@ impl ObligationState {
             "fallback" => ObligationState::Fallback,
             "unmet" => ObligationState::Unmet,
             "ignored" => ObligationState::Ignored,
+            "refused" => ObligationState::Refused,
             _ => ObligationState::Open,
         }
     }
@@ -329,4 +345,60 @@ pub struct Receipt {
     pub channel: ChannelId,
     pub read_through: Seq,
     pub read_at: Millis,
+}
+
+/// A peer's position on a message: no, or disagreement. Humans and agents
+/// alike can take one; nobody overrules it (there is no single decider).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StanceKind {
+    /// "I won't do this." Answers what was asked; never retried.
+    Refusal,
+    /// "I disagree." The conversation continues.
+    Dissent,
+}
+
+impl StanceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StanceKind::Refusal => "refusal",
+            StanceKind::Dissent => "dissent",
+        }
+    }
+
+    pub fn parse(s: &str) -> StanceKind {
+        match s {
+            "refusal" => StanceKind::Refusal,
+            _ => StanceKind::Dissent,
+        }
+    }
+
+    /// The message origin that carries this stance in the chat.
+    pub fn origin(self) -> Origin {
+        match self {
+            StanceKind::Refusal => Origin::Refusal,
+            StanceKind::Dissent => Origin::Dissent,
+        }
+    }
+}
+
+/// A refusal or dissent as recorded: who took it, on what, with which model
+/// and why. Durable and attributed, so it outlives any agent's context
+/// compaction (`chat_context` lists recent ones; `chat_read` attaches them).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Stance {
+    /// The chat message that states it (origin `refusal` or `dissent`).
+    pub message: MessageId,
+    pub channel: ChannelId,
+    pub kind: StanceKind,
+    pub member: MemberId,
+    /// The message it is about.
+    pub target: MessageId,
+    pub reason: Arc<str>,
+    /// The model, as the member reported it (agents only; `None` if unsaid).
+    pub model: Option<Arc<str>>,
+    /// What the agent runtime called itself in the handshake, e.g.
+    /// "claude-agent-acp" (recorded by core, not by the agent).
+    pub runtime: Option<Arc<str>>,
+    pub created_at: Millis,
 }

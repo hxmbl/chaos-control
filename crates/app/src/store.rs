@@ -14,7 +14,7 @@ use chaos_core::{engine::CoreEvent, types as ct};
 use gpui::{Context, EventEmitter, Task};
 use model::{
     Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PaneActionKind, PaneContent,
-    ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus, Workspace,
+    ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus, Stance, Workspace,
 };
 
 use crate::{
@@ -270,6 +270,7 @@ impl ChatStore {
             sent_at,
             body: Arc::from(body),
             reply_to,
+            stance: None,
         };
         self.append(self.selected, vec![message], cx);
     }
@@ -574,6 +575,11 @@ impl ChatStore {
                     sent_at: m.sent_at / 1000,
                     body: m.body.clone(),
                     reply_to,
+                    stance: match m.origin {
+                        ct::Origin::Refusal => Some(Stance::Refusal),
+                        ct::Origin::Dissent => Some(Stance::Dissent),
+                        _ => None,
+                    },
                 };
                 let ix = self.logs.get(&channel).map_or(0, |l| l.len());
                 // A receipt already past this message moves down onto it.
@@ -643,6 +649,7 @@ impl ChatStore {
             sent_at,
             body: Arc::from(body),
             reply_to: None,
+            stance: None,
         };
         self.append(self.selected, vec![message], cx);
     }

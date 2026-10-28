@@ -230,6 +230,7 @@ mod tests {
             sent_at,
             body: Arc::from(body),
             reply_to: None,
+            stance: None,
         }
     }
 

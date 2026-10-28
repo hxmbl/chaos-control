@@ -105,6 +105,20 @@ pub struct PostRequest<'a> {
     pub client_request_id: Option<&'a str>,
 }
 
+/// A refusal or dissent (see [`Engine::take_stance`]).
+pub struct StanceRequest<'a> {
+    pub author: MemberId,
+    pub channel: ChannelId,
+    pub kind: StanceKind,
+    /// The message the stance is about. Must be in `channel`.
+    pub target: MessageId,
+    /// Why, in the member's own words. Posted as the message body.
+    pub reason: &'a str,
+    /// The model, as the member reports it.
+    pub model: Option<&'a str>,
+    pub client_request_id: Option<&'a str>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Posted {
     pub message: Message,
@@ -138,6 +152,8 @@ struct Rt {
     idle_since: Option<Millis>,
     /// Messages the agent posted during the in-flight turn.
     sent_in_turn: Vec<(MessageId, Arc<str>)>,
+    /// What the agent runtime called itself in the last handshake.
+    runtime: Option<Arc<str>>,
     last_status: Option<(Glow, Option<Arc<str>>)>,
 }
 
@@ -378,7 +394,12 @@ impl Engine {
                 return Err(PostError::UnknownMessage);
             }
         }
-        if author.kind == MemberKind::Agent && req.origin == Origin::ChatTool {
+        if author.kind == MemberKind::Agent
+            && matches!(
+                req.origin,
+                Origin::ChatTool | Origin::Refusal | Origin::Dissent
+            )
+        {
             self.pstate
                 .take_post_token(&self.policy, author.id, req.channel, now)
                 .map_err(|retry_after_ms| PostError::RateLimited { retry_after_ms })?;
@@ -531,14 +552,15 @@ impl Engine {
             }
         }
         if let Some(t) = target {
+            // A refusal is an answer like any other: it closes the obligation
+            // (as `refused`), so there is no fallback and no retry.
+            let (state, kind) = match message.origin {
+                Origin::Refusal => (ObligationState::Refused, "refusal"),
+                Origin::Dissent => (ObligationState::Satisfied, "dissent"),
+                _ => (ObligationState::Satisfied, "send"),
+            };
             self.store.tx::<_, PostError>(|c| {
-                store::resolve_obligation(
-                    c,
-                    t,
-                    ObligationState::Satisfied,
-                    Some(message.id),
-                    "send",
-                )?;
+                store::resolve_obligation(c, t, state, Some(message.id), kind)?;
                 Ok(())
             })?;
         }
@@ -723,6 +745,67 @@ impl Engine {
         Ok(())
     }
 
+    /// A member refuses or dissents from `target`: posts `reason` as a reply
+    /// to it (origin `refusal` / `dissent`) and records the stance with who,
+    /// what, the model and the runtime. Goes through [`Engine::post`], so
+    /// membership, rate limits, mentions, hops and obligations all apply; a
+    /// refusal answers the author's reply obligation on `target` as
+    /// `refused`. Nobody is asked to overrule it.
+    pub fn take_stance(
+        &mut self,
+        now: Millis,
+        req: StanceRequest<'_>,
+    ) -> Result<Posted, PostError> {
+        let reason = req.reason.trim();
+        if reason.is_empty() {
+            return Err(PostError::Empty);
+        }
+        let posted = self.post(
+            now,
+            PostRequest {
+                author: req.author,
+                channel: req.channel,
+                body: reason,
+                reply_to: Some(req.target),
+                origin: req.kind.origin(),
+                client_request_id: req.client_request_id,
+            },
+        )?;
+        let runtime = self
+            .rt
+            .get(&(req.author, req.channel))
+            .and_then(|rt| rt.runtime.clone());
+        let model = req
+            .model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(|m| Arc::from(m.chars().take(80).collect::<String>()));
+        let stance = Stance {
+            message: posted.message.id,
+            channel: req.channel,
+            kind: req.kind,
+            member: req.author,
+            target: req.target,
+            reason: Arc::from(reason),
+            model,
+            runtime,
+            created_at: now,
+        };
+        self.store.tx(|c| store::insert_stance(c, &stance))?;
+        if req.kind == StanceKind::Refusal && !posted.deduped {
+            let target_seq = store::message(self.conn(), req.target)?.map(|m| m.seq);
+            // Agents only (humans have no runtime state or presence).
+            if let Some(rt) = self.rt.get_mut(&(req.author, req.channel)) {
+                rt.note = Some(Arc::from(match target_seq {
+                    Some(seq) => format!("declined #{seq}"),
+                    None => "declined a request".to_string(),
+                }));
+                self.publish_status(req.author, req.channel);
+            }
+        }
+        Ok(posted)
+    }
+
     pub fn set_agent_status(&mut self, agent: MemberId, channel: ChannelId, text: Option<&str>) {
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.status = text
@@ -821,6 +904,7 @@ impl Engine {
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.phase = Phase::Open;
         rt.idle_since = Some(now);
+        rt.runtime = info.agent_name.clone();
         self.publish_status(agent, channel);
     }
 
