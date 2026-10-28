@@ -8,7 +8,10 @@ use gpui::{
     MouseExitEvent, MouseMoveEvent, Pixels, ResizeEdge, StyleRefinement, Subscription, Window,
     canvas, div, prelude::*, px,
 };
-use ui::{ActiveTheme, FONT_FAMILY, Theme};
+use ui::{
+    ActiveTheme, Elevation, FONT_FAMILY, Theme, TypeStyleExt,
+    tokens::{radius, space, text},
+};
 
 use crate::{
     composer::Composer,
@@ -26,9 +29,9 @@ use crate::{
 };
 
 /// The sidebars start just under the titlebar.
-const SIDE_TOP: Pixels = px(4.);
+const SIDE_TOP: Pixels = space::X1;
 /// Corner radius of both sidebar panels (their views draw the same).
-const SIDE_RADIUS: Pixels = px(26.);
+const SIDE_RADIUS: Pixels = radius::XL;
 /// The conversation and composer widen with the window between these widths.
 const COLUMN_MIN: Pixels = px(720.);
 const COLUMN_MAX: Pixels = px(960.);
@@ -220,8 +223,7 @@ impl Render for Workspace {
             .flex_col()
             .bg(t.canvas)
             .font_family(FONT_FAMILY)
-            .text_size(px(15.))
-            .line_height(px(22.))
+            .type_style(text::BODY)
             .text_color(t.ink)
             .child(
                 div()
@@ -383,7 +385,9 @@ impl Workspace {
             // panel's own focus transfer.
             .on_any_mouse_down(|_, window, _| window.prevent_default())
             .when(frame.overlay, |d| {
-                d.occlude().rounded(SIDE_RADIUS).shadow(t.overlay_shadow())
+                d.occlude()
+                    .rounded(SIDE_RADIUS)
+                    .shadow(t.elevation(Elevation::Overlay))
             })
             .child(view)
     }

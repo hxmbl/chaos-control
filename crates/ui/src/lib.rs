@@ -9,6 +9,7 @@ mod pill;
 mod text;
 pub mod text_input;
 mod theme;
+pub mod tokens;
 mod tooltip;
 
 pub use assets::{Assets, load_fonts};
@@ -19,6 +20,7 @@ pub use pill::pill;
 pub use text::{Ellipsis, Truncated, truncated};
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{ActiveTheme, Appearance, FONT_FAMILY, Theme};
+pub use tokens::{Elevation, TypeStyle, TypeStyleExt};
 pub use tooltip::Tooltip;
 
 /// Registers globals and key bindings the components rely on. Call once at startup.

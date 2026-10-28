@@ -1,8 +1,12 @@
-//! Calm, outline-first palette from the wireframe: thin lines, pills and generous
-//! radii on a warm off-white. Dark mode follows the OS appearance.
+//! Calm palette from the wireframe: generous radii on a warm off-white, with
+//! separation from background steps rather than outlines. Colour carries
+//! meaning only: `accent` is "you / unread / on", `status_*` is agent state.
+//! Dark mode follows the OS appearance. Sizes live in [`crate::tokens`].
 
 use gpui::{App, BoxShadow, Global, Hsla, WindowAppearance, point, px, rgb};
 use model::AgentState;
+
+use crate::tokens::Elevation;
 
 /// Bundled UI font (see `assets/fonts`).
 pub const FONT_FAMILY: &str = "Plus Jakarta Sans";
@@ -37,13 +41,16 @@ pub struct Theme {
     pub ink_soft: Hsla,
     pub muted: Hsla,
     pub faint: Hsla,
+    /// "You / unread / on": the unread dot, reply bar, switches, selection.
+    /// Never used for agent state.
     pub accent: Hsla,
-    /// Agent Status glows, one per `AgentState`.
-    pub agent_active: Hsla,
-    pub agent_sleeping: Hsla,
-    pub agent_unresponsive: Hsla,
-    pub skeleton: Hsla,
-    pub skeleton_shine: Hsla,
+    /// Text and glyphs drawn on `accent` (the switch knob).
+    pub on_accent: Hsla,
+    /// Agent state, one per `AgentState`: green active, blue sleeping, red
+    /// unresponsive. The only place colour means status.
+    pub status_active: Hsla,
+    pub status_sleeping: Hsla,
+    pub status_unresponsive: Hsla,
     pub selection: Hsla,
     shadow_near: Hsla,
     shadow_far: Hsla,
@@ -69,11 +76,10 @@ impl Theme {
             muted: c(0x8a867e),
             faint: c(0xb3afa6),
             accent: c(0x6e56cf),
-            agent_active: c(0x22b35e),
-            agent_sleeping: c(0x8b5cf6),
-            agent_unresponsive: c(0xef4444),
-            skeleton: c(0xd2cfc7),
-            skeleton_shine: c(0xe9e7e1),
+            on_accent: c(0xffffff),
+            status_active: c(0x22b35e),
+            status_sleeping: c(0x3b82f6),
+            status_unresponsive: c(0xef4444),
             selection: c(0x6e56cf).opacity(0.22),
             shadow_near: c(0x1f1e1c).opacity(0.04),
             shadow_far: c(0x1f1e1c).opacity(0.12),
@@ -95,11 +101,10 @@ impl Theme {
             muted: c(0x8f8b83),
             faint: c(0x5f5c56),
             accent: c(0x9b87f5),
-            agent_active: c(0x3ddc84),
-            agent_sleeping: c(0xa78bfa),
-            agent_unresponsive: c(0xff5c5c),
-            skeleton: c(0x393834),
-            skeleton_shine: c(0x4d4b46),
+            on_accent: c(0xffffff),
+            status_active: c(0x3ddc84),
+            status_sleeping: c(0x60a5fa),
+            status_unresponsive: c(0xff5c5c),
             selection: c(0x9b87f5).opacity(0.3),
             shadow_near: c(0x000000).opacity(0.3),
             shadow_far: c(0x000000).opacity(0.5),
@@ -164,39 +169,41 @@ impl Theme {
         ]
     }
 
-    /// Glow colour for an agent's state: green active, purple sleeping, red
-    /// unresponsive.
-    pub fn agent_state(&self, state: AgentState) -> Hsla {
-        match state {
-            AgentState::Active => self.agent_active,
-            AgentState::Sleeping => self.agent_sleeping,
-            AgentState::Unresponsive => self.agent_unresponsive,
+    /// Shadows for an [`Elevation`] level.
+    pub fn elevation(&self, level: Elevation) -> Vec<BoxShadow> {
+        match level {
+            Elevation::None => Vec::new(),
+            Elevation::Float => self.float_shadow(),
+            Elevation::Overlay => self.overlay_shadow(),
         }
     }
 
-    /// Status glow pooled under an agent pill. Kept soft (about a third weaker
-    /// than the first cut) so eight of them don't shout; on a dark surface the
-    /// glow reads as light, so it spreads a little more.
+    /// Status colour for an agent's state: green active, blue sleeping, red
+    /// unresponsive.
+    pub fn agent_state(&self, state: AgentState) -> Hsla {
+        match state {
+            AgentState::Active => self.status_active,
+            AgentState::Sleeping => self.status_sleeping,
+            AgentState::Unresponsive => self.status_unresponsive,
+        }
+    }
+
+    /// Status glow pooled under an agent tile: one soft layer, no hard
+    /// coloured lip, so eight of them read as a hint of colour rather than a
+    /// grid of halos. On a dark surface the glow reads as light, so it spreads
+    /// a little more.
     pub fn glow_shadow(&self, glow: Hsla) -> Vec<BoxShadow> {
-        let (y, blur, spread, a1, a2) = if self.is_dark() {
-            (5., 12., -6., 0.45, 0.38)
+        let (y, blur, spread, alpha) = if self.is_dark() {
+            (4., 12., -5., 0.32)
         } else {
-            (4., 9., -5., 0.50, 0.32)
+            (4., 10., -5., 0.34)
         };
-        vec![
-            BoxShadow {
-                color: glow.opacity(a1),
-                offset: point(px(0.), px(y)),
-                blur_radius: px(blur),
-                spread_radius: px(spread),
-            },
-            BoxShadow {
-                color: glow.opacity(a2),
-                offset: point(px(0.), px(2.)),
-                blur_radius: px(0.),
-                spread_radius: px(-1.),
-            },
-        ]
+        vec![BoxShadow {
+            color: glow.opacity(alpha),
+            offset: point(px(0.), px(y)),
+            blur_radius: px(blur),
+            spread_radius: px(spread),
+        }]
     }
 }
 
@@ -216,4 +223,35 @@ impl ActiveTheme for App {
 pub(crate) fn init(cx: &mut App) {
     let theme = Theme::for_appearance(cx.window_appearance());
     cx.set_global(theme);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_colours_never_reuse_the_accent() {
+        for t in [Theme::light(), Theme::dark()] {
+            for state in [
+                AgentState::Active,
+                AgentState::Sleeping,
+                AgentState::Unresponsive,
+            ] {
+                assert_ne!(t.agent_state(state), t.accent, "{state:?}");
+            }
+            // Sleeping is blue, well away from the purple accent.
+            let hue = |c: Hsla| c.h * 360.;
+            assert!((200. ..=230.).contains(&hue(t.status_sleeping)));
+            assert!((hue(t.status_sleeping) - hue(t.accent)).abs() > 25.);
+        }
+    }
+
+    #[test]
+    fn status_glow_is_one_soft_layer() {
+        for t in [Theme::light(), Theme::dark()] {
+            let glow = t.glow_shadow(t.status_active);
+            assert_eq!(glow.len(), 1);
+            assert!(glow[0].blur_radius > px(0.), "no hard lip");
+        }
+    }
 }

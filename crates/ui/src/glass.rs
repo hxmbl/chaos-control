@@ -3,8 +3,8 @@
 //! gpui 0.2.2 can't blur what is behind an element (no backdrop filter), so the
 //! glass is built from things it can draw:
 //!
-//! - a translucent fill, a touch lighter at the top than the bottom (a linear
-//!   gradient), so the surface reads as a sheet catching light;
+//! - a flat translucent fill (a gradient here was a 4-point alpha change
+//!   nobody could see, so it went);
 //! - an optional scrim over the content behind, which knocks that content back
 //!   the way a blur would, so text under the pane never fights the pane's text;
 //! - a hairline border plus a brighter 1px highlight along the top inner edge,
@@ -15,16 +15,15 @@
 //! GPUI with real backdrop blur lands, add the blur here, lower `fill`'s alpha
 //! and drop the scrim; nothing that draws a pane needs to change.
 
-use gpui::{Background, BoxShadow, Hsla, linear_color_stop, linear_gradient, point, px};
+use gpui::{BoxShadow, Hsla, point, px};
 
 use crate::Theme;
 
 /// Colours and shadow for one glass surface. `Copy`-cheap except the shadow.
 #[derive(Clone, Debug)]
 pub struct Glass {
-    /// Translucent fill, lighter at the top (see [`Glass::fill`]).
-    pub fill_top: Hsla,
-    pub fill_bottom: Hsla,
+    /// Flat translucent fill.
+    pub fill: Hsla,
     /// Hairline border around the sheet.
     pub border: Hsla,
     /// 1px highlight along the top inner edge.
@@ -52,8 +51,7 @@ impl Theme {
     pub fn glass(&self) -> Glass {
         if self.is_dark() {
             Glass {
-                fill_top: Hsla::from(gpui::rgb(0x2a2a27)).opacity(0.93),
-                fill_bottom: self.surface.opacity(0.89),
+                fill: self.selected.opacity(0.91),
                 border: white(0.10),
                 highlight: white(0.16),
                 scrim: black(0.38),
@@ -77,8 +75,7 @@ impl Theme {
             }
         } else {
             Glass {
-                fill_top: white(0.94),
-                fill_bottom: Hsla::from(gpui::rgb(0xfbfaf8)).opacity(0.90),
+                fill: self.surface.opacity(0.92),
                 border: black(0.09),
                 highlight: white(0.95),
                 scrim: self.canvas.opacity(0.42),
@@ -104,17 +101,6 @@ impl Theme {
     }
 }
 
-impl Glass {
-    /// The sheet's fill: a top-to-bottom gradient between the two stops.
-    pub fn fill(&self) -> Background {
-        linear_gradient(
-            180.,
-            linear_color_stop(self.fill_top, 0.),
-            linear_color_stop(self.fill_bottom, 1.),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,12 +109,10 @@ mod tests {
     fn glass_is_translucent_in_both_themes() {
         for theme in [Theme::light(), Theme::dark()] {
             let g = theme.glass();
-            for stop in [g.fill_top, g.fill_bottom] {
-                assert!(
-                    stop.a > 0.8 && stop.a < 1.,
-                    "fill lets the chat through, faintly"
-                );
-            }
+            assert!(
+                g.fill.a > 0.8 && g.fill.a < 1.,
+                "fill lets the chat through, faintly"
+            );
             assert!(
                 g.scrim.a > 0. && g.scrim.a < 0.5,
                 "scrim softens, never hides"

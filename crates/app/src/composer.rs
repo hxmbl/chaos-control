@@ -1,10 +1,13 @@
 //! Floating message box. With no backend yet, sending posts the message locally.
 
-use gpui::{
-    Context, Entity, Focusable, FontWeight, SharedString, Subscription, Window, div, prelude::*, px,
-};
+use gpui::{Context, Entity, Focusable, SharedString, Subscription, Window, div, prelude::*};
 use model::{ReplyRef, pane::author_name};
-use ui::{ActiveTheme, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, icon, truncated};
+use ui::{
+    ActiveTheme, Elevation, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, TypeStyleExt,
+    icon,
+    tokens::{icon as icons, radius, size, space, text},
+    truncated,
+};
 
 use crate::store::{ChatStore, StoreEvent};
 
@@ -75,25 +78,24 @@ impl Composer {
         let who = SharedString::from(author_name(self.store.read(cx).workspace(), reply.author));
         let hover = t.hover;
         div()
-            .mx(px(4.))
-            .mb(px(8.))
+            .mx(space::X1)
+            .mb(space::X2)
             .flex()
             .items_center()
-            .gap(px(8.))
-            .pl(px(10.))
-            .pr(px(4.))
-            .py(px(4.))
-            .rounded(px(12.))
+            .gap(space::X2)
+            .pl(space::X3)
+            .pr(space::X1)
+            .py(space::X1)
+            .rounded(radius::MD)
             .bg(t.sunken)
             .border_l_2()
             .border_color(t.accent)
-            .text_size(px(13.))
-            .line_height(px(18.))
+            .type_style(text::SMALL)
             .child(div().flex_none().text_color(t.muted).child("Replying to"))
             .child(
                 div()
                     .flex_none()
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(text::SEMIBOLD)
                     .text_color(t.ink)
                     .child(who),
             )
@@ -107,12 +109,12 @@ impl Composer {
             .child(
                 div()
                     .id("cancel-reply")
-                    .size(px(22.))
+                    .size(size::CHIP)
                     .flex_none()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_full()
+                    .rounded(radius::MD)
                     .hover(move |s| s.bg(hover))
                     .tooltip(Tooltip::text("Cancel reply"))
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -120,7 +122,7 @@ impl Composer {
                         this.focus(window, cx);
                         cx.notify();
                     }))
-                    .child(icon(IconName::X, px(12.), t.muted)),
+                    .child(icon(IconName::X, icons::SM, t.muted)),
             )
     }
 }
@@ -136,56 +138,55 @@ impl Render for Composer {
             .w_full()
             .flex()
             .flex_col()
-            .rounded(px(22.))
+            .rounded(radius::FIELD)
             .border_1()
             .border_color(if focused { t.line_strong } else { t.line })
             .bg(t.surface)
-            .px(px(8.))
-            .pt(px(10.))
-            .pb(px(8.))
-            .shadow(t.float_shadow())
+            .px(space::X2)
+            .pt(space::X3)
+            .pb(space::X2)
+            .shadow(t.elevation(Elevation::Float))
             .when_some(self.reply.clone(), |d, reply| {
                 d.child(self.render_reply(&reply, cx))
             })
             .child(
                 div()
-                    .px(px(8.))
-                    .text_size(px(15.))
-                    .line_height(px(24.))
+                    .px(space::X2)
+                    .type_style(text::BODY)
                     .text_color(t.ink)
                     .child(self.input.clone()),
             )
             .child(
                 div()
-                    .mt(px(6.))
+                    .mt(space::X1_5)
                     .flex()
                     .items_center()
                     .justify_between()
                     .child(
                         div()
                             .id("attach")
-                            .size(px(32.))
+                            .size(size::BUTTON)
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
+                            .rounded(radius::MD)
                             .hover(move |s| s.bg(hover))
                             .tooltip(Tooltip::text("Attach"))
-                            .child(icon(IconName::Plus, px(18.), t.muted)),
+                            .child(icon(IconName::Plus, icons::MD, t.muted)),
                     )
                     .child(
                         div()
                             .id("send")
-                            .size(px(32.))
+                            .size(size::BUTTON)
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
-                            .bg(t.ink)
-                            .when(!can_send, |s| s.opacity(0.15))
+                            .rounded(radius::MD)
+                            // Disabled reads as a muted button, not a missing one.
+                            .bg(if can_send { t.ink } else { t.faint })
                             .tooltip(Tooltip::text("Send"))
                             .on_click(cx.listener(|this, _, _, cx| this.send(cx)))
-                            .child(icon(IconName::ArrowUpBold, px(16.), t.surface)),
+                            .child(icon(IconName::ArrowUp, icons::MD, t.surface)),
                     ),
             )
     }

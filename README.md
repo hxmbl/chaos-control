@@ -20,6 +20,7 @@ On macOS, Xcode (for the Metal shader compiler) is enough.
 cargo run                    # debug build
 cargo run --release          # what performance should be judged on
 CHAOS_DEMO_MESSAGES=100000 cargo run --release   # fill #main with synthetic history
+CHAOS_DEMO_CHANNELS=12 cargo run --release      # add sample channels to the sidebar
 ```
 
 Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.

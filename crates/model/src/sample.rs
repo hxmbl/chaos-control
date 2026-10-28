@@ -211,6 +211,23 @@ pub fn demo_history(count: usize) -> impl Iterator<Item = Message> {
     })
 }
 
+/// Extra issue channels for checking how the sidebar's channel list grows and
+/// scrolls (see `CHAOS_DEMO_CHANNELS` in the app). Not shown by default.
+pub fn demo_channels(count: usize) -> impl Iterator<Item = Channel> {
+    (0..count).map(|i| {
+        let n = 400 + i as u32;
+        let name = s(&format!("STRM-{n}"));
+        Channel {
+            id: Id(1_000 + i as u32),
+            name: name.clone(),
+            ordinal: Some(4 + i as u32),
+            linear_issue: Some(name),
+            unread: i % 5 == 1,
+            project_wide: false,
+        }
+    })
+}
+
 /// A few messages for #main so the chat isn't empty on first run, including
 /// one long review that shows collapsed with "Open".
 pub fn sample_history() -> (Id, Vec<Message>) {

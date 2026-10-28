@@ -24,7 +24,7 @@ position and a voice.
   reactions and sessions. Read cursors and dedup mean nothing without
   durability.
 - **Session per agent x channel.** One native session per membership, opened on
-  the first wake and closed after 10 idle minutes (the agent goes purple).
+  the first wake and closed after 10 idle minutes (the agent goes blue).
 - **Wake only when addressed.** An `@handle`, a reply to the agent's message,
   or a human's `@everyone`. Untargeted messages wake no one; agents see them as
   unread context on their next wake.
@@ -182,7 +182,7 @@ be forced onto the bridge with `"chat_tools": "stdio"`.
 | Glow | When |
 | --- | --- |
 | green (`Active`) | a session is open, a turn is in flight, or a retry is scheduled |
-| purple (`Sleeping`) | no session; it needs a ping |
+| blue (`Sleeping`) | no session; it needs a ping |
 | red (`Unresponsive`) | command missing, signed out, or 3 failed deliveries |
 
 Presence is one line for the Agent Status tooltip: the agent's `chat_status`,

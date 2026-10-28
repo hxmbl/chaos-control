@@ -11,7 +11,7 @@ pub use pane::{
     Attachment, PaneAction, PaneActionKind, PaneContent, ProjectQuestion, ProjectQuestionKind,
     ReplyRef, ReviewItem, Settings,
 };
-pub use sample::{demo_history, sample, sample_history};
+pub use sample::{demo_channels, demo_history, sample, sample_history};
 pub use search::{
     CorpusChannel, SearchAction, SearchCorpus, SearchHit, SearchProvider, SearchResult,
     SubstringSearch,
@@ -61,7 +61,7 @@ pub struct Channel {
 /// `ui::Theme::agent_state`):
 ///
 /// - green, [`AgentState::Active`]: running and ready to read and reply.
-/// - purple, [`AgentState::Sleeping`]: idle; it needs a ping before it picks
+/// - blue, [`AgentState::Sleeping`]: idle; it needs a ping before it picks
 ///   anything up.
 /// - red, [`AgentState::Unresponsive`]: missing or not answering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

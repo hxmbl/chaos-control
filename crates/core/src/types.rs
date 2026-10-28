@@ -235,7 +235,7 @@ impl fmt::Display for TriggerId {
 pub enum Glow {
     /// Green: a session is starting, ready or working.
     Active,
-    /// Purple: no session; it needs a ping.
+    /// Blue: no session; it needs a ping.
     Sleeping,
     /// Red: missing, signed out or failing.
     Unresponsive,

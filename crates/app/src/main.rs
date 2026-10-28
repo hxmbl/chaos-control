@@ -66,12 +66,16 @@ fn main() {
             })
             .detach();
 
-            let store = cx.new(|_| store::ChatStore::new(model::sample()));
+            let mut workspace = model::sample();
+            if let Some(count) = demo_count("CHAOS_DEMO_CHANNELS") {
+                workspace.channels.extend(model::demo_channels(count));
+            }
+            let store = cx.new(|_| store::ChatStore::new(workspace));
             match core {
                 Some(link) => store.update(cx, |store, cx| store.attach_core(link, cx)),
                 None => store.update(cx, |store, cx| store.load_sample_history(cx)),
             }
-            if let Some(count) = demo_message_count() {
+            if let Some(count) = demo_count("CHAOS_DEMO_MESSAGES") {
                 store.update(cx, |store, cx| store.load_demo_history(count, cx));
             }
 
@@ -107,11 +111,8 @@ fn main() {
 }
 
 /// `CHAOS_DEMO_MESSAGES=100000` fills #main with synthetic history, for checking
-/// that scrolling stays smooth with very large channels.
-fn demo_message_count() -> Option<usize> {
-    std::env::var("CHAOS_DEMO_MESSAGES")
-        .ok()?
-        .parse()
-        .ok()
-        .filter(|n| *n > 0)
+/// that scrolling stays smooth with very large channels. `CHAOS_DEMO_CHANNELS=12`
+/// adds sample issue channels, for checking the sidebar's list as it grows.
+fn demo_count(var: &str) -> Option<usize> {
+    std::env::var(var).ok()?.parse().ok().filter(|n| *n > 0)
 }
