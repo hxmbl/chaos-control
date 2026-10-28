@@ -24,7 +24,7 @@ use crate::{
     right_sidebar::RightSidebar,
     search::{FocusSearch, PILL_HEIGHT, Search, SearchEvent},
     sidebar::Sidebar,
-    store::ChatStore,
+    store::{ChatStore, StoreEvent},
     titlebar::Titlebar,
 };
 
@@ -133,6 +133,23 @@ impl Workspace {
             });
         // The pane layer is drawn here, so redraw when it opens or closes.
         let pane_changed = cx.observe(&pane, |_, _, cx| cx.notify());
+        // An agent's permission request opens the pane with Approve / Deny,
+        // unless the pane is busy with something else (the request also shows
+        // in the chat and in the agent's presence). An answer from anywhere
+        // closes its pane.
+        let pane_for_store = pane.clone();
+        let permissions =
+            cx.subscribe_in(&store, window, move |_, _, event, window, cx| match event {
+                StoreEvent::PermissionAsked(content) => pane_for_store.update(cx, |p, cx| {
+                    if p.can_show_permission() {
+                        p.open(content.clone(), window, cx);
+                    }
+                }),
+                StoreEvent::PermissionAnswered { request } => {
+                    pane_for_store.update(cx, |p, cx| p.close_permission(*request, window, cx))
+                }
+                _ => {}
+            });
         // After a jump, hand the keyboard back to the composer.
         let jumped = cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
             SearchEvent::Jumped | SearchEvent::Dismissed => {
@@ -166,6 +183,7 @@ impl Workspace {
                 jumped,
                 pane_events,
                 pane_changed,
+                permissions,
             ]
             .into_iter()
             .chain(focus_subscriptions)

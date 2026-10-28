@@ -38,7 +38,7 @@ means "you / unread / on", never agent state:
 | `Unresponsive` | red | Missing or not answering. |
 
 Beside the state, `Agent::presence` holds one line from the runtime ("working:
-running tests", "needs sign-in: ...", "wanted to run X, declined").
+running tests", "needs sign-in: ...", "request pending: X (#3)").
 `Agent::status_line()` joins them for the Agent Status tooltip. Core reports
 both through `CoreEvent::Agent`; presence is never part of the chat log.
 

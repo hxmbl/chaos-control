@@ -34,10 +34,13 @@
 //!
 //! # Permissions
 //!
-//! Chaos Control never approves and never changes the agent's permission mode.
-//! A `session/request_permission` is answered with the agent's own reject
-//! option (`reject_once`, else `reject_always`), or `cancelled` if it offered
-//! none, and surfaces as [`AgentEvent::PermissionDeclined`].
+//! Chaos Control never changes the agent's permission mode. A
+//! `session/request_permission` goes to core through [`OpenSession::permissions`]
+//! and is answered at once with what core decides (`crate::permission`): the
+//! agent's own allow-once option (VM agent, or a human's one-shot grant), else
+//! its own "not now" decline (a reject-once that lets the turn continue) with a
+//! `_meta.chaosControl` note that request #N was sent to the humans, or
+//! `cancelled` if it offered no decline.
 
 use std::{
     path::PathBuf,
@@ -52,6 +55,9 @@ use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::adapter::*;
+use crate::permission::{
+    OptionKind, PermissionAsk, PermissionVerdict, pick_allow, pick_decline, sent_meta,
+};
 use crate::types::BatchId;
 
 /// How to reach the agent process.
@@ -415,30 +421,42 @@ fn v1_outcome(stop: v1::StopReason) -> TurnOutcome {
     }
 }
 
-/// Picks the agent's own decline option.
-fn v1_decline(
+fn v1_kind(k: &v1::PermissionOptionKind) -> OptionKind {
+    match k {
+        v1::PermissionOptionKind::AllowOnce => OptionKind::AllowOnce,
+        v1::PermissionOptionKind::AllowAlways => OptionKind::AllowAlways,
+        v1::PermissionOptionKind::RejectOnce => OptionKind::RejectOnce,
+        v1::PermissionOptionKind::RejectAlways => OptionKind::RejectAlways,
+        _ => OptionKind::Other,
+    }
+}
+
+/// Answers a permission request with the agent's own option for `verdict`.
+fn v1_answer(
     req: &v1::RequestPermissionRequest,
-) -> (v1::RequestPermissionResponse, Option<Arc<str>>) {
-    let pick = req
+    verdict: &PermissionVerdict,
+) -> v1::RequestPermissionResponse {
+    let opts: Vec<(OptionKind, &str)> = req
         .options
         .iter()
-        .find(|o| o.kind == v1::PermissionOptionKind::RejectOnce)
-        .or_else(|| {
-            req.options
-                .iter()
-                .find(|o| o.kind == v1::PermissionOptionKind::RejectAlways)
-        });
-    match pick {
-        Some(o) => (
-            v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Selected(
-                v1::SelectedPermissionOutcome::new(o.option_id.clone()),
-            )),
-            Some(Arc::from(o.name.as_str())),
-        ),
-        None => (
-            v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled),
-            None,
-        ),
+        .map(|o| (v1_kind(&o.kind), o.name.as_str()))
+        .collect();
+    let select = |ix: usize| {
+        v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Selected(
+            v1::SelectedPermissionOutcome::new(req.options[ix].option_id.clone()),
+        ))
+    };
+    let decline = || match pick_decline(&opts) {
+        Some(ix) => select(ix),
+        None => v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled),
+    };
+    match verdict {
+        PermissionVerdict::Allow { .. } => match pick_allow(&opts) {
+            Some(ix) => select(ix),
+            None => decline(),
+        },
+        PermissionVerdict::Sent { request } => decline().meta(sent_meta(*request)),
+        PermissionVerdict::Decline => decline(),
     }
 }
 
@@ -480,6 +498,7 @@ async fn run_v1(
     let ev_perm = events.clone();
     let ev_main = events.clone();
     let t_main = tracker.clone();
+    let gate = req.permissions.clone();
 
     let result = Client
         .builder()
@@ -516,7 +535,6 @@ async fn run_v1(
         )
         .on_receive_request(
             async move |r: v1::RequestPermissionRequest, responder, _cx| {
-                let (response, declined_with) = v1_decline(&r);
                 let (accepted, turn) = {
                     let mut t = t_perm.lock().expect("lock");
                     (t.accept(), t.turn)
@@ -530,12 +548,20 @@ async fn run_v1(
                     .title
                     .clone()
                     .unwrap_or_else(|| "a tool".to_string());
-                ev_perm.emit(AgentEvent::PermissionDeclined {
-                    turn,
-                    title: Arc::from(title),
-                    declined_with,
-                });
-                responder.respond(response)
+                let detail = r
+                    .tool_call
+                    .fields
+                    .raw_input
+                    .as_ref()
+                    .map(|v| Arc::from(v.to_string()));
+                let verdict = gate
+                    .ask(PermissionAsk {
+                        turn,
+                        title: Arc::from(title),
+                        detail,
+                    })
+                    .await;
+                responder.respond(v1_answer(&r, &verdict))
             },
             acp::on_receive_request!(),
         )

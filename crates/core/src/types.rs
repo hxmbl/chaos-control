@@ -199,6 +199,9 @@ pub enum WakeReason {
     ReplyToMe,
     /// A human wrote `@everyone`. Wakes, but creates no reply obligation.
     Everyone,
+    /// A human answered the agent's permission request (`permission`). Wakes,
+    /// but creates no reply obligation.
+    Permission,
 }
 
 impl WakeReason {
@@ -207,6 +210,7 @@ impl WakeReason {
             WakeReason::Mention => "mention",
             WakeReason::ReplyToMe => "reply",
             WakeReason::Everyone => "everyone",
+            WakeReason::Permission => "permission",
         }
     }
 
@@ -214,6 +218,7 @@ impl WakeReason {
         match s {
             "reply" => WakeReason::ReplyToMe,
             "everyone" => WakeReason::Everyone,
+            "permission" => WakeReason::Permission,
             _ => WakeReason::Mention,
         }
     }

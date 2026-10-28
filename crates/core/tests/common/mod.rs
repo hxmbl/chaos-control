@@ -11,6 +11,7 @@ use chaos_core::{
     engine::CoreEvent,
     fake::{self, FakeAgent, Script},
     host::{AgentSpec, Core, HostConfig, ManualClock},
+    permission::RunsIn,
     store,
     types::*,
 };
@@ -63,6 +64,15 @@ impl Harness {
     }
 
     pub async fn agent(&mut self, handle: &str, script: Script) -> Member {
+        self.agent_in(handle, script, RunsIn::Host).await
+    }
+
+    /// An agent that runs in its own VM (every permission is approved).
+    pub async fn agent_in_vm(&mut self, handle: &str, script: Script) -> Member {
+        self.agent_in(handle, script, RunsIn::Vm).await
+    }
+
+    pub async fn agent_in(&mut self, handle: &str, script: Script, runs_in: RunsIn) -> Member {
         let fake = FakeAgent::new(script);
         let f = fake.clone();
         let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
@@ -77,6 +87,7 @@ impl Harness {
                     name: handle.into(),
                     adapter: adapter.clone(),
                     cwd: Some(std::env::temp_dir()),
+                    runs_in,
                 },
                 self.main,
             )

@@ -155,7 +155,7 @@ async fn v2_fallback_text_follows_keyed_message_and_tool_call_upserts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_permission_request_is_declined_with_the_agents_own_option() {
+async fn v2_permission_request_is_sent_and_declined_natively_for_now() {
     let mut h = Harness::new().await;
     let bot = h
         .agent(
@@ -174,7 +174,7 @@ async fn v2_permission_request_is_declined_with_the_agents_own_option() {
         note.body
     );
     assert!(
-        note.body.contains("declined with its own \"Deny\" option"),
+        note.body.contains("permission request #1, sent to @hx"),
         "{}",
         note.body
     );
@@ -193,9 +193,16 @@ async fn v2_permission_request_is_declined_with_the_agents_own_option() {
     assert_eq!(
         outcomes[0]["outcome"]["optionId"],
         json!("deny"),
-        "never the allow option: {}",
+        "never auto-approved on the host: {}",
         outcomes[0]
     );
+    assert_eq!(
+        outcomes[0]["_meta"]["chaosControl"]["status"],
+        json!("request_sent"),
+        "{}",
+        outcomes[0]
+    );
+    assert_eq!(outcomes[0]["_meta"]["chaosControl"]["requestId"], json!(1));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

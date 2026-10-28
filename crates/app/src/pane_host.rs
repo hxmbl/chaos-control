@@ -90,6 +90,24 @@ impl PaneHost {
         });
     }
 
+    /// Whether a permission request may take the pane: it is closed, or it
+    /// already shows another permission request (the newest one wins).
+    pub fn can_show_permission(&self) -> bool {
+        !self.state.is_open() || matches!(self.state.content(), Some(PaneContent::Permission(_)))
+    }
+
+    /// Closes the pane if it shows permission request `request` (it was
+    /// answered somewhere else).
+    pub fn close_permission(&mut self, request: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let showing = matches!(
+            self.state.content(),
+            Some(PaneContent::Permission(p)) if p.request == request
+        );
+        if self.state.is_open() && showing {
+            self.close(window, cx);
+        }
+    }
+
     /// Closes without touching focus, for when something else is taking the
     /// keyboard on purpose (cmd/ctrl-K opening search).
     pub fn close_quietly(&mut self, cx: &mut Context<Self>) {
@@ -127,6 +145,13 @@ impl PaneHost {
             ) => {
                 self.store
                     .update(cx, |store, cx| store.answer_identity(&kind, cx));
+                self.close(window, cx);
+            }
+            (PaneActionKind::Approve | PaneActionKind::Deny, Some(PaneContent::Permission(p))) => {
+                let (request, approve) = (p.request, kind == PaneActionKind::Approve);
+                self.store.update(cx, |store, cx| {
+                    store.answer_permission(request, approve, cx)
+                });
                 self.close(window, cx);
             }
             _ => {
@@ -207,6 +232,7 @@ impl PaneHost {
             // Search draws its own pane (see `Search::render_pane`).
             PaneContent::Search { .. } => pane,
             PaneContent::ProjectIdentity(q) => pane.children(paragraphs(&identity_text(q))),
+            PaneContent::Permission(p) => pane.children(paragraphs(&permission_text(p))),
         };
         Some(pane.into_any_element())
     }
@@ -396,6 +422,29 @@ fn identity_text(q: &model::ProjectQuestion) -> String {
             q.proposed
         ),
     }
+}
+
+/// The permission pane's body: what, why, who was asked, and that the agent
+/// isn't waiting on it.
+fn permission_text(p: &model::PermissionPrompt) -> String {
+    let mut out = format!("Wants to run: {}\n", p.action);
+    if let Some(reason) = &p.reason {
+        out.push_str(&format!("Why: {reason}\n"));
+    }
+    if let Some(detail) = &p.detail {
+        let detail: String = detail.chars().take(600).collect();
+        out.push_str(&format!("Details: {detail}\n"));
+    }
+    let asked = if p.asked.is_empty() {
+        "the room"
+    } else {
+        &p.asked
+    };
+    out.push_str(&format!(
+        "Request #{}, sent to {asked}. Anyone here can answer. {} isn't blocked: it carries on meanwhile and hears your answer as a message.",
+        p.request, p.agent
+    ));
+    out
 }
 
 fn human_size(bytes: u64) -> String {

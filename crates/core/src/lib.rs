@@ -6,6 +6,8 @@
 //! - [`adapter`]: the `AgentAdapter`/`AgentSession` boundary and `AgentEvent`.
 //! - [`acp`]: the generic ACP adapter (v1, plus the v2 draft).
 //! - [`mcp`]: the chat MCP server and the stdio bridge.
+//! - [`permission`]: permissions by where the agent runs (host: ask the
+//!   humans, non-blocking; own VM: approve).
 //! - [`host`]: the in-process runtime behind the [`host::Core`] handle.
 //! - [`fake`]: a scripted ACP agent for tests.
 //!
@@ -19,6 +21,7 @@ pub mod fake;
 pub mod host;
 pub mod mcp;
 pub mod notify;
+pub mod permission;
 pub mod policy;
 pub mod store;
 pub mod types;

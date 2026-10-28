@@ -262,6 +262,35 @@ CREATE TABLE stances (
 CREATE INDEX stances_by_channel ON stances (channel_id, message_id);
 CREATE INDEX stances_by_target ON stances (target_id);
 "#,
+    // 6: permission requests (STRM-401). One row per request an agent made,
+    // natively or through `chat_request_permission`: pending until a human
+    // answers (never times out), or auto_approved for agents in their own VM.
+    // An approval is a one-shot grant, spent when the retried call runs
+    // (`used_at`). `asked_of` is the comma-separated member ids it was routed
+    // to; any human in the channel may answer.
+    r#"
+CREATE TABLE permission_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id     INTEGER NOT NULL REFERENCES members(id),
+    channel_id   INTEGER NOT NULL REFERENCES channels(id),
+    batch_id     INTEGER REFERENCES batches(id),
+    source       TEXT NOT NULL CHECK (source IN ('native', 'chat_tool')),
+    title        TEXT NOT NULL,
+    detail       TEXT,
+    reason       TEXT,
+    state        TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'denied', 'auto_approved')),
+    asked_of     TEXT NOT NULL DEFAULT '',
+    created_at   INTEGER NOT NULL,
+    answered_by  INTEGER REFERENCES members(id),
+    answered_at  INTEGER,
+    answer_note  TEXT,
+    used_at      INTEGER
+);
+CREATE INDEX permission_requests_by_agent
+    ON permission_requests (agent_id, channel_id, state);
+CREATE INDEX permission_requests_by_channel
+    ON permission_requests (channel_id, state);
+"#,
 ];
 
 pub struct Store {

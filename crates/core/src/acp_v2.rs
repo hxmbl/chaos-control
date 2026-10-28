@@ -30,6 +30,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::acp::{ChatToolsPreference, Tracker, V2Open, choose_mcp, error_kind};
 use crate::adapter::*;
+use crate::permission::{
+    OptionKind, PermissionAsk, PermissionGate, PermissionVerdict, pick_allow, pick_decline,
+    sent_meta,
+};
 use crate::types::BatchId;
 
 enum Cmd {
@@ -110,29 +114,43 @@ fn mcp_servers(kind: ChatToolsTransport, ep: &ChatToolsEndpoint) -> Vec<v2::McpS
     }
 }
 
-fn decline(
+fn kind(k: &v2::PermissionOptionKind) -> OptionKind {
+    match k {
+        v2::PermissionOptionKind::AllowOnce => OptionKind::AllowOnce,
+        v2::PermissionOptionKind::AllowAlways => OptionKind::AllowAlways,
+        v2::PermissionOptionKind::RejectOnce => OptionKind::RejectOnce,
+        v2::PermissionOptionKind::RejectAlways => OptionKind::RejectAlways,
+        _ => OptionKind::Other,
+    }
+}
+
+/// Answers a permission request with the agent's own option for `verdict`
+/// (see `crate::permission`).
+fn answer(
     req: &v2::RequestPermissionRequest,
-) -> (v2::RequestPermissionResponse, Option<Arc<str>>) {
-    let pick = req
+    verdict: &PermissionVerdict,
+) -> v2::RequestPermissionResponse {
+    let opts: Vec<(OptionKind, &str)> = req
         .options
         .iter()
-        .find(|o| o.kind == v2::PermissionOptionKind::RejectOnce)
-        .or_else(|| {
-            req.options
-                .iter()
-                .find(|o| o.kind == v2::PermissionOptionKind::RejectAlways)
-        });
-    match pick {
-        Some(o) => (
-            v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
-                v2::SelectedPermissionOutcome::new(o.option_id.clone()),
-            )),
-            Some(Arc::from(o.name.as_str())),
-        ),
-        None => (
-            v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
-            None,
-        ),
+        .map(|o| (kind(&o.kind), o.name.as_str()))
+        .collect();
+    let select = |ix: usize| {
+        v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
+            v2::SelectedPermissionOutcome::new(req.options[ix].option_id.clone()),
+        ))
+    };
+    let decline = || match pick_decline(&opts) {
+        Some(ix) => select(ix),
+        None => v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
+    };
+    match verdict {
+        PermissionVerdict::Allow { .. } => match pick_allow(&opts) {
+            Some(ix) => select(ix),
+            None => decline(),
+        },
+        PermissionVerdict::Sent { request } => decline().meta(sent_meta(*request)),
+        PermissionVerdict::Decline => decline(),
     }
 }
 
@@ -188,8 +206,9 @@ pub(crate) async fn open(
     let events = req.events.clone();
     let cwd = req.cwd.clone();
     let endpoint = req.chat_tools.clone();
+    let gate = req.permissions.clone();
     tokio::spawn(run(
-        transport, cwd, endpoint, pref, tracker, cmd_rx, ready_tx, events,
+        transport, cwd, endpoint, pref, tracker, cmd_rx, ready_tx, events, gate,
     ));
     match ready_rx.await {
         Ok(Ready::Session(info)) => Ok(Arc::new(V2Session { info, cmd: cmd_tx })),
@@ -212,11 +231,12 @@ async fn run(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: oneshot::Sender<Ready>,
     events: EventSink,
+    gate: PermissionGate,
 ) {
     let ready = Arc::new(Mutex::new(Some(ready_tx)));
     let ready_main = ready.clone();
     let (t_notif, t_perm, t_main) = (tracker.clone(), tracker.clone(), tracker.clone());
-    let (ev_notif, ev_perm, ev_main) = (events.clone(), events.clone(), events.clone());
+    let (ev_notif, _ev_perm, ev_main) = (events.clone(), events.clone(), events.clone());
     // Set once the session is handed out; only then do exits become events.
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_main = started.clone();
@@ -325,14 +345,15 @@ async fn run(
         )
         .on_receive_request(
             async move |r: v2::RequestPermissionRequest, responder, _cx: V2ConnectionTo<Agent>| {
-                let (response, declined_with) = decline(&r);
                 let turn = t_perm.lock().expect("lock").turn;
-                ev_perm.emit(AgentEvent::PermissionDeclined {
-                    turn,
-                    title: Arc::from(r.title.as_str()),
-                    declined_with,
-                });
-                responder.respond(response)
+                let verdict = gate
+                    .ask(PermissionAsk {
+                        turn,
+                        title: Arc::from(r.title.as_str()),
+                        detail: r.description.as_deref().map(Arc::from),
+                    })
+                    .await;
+                responder.respond(answer(&r, &verdict))
             },
             acp::on_receive_request!(),
         )

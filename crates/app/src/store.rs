@@ -10,11 +10,16 @@ use std::{
     sync::Arc,
 };
 
-use chaos_core::{engine::CoreEvent, types as ct};
+use chaos_core::{
+    engine::CoreEvent,
+    permission::{PermissionId, PermissionRequest, PermissionState},
+    types as ct,
+};
 use gpui::{Context, EventEmitter, Task};
 use model::{
     Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PaneActionKind, PaneContent,
-    ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus, Stance, Workspace,
+    PermissionPrompt, ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus,
+    Stance, Workspace,
 };
 
 use crate::{
@@ -42,6 +47,11 @@ pub enum StoreEvent {
     /// Read receipts moved: these rows of `channel` gained or lost readers
     /// (their heights may change).
     Receipts { channel: Id, rows: Vec<usize> },
+    /// An agent asked for permission: show it in the pane (Approve / Deny).
+    PermissionAsked(PaneContent),
+    /// A permission request was answered (here or by someone else): close its
+    /// pane if it is still showing.
+    PermissionAnswered { request: i64 },
 }
 
 /// Someone who has read up to a message (Slack/iMessage-style read marks).
@@ -324,6 +334,17 @@ impl ChatStore {
                         store.apply_core_event(CoreEvent::Read(r), cx);
                     }
                     store.mark_main_read(cx);
+                });
+                if ok.is_err() {
+                    return;
+                }
+            }
+            // Requests asked while the app was closed are still pending.
+            if let Ok(pending) = core.pending_permissions(main).await {
+                let ok = this.update(cx, |store, cx| {
+                    for r in pending {
+                        store.apply_core_event(CoreEvent::Permission(r), cx);
+                    }
                 });
                 if ok.is_err() {
                     return;
@@ -630,9 +651,68 @@ impl ChatStore {
                     cx.notify();
                 }
             }
+            CoreEvent::Permission(r) => {
+                if r.channel != attached.link.main() {
+                    return;
+                }
+                if r.state == PermissionState::Pending {
+                    let prompt = self.permission_prompt(&r);
+                    cx.emit(StoreEvent::PermissionAsked(PaneContent::Permission(prompt)));
+                } else {
+                    cx.emit(StoreEvent::PermissionAnswered { request: r.id.0 });
+                }
+            }
             // The model has no reactions yet.
             CoreEvent::Reaction { .. } => {}
         }
+    }
+
+    /// The pane's view of a pending permission request.
+    fn permission_prompt(&self, r: &PermissionRequest) -> PermissionPrompt {
+        let name = |id: ct::MemberId| -> Arc<str> {
+            let attached = self.core.as_ref();
+            attached
+                .and_then(|a| a.link.agents.iter().find(|x| x.member == id))
+                .map(|x| x.name.clone())
+                .or_else(|| attached.and_then(|a| a.names.get(&id).cloned()))
+                .unwrap_or_else(|| Arc::from("An agent"))
+        };
+        let asked = r
+            .asked_of
+            .iter()
+            .map(|m| name(*m).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        PermissionPrompt {
+            request: r.id.0,
+            agent: name(r.agent),
+            action: r.title.clone(),
+            reason: r.reason.clone(),
+            detail: r.detail.clone(),
+            asked: Arc::from(asked),
+        }
+    }
+
+    /// The local human's answer to a permission request. Core posts it and
+    /// wakes the agent; a refusal (already answered) shows as a local note.
+    pub fn answer_permission(&mut self, request: i64, approve: bool, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let human = attached.link.human;
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = core
+                .answer_permission(PermissionId(request), human, approve, None)
+                .await
+            {
+                this.update(cx, |store, cx| {
+                    store.system_note(&format!("Couldn't answer request #{request}: {e}"), cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// A local notice in the selected channel (e.g. a post core refused).

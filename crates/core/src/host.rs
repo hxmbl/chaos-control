@@ -17,6 +17,9 @@ use crate::{
         AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, StanceRequest,
     },
     mcp::{self, Scope, Tokens},
+    permission::{
+        AnswerError, PermissionGate, PermissionId, PermissionRequest, PermissionVerdict, RunsIn,
+    },
     policy::Policy,
     store::Store,
     types::*,
@@ -107,6 +110,9 @@ pub struct AgentSpec {
     pub name: String,
     pub adapter: Arc<dyn AgentAdapter>,
     pub cwd: Option<PathBuf>,
+    /// Where the agent runs: on the host its permission requests go to the
+    /// humans; in its own VM they are approved (see `permission`).
+    pub runs_in: RunsIn,
 }
 
 // ---------- handle ----------
@@ -533,6 +539,34 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// A human approves (`approve`) or denies a pending permission request.
+    /// Any human member of the request's channel may answer; the answer is
+    /// posted and delivered to the agent as a wake.
+    pub async fn answer_permission(
+        &self,
+        request: PermissionId,
+        by: MemberId,
+        approve: bool,
+        note: Option<&str>,
+    ) -> Result<PermissionRequest, AnswerError> {
+        let note = note.map(str::to_string);
+        self.with_engine(move |e, now| {
+            e.answer_permission(now, request, by, approve, note.as_deref())
+        })
+        .await
+        .map_err(AnswerError::Store)?
+    }
+
+    /// Pending permission requests in `channel`, oldest first.
+    pub async fn pending_permissions(
+        &self,
+        channel: ChannelId,
+    ) -> Result<Vec<PermissionRequest>, String> {
+        self.with_engine(move |e, _| e.pending_permissions(channel))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     /// Calls a chat tool as the session `scope` would (tests, debugging).
     pub async fn tool(&self, scope: Scope, name: &str, args: Value) -> Result<Value, String> {
         let name = name.to_string();
@@ -709,6 +743,7 @@ impl Actor {
         self.engine
             .join(channel, &member, now)
             .map_err(|e| e.to_string())?;
+        self.engine.set_runs_in(member.id, spec.runs_in);
         let adapter = spec.adapter.clone();
         self.agents.insert(
             member.id,
@@ -824,7 +859,24 @@ impl Actor {
                 event,
             });
         });
+        // Native permission requests are decided by the engine, in the actor,
+        // and answered by the adapter at once (they never block on a human).
+        let gate_tx = self.tx.clone();
+        let permissions = PermissionGate::new(move |ask| {
+            let tx = gate_tx.clone();
+            Box::pin(async move {
+                let (reply, wait) = oneshot::channel();
+                let f: EngineFn = Box::new(move |e, now| {
+                    let _ = reply.send(e.native_permission(now, agent, channel, ask));
+                });
+                if tx.send(Cmd::Engine(f)).is_err() {
+                    return PermissionVerdict::Decline;
+                }
+                wait.await.unwrap_or(PermissionVerdict::Decline)
+            })
+        });
         let req = OpenSession {
+            permissions,
             agent,
             channel,
             handle: entry.handle.clone(),

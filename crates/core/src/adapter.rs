@@ -23,6 +23,7 @@ use std::{fmt, path::PathBuf, sync::Arc};
 
 use futures::future::BoxFuture;
 
+use crate::permission::PermissionGate;
 use crate::types::{BatchId, ChannelId, MemberId};
 
 /// Capabilities negotiated for one live session.
@@ -168,6 +169,9 @@ pub struct OpenSession {
     pub cwd: PathBuf,
     pub chat_tools: ChatToolsEndpoint,
     pub events: EventSink,
+    /// Where native permission requests go; the adapter answers the agent with
+    /// whatever core decides (see `permission`).
+    pub permissions: PermissionGate,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,13 +227,6 @@ pub enum AgentEvent {
     Accepted { turn: BatchId },
     /// Coarse activity ("Running tests"). Presence only, never the chat.
     Activity { label: Arc<str> },
-    /// The agent asked for permission and the adapter declined it with the
-    /// agent's own decline option (Chaos Control never approves).
-    PermissionDeclined {
-        turn: Option<BatchId>,
-        title: Arc<str>,
-        declined_with: Option<Arc<str>>,
-    },
     /// The turn finished. `final_text` is the agent's last assistant text, a
     /// fallback-reply candidate; it is never posted on its own.
     TurnEnded {

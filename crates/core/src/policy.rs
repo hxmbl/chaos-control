@@ -34,8 +34,8 @@ pub struct Policy {
     pub retry_backoff_ms: Vec<Millis>,
     /// A session with no turn for this long is closed (agent goes blue).
     pub idle_close_ms: Millis,
-    /// Post a system note in the channel when a permission request is declined.
-    pub note_declined_permissions: bool,
+    /// Post a system note in the channel when a permission request is sent to the humans.
+    pub note_permission_requests: bool,
 }
 
 impl Default for Policy {
@@ -48,7 +48,7 @@ impl Default for Policy {
             max_failures: 3,
             retry_backoff_ms: vec![1_000, 5_000, 30_000],
             idle_close_ms: 10 * 60 * 1000,
-            note_declined_permissions: true,
+            note_permission_requests: true,
         }
     }
 }
