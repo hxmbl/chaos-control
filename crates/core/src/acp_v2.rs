@@ -236,7 +236,7 @@ async fn run(
     let ready = Arc::new(Mutex::new(Some(ready_tx)));
     let ready_main = ready.clone();
     let (t_notif, t_perm, t_main) = (tracker.clone(), tracker.clone(), tracker.clone());
-    let (ev_notif, ev_perm, ev_main) = (events.clone(), events.clone(), events.clone());
+    let (ev_notif, _ev_perm, ev_main) = (events.clone(), events.clone(), events.clone());
     // Set once the session is handed out; only then do exits become events.
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_main = started.clone();
