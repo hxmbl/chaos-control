@@ -154,6 +154,26 @@ pub struct Message {
     pub body: Arc<str>,
     /// The message this one replies to, if any.
     pub reply_to: Option<ReplyRef>,
+    /// Set when the message states a refusal or a dissent (a peer's "no" or
+    /// "I disagree"). Drawn distinctly but quietly; never as an error.
+    pub stance: Option<Stance>,
+}
+
+/// A peer's position on the message it replies to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stance {
+    Refusal,
+    Dissent,
+}
+
+impl Stance {
+    /// The quiet label drawn next to the author's name.
+    pub fn label(self) -> &'static str {
+        match self {
+            Stance::Refusal => "declined",
+            Stance::Dissent => "disagrees",
+        }
+    }
 }
 
 /// Everything the static shell shows. Will be replaced by real sources later.

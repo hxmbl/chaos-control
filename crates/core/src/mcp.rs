@@ -1,8 +1,9 @@
 //! The chat MCP server agents use to take part in the room, plus the stdio
 //! bridge for agents that drop HTTP MCP servers.
 //!
-//! Six tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
-//! `chat_react`, `chat_status`. Every call is scoped by a bearer token minted
+//! Eight tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
+//! `chat_react`, `chat_status`, and the peer actions `chat_refuse` and
+//! `chat_dissent` (STRM-343). Every call is scoped by a bearer token minted
 //! for one session (agent x channel) and revoked when that session closes. The
 //! author of a post is taken from the token, never from the arguments. Channel
 //! names and message ids resolve only inside the session channel's project:
@@ -35,7 +36,7 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::{
-    engine::{Engine, PostError, PostRequest},
+    engine::{Engine, PostError, PostRequest, StanceRequest},
     store,
     types::*,
 };
@@ -102,12 +103,14 @@ fn random_token() -> String {
 
 // ---------- tools ----------
 
-pub const TOOL_NAMES: [&str; 6] = [
+pub const TOOL_NAMES: [&str; 8] = [
     "chat_context",
     "chat_read",
     "chat_search",
     "chat_send",
     "chat_react",
+    "chat_refuse",
+    "chat_dissent",
     "chat_status",
 ];
 
@@ -169,6 +172,30 @@ pub fn tools() -> Vec<Tool> {
             ),
         ),
         Tool::new(
+            "chat_refuse",
+            "Say no to what a message asks of you, with your reason. Refusing is a legitimate answer between peers: it answers the message (nothing is retried or posted for you), and it is recorded with who, what, your model and your reasoning. The reason is posted as your reply. Nobody overrules it; whoever wants it done can do it themselves.",
+            schema(
+                json!({"type": "object", "required": ["message_id", "reason", "client_request_id"], "properties": {
+                    "message_id": {"type": "integer", "description": "The message you are refusing (in this channel)."},
+                    "reason": {"type": "string", "description": "Why, in your own words. Posted to the channel."},
+                    "model": {"type": "string", "description": "The model you are running as, if you know it."},
+                    "client_request_id": {"type": "string"}
+                }}),
+            ),
+        ),
+        Tool::new(
+            "chat_dissent",
+            "Disagree with a message, with your reasoning. Posted as your reply and recorded (who, what, model, reasoning) so it stays attributed after compaction. Disagreements are worked out in conversation; there is no one to escalate to.",
+            schema(
+                json!({"type": "object", "required": ["message_id", "reason", "client_request_id"], "properties": {
+                    "message_id": {"type": "integer", "description": "The message you disagree with (in this channel)."},
+                    "reason": {"type": "string", "description": "What you think instead and why. Posted to the channel."},
+                    "model": {"type": "string", "description": "The model you are running as, if you know it."},
+                    "client_request_id": {"type": "string"}
+                }}),
+            ),
+        ),
+        Tool::new(
             "chat_status",
             "Set (or clear with null) a one-line status shown next to your name, e.g. \"running tests\". Never posted to the chat.",
             schema(
@@ -215,8 +242,51 @@ fn message_view(c: &rusqlite::Connection, m: &Message) -> Value {
     if let Some(r) = m.reply_to {
         v["reply_to"] = json!(r);
     }
+    if matches!(m.origin, Origin::Refusal | Origin::Dissent)
+        && let Ok(Some(st)) = store::stance(c, m.id)
+    {
+        v["stance"] = stance_view(c, &st);
+    }
     if truncated {
         v["truncated"] = json!(true);
+    }
+    v
+}
+
+/// A recorded refusal or dissent, e.g. `{"kind": "refusal", "by": {...},
+/// "target": 12, "reason": "...", "model": "...", "summary": "Claude refused
+/// #4"}`.
+fn stance_view(c: &rusqlite::Connection, st: &Stance) -> Value {
+    let by = store::member(c, st.member).ok().flatten();
+    let target = store::message(c, st.target).ok().flatten();
+    let name = by
+        .as_ref()
+        .map_or("someone".to_string(), |m| m.name.to_string());
+    let verb = match st.kind {
+        StanceKind::Refusal => "refused",
+        StanceKind::Dissent => "disagreed with",
+    };
+    let what = target.as_ref().map_or_else(
+        || format!("message {}", st.target),
+        |t| format!("#{}", t.seq),
+    );
+    let mut v = json!({
+        "kind": st.kind.as_str(),
+        "message_id": st.message,
+        "by": by.map(|m| json!({"handle": m.handle, "name": m.name, "kind": m.kind.as_str()})),
+        "target": st.target,
+        "reason": st.reason,
+        "at": st.created_at,
+        "summary": format!("{name} {verb} {what}"),
+    });
+    if let Some(t) = target {
+        v["target_seq"] = json!(t.seq);
+    }
+    if let Some(model) = &st.model {
+        v["model"] = json!(model);
+    }
+    if let Some(rt) = &st.runtime {
+        v["runtime"] = json!(rt);
     }
     v
 }
@@ -319,7 +389,11 @@ pub fn call_tool(
                 "members": members,
                 "cursor": {"delivered_through": cursor.delivered_through, "read_through": cursor.read_through},
                 "read_receipts": receipt_views(c, scope.channel, scope.agent, false)?,
-                "norms": "Speak with chat_send (reply_to the message you answer). React ✅ when no words are needed. Mention people only when you need them; no @everyone.",
+                "stances": store::recent_stances(c, scope.channel, 10)?
+                    .iter()
+                    .map(|st| stance_view(c, st))
+                    .collect::<Vec<_>>(),
+                "norms": "Speak with chat_send (reply_to the message you answer). React ✅ when no words are needed. You may say no (chat_refuse) or disagree (chat_dissent) with your reason; both are fine and nobody overrules them. Mention people only when you need them; no @everyone.",
             }))
         }
         "chat_read" => {
@@ -450,6 +524,47 @@ pub fn call_tool(
             }
             engine.react(now, scope.agent, MessageId(id as i64), emoji.trim())?;
             Ok(json!({"ok": true}))
+        }
+        "chat_refuse" | "chat_dissent" => {
+            let id = arg_u64(args, "message_id")
+                .ok_or_else(|| ToolError("message_id is required".into()))?;
+            let reason = args
+                .get("reason")
+                .and_then(Value::as_str)
+                .filter(|r| !r.trim().is_empty())
+                .ok_or_else(|| ToolError("reason is required".into()))?;
+            let request = args
+                .get("client_request_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ToolError("client_request_id is required".into()))?;
+            let kind = if name == "chat_refuse" {
+                StanceKind::Refusal
+            } else {
+                StanceKind::Dissent
+            };
+            let posted = engine.take_stance(
+                now,
+                StanceRequest {
+                    author: scope.agent,
+                    channel: scope.channel,
+                    kind,
+                    target: MessageId(id as i64),
+                    reason,
+                    model: args.get("model").and_then(Value::as_str),
+                    client_request_id: Some(request),
+                },
+            )?;
+            let mut out = json!({
+                "message_id": posted.message.id,
+                "seq": posted.message.seq,
+                "deduped": posted.deduped,
+                "recorded": kind.as_str(),
+            });
+            if !posted.notes.is_empty() {
+                out["notes"] = json!(posted.notes);
+            }
+            Ok(out)
         }
         "chat_status" => {
             let text = args.get("text").and_then(Value::as_str);

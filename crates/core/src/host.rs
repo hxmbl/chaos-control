@@ -13,7 +13,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     adapter::*,
-    engine::{AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest},
+    engine::{
+        AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, StanceRequest,
+    },
     mcp::{self, Scope, Tokens},
     policy::Policy,
     store::Store,
@@ -447,6 +449,44 @@ impl Core {
         self.with_engine(move |e, now| e.react(now, member, message, &emoji))
             .await
             .map_err(PostError::Store)?
+    }
+
+    /// A human refuses or dissents from `target` (agents use the chat tools).
+    /// Posted as a reply carrying `reason`, recorded as a [`Stance`].
+    pub async fn stance(
+        &self,
+        member: MemberId,
+        channel: ChannelId,
+        kind: StanceKind,
+        target: MessageId,
+        reason: &str,
+    ) -> Result<Message, PostError> {
+        let reason = reason.to_string();
+        self.with_engine(move |e, now| {
+            e.take_stance(
+                now,
+                StanceRequest {
+                    author: member,
+                    channel,
+                    kind,
+                    target,
+                    reason: &reason,
+                    model: None,
+                    client_request_id: None,
+                },
+            )
+            .map(|p| p.message)
+        })
+        .await
+        .map_err(PostError::Store)?
+    }
+
+    /// The stance a message states, if any (for drawing it).
+    pub async fn stance_of(&self, message: MessageId) -> Result<Option<Stance>, String> {
+        self.with_engine(move |e, _| {
+            crate::store::stance(e.conn(), message).map_err(|e| e.to_string())
+        })
+        .await?
     }
 
     pub async fn history(&self, channel: ChannelId, limit: usize) -> Result<Vec<Message>, String> {
