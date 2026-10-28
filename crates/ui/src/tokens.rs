@@ -99,6 +99,8 @@ pub mod radius {
 /// Control heights.
 pub mod size {
     use super::*;
+    /// Read-receipt avatars under a message.
+    pub const READ_MARK: Pixels = px(16.);
     /// Chips, switches, the reply chip's dismiss button.
     pub const CHIP: Pixels = px(22.);
     /// Small buttons: titlebar toggles, "Open".

@@ -12,14 +12,14 @@ use gpui::{
 };
 use model::{Author, Id, PaneContent, pane};
 use ui::{
-    ActiveTheme, Ellipsis, IconName, TypeStyleExt, brand_icon, icon,
+    ActiveTheme, Ellipsis, IconName, Tooltip, TypeStyleExt, brand_icon, icon,
     tokens::{icon as icons, radius, size, space, text},
     truncated,
 };
 
 use crate::{
     pane_host::PaneHost,
-    store::{ChatStore, StoreEvent},
+    store::{ChatStore, Reader, StoreEvent},
 };
 
 /// The empty state's blurb wraps at about 50 characters.
@@ -65,6 +65,17 @@ impl Conversation {
                 cx.notify();
             }
             StoreEvent::Appended { .. } => {}
+            StoreEvent::Receipts { channel, rows } if *channel == this.channel => {
+                // Re-measure just these rows: read marks add or drop a line.
+                let count = this.list.item_count();
+                for &ix in rows {
+                    if ix < count {
+                        this.list.splice(ix..ix + 1, 1);
+                    }
+                }
+                cx.notify();
+            }
+            StoreEvent::Receipts { .. } => {}
         });
         Self {
             store,
@@ -202,11 +213,69 @@ impl Conversation {
                                             .child(SharedString::from(message.body.clone())),
                                     )
                                 }
+                            })
+                            .map(|d| {
+                                let readers = store.readers(self.channel, ix);
+                                if readers.is_empty() {
+                                    d
+                                } else {
+                                    d.child(read_marks(ix, &readers, store.workspace(), &t))
+                                }
                             }),
                     ),
             )
             .into_any_element()
     }
+}
+
+/// Small avatars of who has read up to this message and no further, at the
+/// end of the row (Slack/iMessage style); hover lists names and times. Read
+/// with no reply is a normal outcome, so the marks stay quiet.
+fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Theme) -> AnyElement {
+    let names = readers
+        .iter()
+        .map(|r| format!("{} at {}", r.name, clock(r.read_at)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tip = format!("Read by {names}");
+    let marks = readers.iter().map(|r| {
+        let face: AnyElement = match r.author {
+            Author::Agent(id) => match ws.agent(id) {
+                Some(agent) => icon(brand_icon(agent.brand), icons::SM, t.muted).into_any_element(),
+                None => initial(&r.name, t),
+            },
+            _ => initial(&r.name, t),
+        };
+        div()
+            .size(size::READ_MARK)
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(t.sunken)
+            .child(face)
+    });
+    div()
+        .id(("read-marks", ix))
+        .mt(space::X1)
+        .flex()
+        .justify_end()
+        .gap(space::X0_5)
+        .children(marks)
+        .tooltip(Tooltip::text(tip))
+        .into_any_element()
+}
+
+/// A reader without a brand mark: their first letter.
+fn initial(name: &str, t: &ui::Theme) -> AnyElement {
+    let c: String = name.chars().take(1).collect();
+    div()
+        .type_style(text::CAPTION)
+        .font_weight(text::SEMIBOLD)
+        .text_color(t.muted)
+        .child(SharedString::from(c))
+        .into_any_element()
 }
 
 impl Conversation {

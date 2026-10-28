@@ -4,7 +4,11 @@
 //! sharing data by cloning it around. Each event says exactly what changed, so a
 //! view only re-renders (or re-measures list rows) for the part it shows.
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+    sync::Arc,
+};
 
 use chaos_core::{engine::CoreEvent, types as ct};
 use gpui::{Context, EventEmitter, Task};
@@ -35,6 +39,18 @@ pub enum StoreEvent {
     /// Scroll to and highlight a message (from search). Follows `Selected` when
     /// the message is in another channel.
     Reveal { channel: Id, index: usize },
+    /// Read receipts moved: these rows of `channel` gained or lost readers
+    /// (their heights may change).
+    Receipts { channel: Id, rows: Vec<usize> },
+}
+
+/// Someone who has read up to a message (Slack/iMessage-style read marks).
+#[derive(Clone, Debug)]
+pub struct Reader {
+    pub author: Author,
+    pub name: Arc<str>,
+    /// When they got this far, seconds since the Unix epoch.
+    pub read_at: u64,
 }
 
 pub struct ChatStore {
@@ -60,6 +76,12 @@ struct Attached {
     channel: Id,
     /// Core message id -> index in that channel's log (dedups history vs events).
     seen: HashMap<ct::MessageId, usize>,
+    /// Core seq -> index in that channel's log, for placing read receipts.
+    by_seq: BTreeMap<ct::Seq, usize>,
+    /// The newest read receipt per member in #main (never the local human).
+    receipts: HashMap<ct::MemberId, ct::Receipt>,
+    /// Member names for receipts from people who aren't linked agents.
+    names: HashMap<ct::MemberId, Arc<str>>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
     _events: Task<()>,
@@ -110,7 +132,57 @@ impl ChatStore {
             }
             cx.emit(StoreEvent::Selected);
             cx.notify();
+            self.mark_main_read(cx);
         }
+    }
+
+    /// Who has read up to (and no further than) the message at `index` of
+    /// `channel`, oldest read first. Only core channels have receipts.
+    pub fn readers(&self, channel: Id, index: usize) -> Vec<Reader> {
+        let Some(attached) = self.core.as_ref().filter(|a| a.channel == channel) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Reader> = attached
+            .receipts
+            .values()
+            .filter(|r| row_at(&attached.by_seq, r.read_through) == Some(index))
+            .map(|r| {
+                let linked = attached.link.agents.iter().find(|a| a.member == r.member);
+                Reader {
+                    author: match linked {
+                        Some(a) => Author::Agent(agent_id(a.member)),
+                        None => Author::Human,
+                    },
+                    name: linked
+                        .map(|a| a.name.clone())
+                        .or_else(|| attached.names.get(&r.member).cloned())
+                        .unwrap_or_else(|| Arc::from("Someone")),
+                    read_at: r.read_at / 1000,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.read_at.cmp(&b.read_at).then(a.name.cmp(&b.name)));
+        out
+    }
+
+    /// The human at this keyboard has seen #main up to its newest message
+    /// while it is the selected channel. Core ignores a cursor that would not
+    /// move, so repeating this is cheap.
+    fn mark_main_read(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        if attached.channel != self.selected || attached.by_seq.is_empty() {
+            return;
+        }
+        let core = attached.link.core.clone();
+        let (human, main) = (attached.link.human, attached.link.main());
+        cx.spawn(async move |_, _| {
+            if let Err(e) = core.mark_read(human, main, None).await {
+                eprintln!("chaos-control: could not record a read receipt: {e}");
+            }
+        })
+        .detach();
     }
 
     /// Switches to `channel` and asks its view to scroll to the message at
@@ -235,12 +307,39 @@ impl ChatStore {
                 }
                 Err(e) => eprintln!("chaos-control: could not load #main history: {e}"),
             }
+            if let Ok(members) = core.members(main).await {
+                let ok = this.update(cx, |store, _| {
+                    if let Some(a) = &mut store.core {
+                        a.names = members.into_iter().map(|m| (m.id, m.name)).collect();
+                    }
+                });
+                if ok.is_err() {
+                    return;
+                }
+            }
+            if let Ok(receipts) = core.receipts(main).await {
+                let ok = this.update(cx, |store, cx| {
+                    for r in receipts {
+                        store.apply_core_event(CoreEvent::Read(r), cx);
+                    }
+                    store.mark_main_read(cx);
+                });
+                if ok.is_err() {
+                    return;
+                }
+            }
             let Some(events) = events.as_mut() else {
                 return;
             };
             while let Some(event) = events.recv().await {
+                let message = matches!(event, CoreEvent::Message(_));
                 if this
-                    .update(cx, |store, cx| store.apply_core_event(event, cx))
+                    .update(cx, |store, cx| {
+                        store.apply_core_event(event, cx);
+                        if message {
+                            store.mark_main_read(cx);
+                        }
+                    })
                     .is_err()
                 {
                     break;
@@ -251,6 +350,9 @@ impl ChatStore {
             link,
             channel,
             seen: HashMap::new(),
+            by_seq: BTreeMap::new(),
+            receipts: HashMap::new(),
+            names: HashMap::new(),
             confirm,
             _events: task,
         });
@@ -413,6 +515,15 @@ impl ChatStore {
                     for m in history {
                         store.apply_core_event(CoreEvent::Message(m), cx);
                     }
+                    store.mark_main_read(cx);
+                })
+                .ok();
+            }
+            if let Ok(receipts) = core.receipts(main).await {
+                this.update(cx, |store, cx| {
+                    for r in receipts {
+                        store.apply_core_event(CoreEvent::Read(r), cx);
+                    }
                 })
                 .ok();
             }
@@ -428,6 +539,8 @@ impl ChatStore {
         let folder = attached.link.folder.clone();
         attached.channel = self.show_project(&open, &folder, cx);
         attached.seen.clear();
+        attached.by_seq.clear();
+        attached.receipts.clear();
         attached.link.open = open;
         self.core = Some(attached);
     }
@@ -463,10 +576,41 @@ impl ChatStore {
                     reply_to,
                 };
                 let ix = self.logs.get(&channel).map_or(0, |l| l.len());
+                // A receipt already past this message moves down onto it.
+                let moved: Vec<usize> = attached
+                    .receipts
+                    .values()
+                    .filter(|r| r.read_through >= m.seq)
+                    .filter_map(|r| row_at(&attached.by_seq, r.read_through))
+                    .collect();
                 if let Some(attached) = &mut self.core {
                     attached.seen.insert(m.id, ix);
+                    attached.by_seq.insert(m.seq, ix);
                 }
                 self.append(channel, vec![message], cx);
+                if !moved.is_empty() {
+                    let rows = moved.into_iter().chain([ix]).collect();
+                    cx.emit(StoreEvent::Receipts { channel, rows });
+                }
+            }
+            CoreEvent::Read(r) => {
+                if r.channel != attached.link.main() || r.member == attached.link.human {
+                    return;
+                }
+                let channel = attached.channel;
+                let old = attached
+                    .receipts
+                    .get(&r.member)
+                    .and_then(|k| row_at(&attached.by_seq, k.read_through));
+                let new = row_at(&attached.by_seq, r.read_through);
+                if let Some(attached) = &mut self.core {
+                    attached.receipts.insert(r.member, r);
+                }
+                let rows: Vec<usize> = old.into_iter().chain(new).collect();
+                if !rows.is_empty() {
+                    cx.emit(StoreEvent::Receipts { channel, rows });
+                }
+                cx.notify();
             }
             CoreEvent::Agent(status) => {
                 let id = agent_id(status.agent);
@@ -533,4 +677,9 @@ fn agent_id(member: ct::MemberId) -> Id {
 fn core_message_id(id: Id) -> Option<ct::MessageId> {
     id.0.checked_sub(CORE_MESSAGE_BASE)
         .map(|n| ct::MessageId(i64::from(n)))
+}
+
+/// The log row for the newest message at or before `seq`, if any is loaded.
+fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
+    by_seq.range(..=seq).next_back().map(|(_, ix)| *ix)
 }
