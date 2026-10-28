@@ -15,7 +15,8 @@
 //! still gets v1. On v2 a turn is:
 //!
 //! - the `session/prompt` response straight away, carrying the accepted user
-//!   message's `messageId` (v2 acknowledges acceptance there, not at the end);
+//!   message's `messageId` (v2 acknowledges acceptance there, not at the end),
+//!   and a `user_message` update with that id and the prompt;
 //! - `state_update: running`, then the steps;
 //! - text as `agent_message_chunk`s keyed by an agent `messageId`; a tool call
 //!   starts a new agent message;
@@ -392,10 +393,16 @@ impl FakeAgent {
                     if let Some(Step::Error(msg)) = turn.steps.first() {
                         return responder.respond_with_error(acp::Error::new(-32603, msg.clone()));
                     }
-                    // v2 acknowledges acceptance in the prompt response.
-                    responder.respond(v2::PromptResponse::new(v2::MessageId::new(format!(
-                        "user-{n}"
-                    ))))?;
+                    // v2 acknowledges acceptance in the prompt response, then
+                    // echoes the accepted prompt as the keyed user message.
+                    let user = v2::MessageId::new(format!("user-{n}"));
+                    responder.respond(v2::PromptResponse::new(user.clone()))?;
+                    cx.send_notification(v2::UpdateSessionNotification::new(
+                        req.session_id.clone(),
+                        v2::SessionUpdate::UserMessage(
+                            v2::UserMessage::new(user).content(req.prompt.clone()),
+                        ),
+                    ))?;
                     let me = me3.clone();
                     let mcp = mcp.clone();
                     let wire = Wire::V2 {

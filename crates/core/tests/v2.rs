@@ -337,7 +337,7 @@ fn fake_agent_binary_speaks_v2_when_scripted() {
     };
     send(json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
         "params": {"protocolVersion": 2,
-            "clientInfo": {"name": "test", "version": "0"}}}));
+            "info": {"name": "test", "version": "0"}, "capabilities": {}}}));
     let init = next("initialize response", &response(0));
     assert_eq!(init["result"]["protocolVersion"], json!(2), "{init}");
     assert!(
@@ -362,6 +362,7 @@ fn fake_agent_binary_speaks_v2_when_scripted() {
     send(prompt(2, "quick one"));
     let ack = next("prompt response", &response(2));
     assert!(ack["result"]["messageId"].is_string(), "{ack}");
+    let user_message = ack["result"]["messageId"].clone();
     let end = next("idle with a stop reason", &idle);
     assert_eq!(end["params"]["update"]["stopReason"], json!("end_turn"));
     let seen = frames.borrow().clone();
@@ -382,6 +383,7 @@ fn fake_agent_binary_speaks_v2_when_scripted() {
         kinds,
         vec![
             "state:idle", // the fresh session is ready
+            "user_message",
             "state:running",
             "agent_message_chunk",
             "tool:in_progress",
@@ -390,6 +392,10 @@ fn fake_agent_binary_speaks_v2_when_scripted() {
             "state:idle",
         ],
         "{updates:#?}"
+    );
+    assert_eq!(
+        updates[1]["messageId"], user_message,
+        "the accepted prompt is echoed as the keyed user message"
     );
     let chunks: Vec<&Value> = updates
         .iter()
