@@ -11,12 +11,12 @@ immediate-mode elements) instead of a webview.
   `ChannelLog`) and sample data. No GPUI, so it compiles fast and is easy to
   unit-test. Strings are `Arc<str>`, which turn into GPUI `SharedString`s
   without copying.
-- `ui`: the theme (light and dark, following the OS), bundled assets and the
-  few components the shell needs (pill, icon, tooltip, text input, the pane
-  and its glass). Hand-built to match the design rather than pulling in a
+- `ui`: the theme (light and dark, following the OS), the design tokens,
+  bundled assets and the few components the shell needs (pill, icon, tooltip,
+  text input, the pane and its glass). Hand-built to match the design rather than pulling in a
   component kit.
 - `app`: the binary. One view per region: `Titlebar`, `Sidebar`,
-  `RightSidebar` (+ `CatchUp`), `Conversation`, `Composer`, laid out by the
+  `RightSidebar`, `Conversation`, `Composer`, laid out by the
   root `Workspace` view, plus `PaneHost` (what the pane shows), the
   `AppSettings` global and `project` (which project the launch folder is).
 - `core` (`chaos-core`): the agent runtime. SQLite store, delivery engine,
@@ -25,14 +25,16 @@ immediate-mode elements) instead of a webview.
 
 ## Agent state
 
-Each agent has a `model::AgentState`, drawn as a soft glow under its pill in
-Agent Status. The theme maps it to a colour (`Theme::agent_state`), so no view
-hardcodes one:
+Each agent has a `model::AgentState`, drawn as a soft glow under its tile in
+Agent status. The theme maps it to a colour (`Theme::agent_state`, the
+`status_*` roles), so no view hardcodes one. Status colours are the only
+colour in the sidebars: agent marks are monochrome, and the accent (purple)
+means "you / unread / on", never agent state:
 
 | State | Glow | Meaning |
 | --- | --- | --- |
 | `Active` | green | Running and ready to read and reply. |
-| `Sleeping` | purple | Idle; needs a ping before it picks anything up. |
+| `Sleeping` | blue | Idle; needs a ping before it picks anything up. |
 | `Unresponsive` | red | Missing or not answering. |
 
 Beside the state, `Agent::presence` holds one line from the runtime ("working:
@@ -240,9 +242,9 @@ never moves and there is never more than one.
 - **Element and state.** `ui::Pane` is the element: a red macOS-style close dot
   at the top left (12px, 12px from the corner; an × shows on hover) with a
   header row beside it like a macOS title bar: the title (17px semibold,
-  9px past the dot, ellipsis when narrow) or a custom header such as search's
+  8px past the dot, ellipsis when narrow) or a custom header such as search's
   field, centred on the dot. Then a scrollable body that takes any element, and full-width rounded quick-action
-  rows under a thin divider. `ui::PaneState` is the bookkeeping, unit-tested
+  rows under a 1px hairline divider. `ui::PaneState` is the bookkeeping, unit-tested
   without a window: it remembers what had focus when the pane opened and hands
   it back on close; opening over an open pane swaps the content in place (no
   second animation, focus still returns to where it was before the first).
@@ -260,8 +262,8 @@ never moves and there is never more than one.
 - **Motion.** 140ms fade and scale-in (ease-out cubic), the same timing as the
   search grow and the sidebar peek. Closing is instant.
 - **The glass, faked.** gpui 0.2.2 has no backdrop blur, so `ui::Glass`
-  (`glass.rs`, `Theme::glass`) builds it from a translucent fill that is a
-  touch lighter at the top (a linear gradient, about 94% to 90% opaque), a
+  (`glass.rs`, `Theme::glass`) builds it from a flat translucent fill (about
+  92% opaque light, 91% dark), a
   scrim over the area behind the pane that knocks the chat back the way a blur
   would (light: the canvas colour at 42%; dark: black at 38%), a hairline
   border, a 1px bright highlight along the top inner edge, and a soft, wide
@@ -301,6 +303,36 @@ titlebar keeps a quiet stand-in pill showing the query while the field is in
 the pane. Escape still clears the query first, then closes. cmd/ctrl-K closes
 any other open pane first, so there is still only one.
 
+## Design tokens
+
+Every size the shell draws with comes from `ui::tokens`; colours come from
+`ui::Theme` by role. Views don't write one-off `px(..)` values.
+
+| Token | Values |
+| --- | --- |
+| `space` | 2, 4, 6, 8, 12, 16, 24, 32 |
+| `text` | `CAPTION` 12/16, `SMALL` 13/18, `BODY` 15/22, `TITLE` 17/24 semibold; weights regular, medium, semibold only |
+| `radius` | `SM` 8, `MD` 14, `LG` 20, `XL` 26, plus `rounded_full()`; concentric (each level is its parent minus the 6px inset) |
+| `size` | `CHIP` 22, `BUTTON_SM` 28, `BUTTON` 32, `ROW` 36, `ROW_LG` 44, `HAIRLINE` 1 |
+| `icon` | `SM` 12, `MD` 16, `LG` 20; Phosphor regular weight only |
+| `Elevation` | `None`, `Float` (docked sidebars, composer, search), `Overlay` (a peeking sidebar); `Theme::elevation` |
+
+Apply a type step with `.type_style(text::BODY)` (`ui::TypeStyleExt`).
+Colour roles worth knowing: `accent` and `on_accent` for "you / unread / on",
+`status_active` / `status_sleeping` / `status_unresponsive` for agent state.
+
+Surface rules:
+
+- Separation comes from one signal, never two. Panels have a hairline and a
+  shadow; sections inside them are a background step (`sunken`) with no
+  outline; rows inside sections are borderless pills that show `hover` under
+  the pointer and `selected` when chosen.
+- Text fields (the search pill, the composer) keep a hairline border, because
+  it says "you can type here". Nothing else is outlined.
+- Dividers are 1px hairlines.
+- Optical exceptions (the pane's close-dot centring, the switch knob) stay as
+  named constants beside their component, with a comment.
+
 ## Rendering
 
 - **Virtualized lists.** The message history uses GPUI `list` with a
@@ -309,10 +341,10 @@ any other open pane first, so there is still only one.
   the same per frame as 20. Try it with `CHAOS_DEMO_MESSAGES=100000`. The
   channel list uses `uniform_list` (fixed row height, so no measuring at all).
 - **Cached views.** The root wraps each region in `AnyView::cached`, so a view
-  re-renders only when it is notified itself. The catch-up shimmer is the one
-  thing that animates; it lives in its own cached `CatchUp` view, so each frame
-  re-renders that panel (and the cheap root layout) and replays everything else
-  from the previous frame.
+  re-renders only when it is notified itself. Nothing animates at rest: the
+  only animations are the sidebar slide, the search grow and the pane fade,
+  each of which stops when it finishes. (The wireframe's catch-up card, with
+  its endless shimmer, is not drawn until summaries exist.)
 - **No work in hot paths.** Theme colours are `Copy`; icons are embedded SVGs
   that GPUI rasterises once per size and caches; fonts are compiled in. Row
   rendering does no I/O and no string formatting beyond the timestamp.
@@ -333,7 +365,7 @@ any other open pane first, so there is still only one.
   below for what they do at each width.
 - Layout: both sidebars float 12px from the window edges and run from just
   under the titlebar to 12px above the bottom, so they grow with the window
-  (the channel list, catch-up card and mentions take the extra height). The
+  (the channel list and mentions take the extra height). The
   conversation and composer share one centred column that widens with the
   window, from 720px up to 960px.
 

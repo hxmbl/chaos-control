@@ -61,7 +61,7 @@ pub struct Channel {
 /// `ui::Theme::agent_state`):
 ///
 /// - green, [`AgentState::Active`]: running and ready to read and reply.
-/// - purple, [`AgentState::Sleeping`]: idle; it needs a ping before it picks
+/// - blue, [`AgentState::Sleeping`]: idle; it needs a ping before it picks
 ///   anything up.
 /// - red, [`AgentState::Unresponsive`]: missing or not answering.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

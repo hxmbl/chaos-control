@@ -32,7 +32,7 @@ pub struct Policy {
     pub max_failures: u32,
     /// Backoff before retrying a delivery that was not accepted, by attempt.
     pub retry_backoff_ms: Vec<Millis>,
-    /// A session with no turn for this long is closed (agent goes purple).
+    /// A session with no turn for this long is closed (agent goes blue).
     pub idle_close_ms: Millis,
     /// Post a system note in the channel when a permission request is declined.
     pub note_declined_permissions: bool,
