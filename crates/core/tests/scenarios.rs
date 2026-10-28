@@ -275,7 +275,11 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
     let st = h.core.status(mute.id, h.main).await.unwrap();
     assert_eq!(st.presence.as_deref(), Some("read it and let it go"));
     h.advance(10 * 60 * 1000).await;
-    assert_eq!(h.prompts("mute").len(), 1, "an ignored ping is never retried");
+    assert_eq!(
+        h.prompts("mute").len(),
+        1,
+        "an ignored ping is never retried"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1824,7 +1824,10 @@ mod tests {
             channel: ChannelId(3),
             message: MessageId(10),
         };
-        assert_eq!(obligation_state(c, t).unwrap(), Some(ObligationState::Unmet));
+        assert_eq!(
+            obligation_state(c, t).unwrap(),
+            Some(ObligationState::Unmet)
+        );
         // Existing cursors were never stamped: no receipt until they move.
         let k = cursor(c, MemberId(2), ChannelId(3)).unwrap();
         assert_eq!((k.read_through, k.read_at), (1, None));
@@ -1852,7 +1855,10 @@ mod tests {
         let (a, ch) = (MemberId(1), ChannelId(1));
         assert!(advance_read(c, a, ch, 5, 100).unwrap());
         assert!(!advance_read(c, a, ch, 3, 200).unwrap(), "never backwards");
-        assert!(!advance_read(c, a, ch, 5, 300).unwrap(), "no move, no stamp");
+        assert!(
+            !advance_read(c, a, ch, 5, 300).unwrap(),
+            "no move, no stamp"
+        );
         let k = cursor(c, a, ch).unwrap();
         assert_eq!((k.read_through, k.read_at), (5, Some(100)));
         // Delivery carries read along.
