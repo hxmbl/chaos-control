@@ -28,7 +28,7 @@
 //!     "command": "npx", "args": ["-y", "@agentclientprotocol/claude-agent-acp@0.97.0"],
 //!     "env": {}, "cwd": "/path/to/repo",
 //!     "record": "/tmp/claude-acp.ndjson",
-//!     "acp_v2": true, "chat_tools": "auto"
+//!     "acp_v2": true, "chat_tools": "auto", "runs_in": "host"
 //!   }]
 //! }
 //! ```
@@ -36,7 +36,9 @@
 //! `brand` only picks the icon; the runtime never branches on it. `record`
 //! appends every ACP frame as NDJSON `{dir, frame}` (the replay-fixture format).
 //! `chat_tools` is `"auto"` (HTTP when the agent offers it, else the stdio
-//! bridge) or `"stdio"` (always `chaos-control mcp-bridge`).
+//! bridge) or `"stdio"` (always `chaos-control mcp-bridge`). `runs_in` is
+//! `"host"` (the default: permission requests go to the humans, without
+//! blocking the agent) or `"vm"` (the agent's own VM: everything is approved).
 
 use std::{
     collections::HashMap,
@@ -49,6 +51,7 @@ use chaos_core::{
     adapter::BridgeCommand,
     engine::CoreEvent,
     host::{AgentSpec, Core, HostConfig, SystemClock},
+    permission::RunsIn,
     types::{Channel, ChannelId, MemberId, Project, ProjectId},
 };
 use model::Brand;
@@ -96,6 +99,10 @@ pub struct AgentConfig {
     pub acp_v2: bool,
     #[serde(default)]
     pub chat_tools: ChatTools,
+    /// `"host"` (default: permission requests go to the humans, never
+    /// blocking) or `"vm"` (the agent's own VM: everything is approved).
+    #[serde(default)]
+    pub runs_in: RunsIn,
 }
 
 fn yes() -> bool {
@@ -267,6 +274,7 @@ pub fn start_with(config: AgentsConfig) -> Result<CoreLink, String> {
                         name: name.clone(),
                         adapter: Arc::new(adapter),
                         cwd: a.cwd,
+                        runs_in: a.runs_in,
                     },
                     main,
                 )

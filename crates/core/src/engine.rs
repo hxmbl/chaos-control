@@ -15,6 +15,7 @@ use rusqlite::Connection;
 use crate::{
     adapter::{AgentError, AgentErrorKind, AgentEvent, Probe, SessionInfo, TurnOutcome},
     notify,
+    permission::{self, PermissionRequest, RunsIn},
     policy::{self, Damp, Policy, PolicyState},
     store::{self, NewMessage, Store},
     types::*,
@@ -54,6 +55,8 @@ pub enum CoreEvent {
     Agent(AgentStatus),
     /// A member's read receipt moved forward.
     Read(Receipt),
+    /// A permission request was sent, answered, auto-approved or used.
+    Permission(PermissionRequest),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -158,11 +161,13 @@ struct Rt {
 }
 
 pub struct Engine {
-    store: Store,
+    pub(crate) store: Store,
     policy: Policy,
     pstate: PolicyState,
     rt: HashMap<(MemberId, ChannelId), Rt>,
-    effects: Vec<Effect>,
+    pub(crate) effects: Vec<Effect>,
+    /// Where each agent runs (see `permission`); absent means the host.
+    pub(crate) runs_in: HashMap<MemberId, RunsIn>,
 }
 
 /// Emoji that answer a reply obligation. 👀 ("on it") does not: an agent that
@@ -177,6 +182,7 @@ impl Engine {
             pstate: PolicyState::default(),
             rt: HashMap::new(),
             effects: Vec::new(),
+            runs_in: HashMap::new(),
         };
         let pending = engine.store.tx(|c| store::recover(c, now))?;
         for (agent, channel) in pending {
@@ -335,6 +341,12 @@ impl Engine {
         } else {
             rt.note.clone().or_else(|| rt.status.clone())
         };
+        // A pending permission request shows as such (never "blocked": the
+        // agent may well be doing something else meanwhile).
+        let presence = match rt.red {
+            Some(_) => presence,
+            None => permission::pending_presence(self.conn(), agent, channel).or(presence),
+        };
         AgentStatus {
             agent,
             channel,
@@ -343,7 +355,7 @@ impl Engine {
         }
     }
 
-    fn publish_status(&mut self, agent: MemberId, channel: ChannelId) {
+    pub(crate) fn publish_status(&mut self, agent: MemberId, channel: ChannelId) {
         let status = self.status(agent, channel);
         let key = (status.glow, status.presence.clone());
         let rt = self.rt.entry((agent, channel)).or_default();
@@ -815,12 +827,29 @@ impl Engine {
         self.publish_status(agent, channel);
     }
 
+    /// Sets the agent's runtime note (its presence when idle).
+    pub(crate) fn rt_note(&mut self, agent: MemberId, channel: ChannelId, note: String) {
+        self.rt.entry((agent, channel)).or_default().note = Some(Arc::from(note));
+        self.publish_status(agent, channel);
+    }
+
+    /// A human turned to this agent: clear a red state so it can be tried again.
+    pub(crate) fn human_fresh_start(&mut self, agent: MemberId, channel: ChannelId) {
+        let max = self.policy.max_failures;
+        let rt = self.rt.entry((agent, channel)).or_default();
+        if rt.failures >= max || rt.red.is_some() {
+            rt.failures = 0;
+            rt.red = None;
+            rt.retry_at = None;
+        }
+    }
+
     // ---------- delivery ----------
 
     /// Dispatches the pending batch for agent x channel if nothing is in flight
     /// and the agent is not backing off. One turn at a time; triggers that
     /// arrive meanwhile wait in the (single) pending batch.
-    fn pump(&mut self, now: Millis, agent: MemberId, channel: ChannelId) {
+    pub(crate) fn pump(&mut self, now: Millis, agent: MemberId, channel: ChannelId) {
         if let Err(e) = self.try_pump(now, agent, channel) {
             let rt = self.rt.entry((agent, channel)).or_default();
             rt.note = Some(Arc::from(format!("internal error: {e}")));
@@ -945,18 +974,6 @@ impl Engine {
                 self.rt.entry((agent, channel)).or_default().activity = Some(label);
                 self.publish_status(agent, channel);
             }
-            AgentEvent::PermissionDeclined {
-                turn,
-                title,
-                declined_with,
-            } => self.permission_declined(
-                now,
-                agent,
-                channel,
-                turn,
-                &title,
-                declined_with.as_deref(),
-            ),
             AgentEvent::TurnEnded {
                 turn,
                 outcome,
@@ -1098,47 +1115,6 @@ impl Engine {
         }
         self.publish_status(agent, channel);
         self.pump(now, agent, channel);
-    }
-
-    fn permission_declined(
-        &mut self,
-        now: Millis,
-        agent: MemberId,
-        channel: ChannelId,
-        turn: Option<BatchId>,
-        title: &str,
-        declined_with: Option<&str>,
-    ) {
-        let rt = self.rt.entry((agent, channel)).or_default();
-        rt.note = Some(Arc::from(format!("wanted to run {title}, declined")));
-        self.publish_status(agent, channel);
-        if self.policy.note_declined_permissions {
-            let handle = store::member(self.conn(), agent)
-                .ok()
-                .flatten()
-                .map(|m| m.handle)
-                .unwrap_or_else(|| Arc::from("agent"));
-            // Who woke it: the follow-up is to ask them instead of declining.
-            let woken_by = turn
-                .map(|t| self.woken_by(t))
-                .unwrap_or_default()
-                .join(", ");
-            let suffix = if woken_by.is_empty() {
-                String::new()
-            } else {
-                format!(" (woken by {woken_by})")
-            };
-            let how = declined_with
-                .map(|o| format!(" with its own \"{o}\" option"))
-                .unwrap_or_default();
-            let _ = self.system_note(
-                now,
-                channel,
-                &format!(
-                    "@{handle} asked to run {title}; Chaos Control declined{how}. Approvals aren't supported yet{suffix}."
-                ),
-            );
-        }
     }
 
     /// Handles of the humans whose messages woke this batch.

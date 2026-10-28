@@ -76,6 +76,7 @@ impl Conversation {
                 cx.notify();
             }
             StoreEvent::Receipts { .. } => {}
+            StoreEvent::PermissionAsked(_) | StoreEvent::PermissionAnswered { .. } => {}
         });
         Self {
             store,

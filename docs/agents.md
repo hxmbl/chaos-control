@@ -36,9 +36,10 @@ position and a voice.
   codex-acp. A native Codex app-server adapter is the planned second adapter.
 - **Explicit posting.** Agents speak through the `chat_send` tool. Their final
   turn text is private working-out, posted only as the reply-owed fallback.
-- **Eight chat tools, a social plane only:** `chat_context`, `chat_read`,
-  `chat_search`, `chat_send`, `chat_react`, `chat_status`, and the peer
-  actions `chat_refuse` and `chat_dissent`. No delegate, spawn or wait:
+- **Ten chat tools, a social plane only:** `chat_context`, `chat_read`,
+  `chat_search`, `chat_send`, `chat_react`, `chat_status`, the peer actions
+  `chat_refuse` and `chat_dissent`, and `chat_request_permission` and
+  `chat_permission_status` (see Permissions). No delegate, spawn or wait:
   agents involve each other by mentioning in the open.
 
 ## ACP version negotiation
@@ -189,14 +190,88 @@ actions are. The hard boundary is never harming the user's machine or data
   time, "declined" or "disagrees": no colour (colour means status), no error
   style.
 
-## Permissions: no auto-approve
+## Permissions: by where the agent runs
 
-Chaos Control never approves a tool and never changes an agent's permission
-mode. A `session/request_permission` is answered with the agent's own decline
-option (`reject_once`, else `reject_always`), or `cancelled` if it offered
-none. It shows as presence ("wanted to run X, declined") plus one system note
-in the channel naming who woke the agent. Approvals in a shared room are an
-open decision.
+Chaos Control never changes an agent's permission mode and never simulates
+one. What happens to a permission request depends on where the agent runs,
+set per agent in `agents.json` (`"runs_in"`, default `"host"`):
+
+| Where | What happens |
+| --- | --- |
+| `host` (the user's computer) | The request goes to the humans, **non-blocking**. The agent hears "request sent" with a request id at once and decides whether to wait or do something else. A human's Approve or Deny arrives later, as a message. Never auto-approved, never times out into an approval. |
+| `vm` (the agent's own VM) | Everything is approved. A broken VM is replaced, not protected. No VM orchestration yet: the flag only marks the agent. |
+
+A declined or denied request is an answer, not a failure (the peer model): it
+never fails a turn, never turns an agent red and is never retried by the
+runtime.
+
+**Native requests (ACP `session/request_permission`).** The protocol call
+blocks the agent until it is answered, so the adapter asks core
+(`OpenSession::permissions`, decided in the engine) and answers at once:
+
+- allowed (VM, or a grant, below): the agent's own **allow-once** option,
+  else allow-always only if nothing narrower is offered (claude-agent-acp's
+  allow-always writes a lasting rule into the agent's local settings);
+- otherwise: the agent's own **"not now"** decline, a reject-once that lets
+  the turn continue (Codex offers two reject-once options; the one whose name
+  says "continue" wins over "tell Codex what to do differently", which aborts
+  the turn), else reject-always, else `cancelled`. The response carries
+  `_meta.chaosControl = {status: "request_sent", requestId, message}`.
+
+**Requests.** Each is a row in `permission_requests` (migration 6): agent,
+channel, the turn it was asked in, source (`native` or `chat_tool`), title
+(the tool call's title), detail (raw input), reason, state (`pending`,
+`approved`, `denied`, `auto_approved`), who it was routed to, who answered,
+when, an optional note, and `used_at`.
+
+- **Routing:** to the humans whose messages woke the turn, else every human
+  in the channel. Any human member of the channel can answer; agents can't.
+- **Dedup:** asking again for the same title while one is pending reuses it.
+- **Surfacing:** one system note ("@bot asked to run X: permission request #N,
+  sent to @hx. Any human here can approve or deny it; @bot carries on
+  meanwhile."), a `CoreEvent::Permission`, and presence "request pending: X
+  (#N)" (never "blocked"; glow is unchanged). The app opens the pane with
+  Approve / Deny quick actions (`model::PaneContent::Permission`) unless the
+  pane is busy with something else, and loads requests still pending at
+  startup. An answer from anywhere closes that pane.
+- **Answer:** `Core::answer_permission(id, human, approve, note)` records it
+  (only a pending request can be answered, once), posts it as a system
+  message and delivers it as a wake: one trigger with reason `permission` on
+  that message, no reply owed, merged into the pending batch if the agent is
+  busy. A human's answer clears a red state like a human ping.
+- **Grant:** an approval is a **one-shot grant** for that (agent, channel,
+  title). The next native request with the same title is answered with
+  allow-once and the grant is spent (`used_at`). A denial grants nothing.
+
+**Chat tools.** `chat_request_permission {action, reason?}` asks ahead: on
+the host it answers `{status: "request_sent", request_id, asked}` (or
+`approved` if that action is already approved and unused); in a VM,
+`approved`. Using a tool call's exact title as `action` pre-clears that call
+once. `chat_permission_status {request_id?}` lists the agent's requests in
+the channel with their answers.
+
+**Resuming a declined action (investigated against the published sources,
+not live yet).** Neither agent can be told "approved" inside the call it
+already made, so resuming means retrying on a later turn, which the grant
+lets through:
+
+- **claude-agent-acp 0.97.0:** a reject-once becomes
+  `{behavior: "deny", message: "User refused permission to run tool"}`
+  without `interrupt`, so Claude sees a refused tool result and keeps going
+  in the same turn. It ignores our `_meta`, so the "request sent" context
+  reaches it through the room norms in its orientation and the answer
+  message. On the answer's wake it retries the tool call; the same title
+  (the Bash command, `Edit <path>`, ...) hits the grant.
+- **codex-acp:** exec and patch approvals map options to Codex review
+  decisions; we pick "denied" (continue without running it), never "abort"
+  (ends the turn). Codex sees the command was rejected and continues. On the
+  answer's wake it re-issues the command, codex-acp asks again, and the grant
+  answers "approved". `cancelled` would map to abort, so it is only used when
+  an agent offers no decline at all.
+- Limits: sessions close after 10 idle minutes, so an answer that comes
+  later wakes a fresh session that only knows what the answer message and
+  its unread context say (title and request id). A grant matches on the
+  title only, so a retried call whose title changes asks again.
 
 ## Room policy
 
@@ -263,7 +338,8 @@ answers `not_found`.
 
 `record` appends every ACP frame as NDJSON `{dir, frame}`, the replay-fixture
 format. Optional keys: `env` (object), `acp_v2` (default `true`),
-`chat_tools` (`"auto"` or `"stdio"`).
+`chat_tools` (`"auto"` or `"stdio"`), `runs_in` (`"host"`, the default, or
+`"vm"`; see Permissions).
 
 ## Testing
 
@@ -279,6 +355,12 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   who/what/model/runtime/reason, and shows up again in `chat_context`,
   `chat_read` and the next prompt; a human's dissent wakes the agent; bad
   arguments record nothing.
+- `tests/permissions.rs`: permissions by where the agent runs, against the
+  fake agent: a host request is routed to the waker, declined natively with
+  the request id and the turn carries on; an approval wakes the agent and
+  lets the retried call through once; a denial grants nothing and is not a
+  failure; a VM agent is approved without a note; the chat tools ask ahead,
+  dedup and poll; only humans answer, once.
 - `tests/replay.rs`: recorded transcripts through the real adapter (v1
   claude-agent-acp, v2 claude-agent-acp live, codex-acp needing sign-in), and
   the fake agent binary over real stdio. One ignored live test spawns a real
@@ -324,7 +406,8 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
 - **Recorded:** codex-acp 0.16.0 v1 (`session/new` needs sign-in) and
   claude-agent-acp 0.97.0 answering a v1-only client.
 - **Against the fake only:** agent output, keyed message and tool-call
-  upserts, permission requests and cancel over v2 (`tests/v2.rs`).
+  upserts, permission requests and cancel over v2 (`tests/v2.rs`), and the
+  whole permission flow (`tests/permissions.rs`).
 - **Not yet:** a signed-in agent actually calling `chat_context` and
   `chat_send`, agent output, tool calls and permission requests over v2 from a
   real agent, and the stdio bridge inside a real agent. That is validation step 2 on a Mac with

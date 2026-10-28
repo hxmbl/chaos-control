@@ -19,6 +19,7 @@ use chaos_core::{
     acp::{AcpAdapter, FnTransport, SpawnTransport},
     adapter::*,
     host::{AgentSpec, Core, HostConfig, ManualClock},
+    permission::{PermissionGate, RunsIn},
     types::*,
 };
 use common::*;
@@ -110,6 +111,7 @@ async fn open_replay(
             agent: MemberId(1),
             channel: ChannelId(1),
             handle: Arc::from("claude"),
+            permissions: PermissionGate::decline_all(),
             cwd: std::env::temp_dir(),
             chat_tools: ChatToolsEndpoint {
                 url: "http://127.0.0.1:9/mcp".into(),
@@ -216,6 +218,7 @@ async fn claude_agent_acp_selects_v2_and_a_signed_out_turn_goes_red() {
                 name: "Claude".into(),
                 adapter,
                 cwd: None,
+                runs_in: RunsIn::Host,
             },
             main,
         )
@@ -293,6 +296,7 @@ async fn codex_acp_auth_required_turns_the_agent_red() {
                 name: "Codex".into(),
                 adapter,
                 cwd: None,
+                runs_in: RunsIn::Host,
             },
             main,
         )
@@ -355,6 +359,7 @@ async fn fake_agent_binary_over_real_stdio() {
                 name: "Binary".into(),
                 adapter,
                 cwd: Some(dir.clone()),
+                runs_in: RunsIn::Host,
             },
             main,
         )
@@ -428,6 +433,7 @@ async fn live_acp_agent_handshake_and_first_turn() {
                 name: "Live agent".into(),
                 adapter: adapter.clone(),
                 cwd: Some(std::env::temp_dir()),
+                runs_in: RunsIn::Host,
             },
             main,
         )

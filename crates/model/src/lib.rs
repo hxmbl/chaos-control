@@ -8,8 +8,8 @@ mod sample;
 pub mod search;
 
 pub use pane::{
-    Attachment, PaneAction, PaneActionKind, PaneContent, ProjectQuestion, ProjectQuestionKind,
-    ReplyRef, ReviewItem, Settings,
+    Attachment, PaneAction, PaneActionKind, PaneContent, PermissionPrompt, ProjectQuestion,
+    ProjectQuestionKind, ReplyRef, ReviewItem, Settings,
 };
 pub use sample::{demo_channels, demo_history, sample, sample_history};
 pub use search::{
@@ -104,7 +104,7 @@ pub struct Agent {
     pub brand: Brand,
     pub state: AgentState,
     /// One line from the runtime for the Agent Status tooltip ("running tests",
-    /// "declined a permission request"). Never part of the chat log.
+    /// "request pending: rm -rf build/ (#3)"). Never part of the chat log.
     pub presence: Option<Arc<str>>,
 }
 
@@ -138,7 +138,7 @@ pub struct Mention {
 pub enum Author {
     Agent(Id),
     Human,
-    /// A runtime notice (an agent declined a permission request, a paused
+    /// A runtime notice (an agent asked for permission, a paused
     /// agent-to-agent exchange). Shown quietly; never wakes anyone.
     System,
 }
