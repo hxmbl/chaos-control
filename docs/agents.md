@@ -238,10 +238,20 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
     cargo test -p chaos-core --test replay live -- --ignored --nocapture
   ```
 
-- The `fake-acp-agent` binary passes the v1 suite of the ACP Test
-  Compatibility Kit ([acp-tck](https://github.com/agentclientprotocol/acp-tck),
-  experimental). It is v1-only, so the v2 suite stops at version mismatch.
-  The script needs a sleep so `session/cancel` lands mid-turn:
+- `tests/v2.rs`: the v2 draft client path (`acp_v2.rs`) against the fake in
+  v2 mode: negotiation without fallback, replies through the chat tools,
+  keyed message and tool-call upserts feeding the fallback text, permission
+  declines inside `requires_action`, cancel, an `error` stop after
+  acceptance, and the binary speaking raw v2 JSON-RPC.
+- The fake agent speaks v1 by default. `"protocol": 2` in its script makes
+  it speak the v2 draft too (a v1 `initialize` still gets v1); the module
+  docs in `crates/core/src/fake.rs` list what a v2 turn sends. The
+  `agent_message` step (a keyed snapshot that replaces the chunks of the
+  current message) is v2 only.
+- The `fake-acp-agent` binary is checked against the ACP Test Compatibility
+  Kit ([acp-tck](https://github.com/agentclientprotocol/acp-tck),
+  experimental). The script needs a sleep so `session/cancel` lands
+  mid-turn. v1:
 
   ```sh
   echo '{"turns":[{"steps":[{"text":"Working"},{"tool_call":"Look"},{"sleep_ms":3000},{"text":"Done"}]}]}' > /tmp/tck.json
@@ -249,6 +259,9 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   cd ../acp-tck && uv run acp-tck --protocol-version 1 \
     --agent-env FAKE_ACP_SCRIPT=/tmp/tck.json -- <target>/debug/fake-acp-agent
   ```
+
+  v2: the same with `"protocol":2` added to the script and
+  `--protocol-version 2`.
 
 ## Verified and not yet verified
 
@@ -258,7 +271,9 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   goes red, one note, no retry).
 - **Recorded:** codex-acp 0.16.0 v1 (`session/new` needs sign-in) and
   claude-agent-acp 0.97.0 answering a v1-only client.
+- **Against the fake only:** agent output, keyed message and tool-call
+  upserts, permission requests and cancel over v2 (`tests/v2.rs`).
 - **Not yet:** a signed-in agent actually calling `chat_context` and
-  `chat_send`, agent output, tool calls and permission requests over v2, and
-  the stdio bridge inside a real agent. That is validation step 2 on a Mac with
+  `chat_send`, agent output, tool calls and permission requests over v2 from a
+  real agent, and the stdio bridge inside a real agent. That is validation step 2 on a Mac with
   a signed-in Claude.
