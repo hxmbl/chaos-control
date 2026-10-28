@@ -288,8 +288,11 @@ pub enum ObligationState {
     Satisfied,
     /// The runtime posted the final turn text as the reply.
     Fallback,
-    /// The turn ended (or failed) with nothing to post.
+    /// The turn was cancelled, refused or failed with nothing posted.
     Unmet,
+    /// The agent finished its turn without replying or reacting: it read the
+    /// ping and chose to let it go. Legitimate, never retried, not owed.
+    Ignored,
 }
 
 impl ObligationState {
@@ -299,6 +302,7 @@ impl ObligationState {
             ObligationState::Satisfied => "satisfied",
             ObligationState::Fallback => "fallback",
             ObligationState::Unmet => "unmet",
+            ObligationState::Ignored => "ignored",
         }
     }
 
@@ -307,7 +311,22 @@ impl ObligationState {
             "satisfied" => ObligationState::Satisfied,
             "fallback" => ObligationState::Fallback,
             "unmet" => ObligationState::Unmet,
+            "ignored" => ObligationState::Ignored,
             _ => ObligationState::Open,
         }
     }
+}
+
+/// How far a member has read a channel, and when that last moved.
+///
+/// Agents: `read_through` moves when a turn carrying the messages is accepted
+/// (they were in the prompt) or when the agent reads forward with
+/// `chat_read`. Humans: when the app shows them the channel
+/// (`Core::mark_read`). A member who has never read anything has no receipt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Receipt {
+    pub member: MemberId,
+    pub channel: ChannelId,
+    pub read_through: Seq,
+    pub read_at: Millis,
 }

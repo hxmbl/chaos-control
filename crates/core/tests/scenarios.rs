@@ -251,7 +251,8 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
     let m = h.wait_message("fallback after 👀", Some(eyes.id)).await;
     assert_eq!(m.reply_to, Some(ping3.id));
 
-    // Turn ends with no text and no reply: unmet, nothing posted.
+    // Turn ends with no text and no reply: the agent ignored it, which is
+    // legitimate. Nothing posted, nothing owed, never retried.
     let mute = h
         .agent("mute", script(json!({"turns": [{"steps": []}]})))
         .await;
@@ -268,11 +269,17 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
     .await;
     assert_eq!(
         h.obligation(mute.id, ping4.id).await,
-        Some(ObligationState::Unmet)
+        Some(ObligationState::Ignored)
     );
     assert!(agent_messages(&h.history().await, mute.id).is_empty());
     let st = h.core.status(mute.id, h.main).await.unwrap();
-    assert_eq!(st.presence.as_deref(), Some("finished without replying"));
+    assert_eq!(st.presence.as_deref(), Some("read it and let it go"));
+    h.advance(10 * 60 * 1000).await;
+    assert_eq!(
+        h.prompts("mute").len(),
+        1,
+        "an ignored ping is never retried"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

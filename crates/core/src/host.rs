@@ -455,6 +455,27 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// Records that a human was shown `channel` through `through` (None: the
+    /// channel head). Moves their read receipt forward, never back.
+    pub async fn mark_read(
+        &self,
+        member: MemberId,
+        channel: ChannelId,
+        through: Option<Seq>,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, now| {
+            e.advance_read(now, member, channel, through.unwrap_or(Seq::MAX))
+        })
+        .await
+    }
+
+    /// Who has read how far in `channel` (see [`Receipt`]).
+    pub async fn receipts(&self, channel: ChannelId) -> Result<Vec<Receipt>, String> {
+        self.with_engine(move |e, _| e.receipts(channel))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn members(&self, channel: ChannelId) -> Result<Vec<Member>, String> {
         self.with_engine(move |e, _| crate::store::members_of(e.conn(), channel))
             .await?
