@@ -1850,9 +1850,9 @@ mod tests {
 
     #[test]
     fn read_cursors_stamp_when_they_move_and_never_go_back() {
-        let s = Store::open_in_memory().unwrap();
+        let (s, channel, hx, _) = setup();
         let c = s.conn();
-        let (a, ch) = (MemberId(1), ChannelId(1));
+        let (a, ch) = (hx.id, channel.id);
         assert!(advance_read(c, a, ch, 5, 100).unwrap());
         assert!(!advance_read(c, a, ch, 3, 200).unwrap(), "never backwards");
         assert!(
