@@ -253,7 +253,7 @@ impl Conversation {
                             .gap(space::X1_5)
                             .h(size::BUTTON_SM)
                             .px(space::X3)
-                            .rounded_full()
+                            .rounded(radius::MD)
                             .bg(t.sunken)
                             .type_style(text::SMALL)
                             .font_weight(text::MEDIUM)
@@ -403,7 +403,7 @@ impl Conversation {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
+                            .rounded(radius::MD)
                             .bg(t.sunken)
                             .child(icon(IconName::Hash, icons::LG, t.faint)),
                     )

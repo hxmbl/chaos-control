@@ -312,7 +312,7 @@ Every size the shell draws with comes from `ui::tokens`; colours come from
 | --- | --- |
 | `space` | 2, 4, 6, 8, 12, 16, 24, 32 |
 | `text` | `CAPTION` 12/16, `SMALL` 13/18, `BODY` 15/22, `TITLE` 17/24 semibold; weights regular, medium, semibold only |
-| `radius` | `SM` 8, `MD` 14, `LG` 20, `XL` 26, plus `rounded_full()`; concentric (each level is its parent minus the 6px inset) |
+| `radius` | `SM` 6 (tooltips), `MD` 8 (buttons, rows, agent tiles, send), `FIELD` 10 (search field, composer), `LG` 14 (sections, search panel), `XL` 20 (sidebars, pane); concentric (XL → LG → MD each step the 6px inset; LG wraps FIELD with the search panel's 4px inset). `rounded_full()` only for dots, avatars, status indicators and switches |
 | `size` | `CHIP` 22, `BUTTON_SM` 28, `BUTTON` 32, `ROW` 36, `ROW_LG` 44, `HAIRLINE` 1 |
 | `icon` | `SM` 12, `MD` 16, `LG` 20; Phosphor regular weight only |
 | `Elevation` | `None`, `Float` (docked sidebars, composer, search), `Overlay` (a peeking sidebar); `Theme::elevation` |
@@ -325,9 +325,13 @@ Surface rules:
 
 - Separation comes from one signal, never two. Panels have a hairline and a
   shadow; sections inside them are a background step (`sunken`) with no
-  outline; rows inside sections are borderless pills that show `hover` under
-  the pointer and `selected` when chosen.
-- Text fields (the search pill, the composer) keep a hairline border, because
+  outline; rows inside sections are borderless rounded rows that show `hover`
+  under the pointer and `selected` when chosen.
+- The left sidebar's channel section hugs its rows (channels, "+", Archived)
+  and grows with each new channel; once it reaches the quick links it stops
+  and the list scrolls inside it. The quick links sit straight on the panel
+  surface with hover feedback only.
+- Text fields (the search field, the composer) keep a hairline border, because
   it says "you can type here". Nothing else is outlined.
 - Dividers are 1px hairlines.
 - Optical exceptions (the pane's close-dot centring, the switch knob) stay as

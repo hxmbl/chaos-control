@@ -7,7 +7,7 @@ use gpui::{
 };
 use ui::{
     ActiveTheme, Ellipsis, IconName, Tooltip, TypeStyleExt, icon,
-    tokens::{icon as icons, size, space, text},
+    tokens::{icon as icons, radius, size, space, text},
     truncated,
 };
 
@@ -112,7 +112,7 @@ impl Render for Titlebar {
                         .h(search::PILL_HEIGHT)
                         .w(search_width)
                         .px(space::X3)
-                        .rounded_full()
+                        .rounded(radius::FIELD)
                         .bg(t.sunken)
                         .type_style(text::SMALL)
                         .text_color(t.muted)
@@ -133,7 +133,7 @@ impl Render for Titlebar {
                         .items_center()
                         .h(search::PILL_HEIGHT)
                         .w(search_width)
-                        .rounded_full()
+                        .rounded(radius::FIELD)
                         .border_1()
                         .border_color(t.line)
                         .bg(t.surface)
@@ -206,7 +206,7 @@ impl Titlebar {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded_full()
+                .rounded(radius::MD)
                 .when(on, |s| s.bg(selected))
                 .hover(move |s| s.bg(if on { selected } else { hover }))
                 // Clicks on the button must not start a window drag.
@@ -249,7 +249,7 @@ fn window_controls(window: &Window, cx: &Context<Titlebar>) -> impl IntoElement 
             .flex()
             .items_center()
             .justify_center()
-            .rounded_full()
+            .rounded(radius::MD)
             .hover(move |s| s.bg(hover))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(icon(name, icons::SM, t.ink_soft))

@@ -13,8 +13,12 @@ use crate::{pane_host::PaneHost, store::ChatStore};
 /// Channel row height (`size::ROW`) plus the gap below it (`space::X1`);
 /// `uniform_list` needs one fixed row height.
 const CHANNEL_ROW: f32 = 36. + 4.;
-/// The channel list never shrinks below about three rows.
-const CHANNELS_MIN_H: f32 = 140.;
+/// The channel list never shrinks below about three rows (or its content, if
+/// that is shorter).
+const CHANNELS_MIN_H: f32 = 3. * CHANNEL_ROW;
+
+/// The section's padding (`space::X1_5` twice) plus the Archived row (`size::ROW`).
+const SECTION_CHROME: f32 = 2. * 6. + 36.;
 
 pub struct Sidebar {
     store: Entity<ChatStore>,
@@ -152,6 +156,8 @@ impl Render for Sidebar {
         let project_emoji = SharedString::from(ws.project.emoji.clone());
         let project_name = SharedString::from(ws.project.name.clone());
         let channel_count = ws.channels.len();
+        // Every channel plus the "+" row.
+        let list_h = (channel_count + 1) as f32 * CHANNEL_ROW;
         let quick_links: Vec<_> = ws
             .quick_links
             .iter()
@@ -201,13 +207,17 @@ impl Render for Sidebar {
                 this.child(self.render_projects(cx))
             })
             // Channels. Virtualized: a project can collect hundreds of issue channels.
+            // The section hugs its rows (channels, "+", then Archived), so it
+            // grows with every new channel; once it would run into the quick
+            // links it stops at the space left and the list scrolls inside it.
+            // Archived stays at the section's end.
             .child(
-                // Grows with the window, so a tall window shows more channels.
                 section()
                     .flex()
                     .flex_col()
-                    .flex_1()
-                    .min_h(px(CHANNELS_MIN_H))
+                    .flex_shrink()
+                    // The section's padding plus Archived below the list.
+                    .min_h(px(list_h.min(CHANNELS_MIN_H) + SECTION_CHROME))
                     .child(
                         uniform_list(
                             "channels",
@@ -234,12 +244,12 @@ impl Render for Sidebar {
                                 items
                             }),
                         )
-                        .flex_1()
-                        .min_h_0(),
+                        .h(px(list_h))
+                        .flex_shrink()
+                        .min_h(px(list_h.min(CHANNELS_MIN_H))),
                     )
                     .child(
                         pill("archived", cx)
-                            .mt(space::X1)
                             .h(size::ROW)
                             .gap(space::X2)
                             .pl(space::X3)
@@ -249,11 +259,15 @@ impl Render for Sidebar {
                             .child(icon(IconName::CaretRight, icons::SM, t.muted)),
                     ),
             )
-            // Quick links
+            // Spare height sits under the channels, above the quick links.
+            .child(div().flex_1())
+            // Quick links: straight on the panel surface, hover only.
             .child(
-                section()
+                div()
                     .flex()
+                    .flex_none()
                     .gap(space::X1)
+                    .px(space::X1_5)
                     .children(quick_links.into_iter().enumerate().map(
                         |(ix, (label, brand, url))| {
                             pill(("quick-link", ix), cx)

@@ -698,8 +698,8 @@ impl Render for Search {
             .flex_col()
             .gap(space::X1)
             .p(space::X1 * eased)
-            // From the pill's fully round ends to the panel's radius.
-            .rounded(PILL_HEIGHT / 2. + (radius::LG - PILL_HEIGHT / 2.) * eased)
+            // From the field's radius to the panel's, concentric with its 4px inset.
+            .rounded(radius::FIELD + (radius::LG - radius::FIELD) * eased)
             .border_1()
             .border_color(t.line_strong)
             .bg(t.surface)

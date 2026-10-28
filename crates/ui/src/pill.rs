@@ -1,8 +1,8 @@
 use gpui::{App, ElementId, InteractiveElement, Stateful, Styled, div};
 
-use crate::ActiveTheme;
+use crate::{ActiveTheme, tokens::radius};
 
-/// Borderless pill shared by the rows in both sidebars. It has no outline and
+/// Borderless row shared by the rows in both sidebars. It has no outline and
 /// no fill of its own: it sits on whatever it is placed on, shows `hover` under
 /// the pointer, and callers mark the selected row with `bg(t.selected)`.
 /// Callers add height, padding and content.
@@ -15,7 +15,7 @@ pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<gpui::Div> {
         .flex_none()
         .items_center()
         .w_full()
-        .rounded_full()
+        .rounded(radius::MD)
         .text_color(t.ink)
         .hover(move |s| s.bg(hover_bg))
 }

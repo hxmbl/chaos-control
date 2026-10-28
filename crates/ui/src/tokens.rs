@@ -6,7 +6,8 @@
 //! - [`space`]: gaps, padding and margins on a 4pt grid (plus 2 and 6).
 //! - [`text`]: four type steps with paired line heights, and three weights.
 //! - [`radius`]: concentric corners; each nested level is its parent minus the
-//!   6px inset (26 → 20 → 14 → 8), with `rounded_full()` for pills and dots.
+//!   6px inset (20 → 14 → 8), a 10px field radius, and `rounded_full()` only
+//!   for dots, avatars, status indicators and switches.
 //! - [`size`]: control heights.
 //! - [`icon`]: three icon sizes, all Phosphor regular.
 //! - [`Elevation`]: three levels of lift; read the shadows with
@@ -77,18 +78,22 @@ pub mod text {
     pub const SEMIBOLD: FontWeight = FontWeight::SEMIBOLD;
 }
 
-/// Corner radii, concentric with the 26px panels. Pills and dots use
-/// `rounded_full()`.
+/// Corner radii, concentric with the 20px panels. Only dots, avatars, status
+/// indicators and switches use `rounded_full()`; everything else is a rounded
+/// square.
 pub mod radius {
     use super::*;
-    /// Tooltips, small square buttons.
-    pub const SM: Pixels = px(8.);
-    /// Rows inside a section: message hover, search card, pane quick actions.
-    pub const MD: Pixels = px(14.);
-    /// Sections inside a panel; the search panel.
-    pub const LG: Pixels = px(20.);
-    /// Floating panels: sidebars, pane, composer.
-    pub const XL: Pixels = px(26.);
+    /// Tooltips.
+    pub const SM: Pixels = px(6.);
+    /// Buttons and rows: sidebar rows, agent tiles, message hover, search card,
+    /// pane quick actions, the send button.
+    pub const MD: Pixels = px(8.);
+    /// Text fields: the titlebar search field, the composer.
+    pub const FIELD: Pixels = px(10.);
+    /// Sections inside a panel; the search panel (the field plus its 4px inset).
+    pub const LG: Pixels = px(14.);
+    /// Floating panels: sidebars, pane.
+    pub const XL: Pixels = px(20.);
 }
 
 /// Control heights.
@@ -168,6 +173,8 @@ mod tests {
     fn radii_are_concentric_with_the_inset() {
         assert_eq!(radius::XL - space::X1_5, radius::LG);
         assert_eq!(radius::LG - space::X1_5, radius::MD);
-        assert_eq!(radius::MD - space::X1_5, radius::SM);
+        // The search panel wraps the field with a 4px inset.
+        assert_eq!(radius::LG - space::X1, radius::FIELD);
+        assert!(radius::SM < radius::MD && radius::MD < radius::FIELD);
     }
 }

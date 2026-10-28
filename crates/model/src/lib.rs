@@ -11,7 +11,7 @@ pub use pane::{
     Attachment, PaneAction, PaneActionKind, PaneContent, ProjectQuestion, ProjectQuestionKind,
     ReplyRef, ReviewItem, Settings,
 };
-pub use sample::{demo_history, sample, sample_history};
+pub use sample::{demo_channels, demo_history, sample, sample_history};
 pub use search::{
     CorpusChannel, SearchAction, SearchCorpus, SearchHit, SearchProvider, SearchResult,
     SubstringSearch,

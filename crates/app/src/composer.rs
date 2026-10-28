@@ -114,7 +114,7 @@ impl Composer {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_full()
+                    .rounded(radius::MD)
                     .hover(move |s| s.bg(hover))
                     .tooltip(Tooltip::text("Cancel reply"))
                     .on_click(cx.listener(|this, _, window, cx| {
@@ -138,7 +138,7 @@ impl Render for Composer {
             .w_full()
             .flex()
             .flex_col()
-            .rounded(radius::XL)
+            .rounded(radius::FIELD)
             .border_1()
             .border_color(if focused { t.line_strong } else { t.line })
             .bg(t.surface)
@@ -169,7 +169,7 @@ impl Render for Composer {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
+                            .rounded(radius::MD)
                             .hover(move |s| s.bg(hover))
                             .tooltip(Tooltip::text("Attach"))
                             .child(icon(IconName::Plus, icons::MD, t.muted)),
@@ -181,7 +181,7 @@ impl Render for Composer {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .rounded_full()
+                            .rounded(radius::MD)
                             // Disabled reads as a muted button, not a missing one.
                             .bg(if can_send { t.ink } else { t.faint })
                             .tooltip(Tooltip::text("Send"))
