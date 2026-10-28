@@ -23,15 +23,17 @@ use std::{
 };
 
 use gpui::{
-    App, Context, Entity, EventEmitter, FocusHandle, Focusable, FontWeight, Pixels, SharedString,
-    Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, Pixels, SharedString, Subscription,
+    Task, Window, actions, div, prelude::*, px,
 };
 use model::{
     Author, PaneActionKind, PaneContent, SearchAction, SearchHit, SearchProvider, SearchResult,
 };
 use ui::{
-    ActiveTheme, Ellipsis, IconName, Pane, QuickAction, TextInput, TextInputEvent, Tooltip, icon,
-    pill, truncated,
+    ActiveTheme, Elevation, Ellipsis, IconName, Pane, QuickAction, TextInput, TextInputEvent,
+    TypeStyleExt, icon, pill,
+    tokens::{icon as icons, radius, size, space, text},
+    truncated,
 };
 
 use crate::{settings, store::ChatStore};
@@ -46,8 +48,10 @@ const LIMIT: usize = 20;
 const COLLAPSED_ROWS: usize = 4;
 /// The pill grows into the panel over this long.
 const GROW: Duration = Duration::from_millis(140);
+/// The open panel scrolls past this height.
+const MAX_PANEL_H: f32 = 560.;
 /// The titlebar pill: 396px wide, shrinking to 46% of narrow windows.
-pub const PILL_HEIGHT: Pixels = px(30.);
+pub const PILL_HEIGHT: Pixels = size::BUTTON;
 pub fn pill_width(viewport: Pixels) -> Pixels {
     (viewport * 0.46).min(px(396.))
 }
@@ -102,7 +106,7 @@ impl Search {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let input = cx.new(|cx| TextInput::new("Find anything", cx).centered());
+        let input = cx.new(|cx| TextInput::new("Search channels and messages", cx).centered());
         let focus = input.focus_handle(cx);
         let subscriptions = vec![
             // Focus moving elsewhere in the app closes the panel. Not when the
@@ -365,37 +369,37 @@ impl Search {
             .id("search-card")
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .px(px(12.))
-            .py(px(10.))
-            .rounded(px(14.))
+            .gap(space::X1_5)
+            .px(space::X3)
+            .py(space::X2)
+            .rounded(radius::MD)
             .hover(move |s| s.bg(t.hover))
             .on_click(cx.listener(move |this, _, window, cx| this.confirm(ix, window, cx)))
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(space::X2)
                     .child(icon(
                         match result.hit {
                             SearchHit::Channel { .. } => IconName::Hash,
-                            SearchHit::Message { .. } => IconName::MagnifyingGlassBold,
+                            SearchHit::Message { .. } => IconName::ChatCircle,
                         },
-                        px(16.),
+                        icons::MD,
                         t.ink_soft,
                     ))
                     .child(
                         div()
                             .flex_shrink()
                             .ellipsis()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::MEDIUM)
+                            .type_style(text::BODY)
+                            .font_weight(text::MEDIUM)
                             .child(truncated(title)),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(13.))
+                            .type_style(text::CAPTION)
                             .text_color(t.muted)
                             .child(id),
                     ),
@@ -404,8 +408,7 @@ impl Search {
                 div()
                     .min_w_0()
                     .line_clamp(3)
-                    .text_size(px(13.5))
-                    .line_height(px(20.))
+                    .type_style(text::SMALL)
                     .text_color(t.ink_soft)
                     .child(about),
             )
@@ -421,16 +424,16 @@ impl Search {
             SearchHit::Message { .. } => format!("{title}: {about}").into(),
         };
         pill(("search-row", ix), cx)
-            .h(px(38.))
-            .gap(px(10.))
-            .px(px(14.))
-            .text_size(px(13.5))
+            .h(size::ROW)
+            .gap(space::X2)
+            .px(space::X3)
+            .type_style(text::SMALL)
             .on_click(cx.listener(move |this, _, window, cx| this.confirm(ix, window, cx)))
             .child(div().flex_1().ellipsis().child(truncated(line)))
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(12.))
+                    .type_style(text::CAPTION)
                     .text_color(t.muted)
                     .child(id),
             )
@@ -460,9 +463,9 @@ impl Search {
                 let action = action.clone();
                 let label = SharedString::from(action.label.clone());
                 pill(("search-action", ix), cx)
-                    .h(px(38.))
-                    .px(px(14.))
-                    .text_size(px(13.5))
+                    .h(size::ROW)
+                    .px(space::X3)
+                    .type_style(text::SMALL)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.close(cx);
                         cx.emit(SearchEvent::Action {
@@ -546,11 +549,11 @@ impl Search {
         let header = div()
             .flex()
             .items_center()
-            .gap(px(10.))
-            .h(px(30.))
-            .text_size(px(18.))
-            .line_height(px(24.))
-            .child(icon(IconName::MagnifyingGlassBold, px(17.), t.muted))
+            .gap(space::X2)
+            .h(size::BUTTON)
+            .type_style(text::TITLE)
+            .font_weight(text::REGULAR)
+            .child(icon(IconName::MagnifyingGlass, icons::MD, t.muted))
             .child(div().flex_1().min_w_0().child(field));
         let close = cx.entity();
         let pane = Pane::new("search-pane")
@@ -564,12 +567,12 @@ impl Search {
                 if query.trim().is_empty() {
                     pane.child(
                         div()
-                            .text_size(px(13.5))
+                            .type_style(text::SMALL)
                             .text_color(t.muted)
                             .child("Search channels and messages"),
                     )
                 } else if empty {
-                    pane.child(div().text_size(px(13.5)).text_color(t.muted).child(
+                    pane.child(div().type_style(text::SMALL).text_color(t.muted).child(
                         if self.searching {
                             "Searching…"
                         } else {
@@ -577,7 +580,7 @@ impl Search {
                         },
                     ))
                 } else {
-                    pane.child(div().ml(px(-6.)).child(self.render_card(cx)))
+                    pane.child(div().ml(-space::X1_5).child(self.render_card(cx)))
                         .children(rows)
                 }
             });
@@ -632,15 +635,15 @@ impl Render for Search {
         let body = div()
             .flex()
             .flex_col()
-            .gap(px(6.))
+            .gap(space::X1_5)
             .opacity(eased)
             .when(query_empty, |d| {
                 d.child(
                     div()
-                        .px(px(12.))
-                        .pt(px(2.))
-                        .pb(px(8.))
-                        .text_size(px(13.))
+                        .px(space::X3)
+                        .pt(space::X0_5)
+                        .pb(space::X2)
+                        .type_style(text::SMALL)
                         .text_color(t.muted)
                         .child("Search channels and messages"),
                 )
@@ -648,9 +651,9 @@ impl Render for Search {
             .when(!query_empty && empty, |d| {
                 d.child(
                     div()
-                        .px(px(12.))
-                        .py(px(10.))
-                        .text_size(px(13.5))
+                        .px(space::X3)
+                        .py(space::X2)
+                        .type_style(text::SMALL)
                         .text_color(t.muted)
                         .child(if self.searching {
                             "Searching…"
@@ -663,31 +666,25 @@ impl Render for Search {
             .when(!actions.is_empty(), |d| d.children(actions))
             .when(!rows.is_empty(), |d| {
                 d.child(
-                    div()
-                        .mx(px(4.))
-                        .h(px(3.))
-                        .flex_none()
-                        .rounded_full()
-                        .bg(t.line),
+                    // A hairline, not a bar.
+                    div().mx(space::X1).h(size::HAIRLINE).flex_none().bg(t.line),
                 )
                 .children(rows)
             })
             .when(more, |d| {
                 d.child(
                     pill("search-more", cx)
-                        .h(px(16.))
-                        .justify_center()
-                        .gap(px(6.))
-                        .text_size(px(11.))
-                        .line_height(px(12.))
+                        .h(size::ROW)
+                        .px(space::X3)
+                        .gap(space::X1_5)
+                        .type_style(text::CAPTION)
                         .text_color(t.muted)
-                        .tooltip(Tooltip::text(format!("{hidden} more")))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.expanded = true;
                             cx.notify();
                         }))
-                        .child("…")
-                        .child(icon(IconName::CaretDown, px(10.), t.muted)),
+                        .child(format!("Show {hidden} more"))
+                        .child(icon(IconName::CaretDown, icons::SM, t.muted)),
                 )
             });
 
@@ -695,17 +692,18 @@ impl Render for Search {
             .id("search-panel")
             .occlude()
             .w(width)
-            .max_h(px(560.))
+            .max_h(px(MAX_PANEL_H))
             .overflow_y_scroll()
             .flex()
             .flex_col()
-            .gap(px(4.))
-            .p(px(4.) * eased)
-            .rounded(px(15.) + px(5.) * eased)
+            .gap(space::X1)
+            .p(space::X1 * eased)
+            // From the pill's fully round ends to the panel's radius.
+            .rounded(PILL_HEIGHT / 2. + (radius::LG - PILL_HEIGHT / 2.) * eased)
             .border_1()
             .border_color(t.line_strong)
             .bg(t.surface)
-            .shadow(t.float_shadow())
+            .shadow(t.elevation(Elevation::Float))
             .text_color(t.ink)
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_panel(cx)))
             // The field, where the pill was: icon on the left, query after it.
@@ -714,13 +712,11 @@ impl Render for Search {
                     .flex()
                     .items_center()
                     .flex_none()
-                    .h(PILL_HEIGHT - px(2.) + px(6.) * eased)
-                    .gap(px(8.))
-                    .pl(px(11.))
-                    .pr(px(12.))
-                    .text_size(px(13.) + px(1.) * eased)
-                    .line_height(px(18.))
-                    .child(icon(IconName::MagnifyingGlassBold, px(15.), t.muted))
+                    .h(PILL_HEIGHT - size::HAIRLINE * 2. + space::X1_5 * eased)
+                    .gap(space::X2)
+                    .px(space::X3)
+                    .type_style(text::SMALL)
+                    .child(icon(IconName::MagnifyingGlass, icons::MD, t.muted))
                     .child(div().flex_1().min_w_0().child(field)),
             )
             .child(body)

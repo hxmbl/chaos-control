@@ -5,7 +5,11 @@
 use gpui::{
     Context, Decorations, Entity, MouseButton, Window, WindowControlArea, div, prelude::*, px,
 };
-use ui::{ActiveTheme, Ellipsis, IconName, Tooltip, icon, truncated};
+use ui::{
+    ActiveTheme, Ellipsis, IconName, Tooltip, TypeStyleExt, icon,
+    tokens::{icon as icons, size, space, text},
+    truncated,
+};
 
 use crate::{
     panels::{Mode, Panels, Side, ToggleLeftSidebar, ToggleRightSidebar},
@@ -15,7 +19,7 @@ use crate::{
 /// Where the left toggle sits on macOS: just right of the traffic lights.
 const MAC_TRAFFIC_LIGHTS_END: f32 = 84.;
 /// Width of the Linux window controls (three 28px buttons, 4px gaps) plus a gap.
-const WINDOW_CONTROLS_WIDTH: f32 = 3. * 28. + 2. * 4. + 8.;
+const WINDOW_CONTROLS_WIDTH: f32 = 3. * 28. + 2. * 4. + 8.; // 3 × size::BUTTON_SM, 2 × space::X1, space::X2
 
 pub struct Titlebar {
     panels: Entity<Panels>,
@@ -62,7 +66,7 @@ impl Render for Titlebar {
             .flex()
             .items_center()
             .justify_center()
-            .px(px(12.))
+            .px(space::X3)
             .window_control_area(WindowControlArea::Drag)
             .on_click(|event, window, _| {
                 if event.click_count() == 2 {
@@ -104,18 +108,15 @@ impl Render for Titlebar {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .gap(px(8.))
+                        .gap(space::X2)
                         .h(search::PILL_HEIGHT)
                         .w(search_width)
-                        .px(px(12.))
+                        .px(space::X3)
                         .rounded_full()
-                        .border_1()
-                        .border_color(t.line_strong)
                         .bg(t.sunken)
-                        .text_size(px(13.))
-                        .line_height(px(18.))
+                        .type_style(text::SMALL)
                         .text_color(t.muted)
-                        .child(icon(IconName::MagnifyingGlassBold, px(15.), t.muted))
+                        .child(icon(IconName::MagnifyingGlass, icons::MD, t.muted))
                         .child(div().min_w_0().ellipsis().child(truncated(if empty {
                             "Searching in the pane".into()
                         } else {
@@ -137,8 +138,7 @@ impl Render for Titlebar {
                         .border_color(t.line)
                         .bg(t.surface)
                         .text_color(t.ink)
-                        .text_size(px(13.))
-                        .line_height(px(18.))
+                        .type_style(text::SMALL)
                         .hover(move |s| s.border_color(hover_line))
                         // A click anywhere on the pill grows it into the search
                         // panel. It must not start a window drag either.
@@ -149,12 +149,12 @@ impl Render for Titlebar {
                                 this.search.update(cx, |s, cx| s.focus(window, cx));
                             }),
                         )
-                        .child(div().absolute().left(px(12.)).child(icon(
-                            IconName::MagnifyingGlassBold,
-                            px(15.),
+                        .child(div().absolute().left(space::X3).child(icon(
+                            IconName::MagnifyingGlass,
+                            icons::MD,
                             t.muted,
                         )))
-                        .child(div().w_full().px(px(32.)).child(field)),
+                        .child(div().w_full().px(space::X8).child(field)),
                 )
             })
             .child(self.render_toggles(window, cx))
@@ -189,12 +189,12 @@ impl Titlebar {
         let left_x = if mac_lights {
             px(MAC_TRAFFIC_LIGHTS_END)
         } else {
-            px(12.)
+            space::X3
         };
         let right_x = if client_decorations {
-            px(12. + WINDOW_CONTROLS_WIDTH)
+            space::X3 + px(WINDOW_CONTROLS_WIDTH)
         } else {
-            px(12.)
+            space::X3
         };
 
         let (hover, selected) = (t.hover, t.selected);
@@ -202,16 +202,16 @@ impl Titlebar {
             div()
                 .id(id)
                 .absolute()
-                .size(px(28.))
+                .size(size::BUTTON_SM)
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(8.))
+                .rounded_full()
                 .when(on, |s| s.bg(selected))
                 .hover(move |s| s.bg(if on { selected } else { hover }))
                 // Clicks on the button must not start a window drag.
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(icon(name, px(17.), if on { t.ink } else { t.muted }))
+                .child(icon(name, icons::MD, if on { t.ink } else { t.muted }))
         };
 
         div()
@@ -219,7 +219,7 @@ impl Titlebar {
             .inset_0()
             .child(
                 toggle("toggle-left-sidebar", IconName::SidebarLeft, left_open)
-                    .top(px(12.))
+                    .top(space::X3)
                     .left(left_x)
                     .tooltip(Tooltip::text(left_tip))
                     .on_click(|_, window, cx| {
@@ -228,7 +228,7 @@ impl Titlebar {
             )
             .child(
                 toggle("toggle-right-sidebar", IconName::SidebarRight, right_open)
-                    .top(px(12.))
+                    .top(space::X3)
                     .right(right_x)
                     .tooltip(Tooltip::text(right_tip))
                     .on_click(|_, window, cx| {
@@ -245,21 +245,21 @@ fn window_controls(window: &Window, cx: &Context<Titlebar>) -> impl IntoElement 
     let button = |id: &'static str, name: IconName| {
         div()
             .id(id)
-            .size(px(28.))
+            .size(size::BUTTON_SM)
             .flex()
             .items_center()
             .justify_center()
             .rounded_full()
             .hover(move |s| s.bg(hover))
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(icon(name, px(14.), t.ink_soft))
+            .child(icon(name, icons::SM, t.ink_soft))
     };
     let maximized = window.is_maximized();
     div()
         .absolute()
-        .right(px(12.))
+        .right(space::X3)
         .flex()
-        .gap(px(4.))
+        .gap(space::X1)
         .child(
             button("minimize", IconName::Minus).on_click(|_, window, _| window.minimize_window()),
         )

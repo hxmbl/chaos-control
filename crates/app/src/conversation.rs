@@ -7,16 +7,23 @@
 //! without touching the heights already measured.
 
 use gpui::{
-    AnyElement, Context, Entity, FontWeight, ListAlignment, ListOffset, ListState, SharedString,
-    Subscription, Window, div, list, prelude::*, px,
+    AnyElement, Context, Entity, ListAlignment, ListOffset, ListState, SharedString, Subscription,
+    Window, div, list, prelude::*, px,
 };
 use model::{Author, Id, PaneContent, pane};
-use ui::{ActiveTheme, Ellipsis, IconName, brand_icon, icon, truncated};
+use ui::{
+    ActiveTheme, Ellipsis, IconName, TypeStyleExt, brand_icon, icon,
+    tokens::{icon as icons, radius, size, space, text},
+    truncated,
+};
 
 use crate::{
     pane_host::PaneHost,
     store::{ChatStore, StoreEvent},
 };
+
+/// The empty state's blurb wraps at about 50 characters.
+const EMPTY_MAX_W: f32 = 384.;
 
 pub struct Conversation {
     store: Entity<ChatStore>,
@@ -78,22 +85,22 @@ impl Conversation {
         let (avatar, name): (AnyElement, SharedString) = match message.author {
             Author::Agent(id) => match store.workspace().agent(id) {
                 Some(agent) => (
-                    icon(brand_icon(agent.brand), px(16.), t.ink).into_any_element(),
+                    icon(brand_icon(agent.brand), icons::MD, t.ink).into_any_element(),
                     agent.name.clone().into(),
                 ),
                 None => (div().into_any_element(), "Agent".into()),
             },
             Author::Human => (
                 div()
-                    .text_size(px(11.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .type_style(text::CAPTION)
+                    .font_weight(text::SEMIBOLD)
                     .child("Hx")
                     .into_any_element(),
                 "Hx".into(),
             ),
             Author::System => (
                 div()
-                    .text_size(px(11.))
+                    .type_style(text::CAPTION)
                     .text_color(t.ink_soft)
                     .child("·")
                     .into_any_element(),
@@ -109,22 +116,20 @@ impl Conversation {
                 div()
                     .w_full()
                     .flex()
-                    .gap(px(12.))
-                    .px(px(8.))
-                    .py(px(8.))
-                    .rounded(px(14.))
+                    .gap(space::X3)
+                    .px(space::X2)
+                    .py(space::X2)
+                    .rounded(radius::MD)
                     .when(self.highlighted == Some(ix), |row| row.bg(t.selected))
                     .child(
                         div()
-                            .size(px(32.))
+                            .size(size::BUTTON)
                             .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .border_1()
-                            .border_color(t.line)
-                            .bg(t.surface)
+                            .bg(t.sunken)
                             .text_color(t.ink)
                             .child(avatar),
                     )
@@ -138,20 +143,20 @@ impl Conversation {
                                 div()
                                     .flex()
                                     .items_baseline()
-                                    .gap(px(8.))
+                                    .gap(space::X2)
                                     .min_w_0()
                                     .child(
                                         div()
                                             .flex_shrink()
                                             .ellipsis()
-                                            .text_size(px(14.))
-                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .type_style(text::SMALL)
+                                            .font_weight(text::SEMIBOLD)
                                             .child(truncated(name)),
                                     )
                                     .child(
                                         div()
                                             .flex_none()
-                                            .text_size(px(12.))
+                                            .type_style(text::CAPTION)
                                             .text_color(t.muted)
                                             .child(clock(message.sent_at)),
                                     ),
@@ -161,24 +166,20 @@ impl Conversation {
                                     div()
                                         .flex()
                                         .items_center()
-                                        .gap(px(6.))
+                                        .gap(space::X1_5)
                                         .min_w_0()
-                                        .mt(px(2.))
-                                        .pl(px(8.))
+                                        .mt(space::X0_5)
+                                        .pl(space::X2)
                                         .border_l_2()
                                         .border_color(t.line_strong)
-                                        .text_size(px(13.))
-                                        .line_height(px(18.))
+                                        .type_style(text::SMALL)
                                         .text_color(t.muted)
-                                        .child(
-                                            div()
-                                                .flex_none()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(SharedString::from(pane::author_name(
-                                                    store.workspace(),
-                                                    reply.author,
-                                                ))),
-                                        )
+                                        .child(div().flex_none().font_weight(text::MEDIUM).child(
+                                            SharedString::from(pane::author_name(
+                                                store.workspace(),
+                                                reply.author,
+                                            )),
+                                        ))
                                         .child(
                                             div()
                                                 .flex_1()
@@ -234,30 +235,28 @@ impl Conversation {
             .min_w_0()
             .flex()
             .flex_col()
-            .gap(px(2.))
+            .gap(space::X0_5)
             .text_color(t.ink_soft)
             .children(lines)
             .child(
                 div()
-                    .mt(px(6.))
+                    .mt(space::X1_5)
                     .flex()
                     .items_center()
-                    .gap(px(10.))
+                    .gap(space::X2)
                     .child(
                         div()
                             .id(("open-message", ix))
                             .flex()
                             .flex_none()
                             .items_center()
-                            .gap(px(6.))
-                            .h(px(28.))
-                            .px(px(12.))
+                            .gap(space::X1_5)
+                            .h(size::BUTTON_SM)
+                            .px(space::X3)
                             .rounded_full()
-                            .border_1()
-                            .border_color(t.line_strong)
-                            .bg(t.surface)
-                            .text_size(px(13.))
-                            .font_weight(FontWeight::MEDIUM)
+                            .bg(t.sunken)
+                            .type_style(text::SMALL)
+                            .font_weight(text::MEDIUM)
                             .text_color(t.ink)
                             .cursor_pointer()
                             .hover(move |s| s.bg(hover))
@@ -265,11 +264,11 @@ impl Conversation {
                                 pane.update(cx, |p, cx| p.open(content.clone(), window, cx));
                             })
                             .child("Open")
-                            .child(icon(IconName::CaretRight, px(12.), t.muted)),
+                            .child(icon(IconName::CaretRight, icons::SM, t.muted)),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .type_style(text::CAPTION)
                             .text_color(t.muted)
                             .child(SharedString::from(format!("{words} words"))),
                     ),
@@ -309,19 +308,17 @@ fn header(
         .flex_none()
         .flex()
         .flex_col()
-        .px(px(4.))
-        .pt(px(10.))
-        .pb(px(8.))
+        .px(space::X1)
+        .pt(space::X3)
+        .pb(space::X2)
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(6.))
-                .text_size(px(17.))
-                .line_height(px(24.))
-                .font_weight(FontWeight::SEMIBOLD)
+                .gap(space::X1_5)
+                .type_style(text::TITLE)
                 .text_color(t.ink)
-                .child(icon(IconName::HashBold, px(17.), t.ink))
+                .child(icon(IconName::Hash, icons::MD, t.ink))
                 .child(
                     div()
                         .min_w_0()
@@ -333,8 +330,7 @@ fn header(
             div()
                 .min_w_0()
                 .ellipsis()
-                .text_size(px(12.))
-                .line_height(px(16.))
+                .type_style(text::CAPTION)
                 .text_color(t.muted)
                 .child(truncated(place)),
         )
@@ -389,41 +385,39 @@ impl Conversation {
             .flex()
             .items_center()
             .justify_center()
-            .px(px(24.))
+            .px(space::X6)
             .child(
                 div()
-                    .max_w(px(384.))
+                    .max_w(px(EMPTY_MAX_W))
                     .flex()
                     .flex_col()
                     .items_center()
-                    .gap(px(8.))
+                    .gap(space::X2)
                     .text_center()
                     .child(
                         // flex_none: the blurb below is measured unwrapped first,
                         // so the column can come out short and squash its items.
                         div()
-                            .size(px(40.))
+                            .size(size::ROW_LG)
                             .flex_none()
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded_full()
-                            .border_1()
-                            .border_color(t.line)
-                            .child(icon(IconName::Hash, px(18.), t.faint)),
+                            .bg(t.sunken)
+                            .child(icon(IconName::Hash, icons::LG, t.faint)),
                     )
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .type_style(text::BODY)
+                            .font_weight(text::SEMIBOLD)
                             .text_color(t.ink_soft)
                             .child(SharedString::from(channel.name.clone())),
                     )
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .line_height(px(20.))
+                            .type_style(text::SMALL)
                             .text_color(t.muted)
                             .child(blurb),
                     ),

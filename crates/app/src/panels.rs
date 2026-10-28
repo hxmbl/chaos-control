@@ -19,7 +19,7 @@ pub const LEFT_WIDTH: Pixels = px(258.);
 pub const RIGHT_WIDTH: Pixels = px(320.);
 /// Gap between the window edge and a floating panel. The sidebars use it on the
 /// sides and the bottom; the composer uses it at the bottom.
-pub const SIDE_INSET: Pixels = px(12.);
+pub const SIDE_INSET: Pixels = ui::tokens::space::X3;
 /// Breathing room between a sidebar and the centre column.
 pub const GUTTER: Pixels = px(20.);
 

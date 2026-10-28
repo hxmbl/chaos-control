@@ -23,11 +23,15 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, ElementId, FocusHandle, FontWeight, IntoElement, KeyBinding, Pixels,
-    SharedString, Window, actions, div, prelude::*, px, rgb, svg,
+    AnyElement, App, ElementId, FocusHandle, IntoElement, KeyBinding, Pixels, SharedString, Window,
+    actions, div, prelude::*, px, rgb, svg,
 };
 
-use crate::{ActiveTheme, Ellipsis, IconName, truncated};
+use crate::{
+    ActiveTheme, Ellipsis, IconName, TypeStyleExt,
+    tokens::{radius, size, space, text},
+    truncated,
+};
 
 actions!(pane, [ClosePane]);
 
@@ -346,30 +350,29 @@ impl Pane {
 const CLOSE_RED: u32 = 0xff5f57;
 const CLOSE_RIM: u32 = 0xe2463f;
 const CLOSE_GLYPH: u32 = 0x4d0000;
-const RADIUS: Pixels = px(22.);
+const RADIUS: Pixels = radius::XL;
 /// The close dot: macOS traffic-light diameter.
 pub const CLOSE_DOT: Pixels = px(12.);
 /// How far the dot sits from the pane's top and left edges.
-pub const CLOSE_INSET: Pixels = px(12.);
+pub const CLOSE_INSET: Pixels = space::X3;
 /// Extra hit area around the dot on every side (hover shows the glyph).
-pub const CLOSE_SLOP: Pixels = px(7.);
+pub const CLOSE_SLOP: Pixels = space::X2;
 /// The sheet's content padding left and right.
-const PAD_X: Pixels = px(18.);
+const PAD_X: Pixels = space::X4;
 /// The sheet's border. Padding and absolute offsets both start inside it.
-const BORDER: Pixels = px(1.);
+const BORDER: Pixels = size::HAIRLINE;
 /// Top padding with neither title nor header: the body clears the dot.
-const PAD_TOP_BARE: Pixels = px(30.);
+const PAD_TOP_BARE: Pixels = size::BUTTON;
 /// Height of the header row (title or custom header), centred on the dot.
-const HEADER_H: Pixels = px(30.);
+const HEADER_H: Pixels = size::BUTTON;
 /// The title, on the dot's row: smaller than a page heading so the row stays
 /// compact, still clearly the pane's title.
-pub const TITLE_SIZE: Pixels = px(17.);
-const TITLE_LINE: Pixels = px(22.);
+pub const TITLE_SIZE: Pixels = text::TITLE.size;
 /// Gap between the dot's visual right edge and the title.
-pub const TITLE_GAP: Pixels = px(9.);
+pub const TITLE_GAP: Pixels = space::X2;
 /// Gap between the dot's visual right edge and a custom header (search's
 /// field, which has its own icon to lead with).
-const HEADER_GAP: Pixels = px(12.);
+const HEADER_GAP: Pixels = space::X3;
 
 /// Top padding that centres a [`HEADER_H`] row on the dot.
 fn header_pad_top() -> Pixels {
@@ -432,6 +435,7 @@ impl RenderOnce for Pane {
                         div().invisible().group_hover(group, |s| s.visible()).child(
                             svg()
                                 .path(IconName::X.path())
+                                // Optical: the glyph inside a 12px traffic light.
                                 .size(px(8.))
                                 .text_color(rgb(CLOSE_GLYPH)),
                         ),
@@ -460,9 +464,7 @@ impl RenderOnce for Pane {
                         .flex_1()
                         .min_w_0()
                         .ellipsis()
-                        .text_size(TITLE_SIZE)
-                        .line_height(TITLE_LINE)
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .type_style(text::TITLE)
                         .text_color(t.ink)
                         .child(truncated(title)),
                 ),
@@ -484,12 +486,12 @@ impl RenderOnce for Pane {
                 .flex_none()
                 .items_center()
                 .w_full()
-                .h(px(36.))
-                .px(px(14.))
-                .rounded(px(12.))
+                .h(size::ROW)
+                .px(space::X3)
+                .rounded(radius::MD)
                 .bg(glass.well)
                 .hover(|s| s.bg(glass.well_hover))
-                .text_size(px(14.))
+                .type_style(text::SMALL)
                 .text_color(t.ink)
                 .when(!closing, |d| {
                     d.cursor_pointer()
@@ -513,18 +515,18 @@ impl RenderOnce for Pane {
             .w_full()
             // Scale in (and back out on close): a touch narrower and lower.
             .max_w(self.max_width * (0.96 + 0.04 * p))
-            .mt(px(10.) * (1. - p))
+            .mt(space::X2 * (1. - p))
             .max_h_full()
             .flex()
             .flex_col()
-            .gap(px(14.))
+            .gap(space::X3)
             .pt(pad_top)
-            .pb(px(if has_actions { 12. } else { 18. }))
+            .pb(if has_actions { space::X3 } else { space::X4 })
             .px(PAD_X)
             .rounded(RADIUS)
             .border_1()
             .border_color(glass.border)
-            .bg(glass.fill())
+            .bg(glass.fill)
             .shadow(glass.shadow.to_vec())
             .opacity(p)
             .text_color(t.ink)
@@ -532,10 +534,11 @@ impl RenderOnce for Pane {
             .child(
                 div()
                     .absolute()
+                    // Optical: half a pixel in, so the lip sits on the border.
                     .top(px(0.5))
                     .left(RADIUS * 0.6)
                     .right(RADIUS * 0.6)
-                    .h(px(1.))
+                    .h(size::HAIRLINE)
                     .bg(glass.highlight),
             )
             .children(header)
@@ -547,10 +550,9 @@ impl RenderOnce for Pane {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
-                    .gap(px(10.))
-                    .pr(px(4.))
-                    .text_size(px(15.))
-                    .line_height(px(23.))
+                    .gap(space::X2)
+                    .pr(space::X1)
+                    .type_style(text::BODY)
                     .text_color(t.ink_soft)
                     .children(self.body),
             )
@@ -560,15 +562,9 @@ impl RenderOnce for Pane {
                         .flex()
                         .flex_col()
                         .flex_none()
-                        .gap(px(6.))
-                        .child(
-                            div()
-                                .mx(px(2.))
-                                .mb(px(2.))
-                                .h(px(3.))
-                                .rounded_full()
-                                .bg(glass.divider),
-                        )
+                        .gap(space::X1_5)
+                        // A hairline, not a bar.
+                        .child(div().mb(space::X0_5).h(size::HAIRLINE).bg(glass.divider))
                         .children(rows),
                 )
             })
@@ -587,7 +583,7 @@ impl RenderOnce for Pane {
                 }
             })
             .justify_center()
-            .p(px(16.))
+            .p(space::X4)
             .when(self.scrim, |d| {
                 d.child(
                     div()
@@ -602,26 +598,34 @@ impl RenderOnce for Pane {
     }
 }
 
+/// Switch track width: a chip-high track, wide enough for the knob to travel.
+const SWITCH_W: Pixels = size::ROW;
+
 /// A small on/off switch for settings rows.
 pub fn switch(id: impl Into<ElementId>, on: bool, cx: &App) -> gpui::Stateful<gpui::Div> {
     let t = cx.theme();
     let (track, knob) = if on {
-        (t.accent, gpui::white())
+        (t.accent, t.on_accent)
     } else {
         (t.line_strong, t.surface)
     };
     div()
         .id(id)
         .flex_none()
-        .w(px(36.))
-        .h(px(22.))
-        .p(px(2.))
+        .w(SWITCH_W)
+        .h(size::CHIP)
+        .p(space::X0_5)
         .flex()
         .when(on, |d| d.justify_end())
         .rounded_full()
         .bg(track)
         .cursor_pointer()
-        .child(div().size(px(18.)).rounded_full().bg(knob).shadow_sm())
+        .child(
+            div()
+                .size(size::CHIP - space::X0_5 * 2.)
+                .rounded_full()
+                .bg(knob),
+        )
 }
 
 #[cfg(test)]
@@ -789,7 +793,7 @@ mod tests {
     fn close_dot_is_traffic_light_sized_in_the_corner() {
         assert_eq!(CLOSE_DOT, px(12.));
         assert_eq!(CLOSE_INSET, px(12.));
-        assert_eq!(CLOSE_SLOP, px(7.));
+        assert_eq!(CLOSE_SLOP, px(8.));
         assert!(
             PAD_TOP_BARE > CLOSE_INSET + CLOSE_DOT,
             "a pane with no header row starts its body below the dot"
@@ -810,7 +814,7 @@ mod tests {
             "row centred on the dot"
         );
         assert!(row_top >= px(0.));
-        assert!(TITLE_LINE <= HEADER_H);
+        assert!(text::TITLE.line <= HEADER_H);
 
         let dot_right = CLOSE_INSET + CLOSE_DOT;
         let title_left = BORDER + PAD_X + header_margin_left(TITLE_GAP);

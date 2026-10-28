@@ -1,20 +1,22 @@
-//! Floating, detached activity panel mirroring the left sidebar: catch-up summary,
-//! mentions and agent status. Hidden below 1200px.
+//! Floating, detached activity panel mirroring the left sidebar: mentions and
+//! agent status. Hidden below 1200px.
+//!
+//! The wireframe's catch-up card ("Summarizing what happened while you were
+//! gone…") is not drawn until summaries exist: a card that shimmers forever
+//! for a feature that isn't there reads as fake, and it repainted every frame.
 
-use std::time::Duration;
-
-use gpui::{
-    Animation, AnimationExt as _, AnyView, BoxShadow, Context, Entity, FontWeight, Hsla,
-    SharedString, StyleRefinement, Window, div, linear_color_stop, linear_gradient, point,
-    prelude::*, px, relative,
+use gpui::{Context, Entity, SharedString, Window, div, prelude::*, px};
+use ui::{
+    ActiveTheme, Elevation, Ellipsis, IconName, Theme, Tooltip, TypeStyleExt, brand_icon, icon,
+    pill,
+    tokens::{icon as icons, radius, size, space, text},
+    truncated,
 };
-use ui::{ActiveTheme, Ellipsis, IconName, Theme, Tooltip, brand_icon, icon, pill, truncated};
 
 use crate::store::ChatStore;
 
 pub struct RightSidebar {
     store: Entity<ChatStore>,
-    catch_up: Entity<CatchUp>,
     mentions_open: bool,
 }
 
@@ -23,23 +25,23 @@ impl RightSidebar {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
         Self {
             store,
-            catch_up: cx.new(|_| CatchUp),
             mentions_open: true,
         }
     }
 }
 
-/// A mention pill (36px) plus the gap after it.
-const MENTION_ROW: f32 = 36. + 6.;
+/// A mention row (`size::ROW`) plus the gap after it (`space::X1`).
+const MENTION_ROW: f32 = 36. + 4.;
+/// The mentions section's toggle row plus its padding.
+const MENTIONS_CHROME: f32 = 50.;
 
+/// A section is a background step only: no outline inside the panel's.
 fn section(t: &Theme) -> gpui::Div {
     div()
         .flex()
         .flex_col()
         .flex_none()
-        .rounded(px(21.))
-        .border_1()
-        .border_color(t.line)
+        .rounded(radius::LG)
         .bg(t.sunken)
 }
 
@@ -70,44 +72,30 @@ impl Render for RightSidebar {
             .overflow_hidden()
             .flex()
             .flex_col()
-            .gap(px(6.))
-            .p(px(6.))
-            .rounded(px(26.))
+            .gap(space::X1_5)
+            .p(space::X1_5)
+            .rounded(radius::XL)
             .border_1()
             .border_color(t.line)
             .bg(t.surface)
-            .shadow(t.float_shadow())
-            // Catch-up lives in its own cached view: its animation re-renders only it.
-            // It and the mentions share whatever height the window gives them.
-            .child(
-                div()
-                    .flex_grow()
-                    .flex_shrink()
-                    .flex_basis(px(260.))
-                    .min_h(px(120.))
-                    .child(
-                        AnyView::from(self.catch_up.clone())
-                            .cached(StyleRefinement::default().size_full()),
-                    ),
-            )
-            // Mentions: grows to show more rows, but never past its content, so any
-            // spare height goes to the catch-up card instead of an empty box.
+            .shadow(t.elevation(Elevation::Float))
+            // Mentions: grows to show more rows, but never past its content.
             .child(
                 section(&t)
-                    .gap(px(6.))
-                    .p(px(6.))
+                    .gap(space::X1)
+                    .p(space::X1_5)
                     .when(open, |s| {
                         s.flex_grow()
                             .flex_shrink()
-                            .flex_basis(px(MENTION_ROW * 3. + 50.))
-                            .min_h(px(MENTION_ROW + 50.))
-                            .max_h(px(MENTION_ROW * count as f32 + 50.))
+                            .flex_basis(px(MENTION_ROW * 3. + MENTIONS_CHROME))
+                            .min_h(px(MENTION_ROW + MENTIONS_CHROME))
+                            .max_h(px(MENTION_ROW * count as f32 + MENTIONS_CHROME))
                     })
                     .child(
                         pill("mentions-toggle", cx)
-                            .h(px(36.))
+                            .h(size::ROW)
                             .justify_center()
-                            .gap(px(8.))
+                            .gap(space::X2)
                             .text_color(t.ink_soft)
                             .tooltip(Tooltip::text(if open {
                                 "Collapse mentions"
@@ -121,8 +109,8 @@ impl Render for RightSidebar {
                             .when(!open, |p| {
                                 p.child(
                                     div()
-                                        .text_size(px(13.))
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .type_style(text::SMALL)
+                                        .font_weight(text::MEDIUM)
                                         .child(format!(
                                             "{count} {}",
                                             if count == 1 { "mention" } else { "mentions" }
@@ -135,7 +123,7 @@ impl Render for RightSidebar {
                                 } else {
                                     IconName::CaretDown
                                 },
-                                px(17.),
+                                icons::SM,
                                 t.ink_soft,
                             )),
                     )
@@ -148,16 +136,16 @@ impl Render for RightSidebar {
                                 .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
-                                .gap(px(6.))
+                                .gap(space::X1)
                                 .children(mention_rows.into_iter().enumerate().map(
                                     |(ix, (channel, brand, name, text))| {
                                         let tip = format!("{name}: {text}");
                                         pill(("mention", ix), cx)
-                                            .h(px(36.))
-                                            .gap(px(8.))
-                                            .pl(px(10.))
-                                            .pr(px(12.))
-                                            .text_size(px(13.5))
+                                            .h(size::ROW)
+                                            .gap(space::X2)
+                                            .pl(space::X2)
+                                            .pr(space::X3)
+                                            .type_style(text::SMALL)
                                             .tooltip(Tooltip::text(tip))
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.store
@@ -166,14 +154,14 @@ impl Render for RightSidebar {
                                             .when_some(brand, |p, brand| {
                                                 p.child(
                                                     div()
-                                                        .size(px(20.))
+                                                        .size(icons::LG)
                                                         .flex_none()
                                                         .flex()
                                                         .items_center()
                                                         .justify_center()
                                                         .child(icon(
                                                             brand_icon(brand),
-                                                            px(16.),
+                                                            icons::MD,
                                                             t.ink,
                                                         )),
                                                 )
@@ -189,172 +177,49 @@ impl Render for RightSidebar {
                         )
                     }),
             )
-            // Agent status
+            // Spare height sits here, so agent status stays at the bottom
+            // like the left sidebar's settings row.
+            .child(div().flex_1())
+            // Agent status. Marks are monochrome: colour here only means
+            // state (the glow).
             .child(
                 section(&t)
-                    .gap(px(8.))
-                    .px(px(6.))
-                    .pt(px(10.))
-                    .pb(px(10.))
+                    .gap(space::X2)
+                    .px(space::X1_5)
+                    .pt(space::X3)
+                    .pb(space::X3)
                     .child(
                         div()
-                            .px(px(8.))
+                            .px(space::X2)
                             .ellipsis()
-                            .text_size(px(13.))
-                            .line_height(px(18.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .type_style(text::SMALL)
+                            .font_weight(text::MEDIUM)
                             .text_color(t.ink_soft)
-                            .child(truncated("Agent Status")),
+                            .child(truncated("Agent status")),
                     )
-                    .child(div().flex().flex_col().gap(px(10.)).children(
+                    .child(div().flex().flex_col().gap(space::X2).children(
                         agents.chunks(4).enumerate().map(|(row, chunk)| {
                             div()
                                 .flex()
-                                .gap(px(6.))
+                                .gap(space::X1_5)
                                 .children(chunk.iter().enumerate().map(
                                     |(col, (brand, state, label))| {
                                         let glow = t.agent_state(*state);
                                         pill(("agent", row * 4 + col), cx)
                                             .flex_1()
                                             .min_w_0()
-                                            .h(px(44.))
+                                            .h(size::ROW_LG)
                                             .justify_center()
+                                            // A filled tile, so the glow has
+                                            // something to pool under.
+                                            .bg(t.surface)
                                             .shadow(t.glow_shadow(glow))
                                             .tooltip(Tooltip::text(label.clone()))
-                                            .child(icon(brand_icon(*brand), px(19.), t.ink))
+                                            .child(icon(brand_icon(*brand), icons::LG, t.ink))
                                     },
                                 ))
                         }),
                     )),
-            )
-    }
-}
-
-/// "Summarizing what happened while you were gone…" with a shimmering, blurred
-/// stand-in for the summary text. Purely decorative until summaries exist.
-pub struct CatchUp;
-
-/// Placeholder line widths, eyeballed from the wireframe. Enough lines to fill a
-/// tall card; a short card fades the rest out.
-const SKELETON: [f32; 24] = [
-    0.82, 0.90, 0.76, 0.97, 0.64, 0.74, 0.88, 0.79, 0.91, 0.52, 0.75, 0.86, 0.69, 0.93, 0.78, 0.60,
-    0.84, 0.95, 0.71, 0.89, 0.66, 0.81, 0.92, 0.58,
-];
-
-fn mix(a: Hsla, b: Hsla, t: f32) -> Hsla {
-    Hsla {
-        h: a.h + (b.h - a.h) * t,
-        s: a.s + (b.s - a.s) * t,
-        l: a.l + (b.l - a.l) * t,
-        a: a.a + (b.a - a.a) * t,
-    }
-}
-
-impl Render for CatchUp {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *cx.theme();
-        let period = Duration::from_millis(2400);
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .overflow_hidden()
-            .rounded(px(21.))
-            .border_1()
-            .border_color(t.line)
-            .bg(t.sunken)
-            .px(px(14.))
-            .pt(px(12.))
-            .pb(px(12.))
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(px(10.))
-                    .child(
-                        div()
-                            .mt(px(1.))
-                            .flex_none()
-                            .child(icon(IconName::Sparkle, px(19.), t.ink_soft))
-                            .with_animation(
-                                "catch-up-sparkle",
-                                Animation::new(period).repeat(),
-                                |el, delta| {
-                                    // 1 -> 0.45 -> 1, eased.
-                                    let wave = (delta * std::f32::consts::TAU).cos() * 0.5 + 0.5;
-                                    el.opacity(0.45 + 0.55 * wave)
-                                },
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .ellipsis()
-                            .text_size(px(15.))
-                            .line_height(px(20.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(t.ink)
-                            .child(truncated("Summarizing what happened while you were gone…")),
-                    ),
-            )
-            .child(
-                div()
-                    .relative()
-                    .mt(px(12.))
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.))
-                            .px(px(2.))
-                            .pt(px(2.))
-                            .children(SKELETON.iter().enumerate().map(|(ix, w)| {
-                                let (base, shine) = (t.skeleton, t.skeleton_shine);
-                                let phase = ix as f32 * 0.029;
-                                // GPUI has no blur filter: a soft shadow in the same
-                                // colour stands in for the CSS blur(3px).
-                                div()
-                                    .h(px(13.))
-                                    .flex_none()
-                                    .w(relative(*w))
-                                    .rounded_full()
-                                    .with_animation(
-                                        ("skeleton", ix),
-                                        Animation::new(period).repeat(),
-                                        move |el, delta| {
-                                            let x = (delta - phase).rem_euclid(1.0);
-                                            let glow = (x * std::f32::consts::PI).sin().powi(2);
-                                            let color = mix(base, shine, glow);
-                                            el.bg(color.opacity(0.75)).shadow(vec![BoxShadow {
-                                                color,
-                                                offset: point(px(0.), px(0.)),
-                                                blur_radius: px(4.),
-                                                spread_radius: px(0.),
-                                            }])
-                                        },
-                                    )
-                            })),
-                    )
-                    // Fade the overflow so a short panel cuts off softly.
-                    .child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .right_0()
-                            .bottom_0()
-                            .h(px(24.))
-                            .bg(linear_gradient(
-                                180.,
-                                // Fade from the card's own colour, not transparent black, which
-                                // would darken the middle of the gradient.
-                                linear_color_stop(t.sunken.opacity(0.), 0.),
-                                linear_color_stop(t.sunken, 1.),
-                            )),
-                    ),
             )
     }
 }

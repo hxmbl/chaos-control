@@ -2,11 +2,13 @@ use gpui::{App, ElementId, InteractiveElement, Stateful, Styled, div};
 
 use crate::ActiveTheme;
 
-/// Thin-outlined pill shared by every row in both sidebars.
-/// Callers add height, padding and content; hover is built in.
+/// Borderless pill shared by the rows in both sidebars. It has no outline and
+/// no fill of its own: it sits on whatever it is placed on, shows `hover` under
+/// the pointer, and callers mark the selected row with `bg(t.selected)`.
+/// Callers add height, padding and content.
 pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<gpui::Div> {
     let t = cx.theme();
-    let (hover_bg, hover_line) = (t.hover, t.line_strong);
+    let hover_bg = t.hover;
     div()
         .id(id)
         .flex()
@@ -14,9 +16,6 @@ pub fn pill(id: impl Into<ElementId>, cx: &App) -> Stateful<gpui::Div> {
         .items_center()
         .w_full()
         .rounded_full()
-        .border_1()
-        .border_color(t.line)
-        .bg(t.surface)
         .text_color(t.ink)
-        .hover(move |s| s.bg(hover_bg).border_color(hover_line))
+        .hover(move |s| s.bg(hover_bg))
 }

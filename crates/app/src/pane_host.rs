@@ -10,11 +10,14 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, FontWeight, Pixels,
-    SharedString, Task, Window, div, prelude::*, px,
+    AnyElement, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Pixels, SharedString,
+    Task, Window, div, prelude::*, px,
 };
 use model::{Author, PaneActionKind, PaneContent, ReplyRef, pane::author_name};
-use ui::{ActiveTheme, IconName, Pane, PaneState, QuickAction, brand_icon, icon, switch};
+use ui::{
+    ActiveTheme, IconName, Pane, PaneState, QuickAction, TypeStyleExt, brand_icon, icon, switch,
+    tokens::{icon as icons, radius, space, text},
+};
 
 use crate::{settings, store::ChatStore};
 
@@ -181,7 +184,7 @@ impl PaneHost {
             PaneContent::Attachment(a) => pane
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .type_style(text::SMALL)
                         .text_color(cx.theme().muted)
                         .child(format!("{} · {}", a.mime, human_size(a.size_bytes))),
                 )
@@ -194,7 +197,7 @@ impl PaneHost {
                         .flex_col()
                         .child(
                             div()
-                                .font_weight(FontWeight::MEDIUM)
+                                .font_weight(text::MEDIUM)
                                 .text_color(cx.theme().ink)
                                 .child(SharedString::from(item.title.clone())),
                         )
@@ -215,15 +218,15 @@ impl PaneHost {
         let mark = match author {
             Author::Agent(id) => ws
                 .agent(id)
-                .map(|a| icon(brand_icon(a.brand), px(14.), t.ink_soft).into_any_element()),
+                .map(|a| icon(brand_icon(a.brand), icons::MD, t.ink_soft).into_any_element()),
             Author::Human | Author::System => None,
         };
         let minutes = sent_at / 60;
         div()
             .flex()
             .items_center()
-            .gap(px(8.))
-            .text_size(px(13.))
+            .gap(space::X2)
+            .type_style(text::SMALL)
             .text_color(t.muted)
             .children(mark)
             .child(SharedString::from(format!(
@@ -239,15 +242,23 @@ impl PaneHost {
         let t = *cx.theme();
         let search_in_pane = settings::get(cx).search_in_pane;
         let appearance = if t.is_dark() { "Dark" } else { "Light" };
-        let row = |label: &'static str, about: SharedString| {
+        let well = t.glass().well;
+        let row = move |label: &'static str, about: SharedString, available: bool| {
+            // A feature that isn't built yet: the row is muted and says so in
+            // words, rather than wearing a "Soon" badge.
+            let about: SharedString = if available {
+                about
+            } else {
+                format!("{about} Not available yet.").into()
+            };
             div()
                 .flex()
                 .items_center()
-                .gap(px(16.))
-                .px(px(14.))
-                .py(px(10.))
-                .rounded(px(14.))
-                .bg(t.glass().well)
+                .gap(space::X4)
+                .px(space::X3)
+                .py(space::X2)
+                .rounded(radius::MD)
+                .bg(well)
                 .child(
                     div()
                         .flex_1()
@@ -256,33 +267,18 @@ impl PaneHost {
                         .flex_col()
                         .child(
                             div()
-                                .text_size(px(14.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(t.ink)
+                                .type_style(text::BODY)
+                                .font_weight(text::MEDIUM)
+                                .text_color(if available { t.ink } else { t.muted })
                                 .child(label),
                         )
                         .child(
                             div()
-                                .text_size(px(13.))
-                                .line_height(px(19.))
+                                .type_style(text::SMALL)
                                 .text_color(t.muted)
                                 .child(about),
                         ),
                 )
-        };
-        let soon = |d: gpui::Div| {
-            d.child(
-                div()
-                    .flex_none()
-                    .px(px(8.))
-                    .py(px(2.))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(t.line_strong)
-                    .text_size(px(11.5))
-                    .text_color(t.muted)
-                    .child("Soon"),
-            )
         };
         let shortcut = if cfg!(target_os = "macos") {
             "⌘K search · ⌘⌥[ and ⌘⌥] sidebars · Esc closes the pane"
@@ -293,11 +289,13 @@ impl PaneHost {
             row(
                 "Appearance",
                 format!("Follows your system. Currently {appearance}.").into(),
+                true,
             )
             .into_any_element(),
             row(
                 "Search in the pane",
                 "Experiment: search results open in this pane instead of the dropdown.".into(),
+                true,
             )
             .child(
                 switch("search-in-pane", search_in_pane, cx).on_click(cx.listener(
@@ -318,27 +316,30 @@ impl PaneHost {
                     model::pane::LONG_MESSAGE_LINES
                 )
                 .into(),
+                true,
             )
             .into_any_element(),
-            row("Shortcuts", shortcut.into()).into_any_element(),
-            soon(row(
+            row("Shortcuts", shortcut.into(), true).into_any_element(),
+            row(
                 "Agents",
                 "Add Claude Code, Codex and others to this project.".into(),
-            ))
+                false,
+            )
             .into_any_element(),
-            soon(row(
+            row(
                 "Notifications",
                 "Mentions, direct messages and replies.".into(),
-            ))
+                false,
+            )
             .into_any_element(),
             div()
                 .flex()
                 .items_center()
-                .gap(px(6.))
-                .px(px(4.))
-                .text_size(px(12.5))
+                .gap(space::X1_5)
+                .px(space::X1)
+                .type_style(text::CAPTION)
                 .text_color(t.faint)
-                .child(icon(IconName::GearSix, px(13.), t.faint))
+                .child(icon(IconName::GearSix, icons::SM, t.faint))
                 .child("Settings aren't saved between launches yet.")
                 .into_any_element(),
         ]
@@ -359,7 +360,7 @@ fn paragraphs(text: &str) -> Vec<AnyElement> {
             div()
                 .w_full()
                 .whitespace_normal()
-                .when(gap, |d| d.mt(px(6.)))
+                .when(gap, |d| d.mt(space::X1_5))
                 .child(SharedString::from(line.to_string()))
                 .into_any_element(),
         );

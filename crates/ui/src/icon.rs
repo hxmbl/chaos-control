@@ -1,4 +1,5 @@
-//! Phosphor UI icons and brand marks, drawn as single-colour SVG masks.
+//! Phosphor UI icons (regular weight only) and brand marks, drawn as
+//! single-colour SVG masks. Sizes come from `tokens::icon`.
 
 use gpui::{Hsla, IntoElement, Pixels, Styled, Svg, svg};
 use model::Brand;
@@ -6,20 +7,19 @@ use model::Brand;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconName {
     Archive,
-    ArrowUpBold,
+    ArrowUp,
     CaretDown,
     CaretRight,
     CaretUp,
+    ChatCircle,
     CopySimple,
     GearSix,
     Hash,
-    HashBold,
-    MagnifyingGlassBold,
+    MagnifyingGlass,
     Minus,
     Plus,
     SidebarLeft,
     SidebarRight,
-    Sparkle,
     Square,
     X,
     BrandClaude,
@@ -36,22 +36,21 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [IconName; 28] = [
+    pub const ALL: [IconName; 27] = [
         IconName::Archive,
-        IconName::ArrowUpBold,
+        IconName::ArrowUp,
         IconName::CaretDown,
         IconName::CaretRight,
         IconName::CaretUp,
+        IconName::ChatCircle,
         IconName::CopySimple,
         IconName::GearSix,
         IconName::Hash,
-        IconName::HashBold,
-        IconName::MagnifyingGlassBold,
+        IconName::MagnifyingGlass,
         IconName::Minus,
         IconName::Plus,
         IconName::SidebarLeft,
         IconName::SidebarRight,
-        IconName::Sparkle,
         IconName::Square,
         IconName::X,
         IconName::BrandClaude,
@@ -70,21 +69,20 @@ impl IconName {
     pub fn path(self) -> &'static str {
         match self {
             IconName::Archive => "icons/phosphor/archive.svg",
-            IconName::ArrowUpBold => "icons/phosphor/arrow-up-bold.svg",
+            IconName::ArrowUp => "icons/phosphor/arrow-up.svg",
             IconName::CaretDown => "icons/phosphor/caret-down.svg",
             IconName::CaretRight => "icons/phosphor/caret-right.svg",
             IconName::CaretUp => "icons/phosphor/caret-up.svg",
+            IconName::ChatCircle => "icons/phosphor/chat-circle.svg",
             IconName::CopySimple => "icons/phosphor/copy-simple.svg",
             IconName::GearSix => "icons/phosphor/gear-six.svg",
             IconName::Hash => "icons/phosphor/hash.svg",
-            IconName::HashBold => "icons/phosphor/hash-bold.svg",
-            IconName::MagnifyingGlassBold => "icons/phosphor/magnifying-glass-bold.svg",
+            IconName::MagnifyingGlass => "icons/phosphor/magnifying-glass.svg",
             IconName::Minus => "icons/phosphor/minus.svg",
             IconName::Plus => "icons/phosphor/plus.svg",
             IconName::SidebarLeft => "icons/phosphor/sidebar-simple.svg",
             // Phosphor's sidebar-simple, mirrored.
             IconName::SidebarRight => "icons/phosphor/sidebar-simple-right.svg",
-            IconName::Sparkle => "icons/phosphor/sparkle.svg",
             IconName::Square => "icons/phosphor/square.svg",
             IconName::X => "icons/phosphor/x.svg",
             IconName::BrandClaude => "icons/brands/claude.svg",
