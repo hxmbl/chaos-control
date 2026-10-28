@@ -122,12 +122,12 @@ pub fn tools() -> Vec<Tool> {
     vec![
         Tool::new(
             "chat_context",
-            "Who you are, which channel this is, who's in it (with presence) and your read position. Cheap; call it first.",
+            "Who you are, which channel this is, who's in it (with presence), your read position and how far everyone else has read (read_receipts). Cheap; call it first.",
             schema(json!({"type": "object", "properties": {}})),
         ),
         Tool::new(
             "chat_read",
-            "Read messages. Default: forward from your read position (this advances it). Use after_seq / before_seq / around (a message id) to page.",
+            "Read messages. Default: forward from your read position (this advances it). Use after_seq / before_seq / around (a message id) to page. read_by says how far the humans here have read.",
             schema(json!({"type": "object", "properties": {
                 "channel": {"type": "string", "description": "Channel name in this project; defaults to this session's channel."},
                 "after_seq": {"type": "integer", "minimum": 0},
@@ -250,6 +250,38 @@ fn channel_arg(engine: &Engine, scope: Scope, args: &Value) -> Result<ChannelId,
     }
 }
 
+/// Read receipts in `channel` for everyone but `me` (humans only if
+/// `humans_only`), e.g. `{"handle": "hx", ..., "read_through": 42,
+/// "summary": "Hx read up to #42"}`. `read_at` is Unix milliseconds.
+fn receipt_views(
+    c: &rusqlite::Connection,
+    channel: ChannelId,
+    me: MemberId,
+    humans_only: bool,
+) -> Result<Vec<Value>, ToolError> {
+    let mut out = Vec::new();
+    for r in store::receipts(c, channel)? {
+        if r.member == me {
+            continue;
+        }
+        let Some(m) = store::member(c, r.member)? else {
+            continue;
+        };
+        if humans_only && m.kind != MemberKind::Human {
+            continue;
+        }
+        out.push(json!({
+            "handle": m.handle,
+            "name": m.name,
+            "kind": m.kind.as_str(),
+            "read_through": r.read_through,
+            "read_at": r.read_at,
+            "summary": format!("{} read up to #{}", m.name, r.read_through),
+        }));
+    }
+    Ok(out)
+}
+
 /// Runs one tool for `scope`. Pure over the engine, so it is testable without
 /// HTTP; the server below is a thin shell around it.
 pub fn call_tool(
@@ -286,6 +318,7 @@ pub fn call_tool(
                 "project": store::project(c, &ch.project)?.map(|p| json!({"name": p.name})),
                 "members": members,
                 "cursor": {"delivered_through": cursor.delivered_through, "read_through": cursor.read_through},
+                "read_receipts": receipt_views(c, scope.channel, scope.agent, false)?,
                 "norms": "Speak with chat_send (reply_to the message you answer). React ✅ when no words are needed. Mention people only when you need them; no @everyone.",
             }))
         }
@@ -325,9 +358,15 @@ pub fn call_tool(
             let views: Vec<Value> = messages.iter().map(|m| message_view(c, m)).collect();
             let has_more = forward && last.is_some_and(|s| s < head);
             if forward && let Some(seq) = last {
-                engine.advance_read(scope.agent, channel, seq);
+                engine.advance_read(now, scope.agent, channel, seq);
             }
-            let mut out = json!({"messages": views, "has_more": has_more, "head_seq": head});
+            let read_by = receipt_views(engine.conn(), channel, scope.agent, true)?;
+            let mut out = json!({
+                "messages": views,
+                "has_more": has_more,
+                "head_seq": head,
+                "read_by": read_by,
+            });
             if has_more {
                 out["next_after_seq"] = json!(last);
             }

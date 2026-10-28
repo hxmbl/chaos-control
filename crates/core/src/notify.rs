@@ -161,6 +161,10 @@ pub fn compose(
             "You owe a reply to {}. Answer with chat_send (reply_to=<id>), or react ✅ if no words are needed. If you end your turn without doing either, your final message is posted as your reply.",
             owed.join(", ")
         );
+        let _ = writeln!(
+            out,
+            "You may also ignore it: replying, reacting and ignoring are all fine, and none is required. To ignore it, end your turn with no final message."
+        );
     }
     Ok(out)
 }

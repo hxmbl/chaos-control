@@ -205,6 +205,29 @@ ALTER TABLE projects ADD COLUMN unclaimed_import INTEGER NOT NULL DEFAULT 0
 UPDATE projects SET unclaimed_import = 1
 WHERE root_path IS NULL AND name = 'Imported';
 "#,
+    // 4: read receipts and ignored pings. Cursors learn when they last moved
+    // (NULL: never, e.g. the backfill point an agent joins at), and
+    // obligations gain the `ignored` state, which needs a table rebuild for
+    // the CHECK constraint (rows and keys copied as they are).
+    r#"
+ALTER TABLE cursors ADD COLUMN delivered_at INTEGER;
+ALTER TABLE cursors ADD COLUMN read_at INTEGER;
+CREATE TABLE obligations_v2 (
+    agent_id       INTEGER NOT NULL,
+    channel_id     INTEGER NOT NULL,
+    message_id     INTEGER NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN ('open', 'satisfied', 'fallback', 'unmet', 'ignored')),
+    resolved_by    INTEGER REFERENCES messages(id),
+    resolved_kind  TEXT,
+    PRIMARY KEY (agent_id, channel_id, message_id),
+    FOREIGN KEY (agent_id, channel_id, message_id)
+        REFERENCES triggers (agent_id, channel_id, message_id)
+);
+INSERT INTO obligations_v2 SELECT agent_id, channel_id, message_id, state, resolved_by, resolved_kind
+FROM obligations;
+DROP TABLE obligations;
+ALTER TABLE obligations_v2 RENAME TO obligations;
+"#,
 ];
 
 pub struct Store {
@@ -248,6 +271,8 @@ pub struct BatchRow {
 pub struct Cursor {
     pub delivered_through: Seq,
     pub read_through: Seq,
+    /// When `read_through` last moved forward (None: never read anything).
+    pub read_at: Option<Millis>,
 }
 
 impl Store {
@@ -950,12 +975,13 @@ pub fn add_reaction(
 
 pub fn cursor(c: &Connection, agent: MemberId, channel: ChannelId) -> Result<Cursor> {
     c.query_row(
-        "SELECT delivered_through, read_through FROM cursors WHERE agent_id = ?1 AND channel_id = ?2",
+        "SELECT delivered_through, read_through, read_at FROM cursors WHERE agent_id = ?1 AND channel_id = ?2",
         params![agent.0, channel.0],
         |r| {
             Ok(Cursor {
                 delivered_through: r.get::<_, i64>(0)? as Seq,
                 read_through: r.get::<_, i64>(1)? as Seq,
+                read_at: r.get::<_, Option<i64>>(2)?.map(|t| t as Millis),
             })
         },
     )
@@ -964,39 +990,79 @@ pub fn cursor(c: &Connection, agent: MemberId, channel: ChannelId) -> Result<Cur
         o.unwrap_or(Cursor {
             delivered_through: 0,
             read_through: 0,
+            read_at: None,
         })
     })
 }
 
-/// Moves `delivered_through` (and `read_through` with it) forward to `seq`.
-/// Never moves a cursor backwards.
+/// Moves `delivered_through` (and `read_through` with it) forward to `seq`,
+/// stamping each one that moves with `now`. Never moves a cursor backwards.
+/// Returns whether `read_through` moved.
 pub fn advance_delivered(
     c: &Connection,
     agent: MemberId,
     channel: ChannelId,
     seq: Seq,
-) -> Result<()> {
+    now: Millis,
+) -> Result<bool> {
+    let before = cursor(c, agent, channel)?;
     c.execute(
-        "INSERT INTO cursors (agent_id, channel_id, delivered_through, read_through)
-         VALUES (?1, ?2, ?3, ?3)
+        "INSERT INTO cursors (agent_id, channel_id, delivered_through, read_through,
+                              delivered_at, read_at)
+         VALUES (?1, ?2, ?3, ?3, ?4, ?4)
          ON CONFLICT(agent_id, channel_id) DO UPDATE SET
+            delivered_at = CASE WHEN excluded.delivered_through > delivered_through
+                                THEN excluded.delivered_at ELSE delivered_at END,
+            read_at = CASE WHEN excluded.delivered_through > read_through
+                           THEN excluded.read_at ELSE read_at END,
             delivered_through = MAX(delivered_through, excluded.delivered_through),
             read_through = MAX(read_through, excluded.delivered_through)",
-        params![agent.0, channel.0, seq as i64],
+        params![agent.0, channel.0, seq as i64, now as i64],
     )?;
-    Ok(())
+    Ok(seq > before.read_through)
 }
 
-/// Moves `read_through` forward to `seq` (forward `chat_read`).
-pub fn advance_read(c: &Connection, agent: MemberId, channel: ChannelId, seq: Seq) -> Result<()> {
+/// Moves `read_through` forward to `seq` (a forward `chat_read`, or a human
+/// shown the channel), stamping it with `now` when it moves. Returns whether
+/// it moved.
+pub fn advance_read(
+    c: &Connection,
+    member: MemberId,
+    channel: ChannelId,
+    seq: Seq,
+    now: Millis,
+) -> Result<bool> {
+    let before = cursor(c, member, channel)?;
     c.execute(
-        "INSERT INTO cursors (agent_id, channel_id, delivered_through, read_through)
-         VALUES (?1, ?2, 0, ?3)
+        "INSERT INTO cursors (agent_id, channel_id, delivered_through, read_through, read_at)
+         VALUES (?1, ?2, 0, ?3, ?4)
          ON CONFLICT(agent_id, channel_id) DO UPDATE SET
+            read_at = CASE WHEN excluded.read_through > read_through
+                           THEN excluded.read_at ELSE read_at END,
             read_through = MAX(read_through, excluded.read_through)",
-        params![agent.0, channel.0, seq as i64],
+        params![member.0, channel.0, seq as i64, now as i64],
     )?;
-    Ok(())
+    Ok(seq > before.read_through)
+}
+
+/// Read receipts in `channel`: every current member who has read something,
+/// in member order.
+pub fn receipts(c: &Connection, channel: ChannelId) -> Result<Vec<Receipt>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT k.agent_id, k.read_through, k.read_at FROM cursors k
+         JOIN memberships s ON s.member_id = k.agent_id AND s.channel_id = k.channel_id
+         WHERE k.channel_id = ?1 AND k.read_at IS NOT NULL
+         ORDER BY k.agent_id",
+    )?;
+    stmt.query_map([channel.0], |r| {
+        Ok(Receipt {
+            member: MemberId(r.get(0)?),
+            channel,
+            read_through: r.get::<_, i64>(1)? as Seq,
+            read_at: r.get::<_, i64>(2)? as Millis,
+        })
+    })?
+    .collect()
 }
 
 // ---------- batches, triggers, obligations ----------
@@ -1493,7 +1559,7 @@ mod tests {
             join_project(c, &ch.project, late.id, 0)?;
             join(c, ch.id, &late, 20, 0)?;
             assert_eq!(cursor(c, late.id, ch.id)?.read_through, 10);
-            advance_delivered(c, late.id, ch.id, 5)?;
+            advance_delivered(c, late.id, ch.id, 5, 0)?;
             assert_eq!(
                 cursor(c, late.id, ch.id)?.delivered_through,
                 10,
@@ -1725,6 +1791,79 @@ mod tests {
         assert_eq!(again, vec![imported]);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_v3_database_gains_receipts_and_the_ignored_state() {
+        let conn = Connection::open_in_memory().unwrap();
+        for m in &MIGRATIONS[..3] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.execute_batch(
+            r#"
+            PRAGMA user_version = 3;
+            INSERT INTO projects (id, name, root_path, created_at) VALUES
+                ('0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'P', NULL, 1);
+            INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES
+                (3, '0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'main', 1, 1);
+            INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx'), (2, 'agent', 'bot', 'Bot');
+            INSERT INTO messages (id, channel_id, seq, author_id, origin, body, sent_at) VALUES
+                (10, 3, 1, 1, 'composer', '@bot hi', 1000);
+            INSERT INTO cursors VALUES (2, 3, 1, 1);
+            INSERT INTO batches (id, agent_id, channel_id, state, created_at) VALUES (4, 2, 3, 'settled', 1000);
+            INSERT INTO triggers VALUES (2, 3, 10, 'mention', 0, 4, 1000);
+            INSERT INTO obligations VALUES (2, 3, 10, 'unmet', NULL, 'no_reply');
+            "#,
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let c = s.conn();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let t = TriggerId {
+            agent: MemberId(2),
+            channel: ChannelId(3),
+            message: MessageId(10),
+        };
+        assert_eq!(obligation_state(c, t).unwrap(), Some(ObligationState::Unmet));
+        // Existing cursors were never stamped: no receipt until they move.
+        let k = cursor(c, MemberId(2), ChannelId(3)).unwrap();
+        assert_eq!((k.read_through, k.read_at), (1, None));
+        c.execute(
+            "UPDATE obligations SET state = 'ignored' WHERE message_id = 10",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            obligation_state(c, t).unwrap(),
+            Some(ObligationState::Ignored)
+        );
+        let fk: i64 = c
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk, 0);
+    }
+
+    #[test]
+    fn read_cursors_stamp_when_they_move_and_never_go_back() {
+        let s = Store::open_in_memory().unwrap();
+        let c = s.conn();
+        let (a, ch) = (MemberId(1), ChannelId(1));
+        assert!(advance_read(c, a, ch, 5, 100).unwrap());
+        assert!(!advance_read(c, a, ch, 3, 200).unwrap(), "never backwards");
+        assert!(!advance_read(c, a, ch, 5, 300).unwrap(), "no move, no stamp");
+        let k = cursor(c, a, ch).unwrap();
+        assert_eq!((k.read_through, k.read_at), (5, Some(100)));
+        // Delivery carries read along.
+        assert!(advance_delivered(c, a, ch, 8, 400).unwrap());
+        let k = cursor(c, a, ch).unwrap();
+        assert_eq!(
+            (k.delivered_through, k.read_through, k.read_at),
+            (8, 8, Some(400))
+        );
+        assert!(!advance_delivered(c, a, ch, 6, 500).unwrap());
+        assert_eq!(cursor(c, a, ch).unwrap().read_at, Some(400));
     }
 
     #[test]

@@ -52,6 +52,8 @@ pub enum CoreEvent {
         emoji: Arc<str>,
     },
     Agent(AgentStatus),
+    /// A member's read receipt moved forward.
+    Read(Receipt),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -411,6 +413,10 @@ impl Engine {
         if author.kind == MemberKind::Agent {
             self.on_agent_sent(&author, &message, cause)?;
         } else {
+            // A human has read what they just sent (and so everything before
+            // it they could see). Never for agents: their read cursor decides
+            // what their next notification calls new.
+            self.advance_read(now, author.id, req.channel, message.seq);
             for m in &message.mentions {
                 self.pstate.human_addressed(req.channel, *m);
             }
@@ -910,10 +916,13 @@ impl Engine {
             return;
         }
         let window_to = b.window_to.unwrap_or(0);
-        let _ = self.store.tx(|c| {
+        let read = self.store.tx(|c| {
             store::set_batch_state(c, turn, BatchState::Accepted, now, None)?;
-            store::advance_delivered(c, agent, channel, window_to)
+            store::advance_delivered(c, agent, channel, window_to, now)
         });
+        if read.unwrap_or(false) {
+            self.publish_receipt(agent, channel);
+        }
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.failures = 0;
         rt.retry_at = None;
@@ -1153,15 +1162,24 @@ impl Engine {
                 fallback_message = m.map(|m| (m, author));
             }
         } else if !open.is_empty() {
+            // A completed turn with nothing to say is the agent choosing to let
+            // the ping go: `ignored`, which is fine. Anything else (cancelled,
+            // refused, cut short) is `unmet`.
+            let ignored = *outcome == TurnOutcome::Completed;
+            let (state, kind) = if ignored {
+                (ObligationState::Ignored, "ignored")
+            } else {
+                (ObligationState::Unmet, "no_reply")
+            };
             self.store.tx::<_, PostError>(|c| {
                 for t in &open {
-                    store::resolve_obligation(c, *t, ObligationState::Unmet, None, "no_reply")?;
+                    store::resolve_obligation(c, *t, state, None, kind)?;
                 }
                 Ok(())
             })?;
             let rt = self.rt.entry((agent, channel)).or_default();
-            rt.note = Some(Arc::from(if *outcome == TurnOutcome::Completed {
-                "finished without replying"
+            rt.note = Some(Arc::from(if ignored {
+                "read it and let it go"
             } else {
                 "turn ended without a reply"
             }));
@@ -1229,9 +1247,39 @@ impl Engine {
 
     // ---------- reads for tools ----------
 
-    pub fn advance_read(&mut self, agent: MemberId, channel: ChannelId, seq: Seq) {
-        let _ = self
+    /// Moves `member`'s read receipt in `channel` forward to `seq` (clamped to
+    /// the channel head; never backwards). Agents read forward with
+    /// `chat_read`; humans when the app shows them the channel.
+    pub fn advance_read(&mut self, now: Millis, member: MemberId, channel: ChannelId, seq: Seq) {
+        let head = store::head_seq(self.conn(), channel).unwrap_or(0);
+        let seq = seq.min(head);
+        if seq == 0 {
+            return;
+        }
+        let moved = self
             .store
-            .tx(|c| store::advance_read(c, agent, channel, seq));
+            .tx(|c| store::advance_read(c, member, channel, seq, now));
+        if moved.unwrap_or(false) {
+            self.publish_receipt(member, channel);
+        }
+    }
+
+    /// Read receipts in `channel` (see [`Receipt`]).
+    pub fn receipts(&self, channel: ChannelId) -> rusqlite::Result<Vec<Receipt>> {
+        store::receipts(self.conn(), channel)
+    }
+
+    fn publish_receipt(&mut self, member: MemberId, channel: ChannelId) {
+        let Ok(cursor) = store::cursor(self.conn(), member, channel) else {
+            return;
+        };
+        if let Some(read_at) = cursor.read_at {
+            self.effects.push(Effect::Event(CoreEvent::Read(Receipt {
+                member,
+                channel,
+                read_through: cursor.read_through,
+                read_at,
+            })));
+        }
     }
 }
