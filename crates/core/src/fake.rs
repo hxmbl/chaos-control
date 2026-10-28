@@ -5,6 +5,30 @@
 //! Runs in-process over an in-memory line transport ([`in_process`]) or as the
 //! `fake-acp-agent` binary over stdio. A [`Script`] says what to do on each
 //! prompt. Only the transport and the clock are fake in tests that use it.
+//!
+//! # Protocol versions
+//!
+//! By default the fake speaks ACP v1 only and answers a v2 `initialize` with
+//! `protocolVersion: 1`, so a client that offers the v2 draft falls back. With
+//! `"protocol": 2` in the script it also speaks the **v2 draft**
+//! (`unstable_protocol_v2`): a v2 `initialize` selects v2, a v1 `initialize`
+//! still gets v1. On v2 a turn is:
+//!
+//! - the `session/prompt` response straight away, carrying the accepted user
+//!   message's `messageId` (v2 acknowledges acceptance there, not at the end),
+//!   and a `user_message` update with that id and the prompt;
+//! - `state_update: running`, then the steps;
+//! - text as `agent_message_chunk`s keyed by an agent `messageId`; a tool call
+//!   starts a new agent message;
+//! - a tool call as a keyed `tool_call_update` (`in_progress`, with its title),
+//!   upserted to `completed` (status only) once the agent has started its next
+//!   message, so a client has to treat it as an update to a call it already
+//!   knows, not a new one;
+//! - a permission request inside `state_update: requires_action`, then
+//!   `running` again;
+//! - `state_update: idle` with the stop reason (`end_turn`, `cancelled`,
+//!   `refusal`, `max_tokens`, or `error` for a scripted error after the turn
+//!   was accepted).
 
 use std::{
     collections::HashMap,
@@ -12,8 +36,8 @@ use std::{
 };
 
 use agent_client_protocol::{
-    self as acp, Agent, Client, ConnectTo, DynConnectTo, Lines, Responder,
-    schema::{ProtocolVersion, v1},
+    self as acp, Agent, Client, ConnectTo, DynConnectTo, Lines, Responder, V2ConnectionTo,
+    schema::{ProtocolVersion, v1, v2},
 };
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -29,9 +53,14 @@ pub struct Script {
     /// Fail `session/new` with this message (e.g. "Authentication required").
     #[serde(default)]
     pub fail_session_new: Option<String>,
-    /// Advertise `mcpCapabilities.http` (default true).
+    /// Advertise HTTP MCP (`mcpCapabilities.http` on v1,
+    /// `capabilities.session.mcp.http` on v2; default true).
     #[serde(default = "yes")]
     pub mcp_http: bool,
+    /// The highest ACP version spoken: 1 (default, v1 only) or 2 (also the v2
+    /// draft; a v1 `initialize` still gets v1). See the module docs.
+    #[serde(default)]
+    pub protocol: Option<u16>,
 }
 
 fn yes() -> bool {
@@ -42,7 +71,7 @@ fn yes() -> bool {
 pub struct Turn {
     #[serde(default)]
     pub steps: Vec<Step>,
-    /// `end_turn` (default), `cancelled`, `refusal`.
+    /// `end_turn` (default), `cancelled`, `refusal`, `max_tokens`.
     #[serde(default)]
     pub stop: Option<String>,
 }
@@ -52,7 +81,11 @@ pub struct Turn {
 pub enum Step {
     /// An `agent_message_chunk`.
     Text(String),
-    /// A `tool_call` update (activity; also starts a new final message).
+    /// v2 only (ignored on v1): an `agent_message` snapshot of the current
+    /// agent message. Its content replaces whatever the chunks with the same
+    /// `messageId` said, so a client must not append it.
+    AgentMessage(String),
+    /// A tool call (activity; also starts a new final message).
     ToolCall(String),
     /// Call a chat tool over HTTP MCP. In string args, `$TRIGGER` is the first
     /// owed message id from the prompt and `$N` the prompt number.
@@ -63,7 +96,9 @@ pub enum Step {
     Gate(String),
     /// Real-time sleep.
     SleepMs(u64),
-    /// Answer the prompt with a JSON-RPC error.
+    /// Fail the turn. v1: a JSON-RPC error answers the prompt. v2: as the
+    /// first step, a JSON-RPC error answers the prompt (not accepted);
+    /// later, the turn ends `idle` with an `error` stop reason.
     Error(String),
     /// Exit (binary) or drop the connection (in-process) without answering.
     Exit,
@@ -107,7 +142,12 @@ pub struct Observed {
     pub permission_outcomes: Vec<Value>,
     pub tool_results: Vec<Result<Value, String>>,
     pub cancels: usize,
+    /// The protocol version of each `initialize` the fake answered.
+    pub protocols: Vec<u16>,
 }
+
+/// The chat MCP endpoint (url, bearer token) from the latest `session/new`.
+type McpEndpoint = Arc<Mutex<Option<(String, String)>>>;
 
 #[derive(Clone)]
 pub struct FakeAgent {
@@ -119,7 +159,7 @@ pub struct FakeAgent {
     pub is_binary: bool,
     /// The session of the latest `session/cancel`; a turn in flight on that
     /// session ends with `cancelled`.
-    cancel: Arc<watch::Sender<Option<v1::SessionId>>>,
+    cancel: Arc<watch::Sender<Option<String>>>,
 }
 
 impl FakeAgent {
@@ -143,22 +183,63 @@ impl FakeAgent {
             .unwrap_or_default()
     }
 
+    /// Records a prompt; returns its number.
+    fn record_prompt(&self, text: &str) -> usize {
+        let mut o = self.observed.lock().expect("lock");
+        o.prompts.push(text.to_string());
+        o.prompts.len() - 1
+    }
+
+    /// Records a `session/new` and keeps its HTTP chat MCP endpoint; returns
+    /// the new session id, or the scripted failure.
+    fn record_session(
+        &self,
+        req: Value,
+        http: Option<(String, String)>,
+        mcp: &McpEndpoint,
+    ) -> Result<String, String> {
+        let mut o = self.observed.lock().expect("lock");
+        o.sessions.push(req);
+        if let Some(msg) = &self.script.fail_session_new {
+            return Err(msg.clone());
+        }
+        if let Some(endpoint) = http {
+            *mcp.lock().expect("lock") = Some(endpoint);
+        }
+        Ok(format!("fake-session-{}", o.sessions.len()))
+    }
+
+    fn bearer(value: &str) -> String {
+        value.trim_start_matches("Bearer ").to_string()
+    }
+
     /// The agent side as a connectable component.
-    pub fn component(self) -> impl ConnectTo<Client> {
-        let mcp: Arc<Mutex<Option<(String, String)>>> = Arc::default();
-        let (me1, me2, me3, me4) = (self.clone(), self.clone(), self.clone(), self.clone());
-        let mcp2 = mcp.clone();
+    pub fn component(self) -> DynConnectTo<Client> {
+        let mcp: McpEndpoint = Arc::default();
+        if self.script.protocol == Some(2) {
+            DynConnectTo::new(
+                Agent
+                    .protocol_router()
+                    .with_v1(self.clone().v1_component(mcp.clone()))
+                    .with_v2(self.v2_component(mcp)),
+            )
+        } else {
+            DynConnectTo::new(self.v1_component(mcp))
+        }
+    }
+
+    fn v1_component(self, mcp: McpEndpoint) -> impl ConnectTo<Client> {
+        let (me1, me2, me3, me4) = (self.clone(), self.clone(), self.clone(), self);
         Agent
             .builder()
             .name("fake-acp-agent")
             .on_receive_request(
-                async move |req: v1::InitializeRequest,
+                async move |_req: v1::InitializeRequest,
                             responder: Responder<v1::InitializeResponse>,
                             _cx| {
-                    let _ = &me1;
+                    me1.observed.lock().expect("lock").protocols.push(1);
                     let mut caps = v1::AgentCapabilities::new();
                     caps.mcp_capabilities = v1::McpCapabilities::new().http(me1.script.mcp_http);
-                    let _ = req;
                     responder.respond(
                         v1::InitializeResponse::new(ProtocolVersion::V1)
                             .agent_capabilities(caps)
@@ -168,33 +249,28 @@ impl FakeAgent {
                 acp::on_receive_request!(),
             )
             .on_receive_request(
-                async move |req: v1::NewSessionRequest,
-                            responder: Responder<v1::NewSessionResponse>,
-                            _cx| {
-                    me2.observed
-                        .lock()
-                        .expect("lock")
-                        .sessions
-                        .push(serde_json::to_value(&req).unwrap_or_default());
-                    if let Some(msg) = &me2.script.fail_session_new {
-                        return responder.respond_with_error(acp::Error::new(-32000, msg.clone()));
-                    }
-                    for server in &req.mcp_servers {
-                        if let v1::McpServer::Http(h) = server {
-                            let token = h
-                                .headers
-                                .iter()
-                                .find(|x| x.name.eq_ignore_ascii_case("authorization"))
-                                .map(|x| x.value.trim_start_matches("Bearer ").to_string())
-                                .unwrap_or_default();
-                            *mcp2.lock().expect("lock") = Some((h.url.clone(), token));
+                {
+                    let mcp = mcp.clone();
+                    async move |req: v1::NewSessionRequest,
+                                responder: Responder<v1::NewSessionResponse>,
+                                _cx| {
+                        let http = req.mcp_servers.iter().find_map(|server| match server {
+                            v1::McpServer::Http(h) => Some((
+                                h.url.clone(),
+                                h.headers
+                                    .iter()
+                                    .find(|x| x.name.eq_ignore_ascii_case("authorization"))
+                                    .map(|x| FakeAgent::bearer(&x.value))
+                                    .unwrap_or_default(),
+                            )),
+                            _ => None,
+                        });
+                        let json = serde_json::to_value(&req).unwrap_or_default();
+                        match me2.record_session(json, http, &mcp) {
+                            Ok(id) => responder.respond(v1::NewSessionResponse::new(id)),
+                            Err(msg) => responder.respond_with_error(acp::Error::new(-32000, msg)),
                         }
                     }
-                    let id = format!(
-                        "fake-session-{}",
-                        me2.observed.lock().expect("lock").sessions.len()
-                    );
-                    responder.respond(v1::NewSessionResponse::new(id))
                 },
                 acp::on_receive_request!(),
             )
@@ -210,17 +286,17 @@ impl FakeAgent {
                             _ => None,
                         })
                         .collect();
-                    let n = {
-                        let mut o = me3.observed.lock().expect("lock");
-                        o.prompts.push(text.clone());
-                        o.prompts.len() - 1
-                    };
+                    let n = me3.record_prompt(&text);
                     let turn = me3.turn(n);
                     let me = me3.clone();
                     let mcp = mcp.clone();
-                    let sid = req.session_id.clone();
+                    let wire = Wire::V1 {
+                        cx,
+                        session: req.session_id.clone(),
+                        responder: Some(responder),
+                    };
                     tokio::spawn(async move {
-                        me.run_turn(turn, n, text, sid, mcp, responder, cx).await;
+                        me.run_turn(turn, n, text, wire, mcp).await;
                     });
                     Ok(())
                 },
@@ -229,55 +305,167 @@ impl FakeAgent {
             .on_receive_notification(
                 async move |n: v1::CancelNotification, _cx| {
                     me4.observed.lock().expect("lock").cancels += 1;
-                    me4.cancel.send_replace(Some(n.session_id));
+                    me4.cancel.send_replace(Some(n.session_id.to_string()));
                     Ok(())
                 },
                 acp::on_receive_notification!(),
             )
     }
 
-    #[allow(clippy::too_many_arguments)]
+    fn v2_component(self, mcp: McpEndpoint) -> impl ConnectTo<Client> {
+        let (me1, me2, me3, me4) = (self.clone(), self.clone(), self.clone(), self);
+        Agent
+            .v2()
+            .name("fake-acp-agent")
+            .on_receive_request(
+                async move |_req: v2::InitializeRequest,
+                            responder: Responder<v2::InitializeResponse>,
+                            _cx: V2ConnectionTo<Client>| {
+                    me1.observed.lock().expect("lock").protocols.push(2);
+                    let mut mcp_caps = v2::McpCapabilities::new();
+                    if me1.script.mcp_http {
+                        mcp_caps = mcp_caps.http(v2::McpHttpCapabilities::new());
+                    }
+                    responder.respond(
+                        v2::InitializeResponse::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("fake-acp-agent", "0.0.0"),
+                        )
+                        .capabilities(
+                            v2::AgentCapabilities::new()
+                                .session(v2::SessionCapabilities::new().mcp(mcp_caps)),
+                        ),
+                    )
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let mcp = mcp.clone();
+                    async move |req: v2::NewSessionRequest,
+                                responder: Responder<v2::NewSessionResponse>,
+                                cx: V2ConnectionTo<Client>| {
+                        let http = req.mcp_servers.iter().find_map(|server| match server {
+                            v2::McpServer::Http(h) => Some((
+                                h.url.clone(),
+                                h.headers
+                                    .iter()
+                                    .find(|x| x.name.eq_ignore_ascii_case("authorization"))
+                                    .map(|x| FakeAgent::bearer(&x.value))
+                                    .unwrap_or_default(),
+                            )),
+                            _ => None,
+                        });
+                        let json = serde_json::to_value(&req).unwrap_or_default();
+                        match me2.record_session(json, http, &mcp) {
+                            Ok(id) => {
+                                let session = v2::SessionId::new(id);
+                                responder.respond(v2::NewSessionResponse::new(session.clone()))?;
+                                // A fresh session reports that it is ready.
+                                cx.send_notification(v2::UpdateSessionNotification::new(
+                                    session,
+                                    v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                                        v2::IdleStateUpdate::new(),
+                                    )),
+                                ))
+                            }
+                            Err(msg) => responder.respond_with_error(acp::Error::new(-32000, msg)),
+                        }
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                async move |req: v2::PromptRequest,
+                            responder: Responder<v2::PromptResponse>,
+                            cx: V2ConnectionTo<Client>| {
+                    let text: String = req
+                        .prompt
+                        .iter()
+                        .filter_map(|b| match b {
+                            v2::ContentBlock::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let n = me3.record_prompt(&text);
+                    let turn = me3.turn(n);
+                    // An error before anything else: the prompt is not accepted.
+                    if let Some(Step::Error(msg)) = turn.steps.first() {
+                        return responder.respond_with_error(acp::Error::new(-32603, msg.clone()));
+                    }
+                    // v2 acknowledges acceptance in the prompt response, then
+                    // echoes the accepted prompt as the keyed user message.
+                    let user = v2::MessageId::new(format!("user-{n}"));
+                    responder.respond(v2::PromptResponse::new(user.clone()))?;
+                    cx.send_notification(v2::UpdateSessionNotification::new(
+                        req.session_id.clone(),
+                        v2::SessionUpdate::UserMessage(
+                            v2::UserMessage::new(user).content(req.prompt.clone()),
+                        ),
+                    ))?;
+                    let me = me3.clone();
+                    let mcp = mcp.clone();
+                    let wire = Wire::V2 {
+                        cx,
+                        session: req.session_id.clone(),
+                        message: 0,
+                        open_call: None,
+                    };
+                    tokio::spawn(async move {
+                        me.run_turn(turn, n, text, wire, mcp).await;
+                    });
+                    Ok(())
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |n: v2::CancelSessionNotification, _cx: V2ConnectionTo<Client>| {
+                    me4.observed.lock().expect("lock").cancels += 1;
+                    me4.cancel.send_replace(Some(n.session_id.to_string()));
+                    Ok(())
+                },
+                acp::on_receive_notification!(),
+            )
+    }
+
     async fn run_turn(
         self,
         turn: Turn,
         n: usize,
         prompt: String,
-        session: v1::SessionId,
-        mcp: Arc<Mutex<Option<(String, String)>>>,
-        responder: Responder<v1::PromptResponse>,
-        cx: acp::ConnectionTo<Client>,
+        mut wire: Wire,
+        mcp: McpEndpoint,
     ) {
         // Subscribe before the first step so a cancel that lands at any point
         // in the turn is seen.
         let mut cancels = self.cancel.subscribe();
         cancels.mark_unchanged();
-        let mine = session.clone();
+        let mine = wire.session();
         let cancelled = async move {
             while cancels.changed().await.is_ok() {
-                if cancels.borrow_and_update().as_ref() == Some(&mine) {
+                if cancels.borrow_and_update().as_deref() == Some(mine.as_str()) {
                     return;
                 }
             }
             std::future::pending::<()>().await
         };
+        wire.started();
         let ending = tokio::select! {
-            e = self.clone().steps(turn.steps, n, &prompt, session, mcp, &cx) => e,
-            () = cancelled => Ending::Stop(v1::StopReason::Cancelled),
+            e = self.clone().steps(turn.steps, n, &prompt, &mut wire, mcp) => e,
+            () = cancelled => Ending::Stop(Stop::Cancelled),
         };
         let stop = match ending {
             Ending::Stop(stop) => stop,
-            Ending::Error(msg) => {
-                let _ = responder.respond_with_error(acp::Error::new(-32603, msg));
-                return;
-            }
+            Ending::Error(msg) => return wire.fail(msg),
             Ending::Dropped => return,
             Ending::Done => match turn.stop.as_deref() {
-                Some("cancelled") => v1::StopReason::Cancelled,
-                Some("refusal") => v1::StopReason::Refusal,
-                _ => v1::StopReason::EndTurn,
+                Some("cancelled") => Stop::Cancelled,
+                Some("refusal") => Stop::Refusal,
+                Some("max_tokens") => Stop::MaxTokens,
+                _ => Stop::EndTurn,
             },
         };
-        let _ = responder.respond(v1::PromptResponse::new(stop));
+        wire.end(stop);
     }
 
     async fn steps(
@@ -285,30 +473,15 @@ impl FakeAgent {
         steps: Vec<Step>,
         n: usize,
         prompt: &str,
-        session: v1::SessionId,
-        mcp: Arc<Mutex<Option<(String, String)>>>,
-        cx: &acp::ConnectionTo<Client>,
+        wire: &mut Wire,
+        mcp: McpEndpoint,
     ) -> Ending {
         let trigger = owed_trigger(prompt);
         for step in steps {
             match step {
-                Step::Text(t) => {
-                    let _ = cx.send_notification(v1::SessionNotification::new(
-                        session.clone(),
-                        v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(
-                            v1::ContentBlock::Text(v1::TextContent::new(t)),
-                        )),
-                    ));
-                }
-                Step::ToolCall(title) => {
-                    let _ = cx.send_notification(v1::SessionNotification::new(
-                        session.clone(),
-                        v1::SessionUpdate::ToolCall(v1::ToolCall::new(
-                            v1::ToolCallId::new(format!("call-{n}")),
-                            title,
-                        )),
-                    ));
-                }
+                Step::Text(t) => wire.text(n, t),
+                Step::AgentMessage(t) => wire.agent_message(n, t),
+                Step::ToolCall(title) => wire.tool_call(n, title),
                 Step::Mcp { tool, args } => {
                     let args = substitute(args, trigger.as_deref(), n);
                     let endpoint = mcp.lock().expect("lock").clone();
@@ -327,36 +500,12 @@ impl FakeAgent {
                         .push(result);
                 }
                 Step::Permission(title) => {
-                    let call = v1::ToolCallUpdate::new(
-                        v1::ToolCallId::new(format!("perm-{n}")),
-                        v1::ToolCallUpdateFields::new().title(title),
-                    );
-                    let req = v1::RequestPermissionRequest::new(
-                        session.clone(),
-                        call,
-                        vec![
-                            v1::PermissionOption::new(
-                                "allow",
-                                "Allow",
-                                v1::PermissionOptionKind::AllowOnce,
-                            ),
-                            v1::PermissionOption::new(
-                                "deny",
-                                "Deny",
-                                v1::PermissionOptionKind::RejectOnce,
-                            ),
-                        ],
-                    );
-                    let outcome = cx.send_request(req).block_task().await;
+                    let outcome = wire.permission(n, title).await;
                     self.observed
                         .lock()
                         .expect("lock")
                         .permission_outcomes
-                        .push(
-                            outcome
-                                .map(|o| serde_json::to_value(o).unwrap_or_default())
-                                .unwrap_or_else(|e| Value::String(e.to_string())),
-                        );
+                        .push(outcome);
                 }
                 Step::Gate(name) => {
                     if !self.is_binary {
@@ -384,10 +533,295 @@ impl FakeAgent {
 enum Ending {
     /// Ran every step; answer with the turn's scripted stop reason.
     Done,
-    Stop(v1::StopReason),
+    Stop(Stop),
     Error(String),
     /// Exited or dropped the connection without answering.
     Dropped,
+}
+
+/// A stop reason, either protocol version.
+#[derive(Clone, Copy)]
+enum Stop {
+    EndTurn,
+    Cancelled,
+    Refusal,
+    MaxTokens,
+}
+
+/// One turn's way back to the client.
+enum Wire {
+    V1 {
+        cx: acp::ConnectionTo<Client>,
+        session: v1::SessionId,
+        /// Answered when the turn ends (v1 prompts run to the end of the turn).
+        responder: Option<Responder<v1::PromptResponse>>,
+    },
+    V2 {
+        cx: V2ConnectionTo<Client>,
+        session: v2::SessionId,
+        /// The current agent message; a tool call starts the next one.
+        message: usize,
+        /// A tool call still `in_progress`, upserted to `completed` once the
+        /// agent has started its next message.
+        open_call: Option<v2::ToolCallId>,
+    },
+}
+
+impl Wire {
+    fn session(&self) -> String {
+        match self {
+            Wire::V1 { session, .. } => session.to_string(),
+            Wire::V2 { session, .. } => session.to_string(),
+        }
+    }
+
+    fn v2_update(cx: &V2ConnectionTo<Client>, session: &v2::SessionId, update: v2::SessionUpdate) {
+        let _ = cx.send_notification(v2::UpdateSessionNotification::new(session.clone(), update));
+    }
+
+    fn message_id(n: usize, message: usize) -> v2::MessageId {
+        v2::MessageId::new(format!("agent-{n}-{message}"))
+    }
+
+    /// The turn is running (v2 says so; v1 has no turn state).
+    fn started(&mut self) {
+        if let Wire::V2 { cx, session, .. } = self {
+            Self::v2_update(
+                cx,
+                session,
+                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                    v2::RunningStateUpdate::new(),
+                )),
+            );
+        }
+    }
+
+    fn text(&mut self, n: usize, t: String) {
+        match self {
+            Wire::V1 { cx, session, .. } => {
+                let _ = cx.send_notification(v1::SessionNotification::new(
+                    session.clone(),
+                    v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(
+                        v1::ContentBlock::Text(v1::TextContent::new(t)),
+                    )),
+                ));
+            }
+            Wire::V2 {
+                cx,
+                session,
+                message,
+                open_call,
+            } => {
+                Self::v2_update(
+                    cx,
+                    session,
+                    v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+                        v2::ContentBlock::Text(v2::TextContent::new(t)),
+                        Self::message_id(n, *message),
+                    )),
+                );
+                if let Some(call) = open_call.take() {
+                    Self::v2_update(
+                        cx,
+                        session,
+                        v2::SessionUpdate::ToolCallUpdate(
+                            v2::ToolCallUpdate::new(call).status(v2::ToolCallStatus::Completed),
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    fn agent_message(&mut self, n: usize, t: String) {
+        if let Wire::V2 {
+            cx,
+            session,
+            message,
+            ..
+        } = self
+        {
+            Self::v2_update(
+                cx,
+                session,
+                v2::SessionUpdate::AgentMessage(
+                    v2::AgentMessage::new(Self::message_id(n, *message))
+                        .content(vec![v2::ContentBlock::Text(v2::TextContent::new(t))]),
+                ),
+            );
+        }
+    }
+
+    fn tool_call(&mut self, n: usize, title: String) {
+        match self {
+            Wire::V1 { cx, session, .. } => {
+                let _ = cx.send_notification(v1::SessionNotification::new(
+                    session.clone(),
+                    v1::SessionUpdate::ToolCall(v1::ToolCall::new(
+                        v1::ToolCallId::new(format!("call-{n}")),
+                        title,
+                    )),
+                ));
+            }
+            Wire::V2 {
+                cx,
+                session,
+                message,
+                open_call,
+            } => {
+                *message += 1;
+                let id = v2::ToolCallId::new(format!("call-{n}-{message}"));
+                Self::v2_update(
+                    cx,
+                    session,
+                    v2::SessionUpdate::ToolCallUpdate(
+                        v2::ToolCallUpdate::new(id.clone())
+                            .title(title)
+                            .status(v2::ToolCallStatus::InProgress),
+                    ),
+                );
+                *open_call = Some(id);
+            }
+        }
+    }
+
+    /// Asks for permission; returns the client's answer (or the error) as JSON.
+    async fn permission(&mut self, n: usize, title: String) -> Value {
+        match self {
+            Wire::V1 { cx, session, .. } => {
+                let call = v1::ToolCallUpdate::new(
+                    v1::ToolCallId::new(format!("perm-{n}")),
+                    v1::ToolCallUpdateFields::new().title(title),
+                );
+                let req = v1::RequestPermissionRequest::new(
+                    session.clone(),
+                    call,
+                    vec![
+                        v1::PermissionOption::new(
+                            "allow",
+                            "Allow",
+                            v1::PermissionOptionKind::AllowOnce,
+                        ),
+                        v1::PermissionOption::new(
+                            "deny",
+                            "Deny",
+                            v1::PermissionOptionKind::RejectOnce,
+                        ),
+                    ],
+                );
+                let outcome = cx.send_request(req).block_task().await;
+                outcome
+                    .map(|o| serde_json::to_value(o).unwrap_or_default())
+                    .unwrap_or_else(|e| Value::String(e.to_string()))
+            }
+            Wire::V2 { cx, session, .. } => {
+                Self::v2_update(
+                    cx,
+                    session,
+                    v2::SessionUpdate::StateUpdate(v2::StateUpdate::RequiresAction(
+                        v2::RequiresActionStateUpdate::new(),
+                    )),
+                );
+                let req = v2::RequestPermissionRequest::new(
+                    session.clone(),
+                    title,
+                    vec![
+                        v2::PermissionOption::new(
+                            "allow",
+                            "Allow",
+                            v2::PermissionOptionKind::AllowOnce,
+                        ),
+                        v2::PermissionOption::new(
+                            "deny",
+                            "Deny",
+                            v2::PermissionOptionKind::RejectOnce,
+                        ),
+                    ],
+                );
+                let outcome = cx.send_request(req).block_task().await;
+                Self::v2_update(
+                    cx,
+                    session,
+                    v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                        v2::RunningStateUpdate::new(),
+                    )),
+                );
+                outcome
+                    .map(|o| serde_json::to_value(o).unwrap_or_default())
+                    .unwrap_or_else(|e| Value::String(e.to_string()))
+            }
+        }
+    }
+
+    /// Ends the turn normally.
+    fn end(self, stop: Stop) {
+        match self {
+            Wire::V1 { responder, .. } => {
+                let stop = match stop {
+                    Stop::EndTurn => v1::StopReason::EndTurn,
+                    Stop::Cancelled => v1::StopReason::Cancelled,
+                    Stop::Refusal => v1::StopReason::Refusal,
+                    Stop::MaxTokens => v1::StopReason::MaxTokens,
+                };
+                if let Some(r) = responder {
+                    let _ = r.respond(v1::PromptResponse::new(stop));
+                }
+            }
+            Wire::V2 {
+                cx,
+                session,
+                open_call,
+                ..
+            } => {
+                if let Some(call) = open_call {
+                    let status = match stop {
+                        Stop::Cancelled => v2::ToolCallStatus::Cancelled,
+                        _ => v2::ToolCallStatus::Completed,
+                    };
+                    Self::v2_update(
+                        &cx,
+                        &session,
+                        v2::SessionUpdate::ToolCallUpdate(
+                            v2::ToolCallUpdate::new(call).status(status),
+                        ),
+                    );
+                }
+                let stop = match stop {
+                    Stop::EndTurn => v2::StopReason::EndTurn,
+                    Stop::Cancelled => v2::StopReason::Cancelled,
+                    Stop::Refusal => v2::StopReason::Refusal,
+                    Stop::MaxTokens => v2::StopReason::MaxTokens,
+                };
+                Self::v2_update(
+                    &cx,
+                    &session,
+                    v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                        v2::IdleStateUpdate::new().stop_reason(stop),
+                    )),
+                );
+            }
+        }
+    }
+
+    /// Ends the turn with a scripted error.
+    fn fail(self, msg: String) {
+        match self {
+            Wire::V1 { responder, .. } => {
+                if let Some(r) = responder {
+                    let _ = r.respond_with_error(acp::Error::new(-32603, msg));
+                }
+            }
+            Wire::V2 { cx, session, .. } => Self::v2_update(
+                &cx,
+                &session,
+                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                    v2::IdleStateUpdate::new().stop_reason(v2::StopReason::Error(
+                        v2::ErrorStopReason::new().error(v2::Error::new(-32603, msg)),
+                    )),
+                )),
+            ),
+        }
+    }
 }
 
 fn owed_trigger(prompt: &str) -> Option<String> {

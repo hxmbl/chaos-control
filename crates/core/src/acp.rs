@@ -235,6 +235,11 @@ pub(crate) struct Tracker {
     pub accepted: bool,
     /// Assistant text since the last tool call: the turn's final message.
     pub text: String,
+    /// v2: the agent messages since the last new tool call, by `messageId`,
+    /// in arrival order (chunks append, an `agent_message` snapshot replaces).
+    pub messages: Vec<(String, String)>,
+    /// v2: tool call ids seen this turn (a repeat is an upsert, not a new call).
+    pub calls: std::collections::HashSet<String>,
 }
 
 impl Tracker {
@@ -610,8 +615,7 @@ async fn run_v1(
                             let mut t = t_main.lock().expect("lock");
                             *t = Tracker {
                                 turn: Some(turn),
-                                accepted: false,
-                                text: String::new(),
+                                ..Tracker::default()
                             };
                         }
                         let sent = conn.send_request(v1::PromptRequest::new(

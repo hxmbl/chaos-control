@@ -5,7 +5,14 @@
 //! chat MCP server, prompt acceptance and `state_update` running -> idle (with
 //! an `error` stop: "Authentication required"). Agent output, tool calls and
 //! permission requests over v2 are not verified live yet (they need a signed-in
-//! agent). codex-acp 0.16.0 answers v1.
+//! agent). codex-acp 0.16.0 answers v1. The scripted fake agent's v2 mode
+//! covers agent output, tool calls, permission requests and cancel
+//! (`tests/v2.rs`).
+//!
+//! Final text: agent messages are keyed by `messageId`. Chunks append to their
+//! message, an `agent_message` snapshot replaces it. Tool calls are keyed
+//! upserts: only a `toolCallId` not seen this turn is a new call, which starts
+//! a new final message and becomes the agent's activity.
 //!
 //! Acceptance point: the `session/prompt` response (v2 acknowledges acceptance
 //! there), or an earlier `state_update` (`running` or `idle`) for the in-flight
@@ -16,7 +23,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::{
     self as acp, Agent, Client, DynConnectTo, InitializeOutcome, V2ConnectionTo,
-    schema::{ProtocolVersion, v2},
+    schema::{MaybeUndefined, ProtocolVersion, v2},
 };
 use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
@@ -129,11 +136,43 @@ fn decline(
     }
 }
 
+/// The text of the agent message `id`, added at the end if it is new.
+fn message<'a>(t: &'a mut Tracker, id: &v2::MessageId) -> &'a mut String {
+    let id = id.to_string();
+    let i = match t.messages.iter().position(|(m, _)| *m == id) {
+        Some(i) => i,
+        None => {
+            t.messages.push((id, String::new()));
+            t.messages.len() - 1
+        }
+    };
+    &mut t.messages[i].1
+}
+
+fn text_of(blocks: &[v2::ContentBlock]) -> String {
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            v2::ContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The turn's final message: the agent messages since the last new tool call.
+fn final_text(t: &mut Tracker) -> String {
+    std::mem::take(&mut t.messages)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect()
+}
+
 fn outcome(stop: Option<v2::StopReason>) -> TurnOutcome {
     match stop {
         None | Some(v2::StopReason::EndTurn) => TurnOutcome::Completed,
         Some(v2::StopReason::Cancelled) => TurnOutcome::Cancelled,
         Some(v2::StopReason::Refusal) => TurnOutcome::Refused,
+        Some(v2::StopReason::MaxTokens | v2::StopReason::MaxTurnRequests) => TurnOutcome::MaxTokens,
         Some(other) => TurnOutcome::Other(Arc::from(format!("{other:?}"))),
     }
 }
@@ -201,11 +240,32 @@ async fn run(
                     match &n.update {
                         v2::SessionUpdate::AgentMessageChunk(chunk) if t.turn.is_some() => {
                             if let v2::ContentBlock::Text(text) = &chunk.content {
-                                t.text.push_str(&text.text);
+                                message(&mut t, &chunk.message_id).push_str(&text.text);
                             }
                         }
-                        v2::SessionUpdate::ToolCallUpdate(_) if t.turn.is_some() => {
-                            t.text.clear();
+                        // A snapshot replaces what the chunks of that message said.
+                        v2::SessionUpdate::AgentMessage(m) if t.turn.is_some() => {
+                            match &m.content {
+                                MaybeUndefined::Value(blocks) => {
+                                    *message(&mut t, &m.message_id) = text_of(blocks);
+                                }
+                                MaybeUndefined::Null => message(&mut t, &m.message_id).clear(),
+                                MaybeUndefined::Undefined => {}
+                            }
+                        }
+                        // Tool calls are keyed upserts: only a call id not seen this
+                        // turn is a new call. It starts a new final message and is
+                        // the agent's activity; a later update to it (e.g. status
+                        // `completed`) changes neither.
+                        v2::SessionUpdate::ToolCallUpdate(call) if t.turn.is_some() => {
+                            if t.calls.insert(call.tool_call_id.to_string()) {
+                                t.messages.clear();
+                                if let MaybeUndefined::Value(title) = &call.title {
+                                    out.push(AgentEvent::Activity {
+                                        label: Arc::from(title.as_str()),
+                                    });
+                                }
+                            }
                         }
                         // The agent went `running` on our prompt: that is acceptance
                         // too. The prompt response is handled on another task, so a
@@ -238,7 +298,7 @@ async fn run(
                                             AgentError::new(AgentErrorKind::Protocol, "turn failed")
                                         }
                                     };
-                                    t.text.clear();
+                                    t.messages.clear();
                                     out.push(AgentEvent::TurnFailed {
                                         turn,
                                         accepted: true,
@@ -248,7 +308,7 @@ async fn run(
                                     out.push(AgentEvent::TurnEnded {
                                         turn,
                                         outcome: outcome(idle.stop_reason.clone()),
-                                        final_text: Arc::from(std::mem::take(&mut t.text)),
+                                        final_text: Arc::from(final_text(&mut t)),
                                     });
                                 }
                             }
@@ -342,8 +402,7 @@ async fn run(
                     Cmd::Prompt { turn, text, done } => {
                         *t_main.lock().expect("lock") = Tracker {
                             turn: Some(turn),
-                            accepted: false,
-                            text: String::new(),
+                            ..Tracker::default()
                         };
                         let sent = conn.send_request(v2::PromptRequest::new(
                             session_id.clone(),
