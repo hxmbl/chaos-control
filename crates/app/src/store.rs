@@ -110,7 +110,47 @@ struct Attached {
     reactions: HashMap<ct::MessageId, Vec<ct::Reaction>>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
+    /// The project's `ping_answer_reactions` as core stores it (`None`: the
+    /// default), and the last error from saving it.
+    ping_answers: Option<Vec<String>>,
+    ping_answers_error: Option<Arc<str>>,
     _events: Task<()>,
+}
+
+/// The Settings pane's view of which reactions answer a ping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PingAnswersSetting {
+    /// What is in effect: `["*"]` or emoji.
+    pub list: Vec<String>,
+    /// The built-in default (✅ 👍), not a project setting.
+    pub is_default: bool,
+    /// Why the last save was refused, if it was.
+    pub error: Option<Arc<str>>,
+}
+
+/// What the Settings pane's emoji-list field asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PingAnswersInput {
+    /// Blank: nothing to do.
+    Nothing,
+    /// `default`: clear the project setting.
+    Reset,
+    /// Emoji, :shortcodes: or `*`, split on spaces and commas (core
+    /// validates them).
+    Entries(Vec<String>),
+}
+
+pub fn parse_ping_answers_input(text: &str) -> PingAnswersInput {
+    let entries: Vec<String> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect();
+    match entries.as_slice() {
+        [] => PingAnswersInput::Nothing,
+        [one] if one.eq_ignore_ascii_case("default") => PingAnswersInput::Reset,
+        _ => PingAnswersInput::Entries(entries),
+    }
 }
 
 impl EventEmitter<StoreEvent> for ChatStore {}
@@ -498,9 +538,93 @@ impl ChatStore {
             names: HashMap::new(),
             reactions: HashMap::new(),
             confirm,
+            ping_answers: None,
+            ping_answers_error: None,
             _events: task,
         });
+        self.load_ping_answers(cx);
         cx.notify();
+    }
+
+    /// Which reactions answer a ping in the open project, for Settings.
+    /// `None` without core (sample data has no agents to ping).
+    pub fn ping_answers(&self) -> Option<PingAnswersSetting> {
+        let attached = self.core.as_ref()?;
+        let default = || {
+            chaos_core::reaction::DEFAULT_PING_ANSWERS
+                .iter()
+                .map(|e| e.to_string())
+                .collect()
+        };
+        Some(PingAnswersSetting {
+            list: attached.ping_answers.clone().unwrap_or_else(default),
+            is_default: attached.ping_answers.is_none(),
+            error: attached.ping_answers_error.clone(),
+        })
+    }
+
+    /// Reads the open project's ping-answer list from core.
+    fn load_ping_answers(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.ping_answer_reactions(project.clone()).await;
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                if a.link.open.project.id != project {
+                    return;
+                }
+                match result {
+                    Ok(list) => a.ping_answers = list,
+                    Err(e) => a.ping_answers_error = Some(Arc::from(e)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Saves the Settings field (see [`parse_ping_answers_input`]) as the
+    /// open project's ping-answer list. Core validates it; a refusal is kept
+    /// for the pane to show, and the old list stays. Returns whether a save
+    /// was started (blank input does nothing).
+    pub fn set_ping_answers(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(attached) = &mut self.core else {
+            return false;
+        };
+        let entries = match parse_ping_answers_input(text) {
+            PingAnswersInput::Nothing => return false,
+            PingAnswersInput::Reset => None,
+            PingAnswersInput::Entries(e) => Some(e),
+        };
+        let reset = entries.is_none();
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_ping_answer_reactions(project, entries).await;
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                match result {
+                    Ok(list) => {
+                        a.ping_answers = (!reset).then_some(list);
+                        a.ping_answers_error = None;
+                    }
+                    Err(e) => a.ping_answers_error = Some(Arc::from(e)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        true
     }
 
     /// Shows `open` as the workspace's project: header, picker and channels.
@@ -691,8 +815,11 @@ impl ChatStore {
         attached.by_seq.clear();
         attached.receipts.clear();
         attached.reactions.clear();
+        attached.ping_answers = None;
+        attached.ping_answers_error = None;
         attached.link.open = open;
         self.core = Some(attached);
+        self.load_ping_answers(cx);
     }
 
     /// Folds one core event into the app's state.
@@ -966,4 +1093,26 @@ fn core_message_id(id: Id) -> Option<ct::MessageId> {
 /// The log row for the newest message at or before `seq`, if any is loaded.
 fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
     by_seq.range(..=seq).next_back().map(|(_, ix)| *ix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ping_answers_input_splits_on_spaces_and_commas() {
+        assert_eq!(parse_ping_answers_input("   "), PingAnswersInput::Nothing);
+        assert_eq!(
+            parse_ping_answers_input(" Default "),
+            PingAnswersInput::Reset
+        );
+        assert_eq!(
+            parse_ping_answers_input("✅ 👍, :rocket:"),
+            PingAnswersInput::Entries(vec!["✅".into(), "👍".into(), ":rocket:".into()])
+        );
+        assert_eq!(
+            parse_ping_answers_input("*"),
+            PingAnswersInput::Entries(vec!["*".into()])
+        );
+    }
 }
