@@ -2217,19 +2217,12 @@ mod tests {
                 (3, 2, "👀".to_string(), 1005)
             ]
         );
-        // Still one per (message, member, emoji), and the length CHECK holds.
+        // Still one per (message, member, emoji), and the length CHECK holds
+        // (OR IGNORE skips a row that breaks it).
         assert!(!add_reaction(c, MessageId(11), ChannelId(3), MemberId(1), "👍", 2000).unwrap());
-        assert!(
-            add_reaction(
-                c,
-                MessageId(11),
-                ChannelId(3),
-                MemberId(1),
-                &"x".repeat(33),
-                2000
-            )
-            .is_err()
-        );
+        let long = "x".repeat(33);
+        assert!(!add_reaction(c, MessageId(11), ChannelId(3), MemberId(1), &long, 2000).unwrap());
+        assert_eq!(on(11).len(), 2);
         let fk: i64 = c
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
