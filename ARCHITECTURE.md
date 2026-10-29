@@ -110,7 +110,9 @@ Migration 3 adds `projects.unclaimed_import`, set only on that "Imported"
 project, so it can be adopted by one folder, once (see Relinking imported
 history below). Migrations 4 to 6 add read receipts, stances and permission
 requests; migration 7 rebuilds `reactions` with each reaction's channel
-(see "Reactions" in [docs/agents.md](docs/agents.md)).
+(see "Reactions" in [docs/agents.md](docs/agents.md)); migration 8 adds
+`project_settings`, one JSON value per (project, key), holding
+`ping_answer_reactions` so far.
 
 **`::N`.** A channel's ordinal is assigned when it is created: the project's
 highest so far plus one, starting at 1 (so a new project's #main is `::1`).
@@ -219,6 +221,12 @@ and the chips change when core's `CoreEvent::Reaction` comes back, which
 re-measures only that row (`StoreEvent::Reactions`). A reaction never wakes
 an agent (see [docs/agents.md](docs/agents.md)).
 
+Which reactions answer a ping (close a pinged agent's reply obligation) is
+a project setting in core (`ping_answer_reactions`, default ✅ 👍, `*` for
+any emoji but 👀), with a per-agent override in `agents.json`; the rules
+are in docs/agents.md ("Which reactions answer a ping"). The app only
+shows and edits the project's list (Settings below).
+
 ## Search
 
 The titlebar field (`cmd/ctrl-K`) searches channel names and message text
@@ -313,6 +321,15 @@ The left sidebar's Settings opens the settings pane: appearance (follows the
 OS), the search-in-pane switch, the long-message rule, shortcuts, and
 placeholders for agents and notifications. `model::Settings` lives in the
 `AppSettings` global, in memory only until there is a storage layer.
+
+One row is the exception: "Reactions that answer a ping" is saved in core
+with the open project (`ChatStore::ping_answers` / `set_ping_answers`, over
+`Core::ping_answer_reactions` / `set_ping_answer_reactions`). It shows the
+list in effect ("(default)" when unset) and a field: type emoji or
+`:shortcodes:` separated by spaces or commas, `*` for any emoji but 👀, or
+`default` to clear it, and press Enter. Core validates; a refusal shows
+under the field and the old list stays. Without core the row says it isn't
+available.
 
 ### Search in the pane (experiment)
 

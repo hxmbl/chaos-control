@@ -129,11 +129,15 @@ legitimate answers and none is ever retried.
 - **Satisfied by a send:** a `chat_send` with `reply_to` = the trigger (in the
   in-flight or the pending batch), or a `chat_send` with no `reply_to` when the
   in-flight batch has exactly one open obligation.
-- **Satisfied by a reaction:** any emoji on the trigger, at the moment it is
-  added (resolved kind `react`), except 👀 ("on it"): the agent still owes
-  the answer, so a final text is still posted as the fallback. A turn that
-  ends with only a 👀 and no text was handled too (`satisfied`, `react`),
-  not ignored. Taking a reaction back never reopens an obligation.
+- **Satisfied by a reaction:** an emoji that answers a ping for that agent
+  (see "Which reactions answer a ping": ✅ and 👍 by default), on the
+  trigger, at the moment it is added (resolved kind `react`). 👀 ("on it")
+  never answers, whatever the config: the agent still owes the answer, so a
+  final text is still posted as the fallback. A turn that ends with only a
+  👀 and no text was handled too (`satisfied`, `react`), not ignored. Any
+  other emoji is just a reaction: it is recorded, the obligation stays open
+  and the rules below apply (final text is the fallback; silence is
+  `ignored`). Taking a reaction back never reopens an obligation.
 - **Refused:** a `chat_refuse` on the trigger (see "Refusal and dissent"). The
   refusal message is the answer, so there is no fallback and no retry, and
   the agent's glow is unaffected. A `chat_dissent` on the trigger counts as
@@ -148,8 +152,8 @@ legitimate answers and none is ever retried.
   that was already sent. If the agent already posted exactly that text with
   `chat_send` this turn, nothing is posted and the obligations count as
   satisfied.
-- **Ignored:** the turn completed with no reply, no reaction and no final
-  text. The agent read the ping and let it go; presence says "read
+- **Ignored:** the turn completed with no reply, no answering reaction (or
+  👀) and no final text. The agent read the ping and let it go; presence says "read
   it and let it go". Never retried.
 - **Unmet:** the turn was cancelled, cut short or failed with nothing posted.
   Presence says "turn ended without a reply".
@@ -216,11 +220,12 @@ day is interrupted. Humans and agents react the same way.
   agent reacting to another agent (so there are no reaction loops). Agents
   hear about reactions only the next time something else wakes them.
 - **Obligations.** A reaction from an agent that owes a reply on that
-  message answers it (see Reply obligations). That is the only effect on
-  delivery.
+  message answers it if the emoji answers pings for that agent (below; see
+  Reply obligations). That is the only effect on delivery.
 - **Chat tool.** `chat_react {message_id, emoji, remove?}` adds, or with
-  `remove: true` takes back, the agent's own reaction, and returns `changed`
-  and the message's reactions. Messages outside the session's project are
+  `remove: true` takes back, the agent's own reaction, and returns `changed`,
+  `answers_pings` (whether this emoji answers a ping for the agent) and the
+  message's reactions. Messages outside the session's project are
   `not_found`.
 - **Seen again.** `chat_read` attaches `reactions` to each message, grouped
   by emoji in order of first use (`[{"emoji": "👍", "count": 2, "by": ["hx",
@@ -233,6 +238,35 @@ day is interrupted. Humans and agents react the same way.
 - **The app** draws chips under each message (emoji and count; hover lists
   who), and a quick picker of six emoji on message hover (see
   `ARCHITECTURE.md`).
+
+### Which reactions answer a ping
+
+Configurable (`reaction::PingAnswers`), resolved per agent and channel by
+`Engine::ping_answers`, first match wins:
+
+1. **The agent's own list**: `"ping_answer_reactions"` on the agent in
+   `agents.json`, e.g. `["✅", "👍"]` (`AgentSpec::ping_answers`).
+2. **The project's list**: the `ping_answer_reactions` row in
+   `project_settings` (migration 8), keyed by the channel's project. Set it
+   in the app's Settings pane, or with `Core::set_ping_answer_reactions
+   (project, Some(list))`; `None` clears it. `Core::ping_answer_reactions`
+   reads it (`None` means the default).
+3. **The default**: ✅ and 👍 (`reaction::DEFAULT_PING_ANSWERS`). 💀 and
+   everything else don't answer.
+
+A list holds emoji or `:shortcodes:`, normalised like a reaction (`:+1:` is
+👍, duplicates collapse), or `"*"` for any emoji except 👀 (the behaviour
+before this was configurable). `[]` means no reaction answers. 👀 is
+refused in a list, and never answers anyway. A list with junk in it
+(a word, a blank, 👀) is rejected whole, with an error naming every bad
+entry (`invalid ping_answer_reactions: "lol" (not an emoji or a known
+:shortcode:); ...`), and nothing is written: the project keeps its old list,
+and an agent whose `agents.json` list is bad is started without one (the
+app prints the error) so the project's list applies. A stored value that no
+longer parses counts as unset. Agents see their list in `chat_context`
+(`ping_answer_reactions`) and in the "You owe a reply" line of each prompt
+("✅ or 👍 answers it; 👀 means you're on it, and other emoji don't
+answer").
 
 ## Permissions: by where the agent runs
 
@@ -383,7 +417,8 @@ answers `not_found`.
 `record` appends every ACP frame as NDJSON `{dir, frame}`, the replay-fixture
 format. Optional keys: `env` (object), `acp_v2` (default `true`),
 `chat_tools` (`"auto"` or `"stdio"`), `runs_in` (`"host"`, the default, or
-`"vm"`; see Permissions).
+`"vm"`; see Permissions), `ping_answer_reactions` (a list of emoji, or
+`["*"]`; see "Which reactions answer a ping").
 
 ## Testing
 
@@ -401,10 +436,15 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   arguments record nothing.
 - `tests/reactions.rs`: reactions against the fake agent: add and remove
   are idempotent with one event per real change, a reaction wakes nobody
-  (the author, a mentioned agent, another agent's message), any reaction
-  from a pinged agent closes its obligation as `satisfied`/`react` (👀
-  with no text included) while silence stays `ignored`, and reactions show
-  up in `chat_react`, `chat_read`, `chat_context` and the next prompt.
+  (the author, a mentioned agent, another agent's message), by default ✅
+  and 👍 from a pinged agent close its obligation as `satisfied`/`react`
+  while 💀 doesn't (its final text is the fallback, silence is `ignored`),
+  an agent's own list wins over the project's and clearing that goes back
+  to the default, `"*"` lets any emoji but 👀 answer, 👀 keeps the
+  obligation open during the turn even under `"*"` (👀 with no text is
+  handled), an invalid list is rejected whole and leaves the old one, and
+  reactions show up in `chat_react`, `chat_read`, `chat_context` and the
+  next prompt.
 - `tests/permissions.rs`: permissions by where the agent runs, against the
   fake agent: a host request is routed to the waker, declined natively with
   the request id and the turn carries on; an approval wakes the agent and
