@@ -81,7 +81,9 @@ pub enum PostError {
     UnknownMessage,
     /// Not something that can be a reaction (a word, blank, too long).
     InvalidEmoji,
-    RateLimited { retry_after_ms: Millis },
+    RateLimited {
+        retry_after_ms: Millis,
+    },
     Store(String),
 }
 

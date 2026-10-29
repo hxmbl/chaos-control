@@ -204,7 +204,8 @@ pub fn compose(
                     Some(a) if a == agent => " (yours)",
                     _ => "",
                 };
-                let at = target.map_or_else(|| format!("id:{}", r.message), |t| format!("#{}", t.seq));
+                let at =
+                    target.map_or_else(|| format!("id:{}", r.message), |t| format!("#{}", t.seq));
                 format!("{} {} on {at}{whose}", r.emoji, handle(c, r.member))
             })
             .collect();

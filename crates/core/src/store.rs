@@ -1139,8 +1139,11 @@ pub fn reactions_since(
         "SELECT {REACTION_COLS} FROM reactions WHERE channel_id = ?1 AND created_at > ?2
          ORDER BY created_at, message_id, member_id LIMIT ?3"
     ))?;
-    stmt.query_map(params![channel.0, since as i64, limit as i64], reaction_from_row)?
-        .collect()
+    stmt.query_map(
+        params![channel.0, since as i64, limit as i64],
+        reaction_from_row,
+    )?
+    .collect()
 }
 
 /// Reactions on the messages of `channel` with `seq > after_seq`, oldest

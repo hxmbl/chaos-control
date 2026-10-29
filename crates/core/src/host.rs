@@ -468,9 +468,11 @@ impl Core {
         channel: ChannelId,
         after_seq: Seq,
     ) -> Result<Vec<Reaction>, String> {
-        self.with_engine(move |e, _| crate::store::reactions_after_seq(e.conn(), channel, after_seq))
-            .await?
-            .map_err(|e| e.to_string())
+        self.with_engine(move |e, _| {
+            crate::store::reactions_after_seq(e.conn(), channel, after_seq)
+        })
+        .await?
+        .map_err(|e| e.to_string())
     }
 
     /// A human refuses or dissents from `target` (agents use the chat tools).

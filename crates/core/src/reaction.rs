@@ -125,7 +125,17 @@ mod tests {
 
     #[test]
     fn rejects_words_and_blanks() {
-        for bad in ["", "   ", "::", "lol", "nice one", "ok", ":not_a_code:", "👍 👍", "a👍"] {
+        for bad in [
+            "",
+            "   ",
+            "::",
+            "lol",
+            "nice one",
+            "ok",
+            ":not_a_code:",
+            "👍 👍",
+            "a👍",
+        ] {
             assert_eq!(normalize(bad), None, "{bad:?}");
         }
         let long = "😀".repeat(MAX_EMOJI_CHARS + 1);
@@ -149,7 +159,12 @@ mod tests {
             emoji: Arc::from(emoji),
             created_at: at,
         };
-        let g = group(&[r(2, "💀", 20), r(1, "👍", 10), r(3, "👍", 30), r(3, "💀", 25)]);
+        let g = group(&[
+            r(2, "💀", 20),
+            r(1, "👍", 10),
+            r(3, "👍", 30),
+            r(3, "💀", 25),
+        ]);
         assert_eq!(g.len(), 2);
         assert_eq!(&*g[0].emoji, "👍");
         assert_eq!(g[0].members, vec![MemberId(1), MemberId(3)]);
