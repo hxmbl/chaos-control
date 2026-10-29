@@ -275,6 +275,7 @@ pub fn start_with(config: AgentsConfig) -> Result<CoreLink, String> {
                         adapter: Arc::new(adapter),
                         cwd: a.cwd,
                         runs_in: a.runs_in,
+                        ping_answers: None,
                     },
                     main,
                 )

@@ -324,6 +324,18 @@ DROP TABLE reactions;
 ALTER TABLE reactions_v2 RENAME TO reactions;
 CREATE INDEX reactions_by_channel ON reactions (channel_id, created_at);
 "#,
+    // 8: project settings (STRM-467: `ping_answer_reactions`, which emoji
+    // answer a ping). One JSON value per (project, key); a missing row means
+    // the built-in default. Values are validated before they are written.
+    r#"
+CREATE TABLE project_settings (
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (project_id, key)
+);
+"#,
 ];
 
 pub struct Store {
@@ -626,12 +638,49 @@ pub fn forget_empty_project(c: &Connection, project: &ProjectId) -> Result<Optio
         "DELETE FROM channels WHERE project_id = ?1",
         [project.as_str()],
     )?;
-    c.execute(
-        "DELETE FROM project_members WHERE project_id = ?1",
-        [project.as_str()],
-    )?;
+    for table in ["project_members", "project_settings"] {
+        c.execute(
+            &format!("DELETE FROM {table} WHERE project_id = ?1"),
+            [project.as_str()],
+        )?;
+    }
     c.execute("DELETE FROM projects WHERE id = ?1", [project.as_str()])?;
     Ok(Some(channels))
+}
+
+/// A project setting's stored JSON value, if one was set.
+pub fn project_setting(c: &Connection, project: &ProjectId, key: &str) -> Result<Option<String>> {
+    c.query_row(
+        "SELECT value FROM project_settings WHERE project_id = ?1 AND key = ?2",
+        params![project.as_str(), key],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Sets (`Some`) or clears (`None`, back to the default) a project setting.
+/// The caller validates `value` first.
+pub fn set_project_setting(
+    c: &Connection,
+    project: &ProjectId,
+    key: &str,
+    value: Option<&str>,
+    now: Millis,
+) -> Result<()> {
+    match value {
+        Some(v) => c.execute(
+            "INSERT INTO project_settings (project_id, key, value, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_id, key) DO UPDATE SET
+                value = excluded.value, updated_at = excluded.updated_at",
+            params![project.as_str(), key, v, now as i64],
+        )?,
+        None => c.execute(
+            "DELETE FROM project_settings WHERE project_id = ?1 AND key = ?2",
+            params![project.as_str(), key],
+        )?,
+    };
+    Ok(())
 }
 
 /// Changes a project's display name only; its id, channels and history stay.
@@ -1103,6 +1152,18 @@ pub fn reactions_on(c: &Connection, message: MessageId) -> Result<Vec<Reaction>>
          ORDER BY created_at, member_id, emoji"
     ))?;
     stmt.query_map([message.0], reaction_from_row)?.collect()
+}
+
+/// The emoji `member` has on `message`, oldest first.
+pub fn reactions_by(c: &Connection, message: MessageId, member: MemberId) -> Result<Vec<Arc<str>>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT emoji FROM reactions WHERE message_id = ?1 AND member_id = ?2
+         ORDER BY created_at, emoji",
+    )?;
+    stmt.query_map(params![message.0, member.0], |r| {
+        r.get::<_, String>(0).map(Arc::from)
+    })?
+    .collect()
 }
 
 /// Whether `member` has any reaction on `message`.

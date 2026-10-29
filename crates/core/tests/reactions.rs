@@ -1,6 +1,7 @@
 //! Emoji reactions (STRM-467): add and remove are idempotent, a reaction
 //! never wakes anyone (not even the message's author), a pinged agent's
-//! reaction closes its obligation as handled rather than ignored, and agents
+//! reaction with an answering emoji (✅/👍 by default; per agent, then per
+//! project, configurable; never 👀) closes its obligation as handled, and agents
 //! see reactions in `chat_read`, `chat_context` and their next prompt.
 
 mod common;
@@ -55,33 +56,74 @@ async fn resolved_kind(h: &Harness, message: MessageId) -> Option<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn any_reaction_from_a_pinged_agent_closes_the_obligation_as_handled() {
+async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
     let mut h = Harness::new().await;
-    // 💀 and nothing else: handled, not ignored, and nothing posted.
-    let skull = h
+    // ✅ and nothing else: handled, not ignored, and nothing posted.
+    let check = h
         .agent(
-            "skull",
-            script(json!({"turns": [{"steps": [react("💀")]}]})),
+            "check",
+            script(json!({"turns": [{"steps": [react(":white_check_mark:")]}]})),
         )
         .await;
-    let ping = h.say("@skull I broke CI again").await;
+    let ping = h.say("@check did CI pass?").await;
     h.wait_for(
-        "skull reaction",
-        |e| matches!(e, CoreEvent::Reaction { member, added: true, .. } if *member == skull.id),
+        "check reaction",
+        |e| matches!(e, CoreEvent::Reaction { member, added: true, .. } if *member == check.id),
     )
     .await;
     settled(&mut h, 1).await;
     assert_eq!(
-        h.obligation(skull.id, ping.id).await,
+        h.obligation(check.id, ping.id).await,
         Some(ObligationState::Satisfied)
     );
     assert_eq!(resolved_kind(&h, ping.id).await.as_deref(), Some("react"));
-    assert!(h.by(skull.id).await.is_empty(), "a reaction posts nothing");
-    let st = h.core.status(skull.id, h.main).await.unwrap();
+    assert!(h.by(check.id).await.is_empty(), "a reaction posts nothing");
+    let st = h.core.status(check.id, h.main).await.unwrap();
     assert_ne!(
         st.presence.as_deref(),
         Some("read it and let it go"),
         "reacted is not ignored"
+    );
+    // The prompt named the answering emoji.
+    assert!(
+        h.prompts("check")[0].contains("✅ or 👍 answers it"),
+        "{}",
+        h.prompts("check")[0]
+    );
+
+    // 💀 is recorded but doesn't answer: the obligation stays open during the
+    // turn and the usual turn-end rules apply. With final text, that text is
+    // the fallback reply; with none, the ping was ignored.
+    let skull = h
+        .agent(
+            "skull",
+            script(json!({"turns": [{"steps": [react("💀"), {"text": "Ouch."}]}]})),
+        )
+        .await;
+    let ping2 = h.say("@skull I broke CI again").await;
+    settled(&mut h, 2).await;
+    assert_eq!(
+        h.obligation(skull.id, ping2.id).await,
+        Some(ObligationState::Fallback)
+    );
+    assert_eq!(h.by(skull.id).await.len(), 1, "the final text was posted");
+    assert_eq!(
+        h.count("SELECT COUNT(*) FROM reactions WHERE emoji = '💀'")
+            .await,
+        1
+    );
+
+    let quiet = h
+        .agent(
+            "quiet",
+            script(json!({"turns": [{"steps": [react("💀")]}]})),
+        )
+        .await;
+    let ping3 = h.say("@quiet I broke it again").await;
+    settled(&mut h, 3).await;
+    assert_eq!(
+        h.obligation(quiet.id, ping3.id).await,
+        Some(ObligationState::Ignored)
     );
 
     // 👀 ("on it") holds the obligation during the turn; with no final text
@@ -92,33 +134,225 @@ async fn any_reaction_from_a_pinged_agent_closes_the_obligation_as_handled() {
             script(json!({"turns": [{"steps": [react(":eyes:")]}]})),
         )
         .await;
-    let ping2 = h.say("@eyes can you look").await;
-    settled(&mut h, 2).await;
+    let ping4 = h.say("@eyes can you look").await;
+    settled(&mut h, 4).await;
     assert_eq!(
-        h.obligation(eyes.id, ping2.id).await,
+        h.obligation(eyes.id, ping4.id).await,
         Some(ObligationState::Satisfied)
     );
-    assert_eq!(resolved_kind(&h, ping2.id).await.as_deref(), Some("react"));
+    assert_eq!(resolved_kind(&h, ping4.id).await.as_deref(), Some("react"));
 
     // No reaction and no text is still `ignored`.
     let mute = h
         .agent("mute", script(json!({"turns": [{"steps": []}]})))
         .await;
-    let ping3 = h.say("@mute hello?").await;
-    settled(&mut h, 3).await;
+    let ping5 = h.say("@mute hello?").await;
+    settled(&mut h, 5).await;
     assert_eq!(
-        h.obligation(mute.id, ping3.id).await,
+        h.obligation(mute.id, ping5.id).await,
         Some(ObligationState::Ignored)
     );
 
     // Taking the reaction back later doesn't reopen anything.
-    h.core.react(skull.id, ping.id, "💀", false).await.unwrap();
+    h.core.react(check.id, ping.id, "✅", false).await.unwrap();
+    assert_eq!(
+        h.obligation(check.id, ping.id).await,
+        Some(ObligationState::Satisfied)
+    );
+    h.advance(10 * 60 * 1000).await;
+    assert_eq!(h.prompts("check").len(), 1, "never retried");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agents_own_list_wins_over_the_project_setting() {
+    let mut h = Harness::new().await;
+    // The project says only 🚀 answers; @own says only 💀 does.
+    let set = h
+        .core
+        .set_ping_answer_reactions(project_id(), Some(vec![":rocket:".into()]))
+        .await
+        .unwrap();
+    assert_eq!(set, vec!["🚀"]);
+    assert_eq!(
+        h.core.ping_answer_reactions(project_id()).await.unwrap(),
+        Some(vec!["🚀".to_string()])
+    );
+    let own = h
+        .agent_answering(
+            "own",
+            script(json!({"turns": [{"steps": [react("💀")]}, {"steps": [react("🚀")]}]})),
+            &["💀"],
+        )
+        .await;
+    let proj = h
+        .agent(
+            "proj",
+            script(json!({"turns": [{"steps": [react("🚀")]}, {"steps": [react("✅")]}]})),
+        )
+        .await;
+    let p1 = h.say("@own @proj ship?").await;
+    settled(&mut h, 2).await;
+    assert_eq!(
+        h.obligation(own.id, p1.id).await,
+        Some(ObligationState::Satisfied)
+    );
+    assert_eq!(
+        h.obligation(proj.id, p1.id).await,
+        Some(ObligationState::Satisfied)
+    );
+    // The other way round: 🚀 doesn't answer for @own, ✅ (the default) not
+    // for @proj while the project setting is in force.
+    let p2 = h.say("@own @proj and now?").await;
+    settled(&mut h, 4).await;
+    assert_eq!(
+        h.obligation(own.id, p2.id).await,
+        Some(ObligationState::Ignored)
+    );
+    assert_eq!(
+        h.obligation(proj.id, p2.id).await,
+        Some(ObligationState::Ignored)
+    );
+    // chat_context tells each agent its own list.
+    let ctx = tool(&h, own.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["💀"]));
+    let ctx = tool(&h, proj.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["🚀"]));
+
+    // Clearing the project setting goes back to the default.
+    let cleared = h
+        .core
+        .set_ping_answer_reactions(project_id(), None)
+        .await
+        .unwrap();
+    assert_eq!(cleared, vec!["✅", "👍"]);
+    assert_eq!(
+        h.core.ping_answer_reactions(project_id()).await.unwrap(),
+        None
+    );
+    let ctx = tool(&h, proj.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["✅", "👍"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wildcard_lets_any_emoji_but_eyes_answer() {
+    let mut h = Harness::new().await;
+    h.core
+        .set_ping_answer_reactions(project_id(), Some(vec!["*".into()]))
+        .await
+        .unwrap();
+    let skull = h
+        .agent(
+            "skull",
+            script(json!({"turns": [{"steps": [react("💀")]}]})),
+        )
+        .await;
+    let ping = h.say("@skull I broke CI again").await;
+    settled(&mut h, 1).await;
     assert_eq!(
         h.obligation(skull.id, ping.id).await,
         Some(ObligationState::Satisfied)
     );
-    h.advance(10 * 60 * 1000).await;
-    assert_eq!(h.prompts("skull").len(), 1, "never retried");
+    assert_eq!(resolved_kind(&h, ping.id).await.as_deref(), Some("react"));
+    assert!(
+        h.prompts("skull")[0].contains("any emoji but 👀 answers it"),
+        "{}",
+        h.prompts("skull")[0]
+    );
+    // chat_react says whether it answered.
+    let other = h.say("another").await;
+    let r = tool(
+        &h,
+        skull.id,
+        "chat_react",
+        json!({"message_id": other.id.0, "emoji": "🎉"}),
+    )
+    .await;
+    assert_eq!(r["answers_pings"], json!(true));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn eyes_always_keeps_the_obligation_open_during_the_turn() {
+    let mut h = Harness::new().await;
+    // Even when every emoji answers (project "*" and the agent's own "*"),
+    // 👀 leaves the reply owed: the final text is still posted as the reply.
+    h.core
+        .set_ping_answer_reactions(project_id(), Some(vec!["*".into()]))
+        .await
+        .unwrap();
+    let eyes = h
+        .agent_answering(
+            "eyes",
+            script(json!({"turns": [{"steps": [react("👀"), {"text": "Looking now."}]}]})),
+            &["*"],
+        )
+        .await;
+    let ping = h.say("@eyes can you look").await;
+    let reply = h.wait_message("eyes' fallback", Some(eyes.id)).await;
+    settled(&mut h, 1).await;
+    assert_eq!(&*reply.body, "Looking now.");
+    assert_eq!(
+        h.obligation(eyes.id, ping.id).await,
+        Some(ObligationState::Fallback)
+    );
+    let other = h.say("another").await;
+    let r = tool(
+        &h,
+        eyes.id,
+        "chat_react",
+        json!({"message_id": other.id.0, "emoji": ":eyes:"}),
+    )
+    .await;
+    assert_eq!(r["answers_pings"], json!(false));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_list_is_rejected_whole_with_every_bad_entry_named() {
+    let h = Harness::new().await;
+    h.core
+        .set_ping_answer_reactions(project_id(), Some(vec!["👍".into()]))
+        .await
+        .unwrap();
+    let err = h
+        .core
+        .set_ping_answer_reactions(
+            project_id(),
+            Some(vec!["✅".into(), "lol".into(), "👀".into(), "".into()]),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("invalid ping_answer_reactions"), "{err}");
+    assert!(err.contains("\"lol\""), "{err}");
+    assert!(err.contains("\"👀\""), "{err}");
+    assert!(err.contains("never answers a ping"), "{err}");
+    // Nothing was written: the old setting stands.
+    assert_eq!(
+        h.core.ping_answer_reactions(project_id()).await.unwrap(),
+        Some(vec!["👍".to_string()])
+    );
+    // A project core doesn't know is refused too.
+    let unknown = ProjectId::parse("11111111-2222-4333-8444-555555555555").unwrap();
+    let err = h
+        .core
+        .set_ping_answer_reactions(unknown, Some(vec!["✅".into()]))
+        .await
+        .unwrap_err();
+    assert_eq!(err, "no such project");
+    // A stored value that no longer parses (hand-edited) counts as unset.
+    h.core
+        .with_engine(|e, _| {
+            e.conn()
+                .execute(
+                    "UPDATE project_settings SET value = '[\"nope\"]' WHERE key = 'ping_answer_reactions'",
+                    [],
+                )
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        h.core.ping_answer_reactions(project_id()).await.unwrap(),
+        None
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

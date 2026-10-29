@@ -97,13 +97,15 @@ fn line(c: &Connection, m: &Message, max: usize) -> String {
     )
 }
 
-/// The turn prompt for one batch.
+/// The turn prompt for one batch. `answers` is which reactions answer a ping
+/// for this agent (named in the "you owe a reply" line).
 pub fn compose(
     c: &Connection,
     agent: MemberId,
     channel: ChannelId,
     batch: BatchId,
     window_to: Seq,
+    answers: &reaction::PingAnswers,
 ) -> rusqlite::Result<String> {
     let ch = store::channel(c, channel)?
         .map(|c| c.name)
@@ -227,9 +229,16 @@ pub fn compose(
             "No reply is owed. Post with chat_send only if you have something useful to add."
         );
     } else {
+        let react = match answers {
+            reaction::PingAnswers::Only(list) if list.is_empty() => "Answer with chat_send (reply_to=<id>); reactions don't answer pings here (👀 means you're on it).".to_string(),
+            _ => format!(
+                "Answer with chat_send (reply_to=<id>), or react with chat_react if no words are needed ({} answers it; 👀 means you're on it, and other emoji don't answer).",
+                answers.describe()
+            ),
+        };
         let _ = writeln!(
             out,
-            "You owe a reply to {}. Answer with chat_send (reply_to=<id>), or react with chat_react if no words are needed (any emoji but 👀, which means you're on it). If you end your turn without doing either, your final message is posted as your reply.",
+            "You owe a reply to {}. {react} If you end your turn without answering, your final message is posted as your reply.",
             owed.join(", ")
         );
         let _ = writeln!(

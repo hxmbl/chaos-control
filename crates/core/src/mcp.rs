@@ -167,7 +167,7 @@ pub fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "chat_react",
-            "React to a message with one emoji, or take your reaction back with remove: true. Reacting is quiet: it wakes and notifies nobody, not even the author. Any reaction answers a message you owe a reply to, except 👀, which means you're on it (you still owe the reply). Safe to repeat.",
+            "React to a message with one emoji, or take your reaction back with remove: true. Reacting is quiet: it wakes and notifies nobody, not even the author. On a message you owe a reply to, an emoji that answers pings (✅ or 👍 unless configured; chat_context lists yours as ping_answer_reactions) answers it; 👀 means you're on it (you still owe the reply), and other emoji are just reactions. The result says whether it answered. Safe to repeat.",
             schema(
                 json!({"type": "object", "required": ["message_id", "emoji"], "properties": {
                     "message_id": {"type": "integer"},
@@ -444,6 +444,7 @@ pub fn call_tool(
                     .iter()
                     .map(|st| stance_view(c, st))
                     .collect::<Vec<_>>(),
+                "ping_answer_reactions": engine.ping_answers(scope.agent, scope.channel).to_list(),
                 "recent_reactions": store::recent_reactions(c, scope.channel, 10)?
                     .iter()
                     .map(|r| recent_reaction_view(c, r))
@@ -580,11 +581,19 @@ pub fn call_tool(
             }
             let message = MessageId(id as i64);
             let done = engine.react(now, scope.agent, message, emoji, !remove)?;
+            let target = store::message(engine.conn(), message)?;
+            let answers_pings = !remove
+                && target.is_some_and(|m| {
+                    engine
+                        .ping_answers(scope.agent, m.channel)
+                        .answers(&done.emoji)
+                });
             Ok(json!({
                 "ok": true,
                 "emoji": done.emoji,
                 "removed": remove,
                 "changed": done.changed,
+                "answers_pings": answers_pings,
                 "reactions": reaction_views(engine.conn(), message),
             }))
         }
