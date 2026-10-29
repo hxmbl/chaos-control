@@ -355,7 +355,6 @@ async fn agents_see_reactions_in_read_context_and_tools() {
         .unwrap()
         .unwrap_err();
     assert!(err.0.starts_with("invalid_emoji"), "{}", err.0);
-    let _ = h.by(bot.id).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -372,7 +371,7 @@ async fn prompts_show_reactions_compactly() {
     let ping = h.say("@bot can you look").await;
     let prompts = h.wait_prompts("bot", 1).await;
     assert!(
-        prompts[0].contains(&format!("the flaky test is back [💀 @hx]")),
+        prompts[0].contains("the flaky test is back [💀 @hx]"),
         "reactions ride on the message line: {}",
         prompts[0]
     );

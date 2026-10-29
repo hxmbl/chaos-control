@@ -56,7 +56,8 @@ channels from core and #main is the project's own `main` channel:
   (agents to `Author::Agent`, runtime notices to `Author::System`, replies to
   `ReplyRef`) and glow/presence onto the agent's pill;
 - history is loaded once at attach and deduplicated against the event stream
-  by core message id;
+  by core message id, with the reactions on those messages
+  (`Core::reactions`); `CoreEvent::Reaction` keeps them current;
 - the same binary is the stdio MCP bridge for agents that can't take HTTP:
   `chaos-control mcp-bridge` (URL and token in its environment).
 
@@ -107,7 +108,9 @@ run with foreign keys off around them (SQLite can't drop a referenced table
 otherwise) and each checks `pragma_foreign_key_check` before it commits.
 Migration 3 adds `projects.unclaimed_import`, set only on that "Imported"
 project, so it can be adopted by one folder, once (see Relinking imported
-history below).
+history below). Migrations 4 to 6 add read receipts, stances and permission
+requests; migration 7 rebuilds `reactions` with each reaction's channel
+(see "Reactions" in [docs/agents.md](docs/agents.md)).
 
 **`::N`.** A channel's ordinal is assigned when it is created: the project's
 highest so far plus one, starting at 1 (so a new project's #main is `::1`).
@@ -194,6 +197,27 @@ token by token. Incoming messages (one or a batch) go through
 `ListState::splice(len..len, n)`, so only the new rows are measured; history
 already laid out is left alone. Core's events are received on a GPUI task and
 handed to `append` on the main thread (see Agents above).
+
+## Reactions
+
+Small, quiet chips under a message in a core channel: the emoji and a count
+(`size::CHIP` high, `radius::MD`, caption type), in order of each emoji's
+first use. Hover lists who reacted ("You, Claude Code reacted 👍").
+Monochrome: the local human's own chips sit one step darker (`selected`,
+ink text) than everyone else's (`sunken`, muted text); no colour, since
+colour means status. Clicking a chip adds yours, or takes it back if it is
+already yours.
+
+Hovering a message shows a small floating bar at its top right with six
+common emoji (`QUICK_REACTIONS` in `conversation.rs`: 👍 ✅ 👀 😂 ❤️ 💀), one
+click each; picking one that's already yours takes it back. The bar is the
+row's hover group, invisible otherwise, so it costs no layout.
+
+The store keeps reactions per core message (`ChatStore::reactions`,
+`toggle_reaction`). Nothing is optimistic: the click goes to `Core::react`
+and the chips change when core's `CoreEvent::Reaction` comes back, which
+re-measures only that row (`StoreEvent::Reactions`). A reaction never wakes
+an agent (see [docs/agents.md](docs/agents.md)).
 
 ## Search
 
