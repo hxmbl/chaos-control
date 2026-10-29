@@ -28,7 +28,8 @@
 //!     "command": "npx", "args": ["-y", "@agentclientprotocol/claude-agent-acp@0.97.0"],
 //!     "env": {}, "cwd": "/path/to/repo",
 //!     "record": "/tmp/claude-acp.ndjson",
-//!     "acp_v2": true, "chat_tools": "auto", "runs_in": "host"
+//!     "acp_v2": true, "chat_tools": "auto", "runs_in": "host",
+//!     "ping_answer_reactions": ["✅", "👍"]
 //!   }]
 //! }
 //! ```
@@ -39,6 +40,11 @@
 //! bridge) or `"stdio"` (always `chaos-control mcp-bridge`). `runs_in` is
 //! `"host"` (the default: permission requests go to the humans, without
 //! blocking the agent) or `"vm"` (the agent's own VM: everything is approved).
+//! `ping_answer_reactions` (optional) is this agent's own list of reactions
+//! that answer a ping, over the project's (Settings) and the default (✅ 👍):
+//! emoji, `:shortcodes:`, or `"*"` for any emoji but 👀 (which never answers).
+//! A list with junk in it is skipped with a message naming each bad entry,
+//! and the agent uses the project's list.
 
 use std::{
     collections::HashMap,
@@ -52,6 +58,7 @@ use chaos_core::{
     engine::CoreEvent,
     host::{AgentSpec, Core, HostConfig, SystemClock},
     permission::RunsIn,
+    reaction::PingAnswers,
     types::{Channel, ChannelId, MemberId, Project, ProjectId},
 };
 use model::Brand;
@@ -103,6 +110,20 @@ pub struct AgentConfig {
     /// blocking) or `"vm"` (the agent's own VM: everything is approved).
     #[serde(default)]
     pub runs_in: RunsIn,
+    /// This agent's own reactions that answer a ping (see the module docs).
+    #[serde(default)]
+    pub ping_answer_reactions: Option<Vec<String>>,
+}
+
+impl AgentConfig {
+    /// The agent's own ping-answer list, validated like the project's.
+    pub fn ping_answers(&self) -> Result<Option<PingAnswers>, String> {
+        self.ping_answer_reactions
+            .as_deref()
+            .map(PingAnswers::parse)
+            .transpose()
+            .map_err(|e| format!("@{}: {e}", self.handle))
+    }
 }
 
 fn yes() -> bool {
@@ -254,6 +275,10 @@ pub fn start_with(config: AgentsConfig) -> Result<CoreLink, String> {
             .id;
         let mut agents = Vec::new();
         for a in config.agents {
+            let ping_answers = a.ping_answers().unwrap_or_else(|e| {
+                eprintln!("chaos-control: ignoring ping_answer_reactions for {e}");
+                None
+            });
             let name = a.name.clone().unwrap_or_else(|| a.handle.clone());
             let transport = SpawnTransport {
                 command: a.command,
@@ -275,6 +300,7 @@ pub fn start_with(config: AgentsConfig) -> Result<CoreLink, String> {
                         adapter: Arc::new(adapter),
                         cwd: a.cwd,
                         runs_in: a.runs_in,
+                        ping_answers,
                     },
                     main,
                 )
@@ -471,6 +497,28 @@ mod tests {
         assert!(matches!(c.agents[0].chat_tools, ChatTools::Auto));
         assert_eq!(parse_brand(Some("Claude")), Brand::Claude);
         assert_eq!(parse_brand(None), Brand::Opencode);
+        assert_eq!(c.agents[0].ping_answers(), Ok(None));
+    }
+
+    #[test]
+    fn ping_answer_reactions_override() {
+        let c: AgentsConfig = serde_json::from_str(
+            r#"{"agents":[
+                {"handle":"a","command":"x","ping_answer_reactions":["✅",":+1:"]},
+                {"handle":"b","command":"x","ping_answer_reactions":["*"]},
+                {"handle":"c","command":"x","ping_answer_reactions":["✅","lol","👀"]}
+            ]}"#,
+        )
+        .unwrap();
+        let a = c.agents[0].ping_answers().unwrap().unwrap();
+        assert_eq!(a.to_list(), vec!["✅", "👍"]);
+        assert_eq!(c.agents[1].ping_answers(), Ok(Some(PingAnswers::Any)));
+        let err = c.agents[2].ping_answers().unwrap_err();
+        assert!(
+            err.starts_with("@c: invalid ping_answer_reactions"),
+            "{err}"
+        );
+        assert!(err.contains("\"lol\"") && err.contains("\"👀\""), "{err}");
     }
 
     #[test]

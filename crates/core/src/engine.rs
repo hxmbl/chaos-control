@@ -17,6 +17,7 @@ use crate::{
     notify,
     permission::{self, PermissionRequest, RunsIn},
     policy::{self, Damp, Policy, PolicyState},
+    reaction::{self, PingAnswers, PingAnswersError},
     store::{self, NewMessage, Store},
     types::*,
 };
@@ -47,10 +48,14 @@ pub struct Dispatch {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoreEvent {
     Message(Message),
+    /// A reaction was added (`added`) or removed. Never a wake: nobody is
+    /// notified or delivered anything because of it.
     Reaction {
+        channel: ChannelId,
         message: MessageId,
         member: MemberId,
         emoji: Arc<str>,
+        added: bool,
     },
     Agent(AgentStatus),
     /// A member's read receipt moved forward.
@@ -74,7 +79,11 @@ pub enum PostError {
     NotMember,
     UnknownChannel,
     UnknownMessage,
-    RateLimited { retry_after_ms: Millis },
+    /// Not something that can be a reaction (a word, blank, too long).
+    InvalidEmoji,
+    RateLimited {
+        retry_after_ms: Millis,
+    },
     Store(String),
 }
 
@@ -85,11 +94,46 @@ impl std::fmt::Display for PostError {
             PostError::NotMember => f.write_str("not a member of that channel"),
             PostError::UnknownChannel => f.write_str("no such channel"),
             PostError::UnknownMessage => f.write_str("no such message"),
+            PostError::InvalidEmoji => {
+                f.write_str("invalid_emoji: send one emoji (or a :shortcode: like :+1:)")
+            }
             PostError::RateLimited { retry_after_ms } => {
                 write!(f, "rate_limited: retry after {retry_after_ms} ms")
             }
             PostError::Store(e) => write!(f, "store error: {e}"),
         }
+    }
+}
+
+/// Why a setting was not changed.
+#[derive(Debug)]
+pub enum SettingError {
+    Invalid(PingAnswersError),
+    UnknownProject,
+    Store(String),
+}
+
+impl std::fmt::Display for SettingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SettingError::Invalid(e) => e.fmt(f),
+            SettingError::UnknownProject => f.write_str("no such project"),
+            SettingError::Store(e) => write!(f, "store error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for SettingError {}
+
+impl From<PingAnswersError> for SettingError {
+    fn from(e: PingAnswersError) -> Self {
+        SettingError::Invalid(e)
+    }
+}
+
+impl From<rusqlite::Error> for SettingError {
+    fn from(e: rusqlite::Error) -> Self {
+        SettingError::Store(e.to_string())
     }
 }
 
@@ -168,11 +212,20 @@ pub struct Engine {
     pub(crate) effects: Vec<Effect>,
     /// Where each agent runs (see `permission`); absent means the host.
     pub(crate) runs_in: HashMap<MemberId, RunsIn>,
+    /// Per-agent ping-answer lists from `agents.json`; absent means the
+    /// project's setting, then the default (see [`Engine::ping_answers`]).
+    ping_answers: HashMap<MemberId, PingAnswers>,
 }
 
-/// Emoji that answer a reply obligation. 👀 ("on it") does not: an agent that
-/// reacts 👀 still owes the answer.
-pub const QUALIFYING_REACTIONS: &[&str] = &["✅", "👍", "white_check_mark", "+1", "thumbsup"];
+/// What [`Engine::react`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reacted {
+    /// The emoji as stored (normalised: `:+1:` is 👍).
+    pub emoji: Arc<str>,
+    /// Whether anything changed (adding an emoji already there, or removing
+    /// one that isn't, is a no-op).
+    pub changed: bool,
+}
 
 impl Engine {
     pub fn new(store: Store, policy: Policy, now: Millis) -> Result<Self, rusqlite::Error> {
@@ -183,6 +236,7 @@ impl Engine {
             rt: HashMap::new(),
             effects: Vec::new(),
             runs_in: HashMap::new(),
+            ping_answers: HashMap::new(),
         };
         let pending = engine.store.tx(|c| store::recover(c, now))?;
         for (agent, channel) in pending {
@@ -722,39 +776,124 @@ impl Engine {
         Ok(m)
     }
 
+    /// Adds (`add`) or removes `member`'s `emoji` on `message`. Idempotent:
+    /// adding twice or removing twice changes nothing and emits nothing.
+    ///
+    /// A reaction never wakes anyone: no trigger, no batch, no delivery, not
+    /// even to the message's author. The only side effect beyond the store is
+    /// on the reactor's own reply obligation: adding an emoji that answers a
+    /// ping for this member ([`Engine::ping_answers`]: ✅ and 👍 unless
+    /// configured, never 👀) to a message the reactor owes a reply closes that
+    /// obligation as handled (`satisfied`, kind `react`). Any other emoji is
+    /// recorded but leaves the obligation open for the turn-end rules.
+    /// Removing a reaction later doesn't reopen it.
     pub fn react(
         &mut self,
         now: Millis,
         member: MemberId,
         message: MessageId,
         emoji: &str,
-    ) -> Result<(), PostError> {
+        add: bool,
+    ) -> Result<Reacted, PostError> {
+        let emoji = reaction::normalize(emoji).ok_or(PostError::InvalidEmoji)?;
         let m = store::message(self.conn(), message)?.ok_or(PostError::UnknownMessage)?;
         if !store::is_member(self.conn(), m.channel, member)? {
             return Err(PostError::UnknownMessage);
         }
-        let added = self
-            .store
-            .tx(|c| store::add_reaction(c, message, member, emoji, now))?;
-        if added {
+        let answers = self.ping_answers(member, m.channel);
+        let changed = self.store.tx::<_, PostError>(|c| {
+            let changed = if add {
+                store::add_reaction(c, message, m.channel, member, &emoji, now)?
+            } else {
+                store::remove_reaction(c, message, member, &emoji)?
+            };
+            if add && answers.answers(&emoji) {
+                let t = TriggerId {
+                    agent: member,
+                    channel: m.channel,
+                    message,
+                };
+                store::resolve_obligation(c, t, ObligationState::Satisfied, None, "react")?;
+            }
+            Ok(changed)
+        })?;
+        if changed {
             self.effects.push(Effect::Event(CoreEvent::Reaction {
-                message,
-                member,
-                emoji: Arc::from(emoji),
-            }));
-        }
-        if QUALIFYING_REACTIONS.contains(&emoji) {
-            let t = TriggerId {
-                agent: member,
                 channel: m.channel,
                 message,
-            };
-            self.store.tx::<_, PostError>(|c| {
-                store::resolve_obligation(c, t, ObligationState::Satisfied, None, "react")?;
-                Ok(())
-            })?;
+                member,
+                emoji: emoji.clone(),
+                added: add,
+            }));
         }
-        Ok(())
+        Ok(Reacted { emoji, changed })
+    }
+
+    /// Which reactions answer a ping for `agent` in `channel`: the agent's own
+    /// list (`agents.json`), else the channel's project setting, else the
+    /// default (✅, 👍). A stored value that no longer parses counts as unset.
+    pub fn ping_answers(&self, agent: MemberId, channel: ChannelId) -> PingAnswers {
+        if let Some(own) = self.ping_answers.get(&agent) {
+            return own.clone();
+        }
+        store::channel(self.conn(), channel)
+            .ok()
+            .flatten()
+            .and_then(|ch| self.project_ping_answers(&ch.project).ok().flatten())
+            .unwrap_or_default()
+    }
+
+    /// Sets (`Some`) or clears an agent's own ping-answer list, which wins
+    /// over the project's.
+    pub fn set_agent_ping_answers(&mut self, agent: MemberId, answers: Option<PingAnswers>) {
+        match answers {
+            Some(a) => {
+                self.ping_answers.insert(agent, a);
+            }
+            None => {
+                self.ping_answers.remove(&agent);
+            }
+        }
+    }
+
+    /// The project's ping-answer setting, or `None` when it uses the default.
+    pub fn project_ping_answers(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Option<PingAnswers>, rusqlite::Error> {
+        let Some(raw) = store::project_setting(self.conn(), project, reaction::PING_ANSWERS_KEY)?
+        else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str::<Vec<String>>(&raw)
+            .ok()
+            .and_then(|list| PingAnswers::parse(&list).ok()))
+    }
+
+    /// Validates and stores the project's ping-answer list (`None` clears it,
+    /// back to the default). Junk is rejected whole, naming every bad entry;
+    /// nothing is written then. Returns what is now in effect.
+    pub fn set_project_ping_answers<S: AsRef<str>>(
+        &mut self,
+        now: Millis,
+        project: &ProjectId,
+        entries: Option<&[S]>,
+    ) -> Result<PingAnswers, SettingError> {
+        let parsed = entries.map(PingAnswers::parse).transpose()?;
+        let value = parsed
+            .as_ref()
+            .map(|p| serde_json::to_string(&p.to_list()).expect("strings serialise"));
+        if store::project(self.conn(), project)?.is_none() {
+            return Err(SettingError::UnknownProject);
+        }
+        store::set_project_setting(
+            self.conn(),
+            project,
+            reaction::PING_ANSWERS_KEY,
+            value.as_deref(),
+            now,
+        )?;
+        Ok(parsed.unwrap_or_default())
     }
 
     /// A member refuses or dissents from `target`: posts `reason` as a reply
@@ -900,7 +1039,8 @@ impl Engine {
         let attempt = self
             .store
             .tx(|c| store::dispatch_batch(c, pending.id, window_to))?;
-        let prompt = notify::compose(self.conn(), agent, channel, pending.id, window_to)?;
+        let answers = self.ping_answers(agent, channel);
+        let prompt = notify::compose(self.conn(), agent, channel, pending.id, window_to, &answers)?;
         let orientation = notify::orientation(self.conn(), agent, channel)?;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.retry_at = None;
@@ -1224,25 +1364,36 @@ impl Engine {
         } else if !open.is_empty() {
             // A completed turn with nothing to say is the agent choosing to let
             // the ping go: `ignored`, which is fine. Anything else (cancelled,
-            // refused, cut short) is `unmet`.
-            let ignored = *outcome == TurnOutcome::Completed;
-            let (state, kind) = if ignored {
-                (ObligationState::Ignored, "ignored")
-            } else {
-                (ObligationState::Unmet, "no_reply")
-            };
+            // refused, cut short) is `unmet`. A trigger the agent put 👀 on
+            // (an answering emoji closed it when it was added; this also
+            // catches one the config made answering since) was handled, not
+            // ignored. Any other reaction doesn't count: still `ignored`.
+            let completed = *outcome == TurnOutcome::Completed;
+            let answers = self.ping_answers(agent, channel);
+            let mut ignored_any = false;
             self.store.tx::<_, PostError>(|c| {
                 for t in &open {
+                    let (state, kind) = if !completed {
+                        (ObligationState::Unmet, "no_reply")
+                    } else if store::reactions_by(c, t.message, agent)?
+                        .iter()
+                        .any(|e| reaction::HOLDS_OBLIGATION.contains(&&**e) || answers.answers(e))
+                    {
+                        (ObligationState::Satisfied, "react")
+                    } else {
+                        ignored_any = true;
+                        (ObligationState::Ignored, "ignored")
+                    };
                     store::resolve_obligation(c, *t, state, None, kind)?;
                 }
                 Ok(())
             })?;
             let rt = self.rt.entry((agent, channel)).or_default();
-            rt.note = Some(Arc::from(if ignored {
-                "read it and let it go"
-            } else {
-                "turn ended without a reply"
-            }));
+            if !completed {
+                rt.note = Some(Arc::from("turn ended without a reply"));
+            } else if ignored_any {
+                rt.note = Some(Arc::from("read it and let it go"));
+            }
         }
         self.store.tx::<_, PostError>(|c| {
             store::set_batch_state(c, turn, BatchState::Settled, now, Some(&outcome_label))?;

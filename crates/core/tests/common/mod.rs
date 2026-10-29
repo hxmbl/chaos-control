@@ -73,6 +73,29 @@ impl Harness {
     }
 
     pub async fn agent_in(&mut self, handle: &str, script: Script, runs_in: RunsIn) -> Member {
+        self.agent_with(handle, script, runs_in, None).await
+    }
+
+    /// An agent with its own list of reactions that answer a ping (as
+    /// `ping_answer_reactions` in `agents.json`).
+    pub async fn agent_answering(
+        &mut self,
+        handle: &str,
+        script: Script,
+        answers: &[&str],
+    ) -> Member {
+        let answers = chaos_core::reaction::PingAnswers::parse(answers).expect("valid list");
+        self.agent_with(handle, script, RunsIn::Host, Some(answers))
+            .await
+    }
+
+    pub async fn agent_with(
+        &mut self,
+        handle: &str,
+        script: Script,
+        runs_in: RunsIn,
+        ping_answers: Option<chaos_core::reaction::PingAnswers>,
+    ) -> Member {
         let fake = FakeAgent::new(script);
         let f = fake.clone();
         let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
@@ -88,6 +111,7 @@ impl Harness {
                     adapter: adapter.clone(),
                     cwd: Some(std::env::temp_dir()),
                     runs_in,
+                    ping_answers,
                 },
                 self.main,
             )

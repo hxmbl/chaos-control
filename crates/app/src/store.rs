@@ -47,6 +47,9 @@ pub enum StoreEvent {
     /// Read receipts moved: these rows of `channel` gained or lost readers
     /// (their heights may change).
     Receipts { channel: Id, rows: Vec<usize> },
+    /// Reactions changed on these rows of `channel` (a chip row may appear,
+    /// change or go, so their heights may change).
+    Reactions { channel: Id, rows: Vec<usize> },
     /// An agent asked for permission: show it in the pane (Approve / Deny).
     PermissionAsked(PaneContent),
     /// A permission request was answered (here or by someone else): close its
@@ -71,6 +74,17 @@ pub struct ChatStore {
     core: Option<Attached>,
 }
 
+/// One emoji under a message: how many put it there and who.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReactionChip {
+    pub emoji: Arc<str>,
+    pub count: usize,
+    /// The human at this keyboard is one of them (clicking takes it back).
+    pub mine: bool,
+    /// Who reacted, in the order they did ("You" for the local human).
+    pub names: Vec<Arc<str>>,
+}
+
 /// How [`ChatStore::switch_to`] opens the project.
 enum Switch {
     /// Open this project (writing the folder's file if `true`).
@@ -92,9 +106,51 @@ struct Attached {
     receipts: HashMap<ct::MemberId, ct::Receipt>,
     /// Member names for receipts from people who aren't linked agents.
     names: HashMap<ct::MemberId, Arc<str>>,
+    /// Reactions per core message in #main, in the order they were added.
+    reactions: HashMap<ct::MessageId, Vec<ct::Reaction>>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
+    /// The project's `ping_answer_reactions` as core stores it (`None`: the
+    /// default), and the last error from saving it.
+    ping_answers: Option<Vec<String>>,
+    ping_answers_error: Option<Arc<str>>,
     _events: Task<()>,
+}
+
+/// The Settings pane's view of which reactions answer a ping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PingAnswersSetting {
+    /// What is in effect: `["*"]` or emoji.
+    pub list: Vec<String>,
+    /// The built-in default (✅ 👍), not a project setting.
+    pub is_default: bool,
+    /// Why the last save was refused, if it was.
+    pub error: Option<Arc<str>>,
+}
+
+/// What the Settings pane's emoji-list field asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PingAnswersInput {
+    /// Blank: nothing to do.
+    Nothing,
+    /// `default`: clear the project setting.
+    Reset,
+    /// Emoji, :shortcodes: or `*`, split on spaces and commas (core
+    /// validates them).
+    Entries(Vec<String>),
+}
+
+pub fn parse_ping_answers_input(text: &str) -> PingAnswersInput {
+    let entries: Vec<String> = text
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|e| !e.is_empty())
+        .map(str::to_string)
+        .collect();
+    match entries.as_slice() {
+        [] => PingAnswersInput::Nothing,
+        [one] if one.eq_ignore_ascii_case("default") => PingAnswersInput::Reset,
+        _ => PingAnswersInput::Entries(entries),
+    }
 }
 
 impl EventEmitter<StoreEvent> for ChatStore {}
@@ -173,6 +229,104 @@ impl ChatStore {
             .collect();
         out.sort_by(|a, b| a.read_at.cmp(&b.read_at).then(a.name.cmp(&b.name)));
         out
+    }
+
+    /// The reaction chips under the message at `index` of `channel`, in order
+    /// of each emoji's first use. Only core messages have reactions.
+    pub fn reactions(&self, channel: Id, index: usize) -> Vec<ReactionChip> {
+        let Some(attached) = self.core.as_ref().filter(|a| a.channel == channel) else {
+            return Vec::new();
+        };
+        let Some(id) = self
+            .logs
+            .get(&channel)
+            .and_then(|l| l.get(index))
+            .and_then(|m| core_message_id(m.id))
+        else {
+            return Vec::new();
+        };
+        let Some(all) = attached.reactions.get(&id).filter(|v| !v.is_empty()) else {
+            return Vec::new();
+        };
+        chaos_core::reaction::group(all)
+            .into_iter()
+            .map(|g| ReactionChip {
+                count: g.members.len(),
+                mine: g.members.contains(&attached.link.human),
+                names: g.members.iter().map(|m| self.member_name(*m)).collect(),
+                emoji: g.emoji,
+            })
+            .collect()
+    }
+
+    /// Whether the local human can react to the message at `index` (it came
+    /// from core, so there is somewhere to store the reaction).
+    pub fn can_react(&self, channel: Id, index: usize) -> bool {
+        self.core.as_ref().is_some_and(|a| a.channel == channel)
+            && self
+                .logs
+                .get(&channel)
+                .and_then(|l| l.get(index))
+                .and_then(|m| core_message_id(m.id))
+                .is_some()
+    }
+
+    /// Adds the local human's `emoji` to the message at `index`, or takes it
+    /// back if it is already theirs. Core echoes the change as an event, which
+    /// is what redraws the chips.
+    pub fn toggle_reaction(
+        &mut self,
+        channel: Id,
+        index: usize,
+        emoji: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(attached) = self.core.as_ref().filter(|a| a.channel == channel) else {
+            return;
+        };
+        let Some(id) = self
+            .logs
+            .get(&channel)
+            .and_then(|l| l.get(index))
+            .and_then(|m| core_message_id(m.id))
+        else {
+            return;
+        };
+        let human = attached.link.human;
+        let mine = attached
+            .reactions
+            .get(&id)
+            .is_some_and(|v| v.iter().any(|r| r.member == human && &*r.emoji == emoji));
+        let core = attached.link.core.clone();
+        let emoji = emoji.to_string();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = core.react(human, id, &emoji, !mine).await {
+                this.update(cx, |store, cx| {
+                    store.system_note(&format!("Couldn't react: {e}"), cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// A member's display name: "You" for the local human, a linked agent's
+    /// name, else what core calls them.
+    fn member_name(&self, member: ct::MemberId) -> Arc<str> {
+        let Some(attached) = self.core.as_ref() else {
+            return Arc::from("Someone");
+        };
+        if member == attached.link.human {
+            return Arc::from("You");
+        }
+        attached
+            .link
+            .agents
+            .iter()
+            .find(|a| a.member == member)
+            .map(|a| a.name.clone())
+            .or_else(|| attached.names.get(&member).cloned())
+            .unwrap_or_else(|| Arc::from("Someone"))
     }
 
     /// The human at this keyboard has seen #main up to its newest message
@@ -307,6 +461,7 @@ impl ChatStore {
         let task = cx.spawn(async move |this, cx| {
             match core.history(main, 200).await {
                 Ok(history) => {
+                    let after = history.first().map_or(0, |m| m.seq.saturating_sub(1));
                     let ok = this.update(cx, |store, cx| {
                         for m in history {
                             store.apply_core_event(CoreEvent::Message(m), cx);
@@ -314,6 +469,12 @@ impl ChatStore {
                     });
                     if ok.is_err() {
                         return;
+                    }
+                    if let Ok(reactions) = core.reactions(main, after).await {
+                        let ok = this.update(cx, |store, cx| store.load_reactions(reactions, cx));
+                        if ok.is_err() {
+                            return;
+                        }
                     }
                 }
                 Err(e) => eprintln!("chaos-control: could not load #main history: {e}"),
@@ -375,10 +536,95 @@ impl ChatStore {
             by_seq: BTreeMap::new(),
             receipts: HashMap::new(),
             names: HashMap::new(),
+            reactions: HashMap::new(),
             confirm,
+            ping_answers: None,
+            ping_answers_error: None,
             _events: task,
         });
+        self.load_ping_answers(cx);
         cx.notify();
+    }
+
+    /// Which reactions answer a ping in the open project, for Settings.
+    /// `None` without core (sample data has no agents to ping).
+    pub fn ping_answers(&self) -> Option<PingAnswersSetting> {
+        let attached = self.core.as_ref()?;
+        let default = || {
+            chaos_core::reaction::DEFAULT_PING_ANSWERS
+                .iter()
+                .map(|e| e.to_string())
+                .collect()
+        };
+        Some(PingAnswersSetting {
+            list: attached.ping_answers.clone().unwrap_or_else(default),
+            is_default: attached.ping_answers.is_none(),
+            error: attached.ping_answers_error.clone(),
+        })
+    }
+
+    /// Reads the open project's ping-answer list from core.
+    fn load_ping_answers(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.ping_answer_reactions(project.clone()).await;
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                if a.link.open.project.id != project {
+                    return;
+                }
+                match result {
+                    Ok(list) => a.ping_answers = list,
+                    Err(e) => a.ping_answers_error = Some(Arc::from(e)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Saves the Settings field (see [`parse_ping_answers_input`]) as the
+    /// open project's ping-answer list. Core validates it; a refusal is kept
+    /// for the pane to show, and the old list stays. Returns whether a save
+    /// was started (blank input does nothing).
+    pub fn set_ping_answers(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(attached) = &mut self.core else {
+            return false;
+        };
+        let entries = match parse_ping_answers_input(text) {
+            PingAnswersInput::Nothing => return false,
+            PingAnswersInput::Reset => None,
+            PingAnswersInput::Entries(e) => Some(e),
+        };
+        let reset = entries.is_none();
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_ping_answer_reactions(project, entries).await;
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                match result {
+                    Ok(list) => {
+                        a.ping_answers = (!reset).then_some(list);
+                        a.ping_answers_error = None;
+                    }
+                    Err(e) => a.ping_answers_error = Some(Arc::from(e)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        true
     }
 
     /// Shows `open` as the workspace's project: header, picker and channels.
@@ -533,6 +779,7 @@ impl ChatStore {
                 }
             };
             if let Ok(history) = core.history(main, 200).await {
+                let after = history.first().map_or(0, |m| m.seq.saturating_sub(1));
                 this.update(cx, |store, cx| {
                     for m in history {
                         store.apply_core_event(CoreEvent::Message(m), cx);
@@ -540,6 +787,10 @@ impl ChatStore {
                     store.mark_main_read(cx);
                 })
                 .ok();
+                if let Ok(reactions) = core.reactions(main, after).await {
+                    this.update(cx, |store, cx| store.load_reactions(reactions, cx))
+                        .ok();
+                }
             }
             if let Ok(receipts) = core.receipts(main).await {
                 this.update(cx, |store, cx| {
@@ -563,8 +814,12 @@ impl ChatStore {
         attached.seen.clear();
         attached.by_seq.clear();
         attached.receipts.clear();
+        attached.reactions.clear();
+        attached.ping_answers = None;
+        attached.ping_answers_error = None;
         attached.link.open = open;
         self.core = Some(attached);
+        self.load_ping_answers(cx);
     }
 
     /// Folds one core event into the app's state.
@@ -662,9 +917,78 @@ impl ChatStore {
                     cx.emit(StoreEvent::PermissionAnswered { request: r.id.0 });
                 }
             }
-            // The model has no reactions yet.
-            CoreEvent::Reaction { .. } => {}
+            CoreEvent::Reaction {
+                channel,
+                message,
+                member,
+                emoji,
+                added,
+            } => {
+                if channel != attached.link.main() {
+                    return;
+                }
+                let row = attached.seen.get(&message).copied();
+                let app_channel = attached.channel;
+                let Some(attached) = &mut self.core else {
+                    return;
+                };
+                let list = attached.reactions.entry(message).or_default();
+                let at = list
+                    .iter()
+                    .position(|r| r.member == member && r.emoji == emoji);
+                match (added, at) {
+                    (true, None) => list.push(ct::Reaction {
+                        message,
+                        channel,
+                        member,
+                        emoji,
+                        created_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_millis() as ct::Millis),
+                    }),
+                    (false, Some(ix)) => {
+                        list.remove(ix);
+                    }
+                    _ => return,
+                }
+                if let Some(row) = row {
+                    cx.emit(StoreEvent::Reactions {
+                        channel: app_channel,
+                        rows: vec![row],
+                    });
+                }
+                cx.notify();
+            }
         }
+    }
+
+    /// Reactions loaded with history (oldest first, real timestamps). Replaces
+    /// what was known for those messages.
+    fn load_reactions(&mut self, reactions: Vec<ct::Reaction>, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let mut rows = Vec::new();
+        let mut fresh: HashMap<ct::MessageId, Vec<ct::Reaction>> = HashMap::new();
+        for r in reactions {
+            if r.channel == attached.link.main() {
+                fresh.entry(r.message).or_default().push(r);
+            }
+        }
+        for (message, list) in fresh {
+            if let Some(&row) = attached.seen.get(&message) {
+                rows.push(row);
+            }
+            attached.reactions.insert(message, list);
+        }
+        if !rows.is_empty() {
+            rows.sort_unstable();
+            cx.emit(StoreEvent::Reactions {
+                channel: attached.channel,
+                rows,
+            });
+        }
+        cx.notify();
     }
 
     /// The pane's view of a pending permission request.
@@ -769,4 +1093,26 @@ fn core_message_id(id: Id) -> Option<ct::MessageId> {
 /// The log row for the newest message at or before `seq`, if any is loaded.
 fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
     by_seq.range(..=seq).next_back().map(|(_, ix)| *ix)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ping_answers_input_splits_on_spaces_and_commas() {
+        assert_eq!(parse_ping_answers_input("   "), PingAnswersInput::Nothing);
+        assert_eq!(
+            parse_ping_answers_input(" Default "),
+            PingAnswersInput::Reset
+        );
+        assert_eq!(
+            parse_ping_answers_input("✅ 👍, :rocket:"),
+            PingAnswersInput::Entries(vec!["✅".into(), "👍".into(), ":rocket:".into()])
+        );
+        assert_eq!(
+            parse_ping_answers_input("*"),
+            PingAnswersInput::Entries(vec!["*".into()])
+        );
+    }
 }

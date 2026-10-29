@@ -14,13 +14,15 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     adapter::*,
     engine::{
-        AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, StanceRequest,
+        AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, Reacted,
+        StanceRequest,
     },
     mcp::{self, Scope, Tokens},
     permission::{
         AnswerError, PermissionGate, PermissionId, PermissionRequest, PermissionVerdict, RunsIn,
     },
     policy::Policy,
+    reaction::PingAnswers,
     store::Store,
     types::*,
 };
@@ -113,6 +115,10 @@ pub struct AgentSpec {
     /// Where the agent runs: on the host its permission requests go to the
     /// humans; in its own VM they are approved (see `permission`).
     pub runs_in: RunsIn,
+    /// The agent's own list of reactions that answer a ping
+    /// (`ping_answer_reactions` in `agents.json`); `None` uses the project's
+    /// setting, then the default (see `Engine::ping_answers`).
+    pub ping_answers: Option<PingAnswers>,
 }
 
 // ---------- handle ----------
@@ -445,16 +451,61 @@ impl Core {
         .map_err(PostError::Store)?
     }
 
+    /// Adds (`add`) or removes `member`'s reaction. Idempotent, and never a
+    /// wake (see [`Engine::react`]).
     pub async fn react(
         &self,
         member: MemberId,
         message: MessageId,
         emoji: &str,
-    ) -> Result<(), PostError> {
+        add: bool,
+    ) -> Result<Reacted, PostError> {
         let emoji = emoji.to_string();
-        self.with_engine(move |e, now| e.react(now, member, message, &emoji))
+        self.with_engine(move |e, now| e.react(now, member, message, &emoji, add))
             .await
             .map_err(PostError::Store)?
+    }
+
+    /// The project's list of reactions that answer a ping, as stored (`["*"]`
+    /// or emoji), or `None` when it uses the default (✅, 👍).
+    pub async fn ping_answer_reactions(
+        &self,
+        project: ProjectId,
+    ) -> Result<Option<Vec<String>>, String> {
+        self.with_engine(move |e, _| e.project_ping_answers(&project))
+            .await?
+            .map(|p| p.map(|p| p.to_list()))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Validates and saves the project's list of reactions that answer a
+    /// ping (`None` goes back to the default). Junk is rejected whole with an
+    /// error naming each bad entry. Returns the list now in effect.
+    pub async fn set_ping_answer_reactions(
+        &self,
+        project: ProjectId,
+        entries: Option<Vec<String>>,
+    ) -> Result<Vec<String>, String> {
+        self.with_engine(move |e, now| {
+            e.set_project_ping_answers(now, &project, entries.as_deref())
+                .map(|p| p.to_list())
+                .map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
+    /// Reactions on the messages of `channel` after `after_seq`, oldest first
+    /// (load them with the history they belong to).
+    pub async fn reactions(
+        &self,
+        channel: ChannelId,
+        after_seq: Seq,
+    ) -> Result<Vec<Reaction>, String> {
+        self.with_engine(move |e, _| {
+            crate::store::reactions_after_seq(e.conn(), channel, after_seq)
+        })
+        .await?
+        .map_err(|e| e.to_string())
     }
 
     /// A human refuses or dissents from `target` (agents use the chat tools).
@@ -744,6 +795,8 @@ impl Actor {
             .join(channel, &member, now)
             .map_err(|e| e.to_string())?;
         self.engine.set_runs_in(member.id, spec.runs_in);
+        self.engine
+            .set_agent_ping_answers(member.id, spec.ping_answers.clone());
         let adapter = spec.adapter.clone();
         self.agents.insert(
             member.id,
