@@ -7,20 +7,29 @@
 //! without touching the heights already measured.
 
 use gpui::{
-    AnyElement, Context, Entity, ListAlignment, ListOffset, ListState, SharedString, Subscription,
-    Window, div, list, prelude::*, px,
+    AnyElement, Context, ElementId, Entity, ListAlignment, ListOffset, ListState, SharedString,
+    Subscription, Window, div, list, prelude::*, px,
 };
 use model::{Author, Id, PaneContent, pane};
 use ui::{
-    ActiveTheme, Ellipsis, IconName, Tooltip, TypeStyleExt, brand_icon, icon,
+    ActiveTheme, Elevation, Ellipsis, IconName, Tooltip, TypeStyleExt, brand_icon, icon,
     tokens::{icon as icons, radius, size, space, text},
     truncated,
 };
 
 use crate::{
     pane_host::PaneHost,
-    store::{ChatStore, Reader, StoreEvent},
+    store::{ChatStore, ReactionChip, Reader, StoreEvent},
 };
+
+/// The quick picker's emoji, shown on message hover. Short on purpose: a
+/// full emoji picker is the system's (ctrl-cmd-space on macOS) once the
+/// composer can react.
+const QUICK_REACTIONS: [&str; 6] = ["👍", "✅", "👀", "😂", "❤️", "💀"];
+
+/// Every message row is this hover group, so the quick picker shows for the
+/// row under the pointer only.
+const ROW_GROUP: &str = "message-row";
 
 /// The empty state's blurb wraps at about 50 characters.
 const EMPTY_MAX_W: f32 = 384.;
@@ -65,8 +74,11 @@ impl Conversation {
                 cx.notify();
             }
             StoreEvent::Appended { .. } => {}
-            StoreEvent::Receipts { channel, rows } if *channel == this.channel => {
-                // Re-measure just these rows: read marks add or drop a line.
+            StoreEvent::Receipts { channel, rows } | StoreEvent::Reactions { channel, rows }
+                if *channel == this.channel =>
+            {
+                // Re-measure just these rows: read marks and reaction chips
+                // add or drop a line.
                 let count = this.list.item_count();
                 for &ix in rows {
                     if ix < count {
@@ -75,7 +87,7 @@ impl Conversation {
                 }
                 cx.notify();
             }
-            StoreEvent::Receipts { .. } => {}
+            StoreEvent::Receipts { .. } | StoreEvent::Reactions { .. } => {}
             StoreEvent::PermissionAsked(_) | StoreEvent::PermissionAnswered { .. } => {}
         });
         Self {
@@ -120,12 +132,17 @@ impl Conversation {
             ),
         };
 
+        let can_react = store.can_react(self.channel, ix);
+        let chips = store.reactions(self.channel, ix);
+
         div()
             .w_full()
             .flex()
             .justify_center()
             .child(
                 div()
+                    .group(ROW_GROUP)
+                    .relative()
                     .w_full()
                     .flex()
                     .gap(space::X3)
@@ -228,6 +245,9 @@ impl Conversation {
                                     )
                                 }
                             })
+                            .when(!chips.is_empty(), |d| {
+                                d.child(self.reaction_chips(ix, &chips, can_react, &t))
+                            })
                             .map(|d| {
                                 let readers = store.readers(self.channel, ix);
                                 if readers.is_empty() {
@@ -236,8 +256,101 @@ impl Conversation {
                                     d.child(read_marks(ix, &readers, store.workspace(), &t))
                                 }
                             }),
-                    ),
+                    )
+                    .when(can_react, |row| row.child(self.quick_picker(ix, &t))),
             )
+            .into_any_element()
+    }
+
+    /// Small, quiet chips under a message: the emoji and how many, in order
+    /// of first use. Hover lists who; clicking adds the local human's own
+    /// (or takes it back if it is already theirs). Monochrome: yours is a
+    /// step darker, never a colour.
+    fn reaction_chips(
+        &self,
+        ix: usize,
+        chips: &[ReactionChip],
+        can_react: bool,
+        t: &ui::Theme,
+    ) -> AnyElement {
+        let channel = self.channel;
+        let items = chips.iter().enumerate().map(|(n, chip)| {
+            let tip = format!("{} reacted {}", chip.names.join(", "), chip.emoji);
+            let store = self.store.clone();
+            let emoji = chip.emoji.clone();
+            let hover = t.hover;
+            div()
+                .id(ElementId::Name(format!("reaction-{ix}-{n}").into()))
+                .h(size::CHIP)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(space::X1)
+                .px(space::X1_5)
+                .rounded(radius::MD)
+                .bg(if chip.mine { t.selected } else { t.sunken })
+                .type_style(text::CAPTION)
+                .font_weight(text::MEDIUM)
+                .text_color(if chip.mine { t.ink } else { t.muted })
+                .child(SharedString::from(chip.emoji.clone()))
+                .child(SharedString::from(chip.count.to_string()))
+                .tooltip(Tooltip::text(tip))
+                .when(can_react, move |d| {
+                    d.cursor_pointer()
+                        .hover(move |s| s.bg(hover))
+                        .on_click(move |_, _, cx| {
+                            store.update(cx, |s, cx| s.toggle_reaction(channel, ix, &emoji, cx));
+                        })
+                })
+        });
+        div()
+            .mt(space::X1)
+            .flex()
+            .flex_wrap()
+            .gap(space::X1)
+            .children(items)
+            .into_any_element()
+    }
+
+    /// The hover bar at the row's top right: a few common emoji, one click
+    /// each. Clicking one that is already yours takes it back.
+    fn quick_picker(&self, ix: usize, t: &ui::Theme) -> AnyElement {
+        let channel = self.channel;
+        let hover = t.hover;
+        let buttons = QUICK_REACTIONS.iter().enumerate().map(|(n, emoji)| {
+            let store = self.store.clone();
+            div()
+                .id(ElementId::Name(format!("quick-react-{ix}-{n}").into()))
+                .size(size::BUTTON_SM)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .rounded(radius::MD)
+                .type_style(text::SMALL)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    store.update(cx, |s, cx| s.toggle_reaction(channel, ix, emoji, cx));
+                })
+                .child(SharedString::from(*emoji))
+        });
+        div()
+            .id(ElementId::Name(format!("quick-picker-{ix}").into()))
+            .absolute()
+            .top(space::X1)
+            .right(space::X2)
+            .invisible()
+            .group_hover(ROW_GROUP, |s| s.visible())
+            .flex()
+            .items_center()
+            .gap(space::X0_5)
+            .p(space::X0_5)
+            .rounded(radius::MD)
+            .bg(t.surface)
+            .shadow(t.elevation(Elevation::Float))
+            .children(buttons)
             .into_any_element()
     }
 }
