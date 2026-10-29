@@ -2171,6 +2171,103 @@ mod tests {
     }
 
     #[test]
+    fn a_v6_database_moves_reactions_into_the_v7_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        for m in &MIGRATIONS[..6] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.execute_batch(
+            r#"
+            PRAGMA user_version = 6;
+            INSERT INTO projects (id, name, root_path, created_at) VALUES
+                ('0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'P', NULL, 1);
+            INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES
+                (3, '0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'main', 1, 1);
+            INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx'), (2, 'agent', 'bot', 'Bot');
+            INSERT INTO messages (id, channel_id, seq, author_id, origin, body, sent_at) VALUES
+                (10, 3, 1, 1, 'composer', '@bot hi', 1000),
+                (11, 3, 2, 2, 'chat_tool', 'hello', 1001);
+            INSERT INTO reactions (message_id, member_id, emoji, created_at) VALUES
+                (10, 2, '✅', 1002),
+                (10, 2, 'white_check_mark', 1003),
+                (11, 1, '+1', 1004),
+                (11, 2, '👀', 1005),
+                (11, 2, 'eyes', 1006),
+                (11, 1, 'this is far too long to be any kind of emoji at all', 1007);
+            "#,
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let c = s.conn();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let on = |m| {
+            reactions_on(c, MessageId(m))
+                .unwrap()
+                .into_iter()
+                .map(|r| (r.channel.0, r.member.0, r.emoji.to_string(), r.created_at))
+                .collect::<Vec<_>>()
+        };
+        // Shortcodes became the emoji; a duplicate after mapping keeps the
+        // older row; the junk row is gone; every row knows its channel.
+        assert_eq!(on(10), vec![(3, 2, "✅".to_string(), 1002)]);
+        assert_eq!(
+            on(11),
+            vec![
+                (3, 1, "👍".to_string(), 1004),
+                (3, 2, "👀".to_string(), 1005)
+            ]
+        );
+        // Still one per (message, member, emoji), and the length CHECK holds.
+        assert!(!add_reaction(c, MessageId(11), ChannelId(3), MemberId(1), "👍", 2000).unwrap());
+        assert!(
+            add_reaction(
+                c,
+                MessageId(11),
+                ChannelId(3),
+                MemberId(1),
+                &"x".repeat(33),
+                2000
+            )
+            .is_err()
+        );
+        let fk: i64 = c
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(fk, 0);
+    }
+
+    #[test]
+    fn reactions_add_remove_and_list() {
+        let (mut s, channel, hx, bot) = setup();
+        let m = s
+            .tx(|c| insert_message(c, &msg(channel.id, hx.id, "ship it")))
+            .unwrap();
+        let c = s.conn();
+        assert!(add_reaction(c, m.id, channel.id, bot.id, "👍", 10).unwrap());
+        assert!(!add_reaction(c, m.id, channel.id, bot.id, "👍", 11).unwrap());
+        assert!(add_reaction(c, m.id, channel.id, hx.id, "👍", 12).unwrap());
+        assert!(add_reaction(c, m.id, channel.id, bot.id, "💀", 13).unwrap());
+        assert!(has_reacted(c, m.id, bot.id).unwrap());
+        assert_eq!(reactions_on(c, m.id).unwrap().len(), 3);
+        assert_eq!(recent_reactions(c, channel.id, 2).unwrap().len(), 2);
+        assert_eq!(
+            recent_reactions(c, channel.id, 2).unwrap()[1]
+                .emoji
+                .as_ref(),
+            "💀",
+            "newest last"
+        );
+        assert_eq!(reactions_since(c, channel.id, 11, 10).unwrap().len(), 2);
+        assert_eq!(reactions_after_seq(c, channel.id, 0).unwrap().len(), 3);
+        assert_eq!(reactions_after_seq(c, channel.id, m.seq).unwrap().len(), 0);
+        assert!(remove_reaction(c, m.id, bot.id, "👍").unwrap());
+        assert!(!remove_reaction(c, m.id, bot.id, "👍").unwrap());
+        assert_eq!(reactions_on(c, m.id).unwrap().len(), 2);
+    }
+
+    #[test]
     fn read_cursors_stamp_when_they_move_and_never_go_back() {
         let (s, channel, hx, _) = setup();
         let c = s.conn();
