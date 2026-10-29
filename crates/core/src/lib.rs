@@ -3,6 +3,7 @@
 //! - [`store`]: SQLite (messages, members, cursors, triggers, batches, obligations).
 //! - [`engine`]: the delivery and wake engine (sync, clock-driven).
 //! - [`policy`]: room dampers (hop budget, ping-pong, rate limit).
+//! - [`reaction`]: emoji reactions (what counts as one, grouping).
 //! - [`adapter`]: the `AgentAdapter`/`AgentSession` boundary and `AgentEvent`.
 //! - [`acp`]: the generic ACP adapter (v1, plus the v2 draft).
 //! - [`mcp`]: the chat MCP server and the stdio bridge.
@@ -23,5 +24,6 @@ pub mod mcp;
 pub mod notify;
 pub mod permission;
 pub mod policy;
+pub mod reaction;
 pub mod store;
 pub mod types;

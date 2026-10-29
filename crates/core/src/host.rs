@@ -14,7 +14,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::{
     adapter::*,
     engine::{
-        AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, StanceRequest,
+        AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, Reacted,
+        StanceRequest,
     },
     mcp::{self, Scope, Tokens},
     permission::{
@@ -445,16 +446,31 @@ impl Core {
         .map_err(PostError::Store)?
     }
 
+    /// Adds (`add`) or removes `member`'s reaction. Idempotent, and never a
+    /// wake (see [`Engine::react`]).
     pub async fn react(
         &self,
         member: MemberId,
         message: MessageId,
         emoji: &str,
-    ) -> Result<(), PostError> {
+        add: bool,
+    ) -> Result<Reacted, PostError> {
         let emoji = emoji.to_string();
-        self.with_engine(move |e, now| e.react(now, member, message, &emoji))
+        self.with_engine(move |e, now| e.react(now, member, message, &emoji, add))
             .await
             .map_err(PostError::Store)?
+    }
+
+    /// Reactions on the messages of `channel` after `after_seq`, oldest first
+    /// (load them with the history they belong to).
+    pub async fn reactions(
+        &self,
+        channel: ChannelId,
+        after_seq: Seq,
+    ) -> Result<Vec<Reaction>, String> {
+        self.with_engine(move |e, _| crate::store::reactions_after_seq(e.conn(), channel, after_seq))
+            .await?
+            .map_err(|e| e.to_string())
     }
 
     /// A human refuses or dissents from `target` (agents use the chat tools).

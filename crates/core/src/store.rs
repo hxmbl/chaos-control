@@ -291,6 +291,39 @@ CREATE INDEX permission_requests_by_agent
 CREATE INDEX permission_requests_by_channel
     ON permission_requests (channel_id, state);
 "#,
+    // 7: emoji reactions (STRM-467). The table from migration 1 is rebuilt
+    // with the channel beside each reaction (a channel's recent reactions
+    // and the app's history load read it without a join over messages) and
+    // a CHECK on the emoji's length (`reaction::MAX_EMOJI_CHARS`). Rows are
+    // copied with the shortcodes earlier agents sent (`+1`, `thumbsup`,
+    // `white_check_mark`, `eyes`) mapped to the emoji, so `:+1:` and 👍 are
+    // one reaction; a row that would duplicate another after mapping, or is
+    // too long to be an emoji, is dropped. Still one row per (message,
+    // member, emoji).
+    r#"
+CREATE TABLE reactions_v2 (
+    message_id  INTEGER NOT NULL REFERENCES messages(id),
+    channel_id  INTEGER NOT NULL REFERENCES channels(id),
+    member_id   INTEGER NOT NULL REFERENCES members(id),
+    emoji       TEXT NOT NULL CHECK (length(emoji) BETWEEN 1 AND 32),
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (message_id, member_id, emoji)
+);
+INSERT OR IGNORE INTO reactions_v2 (message_id, channel_id, member_id, emoji, created_at)
+SELECT r.message_id, m.channel_id, r.member_id,
+       CASE lower(trim(r.emoji, ' :'))
+           WHEN '+1' THEN '👍' WHEN 'thumbsup' THEN '👍'
+           WHEN 'white_check_mark' THEN '✅' WHEN 'eyes' THEN '👀'
+           ELSE trim(r.emoji)
+       END,
+       r.created_at
+FROM reactions r JOIN messages m ON m.id = r.message_id
+WHERE length(trim(r.emoji)) BETWEEN 1 AND 32
+ORDER BY r.created_at;
+DROP TABLE reactions;
+ALTER TABLE reactions_v2 RENAME TO reactions;
+CREATE INDEX reactions_by_channel ON reactions (channel_id, created_at);
+"#,
 ];
 
 pub struct Store {
@@ -1020,18 +1053,111 @@ pub fn last_agent_message_after(
     .pop())
 }
 
+/// Adds `member`'s `emoji` (already normalised) to `message`. Returns whether
+/// it was new; adding it again is a no-op.
 pub fn add_reaction(
     c: &Connection,
     message: MessageId,
+    channel: ChannelId,
     member: MemberId,
     emoji: &str,
     now: Millis,
 ) -> Result<bool> {
     Ok(c.execute(
-        "INSERT OR IGNORE INTO reactions (message_id, member_id, emoji, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![message.0, member.0, emoji, now as i64],
+        "INSERT OR IGNORE INTO reactions (message_id, channel_id, member_id, emoji, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![message.0, channel.0, member.0, emoji, now as i64],
     )? == 1)
+}
+
+/// Removes `member`'s `emoji` from `message`. Returns whether there was one;
+/// removing it again is a no-op.
+pub fn remove_reaction(
+    c: &Connection,
+    message: MessageId,
+    member: MemberId,
+    emoji: &str,
+) -> Result<bool> {
+    Ok(c.execute(
+        "DELETE FROM reactions WHERE message_id = ?1 AND member_id = ?2 AND emoji = ?3",
+        params![message.0, member.0, emoji],
+    )? == 1)
+}
+
+const REACTION_COLS: &str = "message_id, channel_id, member_id, emoji, created_at";
+
+fn reaction_from_row(r: &Row<'_>) -> Result<Reaction> {
+    Ok(Reaction {
+        message: MessageId(r.get(0)?),
+        channel: ChannelId(r.get(1)?),
+        member: MemberId(r.get(2)?),
+        emoji: Arc::from(r.get::<_, String>(3)?),
+        created_at: r.get::<_, i64>(4)? as Millis,
+    })
+}
+
+/// Every reaction on `message`, oldest first.
+pub fn reactions_on(c: &Connection, message: MessageId) -> Result<Vec<Reaction>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {REACTION_COLS} FROM reactions WHERE message_id = ?1
+         ORDER BY created_at, member_id, emoji"
+    ))?;
+    stmt.query_map([message.0], reaction_from_row)?.collect()
+}
+
+/// Whether `member` has any reaction on `message`.
+pub fn has_reacted(c: &Connection, message: MessageId, member: MemberId) -> Result<bool> {
+    c.query_row(
+        "SELECT EXISTS (SELECT 1 FROM reactions WHERE message_id = ?1 AND member_id = ?2)",
+        params![message.0, member.0],
+        |r| r.get(0),
+    )
+}
+
+/// The channel's newest `limit` reactions, returned oldest first.
+pub fn recent_reactions(c: &Connection, channel: ChannelId, limit: usize) -> Result<Vec<Reaction>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {REACTION_COLS} FROM reactions WHERE channel_id = ?1
+         ORDER BY created_at DESC, message_id DESC, member_id DESC LIMIT ?2"
+    ))?;
+    let mut v = stmt
+        .query_map(params![channel.0, limit as i64], reaction_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    v.reverse();
+    Ok(v)
+}
+
+/// Reactions added in `channel` after `since` (exclusive), oldest first, at
+/// most `limit`.
+pub fn reactions_since(
+    c: &Connection,
+    channel: ChannelId,
+    since: Millis,
+    limit: usize,
+) -> Result<Vec<Reaction>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {REACTION_COLS} FROM reactions WHERE channel_id = ?1 AND created_at > ?2
+         ORDER BY created_at, message_id, member_id LIMIT ?3"
+    ))?;
+    stmt.query_map(params![channel.0, since as i64, limit as i64], reaction_from_row)?
+        .collect()
+}
+
+/// Reactions on the messages of `channel` with `seq > after_seq`, oldest
+/// first (the app loads them alongside history).
+pub fn reactions_after_seq(
+    c: &Connection,
+    channel: ChannelId,
+    after_seq: Seq,
+) -> Result<Vec<Reaction>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT r.message_id, r.channel_id, r.member_id, r.emoji, r.created_at
+         FROM reactions r JOIN messages m ON m.id = r.message_id
+         WHERE r.channel_id = ?1 AND m.seq > ?2
+         ORDER BY r.created_at, r.message_id, r.member_id",
+    )?;
+    stmt.query_map(params![channel.0, after_seq as i64], reaction_from_row)?
+        .collect()
 }
 
 // ---------- cursors ----------

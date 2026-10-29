@@ -17,6 +17,7 @@ use crate::{
     notify,
     permission::{self, PermissionRequest, RunsIn},
     policy::{self, Damp, Policy, PolicyState},
+    reaction,
     store::{self, NewMessage, Store},
     types::*,
 };
@@ -47,10 +48,14 @@ pub struct Dispatch {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoreEvent {
     Message(Message),
+    /// A reaction was added (`added`) or removed. Never a wake: nobody is
+    /// notified or delivered anything because of it.
     Reaction {
+        channel: ChannelId,
         message: MessageId,
         member: MemberId,
         emoji: Arc<str>,
+        added: bool,
     },
     Agent(AgentStatus),
     /// A member's read receipt moved forward.
@@ -74,6 +79,8 @@ pub enum PostError {
     NotMember,
     UnknownChannel,
     UnknownMessage,
+    /// Not something that can be a reaction (a word, blank, too long).
+    InvalidEmoji,
     RateLimited { retry_after_ms: Millis },
     Store(String),
 }
@@ -85,6 +92,9 @@ impl std::fmt::Display for PostError {
             PostError::NotMember => f.write_str("not a member of that channel"),
             PostError::UnknownChannel => f.write_str("no such channel"),
             PostError::UnknownMessage => f.write_str("no such message"),
+            PostError::InvalidEmoji => {
+                f.write_str("invalid_emoji: send one emoji (or a :shortcode: like :+1:)")
+            }
             PostError::RateLimited { retry_after_ms } => {
                 write!(f, "rate_limited: retry after {retry_after_ms} ms")
             }
@@ -170,9 +180,15 @@ pub struct Engine {
     pub(crate) runs_in: HashMap<MemberId, RunsIn>,
 }
 
-/// Emoji that answer a reply obligation. 👀 ("on it") does not: an agent that
-/// reacts 👀 still owes the answer.
-pub const QUALIFYING_REACTIONS: &[&str] = &["✅", "👍", "white_check_mark", "+1", "thumbsup"];
+/// What [`Engine::react`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reacted {
+    /// The emoji as stored (normalised: `:+1:` is 👍).
+    pub emoji: Arc<str>,
+    /// Whether anything changed (adding an emoji already there, or removing
+    /// one that isn't, is a no-op).
+    pub changed: bool,
+}
 
 impl Engine {
     pub fn new(store: Store, policy: Policy, now: Millis) -> Result<Self, rusqlite::Error> {
@@ -722,39 +738,54 @@ impl Engine {
         Ok(m)
     }
 
+    /// Adds (`add`) or removes `member`'s `emoji` on `message`. Idempotent:
+    /// adding twice or removing twice changes nothing and emits nothing.
+    ///
+    /// A reaction never wakes anyone: no trigger, no batch, no delivery, not
+    /// even to the message's author. The only side effect beyond the store is
+    /// on the reactor's own reply obligation: adding any emoji except 👀
+    /// (`reaction::HOLDS_OBLIGATION`) to a message the reactor owes a reply
+    /// closes that obligation as handled (`satisfied`, kind `react`). Removing
+    /// a reaction later doesn't reopen it.
     pub fn react(
         &mut self,
         now: Millis,
         member: MemberId,
         message: MessageId,
         emoji: &str,
-    ) -> Result<(), PostError> {
+        add: bool,
+    ) -> Result<Reacted, PostError> {
+        let emoji = reaction::normalize(emoji).ok_or(PostError::InvalidEmoji)?;
         let m = store::message(self.conn(), message)?.ok_or(PostError::UnknownMessage)?;
         if !store::is_member(self.conn(), m.channel, member)? {
             return Err(PostError::UnknownMessage);
         }
-        let added = self
-            .store
-            .tx(|c| store::add_reaction(c, message, member, emoji, now))?;
-        if added {
+        let changed = self.store.tx::<_, PostError>(|c| {
+            let changed = if add {
+                store::add_reaction(c, message, m.channel, member, &emoji, now)?
+            } else {
+                store::remove_reaction(c, message, member, &emoji)?
+            };
+            if add && reaction::answers_obligation(&emoji) {
+                let t = TriggerId {
+                    agent: member,
+                    channel: m.channel,
+                    message,
+                };
+                store::resolve_obligation(c, t, ObligationState::Satisfied, None, "react")?;
+            }
+            Ok(changed)
+        })?;
+        if changed {
             self.effects.push(Effect::Event(CoreEvent::Reaction {
-                message,
-                member,
-                emoji: Arc::from(emoji),
-            }));
-        }
-        if QUALIFYING_REACTIONS.contains(&emoji) {
-            let t = TriggerId {
-                agent: member,
                 channel: m.channel,
                 message,
-            };
-            self.store.tx::<_, PostError>(|c| {
-                store::resolve_obligation(c, t, ObligationState::Satisfied, None, "react")?;
-                Ok(())
-            })?;
+                member,
+                emoji: emoji.clone(),
+                added: add,
+            }));
         }
-        Ok(())
+        Ok(Reacted { emoji, changed })
     }
 
     /// A member refuses or dissents from `target`: posts `reason` as a reply
@@ -1224,25 +1255,31 @@ impl Engine {
         } else if !open.is_empty() {
             // A completed turn with nothing to say is the agent choosing to let
             // the ping go: `ignored`, which is fine. Anything else (cancelled,
-            // refused, cut short) is `unmet`.
-            let ignored = *outcome == TurnOutcome::Completed;
-            let (state, kind) = if ignored {
-                (ObligationState::Ignored, "ignored")
-            } else {
-                (ObligationState::Unmet, "no_reply")
-            };
+            // refused, cut short) is `unmet`. A trigger the agent reacted to
+            // (only 👀 is still open by now: every other emoji closed it when
+            // it was added) was handled, not ignored.
+            let completed = *outcome == TurnOutcome::Completed;
+            let mut ignored_any = false;
             self.store.tx::<_, PostError>(|c| {
                 for t in &open {
+                    let (state, kind) = if !completed {
+                        (ObligationState::Unmet, "no_reply")
+                    } else if store::has_reacted(c, t.message, agent)? {
+                        (ObligationState::Satisfied, "react")
+                    } else {
+                        ignored_any = true;
+                        (ObligationState::Ignored, "ignored")
+                    };
                     store::resolve_obligation(c, *t, state, None, kind)?;
                 }
                 Ok(())
             })?;
             let rt = self.rt.entry((agent, channel)).or_default();
-            rt.note = Some(Arc::from(if ignored {
-                "read it and let it go"
-            } else {
-                "turn ended without a reply"
-            }));
+            if !completed {
+                rt.note = Some(Arc::from("turn ended without a reply"));
+            } else if ignored_any {
+                rt.note = Some(Arc::from("read it and let it go"));
+            }
         }
         self.store.tx::<_, PostError>(|c| {
             store::set_batch_state(c, turn, BatchState::Settled, now, Some(&outcome_label))?;
