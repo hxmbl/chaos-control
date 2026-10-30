@@ -60,9 +60,21 @@ fn main() {
                 KeyBinding::new("down", search::SelectNext, Some(search::KEY_CONTEXT)),
                 KeyBinding::new("up", search::SelectPrevious, Some(search::KEY_CONTEXT)),
                 KeyBinding::new("escape", search::Dismiss, Some(search::KEY_CONTEXT)),
-                KeyBinding::new("down", model_picker::SelectNext, Some(model_picker::KEY_CONTEXT)),
-                KeyBinding::new("up", model_picker::SelectPrevious, Some(model_picker::KEY_CONTEXT)),
-                KeyBinding::new("escape", model_picker::Dismiss, Some(model_picker::KEY_CONTEXT)),
+                KeyBinding::new(
+                    "down",
+                    model_picker::SelectNext,
+                    Some(model_picker::KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "up",
+                    model_picker::SelectPrevious,
+                    Some(model_picker::KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "escape",
+                    model_picker::Dismiss,
+                    Some(model_picker::KEY_CONTEXT),
+                ),
             ]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {

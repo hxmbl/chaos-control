@@ -405,7 +405,8 @@ async fn run(
             let session_id = new.session_id.clone();
             let options = serde_json::to_value(&new.config_options).unwrap_or_default();
             let offered = crate::acp::model_option(&options);
-            let (current, applied) = match crate::acp::plan_model(model.as_ref(), offered.as_ref()) {
+            let (current, applied) = match crate::acp::plan_model(model.as_ref(), offered.as_ref())
+            {
                 crate::acp::ModelPlan::Set {
                     config_id,
                     value,

@@ -201,8 +201,8 @@ pub fn project_count(c: &Connection, member: MemberId) -> Result<i64> {
 
 /// The harness's cached model list (from its own answer), in its order.
 pub fn harness_models(c: &Connection, harness: &str) -> Result<Vec<ModelInfo>> {
-    let mut stmt = c
-        .prepare_cached("SELECT model, name FROM harness_models WHERE harness = ?1 ORDER BY ord")?;
+    let mut stmt =
+        c.prepare_cached("SELECT model, name FROM harness_models WHERE harness = ?1 ORDER BY ord")?;
     stmt.query_map([harness], |r| {
         let id: String = r.get(0)?;
         let name: String = r.get(1)?;

@@ -290,7 +290,8 @@ pub(crate) struct ModelOption {
 /// (fx names it that way). Grouped options are flattened in order.
 pub(crate) fn model_option(config_options: &serde_json::Value) -> Option<ModelOption> {
     let all = config_options.as_array()?;
-    let is_select = |o: &&serde_json::Value| o.get("type").and_then(|t| t.as_str()) == Some("select");
+    let is_select =
+        |o: &&serde_json::Value| o.get("type").and_then(|t| t.as_str()) == Some("select");
     let pick = all
         .iter()
         .filter(is_select)
@@ -395,7 +396,10 @@ async fn discover_v1(
                 .block_task()
                 .await;
             if let Err(e) = init {
-                send_main(Err(AgentError::new(error_kind(&e), format!("initialize: {e}"))));
+                send_main(Err(AgentError::new(
+                    error_kind(&e),
+                    format!("initialize: {e}"),
+                )));
                 return Ok(());
             }
             let new = match conn
@@ -405,7 +409,10 @@ async fn discover_v1(
             {
                 Ok(n) => n,
                 Err(e) => {
-                    send_main(Err(AgentError::new(error_kind(&e), format!("session/new: {e}"))));
+                    send_main(Err(AgentError::new(
+                        error_kind(&e),
+                        format!("session/new: {e}"),
+                    )));
                     return Ok(());
                 }
             };

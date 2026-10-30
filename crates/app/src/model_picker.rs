@@ -26,8 +26,8 @@ use gpui::{
     Window, actions, div, prelude::*,
 };
 use ui::{
-    ActiveTheme, Ellipsis, IconName, Pane, TextInput, TextInputEvent, Tooltip, TypeStyleExt, brand_icon,
-    icon, pill,
+    ActiveTheme, Ellipsis, IconName, Pane, TextInput, TextInputEvent, Tooltip, TypeStyleExt,
+    brand_icon, icon, pill,
     tokens::{icon as icons, radius, size, space, text},
     truncated,
 };
@@ -148,12 +148,23 @@ impl ModelPicker {
             .offers
             .iter()
             .filter(|o| self.filter.is_none_or(|f| f == o.harness))
-            .filter(|o| !self.store.read(cx).has_member(o.harness, o.model.as_deref()))
+            .filter(|o| {
+                !self
+                    .store
+                    .read(cx)
+                    .has_member(o.harness, o.model.as_deref())
+            })
             .cloned()
             .collect();
         match offers.as_slice() {
             [] => {}
-            [only] => self.add(only.harness, only.model.clone(), row.name.clone(), window, cx),
+            [only] => self.add(
+                only.harness,
+                only.model.clone(),
+                row.name.clone(),
+                window,
+                cx,
+            ),
             _ => {
                 self.choosing = Some(row.key.clone());
                 cx.notify();
@@ -251,7 +262,10 @@ impl ModelPicker {
                 } else if let Some(n) = &c.note {
                     Some(format!("{}: {n}. Showing its usual models.", c.name))
                 } else if c.preset_only {
-                    Some(format!("{}: its usual models (it hasn't listed its own yet)", c.name))
+                    Some(format!(
+                        "{}: its usual models (it hasn't listed its own yet)",
+                        c.name
+                    ))
                 } else {
                     None
                 };
@@ -321,7 +335,9 @@ impl ModelPicker {
             .text_color(if selected { t.ink } else { t.ink_soft })
             .when(selected, |d| d.bg(t.selected))
             .hover(move |s| s.bg(t.hover))
-            .when_some(brand, |d, b| d.child(icon(brand_icon(b), icons::SM, t.ink_soft)))
+            .when_some(brand, |d, b| {
+                d.child(icon(brand_icon(b), icons::SM, t.ink_soft))
+            })
             .child(label)
             .when_some(tip, |d, tip| d.tooltip(Tooltip::text(tip)))
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -360,60 +376,57 @@ impl ModelPicker {
             .join(" · ");
         let choosing = self.choosing.as_deref() == Some(row.key.as_str());
 
-        let main = pill(("model-row", ix), cx)
-            .h(size::ROW)
-            .gap(space::X2)
-            .px(space::X2)
-            .when(highlighted, |p| p.bg(t.selected))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .gap(space::X0_5)
-                    .children(offers.iter().take(3).map(|o| {
+        let main =
+            pill(("model-row", ix), cx)
+                .h(size::ROW)
+                .gap(space::X2)
+                .px(space::X2)
+                .when(highlighted, |p| p.bg(t.selected))
+                .child(div().flex().flex_none().gap(space::X0_5).children(
+                    offers.iter().take(3).map(|o| {
                         icon(brand_icon(parse_brand(Some(o.icon))), icons::MD, t.ink_soft)
-                    })),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
+                    }),
+                ))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .ellipsis()
+                                .type_style(text::BODY)
+                                .text_color(if all_added { t.muted } else { t.ink })
+                                .child(truncated(SharedString::from(row.name.clone()))),
+                        )
+                        .child(
+                            div()
+                                .ellipsis()
+                                .type_style(text::CAPTION)
+                                .text_color(t.muted)
+                                .child(truncated(SharedString::from(if guessed {
+                                    format!("via {via} · usual list")
+                                } else {
+                                    format!("via {via}")
+                                }))),
+                        ),
+                )
+                .when(all_added, |p| {
+                    p.child(
                         div()
-                            .ellipsis()
-                            .type_style(text::BODY)
-                            .text_color(if all_added { t.muted } else { t.ink })
-                            .child(truncated(SharedString::from(row.name.clone()))),
-                    )
-                    .child(
-                        div()
-                            .ellipsis()
+                            .flex_none()
                             .type_style(text::CAPTION)
                             .text_color(t.muted)
-                            .child(truncated(SharedString::from(if guessed {
-                                format!("via {via} · usual list")
-                            } else {
-                                format!("via {via}")
-                            }))),
-                    ),
-            )
-            .when(all_added, |p| {
-                p.child(
-                    div()
-                        .flex_none()
-                        .type_style(text::CAPTION)
-                        .text_color(t.muted)
-                        .child("Added"),
-                )
-            })
-            .when(!all_added, |p| {
-                p.on_click(cx.listener(move |this, _, window, cx| {
-                    this.highlighted = ix;
-                    this.confirm(ix, window, cx);
-                }))
-            });
+                            .child("Added"),
+                    )
+                })
+                .when(!all_added, |p| {
+                    p.on_click(cx.listener(move |this, _, window, cx| {
+                        this.highlighted = ix;
+                        this.confirm(ix, window, cx);
+                    }))
+                });
 
         let mut col = div().flex().flex_col().child(main);
         if choosing {
@@ -422,8 +435,7 @@ impl ModelPicker {
                 .filter(|o| !store.has_member(o.harness, o.model.as_deref()))
                 .enumerate()
                 .map(|(n, o)| {
-                    let (harness, model, name) =
-                        (o.harness, o.model.clone(), row.name.clone());
+                    let (harness, model, name) = (o.harness, o.model.clone(), row.name.clone());
                     div()
                         .id(SharedString::from(format!("via-{ix}-{n}")))
                         .flex()

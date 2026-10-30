@@ -955,9 +955,9 @@ impl Engine {
         if !info.models.is_empty()
             && let Ok(Some(mm)) = crate::roster::model_member(self.conn(), agent)
         {
-            let saved = self.store.tx(|c| {
-                crate::roster::set_harness_models(c, &mm.harness, &info.models, now)
-            });
+            let saved = self
+                .store
+                .tx(|c| crate::roster::set_harness_models(c, &mm.harness, &info.models, now));
             if saved.is_ok() {
                 self.effects.push(Effect::Event(CoreEvent::Models {
                     harness: mm.harness.clone(),

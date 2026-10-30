@@ -16,8 +16,8 @@
 pub mod acp;
 mod acp_v2;
 pub mod adapter;
-pub mod engine;
 pub mod codex;
+pub mod engine;
 pub mod fake;
 pub mod fake_codex;
 pub mod harness;

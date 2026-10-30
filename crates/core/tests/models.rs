@@ -94,9 +94,13 @@ async fn acp_member_runs_its_model_through_the_session_model_option() {
     .await;
     assert_eq!(&*m.member.handle, "big-two");
     h.say("@big-two hello").await;
-    h.wait_message("the fallback reply", Some(m.member.id)).await;
+    h.wait_message("the fallback reply", Some(m.member.id))
+        .await;
     let o = fake.observed.lock().unwrap().clone();
-    assert_eq!(o.config_sets, vec![("model".to_string(), "big-2".to_string())]);
+    assert_eq!(
+        o.config_sets,
+        vec![("model".to_string(), "big-2".to_string())]
+    );
     // The session reported the harness's models; they are cached for the
     // picker and announced.
     match h
@@ -167,7 +171,10 @@ async fn acp_discovery_opens_and_closes_a_throwaway_session_without_chat_tools()
         .await
         .unwrap();
     assert_eq!(
-        found.iter().map(|m| m.id.as_deref().unwrap()).collect::<Vec<_>>(),
+        found
+            .iter()
+            .map(|m| m.id.as_deref().unwrap())
+            .collect::<Vec<_>>(),
         ["fast-1", "big-2"]
     );
     let o = fake.observed.lock().unwrap().clone();
@@ -197,8 +204,7 @@ async fn discovery_of_a_signed_out_harness_is_an_error_and_caches_nothing() {
 
 fn codex(script: fake_codex::Script, model: Option<&str>) -> (FakeCodex, Arc<CodexAdapter>) {
     let fake = FakeCodex::new(script);
-    let adapter =
-        Arc::new(CodexAdapter::new(Arc::new(fake.clone())).model(model.map(Arc::from)));
+    let adapter = Arc::new(CodexAdapter::new(Arc::new(fake.clone())).model(model.map(Arc::from)));
     (fake, adapter)
 }
 
@@ -227,9 +233,19 @@ async fn codex_member_takes_a_turn_and_its_last_message_is_the_fallback_reply() 
         },
         Some("gpt-6.1-sol"),
     );
-    let m = add(&h, "codex", Some("gpt-6.1-sol"), "GPT-6.1 Sol", adapter, RunsIn::Host).await;
+    let m = add(
+        &h,
+        "codex",
+        Some("gpt-6.1-sol"),
+        "GPT-6.1 Sol",
+        adapter,
+        RunsIn::Host,
+    )
+    .await;
     let ping = h.say("@gpt-6-1-sol run the tests").await;
-    let reply = h.wait_message("the fallback reply", Some(m.member.id)).await;
+    let reply = h
+        .wait_message("the fallback reply", Some(m.member.id))
+        .await;
     assert_eq!(&*reply.body, "All green.");
     assert_eq!(reply.reply_to, Some(ping.id));
 
@@ -240,7 +256,12 @@ async fn codex_member_takes_a_turn_and_its_last_message_is_the_fallback_reply() 
     let start = fake.request("thread/start").unwrap();
     assert_eq!(start["model"], "gpt-6.1-sol");
     let mcp = &start["config"]["mcp_servers.chaos-control"];
-    assert!(mcp["url"].as_str().unwrap().starts_with("http://127.0.0.1:"));
+    assert!(
+        mcp["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:")
+    );
     assert!(
         mcp["http_headers"]["Authorization"]
             .as_str()
@@ -274,7 +295,15 @@ async fn codex_model_missing_from_model_list_starts_on_the_default() {
         },
         Some("gpt-old"),
     );
-    let m = add(&h, "codex", Some("gpt-old"), "GPT Old", adapter, RunsIn::Host).await;
+    let m = add(
+        &h,
+        "codex",
+        Some("gpt-old"),
+        "GPT Old",
+        adapter,
+        RunsIn::Host,
+    )
+    .await;
     h.say("@gpt-old hi").await;
     h.wait_message("the reply", Some(m.member.id)).await;
     assert!(fake.request("thread/start").unwrap().get("model").is_none());
@@ -300,9 +329,10 @@ async fn codex_approvals_go_through_the_permission_gate() {
     let m = add(&h, "codex", None, "Codex default", adapter, RunsIn::Host).await;
     h.say("@codex clean up").await;
     let req = match h
-        .wait_for("a pending request", |e| {
-            matches!(e, CoreEvent::Permission(r) if r.state == PermissionState::Pending)
-        })
+        .wait_for(
+            "a pending request",
+            |e| matches!(e, CoreEvent::Permission(r) if r.state == PermissionState::Pending),
+        )
         .await
     {
         CoreEvent::Permission(r) => r,
@@ -310,7 +340,8 @@ async fn codex_approvals_go_through_the_permission_gate() {
     };
     assert_eq!(&*req.title, "rm -rf build/");
     assert_eq!(req.agent, m.member.id);
-    h.wait_message("the turn carried on", Some(m.member.id)).await;
+    h.wait_message("the turn carried on", Some(m.member.id))
+        .await;
     assert_eq!(*fake.decisions.lock().unwrap(), ["decline"]);
 
     // In its own VM: accepted.
@@ -318,7 +349,10 @@ async fn codex_approvals_go_through_the_permission_gate() {
     let (fake, adapter) = codex(
         fake_codex::Script {
             turns: vec![fake_codex::Turn {
-                steps: vec![Step::Approval("make".into()), Step::Message("Built.".into())],
+                steps: vec![
+                    Step::Approval("make".into()),
+                    Step::Message("Built.".into()),
+                ],
                 ..Default::default()
             }],
             ..Default::default()
@@ -379,7 +413,10 @@ async fn codex_interrupt_ends_the_turn_cancelled_with_no_fallback() {
     let m = add(&h, "codex", None, "Codex default", adapter, RunsIn::Host).await;
     let ping = h.say("@codex long job").await;
     eventually("turn started", async || {
-        fake.methods().iter().any(|m| m == "turn/start").then_some(())
+        fake.methods()
+            .iter()
+            .any(|m| m == "turn/start")
+            .then_some(())
     })
     .await;
     // Let the turn be accepted before cancelling.
@@ -390,7 +427,10 @@ async fn codex_interrupt_ends_the_turn_cancelled_with_no_fallback() {
     .await;
     h.core.interrupt(m.member.id, h.main);
     eventually("interrupt sent", async || {
-        fake.methods().iter().any(|m| m == "turn/interrupt").then_some(())
+        fake.methods()
+            .iter()
+            .any(|m| m == "turn/interrupt")
+            .then_some(())
     })
     .await;
     let state = eventually("obligation unmet", async || {
@@ -400,7 +440,10 @@ async fn codex_interrupt_ends_the_turn_cancelled_with_no_fallback() {
     .await;
     assert_eq!(state, ObligationState::Unmet);
     h.quiesce().await;
-    assert!(h.by(m.member.id).await.is_empty(), "no fallback after a cancel");
+    assert!(
+        h.by(m.member.id).await.is_empty(),
+        "no fallback after a cancel"
+    );
     let _ = &mut h;
 }
 
@@ -413,7 +456,11 @@ async fn codex_lists_models_without_starting_a_thread() {
         },
         None,
     );
-    let found = adapter.list_models(std::env::temp_dir()).await.unwrap().unwrap();
+    let found = adapter
+        .list_models(std::env::temp_dir())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(found.len(), 2);
     assert_eq!(&*found[0].name, "GPT-6.1 Sol");
     assert!(!fake.methods().iter().any(|m| m == "thread/start"));
@@ -426,8 +473,24 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     let mut h = Harness::new().await;
     let fake_a = FakeAgent::new(script(models_script()));
     let fake_b = FakeAgent::new(script(models_script()));
-    let a = add(&h, "fx", Some("fast-1"), "Fast One", acp_adapter(&fake_a, Some("fast-1")), RunsIn::Host).await;
-    let b = add(&h, "fx", Some("big-2"), "Big Two", acp_adapter(&fake_b, Some("big-2")), RunsIn::Host).await;
+    let a = add(
+        &h,
+        "fx",
+        Some("fast-1"),
+        "Fast One",
+        acp_adapter(&fake_a, Some("fast-1")),
+        RunsIn::Host,
+    )
+    .await;
+    let b = add(
+        &h,
+        "fx",
+        Some("big-2"),
+        "Big Two",
+        acp_adapter(&fake_b, Some("big-2")),
+        RunsIn::Host,
+    )
+    .await;
     assert_ne!(a.member.id, b.member.id);
     let project = common::project_id();
     let roster = h.core.roster(&project).await.unwrap();
@@ -437,7 +500,15 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     );
 
     // Adding again is the same member (startup re-registration).
-    let again = add(&h, "fx", Some("big-2"), "Big Two", acp_adapter(&fake_b, Some("big-2")), RunsIn::Host).await;
+    let again = add(
+        &h,
+        "fx",
+        Some("big-2"),
+        "Big Two",
+        acp_adapter(&fake_b, Some("big-2")),
+        RunsIn::Host,
+    )
+    .await;
     assert_eq!(again.member.id, b.member.id);
     assert_eq!(h.core.roster(&project).await.unwrap().len(), 2);
 
@@ -457,7 +528,10 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     h.say("@fast-one @big-two both of you").await;
     h.wait_message("b's reply", Some(b.member.id)).await;
     h.quiesce().await;
-    assert_eq!(fake_a.observed.lock().unwrap().prompts.len(), prompts_before);
+    assert_eq!(
+        fake_a.observed.lock().unwrap().prompts.len(),
+        prompts_before
+    );
 
     // Seeding happens once per project.
     assert!(h.core.seed_roster_once(&project).await.unwrap());

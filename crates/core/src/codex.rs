@@ -214,8 +214,15 @@ impl AgentAdapter for CodexAdapter {
 
 #[derive(Debug)]
 enum Incoming {
-    Notification { method: String, params: Value },
-    Request { id: Value, method: String, params: Value },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    Request {
+        id: Value,
+        method: String,
+        params: Value,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -372,9 +379,9 @@ impl Rpc {
     }
 
     fn respond_error(&self, id: Value, code: i64, message: &str) {
-        let _ = self.out.send(
-            json!({ "id": id, "error": { "code": code, "message": message } }).to_string(),
-        );
+        let _ = self
+            .out
+            .send(json!({ "id": id, "error": { "code": code, "message": message } }).to_string());
     }
 }
 
@@ -546,9 +553,9 @@ async fn open(
     let init = initialize(&rpc).await?;
     // The model list is a nicety: a Codex too old for it still runs.
     let models = list_models(&rpc).await.unwrap_or_default();
-    let use_model = model.as_ref().filter(|m| {
-        models.is_empty() || models.iter().any(|x| x.id.as_deref() == Some(&***m))
-    });
+    let use_model = model
+        .as_ref()
+        .filter(|m| models.is_empty() || models.iter().any(|x| x.id.as_deref() == Some(&***m)));
     let (mcp, chat_tools) = mcp_config(pref, &req.chat_tools);
     let mut params = json!({
         "cwd": req.cwd.to_string_lossy(),

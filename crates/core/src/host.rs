@@ -510,11 +510,9 @@ impl Core {
     /// the roster from auto-detection. Afterwards the roster is the user's.
     pub async fn seed_roster_once(&self, project: &ProjectId) -> Result<bool, String> {
         let project = project.clone();
-        self.with_engine(move |e, now| {
-            e.store_tx(|c| crate::roster::mark_seeded(c, &project, now))
-        })
-        .await?
-        .map_err(|e| e.to_string())
+        self.with_engine(move |e, now| e.store_tx(|c| crate::roster::mark_seeded(c, &project, now)))
+            .await?
+            .map_err(|e| e.to_string())
     }
 
     /// The harness's cached model list (empty until it reported one).

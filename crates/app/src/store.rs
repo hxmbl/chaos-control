@@ -592,7 +592,12 @@ impl ChatStore {
         let Some(attached) = &mut self.core else {
             return;
         };
-        if attached.link.agents.iter().any(|a| a.member == linked.member) {
+        if attached
+            .link
+            .agents
+            .iter()
+            .any(|a| a.member == linked.member)
+        {
             return;
         }
         attached.names.insert(linked.member, linked.name.clone());

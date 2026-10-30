@@ -421,11 +421,7 @@ pub fn detect_one(p: &'static HarnessPreset, env: &DetectEnv) -> Option<Detected
     })
 }
 
-fn launch_for(
-    p: &HarnessPreset,
-    found: &Path,
-    env: &DetectEnv,
-) -> Option<(PathBuf, Vec<String>)> {
+fn launch_for(p: &HarnessPreset, found: &Path, env: &DetectEnv) -> Option<(PathBuf, Vec<String>)> {
     let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if let Some(adapter) = &p.adapter {
         if let Some(bin) = env.find(adapter.binary) {
@@ -766,7 +762,10 @@ pub fn score(row: &Searchable, query: &str) -> Option<i64> {
 }
 
 /// Rows matching `query`, best first; ties keep their catalog order.
-pub fn rank<'a>(models: impl IntoIterator<Item = &'a CatalogModel>, query: &str) -> Vec<&'a CatalogModel> {
+pub fn rank<'a>(
+    models: impl IntoIterator<Item = &'a CatalogModel>,
+    query: &str,
+) -> Vec<&'a CatalogModel> {
     let mut scored: Vec<(i64, usize, &CatalogModel)> = models
         .into_iter()
         .enumerate()
@@ -865,12 +864,18 @@ mod tests {
         assert_eq!(found[0].args, ["app-server"]);
         assert_eq!(found[1].args, ["acp"]);
         // Vibe runs its sibling ACP binary, not the TUI.
-        assert_eq!(found[2].command, PathBuf::from("/home/hx/.local/bin/vibe-acp"));
+        assert_eq!(
+            found[2].command,
+            PathBuf::from("/home/hx/.local/bin/vibe-acp")
+        );
     }
 
     #[test]
     fn claude_code_prefers_the_installed_adapter_then_npx() {
-        let files: HashSet<PathBuf> = ["/bin/claude", "/bin/npx"].iter().map(PathBuf::from).collect();
+        let files: HashSet<PathBuf> = ["/bin/claude", "/bin/npx"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
         let exists = |p: &Path| files.contains(p);
         let env = env_with(&files, &["/bin"], &exists);
         let d = detect_one(preset("claude-code").unwrap(), &env).unwrap();
@@ -938,7 +943,11 @@ mod tests {
                     (Some("openai/gpt-6.1-sol"), "GPT-6.1 Sol"),
                 ],
             ),
-            hm("codex", ModelSource::Live, &[(Some("gpt-6.1-sol"), "GPT-6.1 Sol")]),
+            hm(
+                "codex",
+                ModelSource::Live,
+                &[(Some("gpt-6.1-sol"), "GPT-6.1 Sol")],
+            ),
         ]);
         let names: Vec<_> = cat.models.iter().map(|m| &*m.name).collect();
         // Codex first (priority), so GPT-6.1 Sol leads; fx's rows follow.
@@ -998,7 +1007,10 @@ mod tests {
     fn handles_stay_unique() {
         let taken: HashSet<&str> = ["gpt-6-1-sol", "gpt-6-1-sol-fx"].into_iter().collect();
         let t = |h: &str| taken.contains(h);
-        assert_eq!(handle_for("Claude Opus 5.5", "claude-code", &t), "claude-opus-5-5");
+        assert_eq!(
+            handle_for("Claude Opus 5.5", "claude-code", &t),
+            "claude-opus-5-5"
+        );
         assert_eq!(handle_for("GPT-6.1 Sol", "codex", &t), "gpt-6-1-sol-codex");
         assert_eq!(handle_for("GPT-6.1 Sol", "fx", &t), "gpt-6-1-sol-fx-2");
         assert_eq!(handle_for("fx default", "fx", &|_| false), "fx");

@@ -270,7 +270,9 @@ impl Render for RightSidebar {
                                                     .size(size::CHIP)
                                                     .rounded(radius::SM)
                                                     .hover(|s| s.bg(t.selected))
-                                                    .tooltip(Tooltip::text("Remove from this project"))
+                                                    .tooltip(Tooltip::text(
+                                                        "Remove from this project",
+                                                    ))
                                                     .on_click(cx.listener(move |this, _, _, cx| {
                                                         cx.stop_propagation();
                                                         this.hovered_agent = None;
@@ -278,7 +280,11 @@ impl Render for RightSidebar {
                                                             s.remove_agent(id, cx)
                                                         });
                                                     }))
-                                                    .child(icon(IconName::X, icons::SM, t.ink_soft)),
+                                                    .child(icon(
+                                                        IconName::X,
+                                                        icons::SM,
+                                                        t.ink_soft,
+                                                    )),
                                             )
                                         })
                                         .child(

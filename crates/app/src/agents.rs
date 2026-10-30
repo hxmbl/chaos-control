@@ -817,10 +817,8 @@ mod tests {
             home: None,
             is_executable: &exists,
         };
-        let config: AgentsConfig = serde_json::from_str(
-            r#"{"harnesses": {"codex": {"command": "/opt/codex"}}}"#,
-        )
-        .unwrap();
+        let config: AgentsConfig =
+            serde_json::from_str(r#"{"harnesses": {"codex": {"command": "/opt/codex"}}}"#).unwrap();
         let found = harnesses(&config, &env);
         let ids: Vec<_> = found.iter().map(|h| h.preset.id).collect();
         // Codex is not on PATH but its command override counts.

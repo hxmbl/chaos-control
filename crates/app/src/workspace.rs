@@ -16,12 +16,12 @@ use ui::{
 use crate::{
     composer::Composer,
     conversation::Conversation,
+    model_picker::{ModelPicker, ModelPickerEvent},
     pane_host::{PaneEvent, PaneHost, pane_frame},
     panels::{
         GUTTER, LEFT_WIDTH, Panels, RIGHT_WIDTH, SIDE_INSET, Side, SideFrame, ToggleLeftSidebar,
         ToggleRightSidebar,
     },
-    model_picker::{ModelPicker, ModelPickerEvent},
     right_sidebar::RightSidebar,
     search::{FocusSearch, PILL_HEIGHT, Search, SearchEvent},
     sidebar::Sidebar,
@@ -164,15 +164,16 @@ impl Workspace {
         // The model picker draws in the pane layer; Agent Status opens it.
         let model_picker = cx.new(|cx| ModelPicker::new(store.clone(), window, cx));
         let picker_changed = cx.observe(&model_picker, |_, _, cx| cx.notify());
-        let picker_events = cx.subscribe_in(
-            &model_picker,
-            window,
-            |this, _, event, window, cx| match event {
-                ModelPickerEvent::Dismissed => {
-                    this.composer.update(cx, |c, cx| c.focus(window, cx))
-                }
-            },
-        );
+        let picker_events =
+            cx.subscribe_in(
+                &model_picker,
+                window,
+                |this, _, event, window, cx| match event {
+                    ModelPickerEvent::Dismissed => {
+                        this.composer.update(cx, |c, cx| c.focus(window, cx))
+                    }
+                },
+            );
 
         // A launch-time project identity question (see `project.rs`) opens
         // straight away; the project shown until it's answered is the one
@@ -186,8 +187,7 @@ impl Workspace {
             panels,
             search,
             sidebar: cx.new(|cx| Sidebar::new(store.clone(), pane.clone(), cx)),
-            right_sidebar: cx
-                .new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), cx)),
+            right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), cx)),
             model_picker,
             conversation: cx.new(|cx| Conversation::new(store.clone(), pane.clone(), cx)),
             pane,

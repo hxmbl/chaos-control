@@ -107,7 +107,8 @@ pub struct Agent {
     pub state: AgentState,
     /// One line from the runtime for the Agent Status tooltip ("running tests",
     /// "request pending: rm -rf build/ (#3)"). Never part of the chat log.
-    pub presence: Option<Arc<str>>,    /// The harness it runs through ("Codex", "fx"), when it is a model
+    pub presence: Option<Arc<str>>,
+    /// The harness it runs through ("Codex", "fx"), when it is a model
     /// member. `brand` is that harness's mark.
     pub harness: Option<Arc<str>>,
     /// On the project's roster, so the user can remove it from Agent Status.
