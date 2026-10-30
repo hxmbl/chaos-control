@@ -5,13 +5,14 @@
 //! view only re-renders (or re-measures list rows) for the part it shows.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
 };
 
 use chaos_core::{
     engine::CoreEvent,
+    harness::{self, Catalog, HarnessModels, ModelInfo, ModelSource},
     permission::{PermissionId, PermissionRequest, PermissionState},
     types as ct,
 };
@@ -23,7 +24,7 @@ use model::{
 };
 
 use crate::{
-    agents::{self, CoreLink, OpenProject},
+    agents::{self, CoreLink, LinkedAgent, OpenProject},
     project::{self, Confirm, Question, Target},
 };
 
@@ -94,7 +95,28 @@ struct Attached {
     names: HashMap<ct::MemberId, Arc<str>>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
+    /// Each usable harness's models: its preset list until it reports its
+    /// own (a live session, or discovery when the model picker opens).
+    models: HashMap<&'static str, HarnessModels>,
+    /// Harnesses being asked for their models right now.
+    discovering: HashSet<&'static str>,
+    /// Members removed this run: their messages still read as an agent's.
+    former: HashSet<ct::MemberId>,
     _events: Task<()>,
+}
+
+/// One harness in the model picker's filter row.
+#[derive(Clone, Debug)]
+pub struct HarnessChip {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub brand: model::Brand,
+    /// Asking the harness for its models right now.
+    pub checking: bool,
+    /// Its list is the preset guess, not the harness's own answer.
+    pub preset_only: bool,
+    /// Why its own list is missing ("signed out"), if a discovery failed.
+    pub note: Option<Arc<str>>,
 }
 
 impl EventEmitter<StoreEvent> for ChatStore {}
@@ -290,15 +312,26 @@ impl ChatStore {
     /// projects, its agents join Agent Status, #main's history loads and its
     /// events flow in from here on.
     pub fn attach_core(&mut self, mut link: CoreLink, cx: &mut Context<Self>) {
-        for a in &link.agents {
-            self.workspace.agents.push(Agent {
-                id: agent_id(a.member),
-                name: a.name.clone(),
-                brand: a.brand,
-                state: AgentState::Sleeping,
-                presence: None,
-            });
-        }
+        // Agent Status is the project's members now, not the sample cast
+        // (and the sample mentions name sample agents).
+        self.workspace.agents = link.agents.iter().map(status_agent).collect();
+        self.workspace.mentions.clear();
+        let models: HashMap<&'static str, HarnessModels> = link
+            .harnesses
+            .iter()
+            .map(|h| {
+                (
+                    h.preset.id,
+                    HarnessModels {
+                        harness: h.preset,
+                        source: ModelSource::Preset,
+                        models: harness::preset_models(h.preset),
+                        note: None,
+                    },
+                )
+            })
+            .collect();
+        let cached: Vec<&'static str> = models.keys().copied().collect();
         let channel = self.show_project(&link.open, &link.folder, cx);
         let confirm = link.confirm.take();
         let mut events = link.events.take();
@@ -317,6 +350,17 @@ impl ChatStore {
                     }
                 }
                 Err(e) => eprintln!("chaos-control: could not load #main history: {e}"),
+            }
+            // Model lists harnesses reported earlier, for the picker.
+            for id in cached {
+                if let Ok(list) = core.harness_models(id).await
+                    && !list.is_empty()
+                {
+                    let ok = this.update(cx, |store, cx| store.set_models(id, list, cx));
+                    if ok.is_err() {
+                        return;
+                    }
+                }
             }
             if let Ok(members) = core.members(main).await {
                 let ok = this.update(cx, |store, _| {
@@ -376,9 +420,216 @@ impl ChatStore {
             receipts: HashMap::new(),
             names: HashMap::new(),
             confirm,
+            models,
+            discovering: HashSet::new(),
+            former: HashSet::new(),
             _events: task,
         });
         cx.notify();
+    }
+
+    // ---------- members (models through harnesses) ----------
+
+    /// Whether core runs (so members can be added and removed).
+    pub fn has_core(&self) -> bool {
+        self.core.is_some()
+    }
+
+    /// Every usable harness's models, grouped by model (see
+    /// `harness::Catalog`): the model picker's rows.
+    pub fn catalog(&self) -> Catalog {
+        let Some(attached) = &self.core else {
+            return Catalog::default();
+        };
+        let lists: Vec<HarnessModels> = attached
+            .link
+            .harnesses
+            .iter()
+            .filter_map(|h| attached.models.get(h.preset.id).cloned())
+            .collect();
+        Catalog::build(&lists)
+    }
+
+    /// The picker's harness filter, in preset order.
+    pub fn harness_chips(&self) -> Vec<HarnessChip> {
+        let Some(attached) = &self.core else {
+            return Vec::new();
+        };
+        attached
+            .link
+            .harnesses
+            .iter()
+            .map(|h| {
+                let m = attached.models.get(h.preset.id);
+                HarnessChip {
+                    id: h.preset.id,
+                    name: h.preset.name,
+                    brand: h.brand(),
+                    checking: attached.discovering.contains(h.preset.id),
+                    preset_only: m.is_none_or(|m| m.source == ModelSource::Preset),
+                    note: m.and_then(|m| m.note.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the member running `model` on `harness` is already here.
+    pub fn has_member(&self, harness: &str, model: Option<&str>) -> bool {
+        self.core.as_ref().is_some_and(|a| {
+            a.link
+                .agents
+                .iter()
+                .any(|x| x.harness_id.as_deref() == Some(harness) && x.model.as_deref() == model)
+        })
+    }
+
+    /// Asks every harness that has only its preset list for its own (the
+    /// model picker just opened). Each answer, or failure, updates the
+    /// picker as it lands; a harness is asked once at a time.
+    pub fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let folder = attached.link.folder.clone();
+        let todo: Vec<agents::Harness> = attached
+            .link
+            .harnesses
+            .iter()
+            .filter(|h| {
+                attached
+                    .models
+                    .get(h.preset.id)
+                    .is_none_or(|m| m.source == ModelSource::Preset)
+            })
+            .filter(|h| !attached.discovering.contains(h.preset.id))
+            .cloned()
+            .collect();
+        for h in todo {
+            let id = h.preset.id;
+            attached.discovering.insert(id);
+            let (core, folder) = (core.clone(), folder.clone());
+            cx.spawn(async move |this, cx| {
+                let found = core.discover_models(id, h.adapter(None), folder).await;
+                this.update(cx, |store, cx| {
+                    if let Some(a) = &mut store.core {
+                        a.discovering.remove(id);
+                    }
+                    match found {
+                        Ok(list) if !list.is_empty() => store.set_models(id, list, cx),
+                        Ok(_) => store.note_models(id, None, cx),
+                        Err(e) => store.note_models(id, Some(short_reason(&e)), cx),
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// A harness's own model list arrived.
+    fn set_models(&mut self, id: &str, list: Vec<ModelInfo>, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let Some(entry) = attached.models.values_mut().find(|m| m.harness.id == id) else {
+            return;
+        };
+        // Keep "the harness default" first: it is always a valid choice.
+        let mut models = vec![ModelInfo::default_for(entry.harness)];
+        models.extend(list.into_iter().filter(|m| m.id.is_some()));
+        entry.models = models;
+        entry.source = ModelSource::Live;
+        entry.note = None;
+        cx.notify();
+    }
+
+    /// Discovery for `id` ended without a list (`why` when it failed).
+    fn note_models(&mut self, id: &str, why: Option<Arc<str>>, cx: &mut Context<Self>) {
+        if let Some(entry) = self
+            .core
+            .as_mut()
+            .and_then(|a| a.models.values_mut().find(|m| m.harness.id == id))
+        {
+            entry.note = why;
+            cx.notify();
+        }
+    }
+
+    /// Adds the member running `model` on `harness` to this project. It
+    /// shows in Agent Status once core has it (sleeping until pinged).
+    pub fn add_member(
+        &mut self,
+        harness: &str,
+        model: Option<Arc<str>>,
+        name: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        if self.has_member(harness, model.as_deref()) {
+            return;
+        }
+        let Some(h) = attached.link.harness(harness).cloned() else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let main = attached.link.main();
+        cx.spawn(async move |this, cx| {
+            let added = agents::add_member(core, h, model, name, main).await;
+            this.update(cx, |store, cx| match added {
+                Ok(linked) => store.linked(linked, cx),
+                Err(e) => store.system_note(&format!("Could not add that model: {e}"), cx),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn linked(&mut self, linked: LinkedAgent, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        if attached.link.agents.iter().any(|a| a.member == linked.member) {
+            return;
+        }
+        attached.names.insert(linked.member, linked.name.clone());
+        self.workspace.agents.push(status_agent(&linked));
+        attached.link.agents.push(linked);
+        cx.notify();
+    }
+
+    /// Takes a roster member out of this project (Agent Status's remove).
+    /// Its messages stay in the chat.
+    pub fn remove_agent(&mut self, id: Id, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let Some(ix) = attached
+            .link
+            .agents
+            .iter()
+            .position(|a| agent_id(a.member) == id && a.removable)
+        else {
+            return;
+        };
+        let member = attached.link.agents.remove(ix).member;
+        attached.former.insert(member);
+        self.workspace.agents.retain(|a| a.id != id);
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = core.remove_member(&project, member).await {
+                this.update(cx, |store, cx| {
+                    store.system_note(&format!("Could not remove that member: {e}"), cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     /// Shows `open` as the workspace's project: header, picker and channels.
@@ -580,7 +831,10 @@ impl ChatStore {
                 let author = match m.author {
                     _ if m.origin == ct::Origin::System => Author::System,
                     None => Author::System,
-                    Some(id) if attached.link.agents.iter().any(|a| a.member == id) => {
+                    Some(id)
+                        if attached.link.agents.iter().any(|a| a.member == id)
+                            || attached.former.contains(&id) =>
+                    {
                         Author::Agent(agent_id(id))
                     }
                     Some(_) => Author::Human,
@@ -664,6 +918,12 @@ impl ChatStore {
             }
             // The model has no reactions yet.
             CoreEvent::Reaction { .. } => {}
+            CoreEvent::Models { harness, models } => {
+                let id = harness::preset(&harness).map(|p| p.id);
+                if let Some(id) = id {
+                    self.set_models(id, models, cx);
+                }
+            }
         }
     }
 
@@ -755,6 +1015,31 @@ fn monogram(name: &str) -> String {
     name.chars()
         .find(|c| c.is_alphanumeric())
         .map_or_else(|| "#".to_string(), |c| c.to_uppercase().collect())
+}
+
+/// How a linked agent shows in Agent Status (sleeping until core says).
+fn status_agent(a: &LinkedAgent) -> Agent {
+    Agent {
+        id: agent_id(a.member),
+        name: a.name.clone(),
+        brand: a.brand,
+        state: AgentState::Sleeping,
+        presence: None,
+        harness: a.harness.clone(),
+        removable: a.removable,
+    }
+}
+
+/// A discovery error, short enough for the picker ("signed out").
+fn short_reason(e: &str) -> Arc<str> {
+    let lower = e.to_lowercase();
+    if ["auth", "login", "log in", "sign in"]
+        .iter()
+        .any(|k| lower.contains(k))
+    {
+        return Arc::from("signed out");
+    }
+    Arc::from(e.chars().take(80).collect::<String>())
 }
 
 fn agent_id(member: ct::MemberId) -> Id {

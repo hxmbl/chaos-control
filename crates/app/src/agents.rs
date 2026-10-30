@@ -270,6 +270,9 @@ pub struct LinkedAgent {
     pub brand: Brand,
     /// The harness's name, for the tooltip ("via Codex").
     pub harness: Option<Arc<str>>,
+    /// The harness preset id and the model id, for a model member.
+    pub harness_id: Option<Arc<str>>,
+    pub model: Option<Arc<str>>,
     /// On the project's roster (a model member), so the user can remove it.
     pub removable: bool,
 }
@@ -282,6 +285,8 @@ impl LinkedAgent {
             name: m.model_name.clone(),
             brand: parse_brand(preset.map(|p| p.icon)),
             harness: preset.map(|p| Arc::from(p.name)),
+            harness_id: Some(m.harness.clone()),
+            model: m.model.clone(),
             removable: true,
         }
     }
@@ -513,6 +518,8 @@ pub fn start_with(config: AgentsConfig, harnesses: Vec<Harness>) -> Result<CoreL
                 name: Arc::from(name),
                 brand: parse_brand(a.brand.as_deref()),
                 harness: None,
+                harness_id: None,
+                model: None,
                 removable: false,
             });
         }

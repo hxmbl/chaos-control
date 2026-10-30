@@ -1,6 +1,11 @@
 //! Floating, detached activity panel mirroring the left sidebar: mentions and
 //! agent status. Hidden below 1200px.
 //!
+//! Agent Status is a list of the project's members: each row is a model's
+//! name with its harness's mark and its status dot (green active, blue
+//! sleeping, red missing or unresponsive), and a remove button on hover for
+//! roster members. The last row, "Add a model", opens the model picker.
+//!
 //! The wireframe's catch-up card ("Summarizing what happened while you were
 //! gone…") is not drawn until summaries exist: a card that shimmers forever
 //! for a feature that isn't there reads as fake, and it repainted every frame.
@@ -13,22 +18,34 @@ use ui::{
     truncated,
 };
 
-use crate::store::ChatStore;
+use crate::{model_picker::ModelPicker, store::ChatStore};
 
 pub struct RightSidebar {
     store: Entity<ChatStore>,
+    picker: Entity<ModelPicker>,
     mentions_open: bool,
+    /// The Agent Status row under the pointer (shows its remove button).
+    hovered_agent: Option<model::Id>,
 }
 
 impl RightSidebar {
-    pub fn new(store: Entity<ChatStore>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Entity<ChatStore>,
+        picker: Entity<ModelPicker>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
         Self {
             store,
+            picker,
             mentions_open: true,
+            hovered_agent: None,
         }
     }
 }
+
+/// The status dot's diameter.
+const DOT: f32 = 8.;
 
 /// A mention row (`size::ROW`) plus the gap after it (`space::X1`).
 const MENTION_ROW: f32 = 36. + 4.;
@@ -62,8 +79,18 @@ impl Render for RightSidebar {
         let agents: Vec<_> = ws
             .agents
             .iter()
-            .map(|a| (a.brand, a.state, a.status_line()))
+            .map(|a| {
+                (
+                    a.id,
+                    a.name.clone(),
+                    a.brand,
+                    a.state,
+                    a.status_line(),
+                    a.removable,
+                )
+            })
             .collect();
+        let can_add = self.store.read(cx).has_core();
         let count = mention_rows.len();
         let open = self.mentions_open;
 
@@ -181,45 +208,105 @@ impl Render for RightSidebar {
             // like the left sidebar's settings row.
             .child(div().flex_1())
             // Agent status. Marks are monochrome: colour here only means
-            // state (the glow).
+            // state (the dot).
             .child(
                 section(&t)
-                    .gap(space::X2)
+                    .gap(space::X1)
                     .px(space::X1_5)
                     .pt(space::X3)
-                    .pb(space::X3)
+                    .pb(space::X1_5)
                     .child(
                         div()
                             .px(space::X2)
+                            .pb(space::X1)
                             .ellipsis()
                             .type_style(text::SMALL)
                             .font_weight(text::MEDIUM)
                             .text_color(t.ink_soft)
                             .child(truncated("Agent status")),
                     )
-                    .child(div().flex().flex_col().gap(space::X2).children(
-                        agents.chunks(4).enumerate().map(|(row, chunk)| {
-                            div()
-                                .flex()
-                                .gap(space::X1_5)
-                                .children(chunk.iter().enumerate().map(
-                                    |(col, (brand, state, label))| {
-                                        let glow = t.agent_state(*state);
-                                        pill(("agent", row * 4 + col), cx)
-                                            .flex_1()
-                                            .min_w_0()
-                                            .h(size::ROW_LG)
-                                            .justify_center()
-                                            // A filled tile, so the glow has
-                                            // something to pool under.
-                                            .bg(t.surface)
-                                            .shadow(t.glow_shadow(glow))
-                                            .tooltip(Tooltip::text(label.clone()))
-                                            .child(icon(brand_icon(*brand), icons::LG, t.ink))
-                                    },
-                                ))
-                        }),
-                    )),
+                    .child(
+                        div()
+                            .id("agent-rows")
+                            .flex()
+                            .flex_col()
+                            .gap(space::X0_5)
+                            .max_h(px(MENTION_ROW * 6.))
+                            .overflow_y_scroll()
+                            .children(agents.into_iter().map(
+                                |(id, name, brand, state, label, removable)| {
+                                    let hovered = self.hovered_agent == Some(id);
+                                    let dot = t.agent_state(state);
+                                    pill(("agent", id.0 as usize), cx)
+                                        .h(size::ROW)
+                                        .gap(space::X2)
+                                        .pl(space::X2)
+                                        .pr(space::X2)
+                                        .tooltip(Tooltip::text(label))
+                                        .on_hover(cx.listener(move |this, over: &bool, _, cx| {
+                                            let now = if *over { Some(id) } else { None };
+                                            if *over || this.hovered_agent == Some(id) {
+                                                this.hovered_agent = now;
+                                                cx.notify();
+                                            }
+                                        }))
+                                        .child(icon(brand_icon(brand), icons::MD, t.ink_soft))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .ellipsis()
+                                                .type_style(text::SMALL)
+                                                .child(truncated(SharedString::from(name))),
+                                        )
+                                        .when(hovered && removable, |row| {
+                                            row.child(
+                                                div()
+                                                    .id(("agent-remove", id.0 as usize))
+                                                    .flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .size(size::CHIP)
+                                                    .rounded(radius::SM)
+                                                    .hover(|s| s.bg(t.selected))
+                                                    .tooltip(Tooltip::text("Remove from this project"))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.hovered_agent = None;
+                                                        this.store.update(cx, |s, cx| {
+                                                            s.remove_agent(id, cx)
+                                                        });
+                                                    }))
+                                                    .child(icon(IconName::X, icons::SM, t.ink_soft)),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(DOT))
+                                                .rounded_full()
+                                                .bg(dot)
+                                                .shadow(t.glow_shadow(dot)),
+                                        )
+                                },
+                            )),
+                    )
+                    .when(can_add, |s| {
+                        s.child(
+                            pill("agent-add", cx)
+                                .h(size::ROW)
+                                .gap(space::X2)
+                                .px(space::X2)
+                                .text_color(t.ink_soft)
+                                .type_style(text::SMALL)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.picker.update(cx, |p, cx| p.open(window, cx));
+                                }))
+                                .child(icon(IconName::Plus, icons::MD, t.ink_soft))
+                                .child("Add a model"),
+                        )
+                    }),
             )
     }
 }

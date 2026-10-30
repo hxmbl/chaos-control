@@ -21,6 +21,7 @@ use crate::{
         GUTTER, LEFT_WIDTH, Panels, RIGHT_WIDTH, SIDE_INSET, Side, SideFrame, ToggleLeftSidebar,
         ToggleRightSidebar,
     },
+    model_picker::{ModelPicker, ModelPickerEvent},
     right_sidebar::RightSidebar,
     search::{FocusSearch, PILL_HEIGHT, Search, SearchEvent},
     sidebar::Sidebar,
@@ -64,6 +65,7 @@ pub struct Workspace {
     titlebar: Entity<Titlebar>,
     sidebar: Entity<Sidebar>,
     right_sidebar: Entity<RightSidebar>,
+    model_picker: Entity<ModelPicker>,
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
     /// Tracks keyboard focus anywhere inside each sidebar, so a peek holds
@@ -159,6 +161,19 @@ impl Workspace {
             SearchEvent::Action { .. } => {}
         });
 
+        // The model picker draws in the pane layer; Agent Status opens it.
+        let model_picker = cx.new(|cx| ModelPicker::new(store.clone(), window, cx));
+        let picker_changed = cx.observe(&model_picker, |_, _, cx| cx.notify());
+        let picker_events = cx.subscribe_in(
+            &model_picker,
+            window,
+            |this, _, event, window, cx| match event {
+                ModelPickerEvent::Dismissed => {
+                    this.composer.update(cx, |c, cx| c.focus(window, cx))
+                }
+            },
+        );
+
         // A launch-time project identity question (see `project.rs`) opens
         // straight away; the project shown until it's answered is the one
         // this folder had before.
@@ -171,7 +186,9 @@ impl Workspace {
             panels,
             search,
             sidebar: cx.new(|cx| Sidebar::new(store.clone(), pane.clone(), cx)),
-            right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), cx)),
+            right_sidebar: cx
+                .new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), cx)),
+            model_picker,
             conversation: cx.new(|cx| Conversation::new(store.clone(), pane.clone(), cx)),
             pane,
             composer,
@@ -184,6 +201,8 @@ impl Workspace {
                 pane_events,
                 pane_changed,
                 permissions,
+                picker_changed,
+                picker_events,
             ]
             .into_iter()
             .chain(focus_subscriptions)
@@ -354,8 +373,12 @@ impl Workspace {
     ) -> Option<impl IntoElement + use<>> {
         let (left, right, max_width) = pane_frame(viewport, left_space, right_space, column);
         let pane = self
-            .search
-            .update(cx, |s, cx| s.render_pane(max_width, window, cx))
+            .model_picker
+            .update(cx, |p, cx| p.render_pane(max_width, window, cx))
+            .or_else(|| {
+                self.search
+                    .update(cx, |s, cx| s.render_pane(max_width, window, cx))
+            })
             .or_else(|| {
                 self.pane
                     .update(cx, |p, cx| p.render_overlay(max_width, window, cx))
