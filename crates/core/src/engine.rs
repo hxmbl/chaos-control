@@ -57,6 +57,12 @@ pub enum CoreEvent {
     Read(Receipt),
     /// A permission request was sent, answered, auto-approved or used.
     Permission(PermissionRequest),
+    /// A harness reported the models it offers (from a live session); they
+    /// are cached in the store too.
+    Models {
+        harness: Arc<str>,
+        models: Vec<crate::harness::ModelInfo>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -247,6 +253,15 @@ impl Engine {
     ) -> rusqlite::Result<Channel> {
         self.store
             .tx(|c| store::ensure_channel(c, project, name, now))
+    }
+
+    /// Runs `f` in one store transaction (for host calls outside the
+    /// engine's own rules, such as the roster).
+    pub fn store_tx<T, E: From<rusqlite::Error>>(
+        &mut self,
+        f: impl FnOnce(&Connection) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.store.tx(f)
     }
 
     /// Makes `member` a member of `project`, which is what lets it join the
@@ -934,7 +949,43 @@ impl Engine {
         rt.phase = Phase::Open;
         rt.idle_since = Some(now);
         rt.runtime = info.agent_name.clone();
+        if let Some(note) = &info.model_note {
+            rt.note = Some(note.clone());
+        }
+        if !info.models.is_empty()
+            && let Ok(Some(mm)) = crate::roster::model_member(self.conn(), agent)
+        {
+            let saved = self.store.tx(|c| {
+                crate::roster::set_harness_models(c, &mm.harness, &info.models, now)
+            });
+            if saved.is_ok() {
+                self.effects.push(Effect::Event(CoreEvent::Models {
+                    harness: mm.harness.clone(),
+                    models: info.models.clone(),
+                }));
+            }
+        }
         self.publish_status(agent, channel);
+    }
+
+    /// Takes `member` off `project`'s roster and out of its channels (see
+    /// `roster::leave_project`). Returns the channels it left; the host
+    /// closes any session it had there.
+    pub fn leave_project(
+        &mut self,
+        now: Millis,
+        project: &ProjectId,
+        member: MemberId,
+    ) -> rusqlite::Result<Vec<ChannelId>> {
+        let channels = self.store.tx(|c| {
+            let channels = crate::roster::leave_project(c, project, member, now)?;
+            crate::roster::roster_remove(c, project, member)?;
+            Ok::<_, rusqlite::Error>(channels)
+        })?;
+        for ch in &channels {
+            self.rt.remove(&(member, *ch));
+        }
+        Ok(channels)
     }
 
     /// The host's session for agent x channel is gone (closed or exited).

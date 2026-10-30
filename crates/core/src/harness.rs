@@ -396,7 +396,7 @@ impl DetectEnv<'_> {
 }
 
 /// An installed harness and the exact command that starts it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Detected {
     pub preset: &'static HarnessPreset,
     /// The binary that showed it is installed.
@@ -449,6 +449,80 @@ fn launch_for(
         }
     };
     Some((command, args(p.launch.args)))
+}
+
+// ---------- adapters ----------
+
+/// Per-member knobs on top of the preset (from agents.json).
+#[derive(Clone, Debug)]
+pub struct AdapterOptions {
+    pub env: Vec<(String, String)>,
+    /// ACP only: append every frame as NDJSON (the replay-fixture format).
+    pub record: Option<PathBuf>,
+    /// ACP only: offer the v2 draft first.
+    pub acp_v2: bool,
+    pub chat_tools: crate::acp::ChatToolsPreference,
+}
+
+impl Default for AdapterOptions {
+    fn default() -> Self {
+        AdapterOptions {
+            env: Vec::new(),
+            record: None,
+            acp_v2: true,
+            chat_tools: crate::acp::ChatToolsPreference::Auto,
+        }
+    }
+}
+
+/// The adapter for one member: `command args` spoken over `transport`,
+/// running `model` (`None`: the harness default).
+pub fn adapter_for(
+    transport: Transport,
+    command: PathBuf,
+    args: Vec<String>,
+    model: Option<Arc<str>>,
+    opts: AdapterOptions,
+) -> Arc<dyn crate::adapter::AgentAdapter> {
+    match transport {
+        Transport::Acp => Arc::new(
+            crate::acp::AcpAdapter::new(Arc::new(crate::acp::SpawnTransport {
+                command,
+                args,
+                env: opts.env,
+                record: opts.record,
+            }))
+            .prefer_v2(opts.acp_v2)
+            .chat_tools(opts.chat_tools)
+            .model(model),
+        ),
+        Transport::CodexAppServer => Arc::new(
+            crate::codex::CodexAdapter::new(Arc::new(crate::codex::CodexSpawn {
+                command,
+                args,
+                env: opts.env,
+            }))
+            .chat_tools(opts.chat_tools)
+            .model(model),
+        ),
+    }
+}
+
+impl Detected {
+    /// This harness's adapter for one of its models.
+    pub fn adapter(
+        &self,
+        model: Option<Arc<str>>,
+        opts: AdapterOptions,
+    ) -> Arc<dyn crate::adapter::AgentAdapter> {
+        adapter_for(
+            self.preset.transport,
+            self.command.clone(),
+            self.args.clone(),
+            model,
+            opts,
+        )
+    }
 }
 
 // ---------- models ----------
