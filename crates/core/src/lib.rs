@@ -18,6 +18,7 @@ mod acp_v2;
 pub mod adapter;
 pub mod engine;
 pub mod fake;
+pub mod harness;
 pub mod host;
 pub mod mcp;
 pub mod notify;

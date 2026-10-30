@@ -95,6 +95,8 @@ pub enum Brand {
     Mistral,
     Opencode,
     Pi,
+    Gemini,
+    Cursor,
 }
 
 #[derive(Clone, Debug)]
