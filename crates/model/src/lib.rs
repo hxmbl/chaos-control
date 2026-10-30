@@ -95,6 +95,8 @@ pub enum Brand {
     Mistral,
     Opencode,
     Pi,
+    Gemini,
+    Cursor,
 }
 
 #[derive(Clone, Debug)]
@@ -106,14 +108,23 @@ pub struct Agent {
     /// One line from the runtime for the Agent Status tooltip ("running tests",
     /// "request pending: rm -rf build/ (#3)"). Never part of the chat log.
     pub presence: Option<Arc<str>>,
+    /// The harness it runs through ("Codex", "fx"), when it is a model
+    /// member. `brand` is that harness's mark.
+    pub harness: Option<Arc<str>>,
+    /// On the project's roster, so the user can remove it from Agent Status.
+    pub removable: bool,
 }
 
 impl Agent {
     /// "Claude Code: Active · running tests", for the Agent Status tooltip.
     pub fn status_line(&self) -> String {
+        let who = match &self.harness {
+            Some(h) => format!("{} via {h}", self.name),
+            None => self.name.to_string(),
+        };
         match &self.presence {
-            Some(p) if !p.is_empty() => format!("{}: {} · {}", self.name, self.state.label(), p),
-            _ => format!("{}: {}", self.name, self.state.label()),
+            Some(p) if !p.is_empty() => format!("{who}: {} · {}", self.state.label(), p),
+            _ => format!("{who}: {}", self.state.label()),
         }
     }
 }

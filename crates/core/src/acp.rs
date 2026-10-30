@@ -55,6 +55,7 @@ use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::adapter::*;
+use crate::harness::ModelInfo;
 use crate::permission::{
     OptionKind, PermissionAsk, PermissionVerdict, pick_allow, pick_decline, sent_meta,
 };
@@ -167,6 +168,9 @@ pub struct AcpAdapter {
     chat_tools: ChatToolsPreference,
     /// The version the agent selected last time (1 or 2).
     negotiated: Mutex<Option<u16>>,
+    /// The model member's model, chosen through the session's model config
+    /// option after `session/new`. `None` runs the harness default.
+    model: Option<Arc<str>>,
 }
 
 impl AcpAdapter {
@@ -176,7 +180,15 @@ impl AcpAdapter {
             prefer_v2: true,
             chat_tools: ChatToolsPreference::Auto,
             negotiated: Mutex::new(None),
+            model: None,
         }
+    }
+
+    /// Runs sessions on `model` (the harness's own id), set through ACP's
+    /// `session/set_config_option` on the session's model option.
+    pub fn model(mut self, model: Option<Arc<str>>) -> Self {
+        self.model = model;
+        self
     }
 
     pub fn prefer_v2(mut self, yes: bool) -> Self {
@@ -208,7 +220,14 @@ impl AgentAdapter for AcpAdapter {
         Box::pin(async move {
             let cached = self.negotiated_version();
             if self.prefer_v2 && cached != Some(1) {
-                match crate::acp_v2::open(self.transport.connect()?, &req, self.chat_tools).await {
+                match crate::acp_v2::open(
+                    self.transport.connect()?,
+                    &req,
+                    self.chat_tools,
+                    self.model.clone(),
+                )
+                .await
+                {
                     Ok(session) => {
                         *self.negotiated.lock().expect("lock") = Some(2);
                         return Ok(session);
@@ -219,11 +238,204 @@ impl AgentAdapter for AcpAdapter {
                     Err(V2Open::Failed(e)) => return Err(e),
                 }
             }
-            let session = open_v1(self.transport.connect()?, req, self.chat_tools).await?;
+            let session = open_v1(
+                self.transport.connect()?,
+                req,
+                self.chat_tools,
+                self.model.clone(),
+            )
+            .await?;
             *self.negotiated.lock().expect("lock") = Some(1);
             Ok(session)
         })
     }
+
+    fn list_models(
+        &self,
+        cwd: PathBuf,
+    ) -> BoxFuture<'_, Option<Result<Vec<ModelInfo>, AgentError>>> {
+        Box::pin(async move {
+            let transport = match self.transport.connect() {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e)),
+            };
+            let found = tokio::time::timeout(DISCOVERY_TIMEOUT, discover_v1(transport, cwd))
+                .await
+                .unwrap_or_else(|_| {
+                    Err(AgentError::new(
+                        AgentErrorKind::Transport,
+                        "no answer while listing models",
+                    ))
+                });
+            Some(found)
+        })
+    }
+}
+
+/// How long model discovery may take before the picker keeps the preset list.
+const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+// ---------- models (session config options) ----------
+
+/// The session's model selector, read from ACP `configOptions` (v1 and the
+/// v2 draft share the JSON shape, so both are read through serde).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModelOption {
+    pub config_id: String,
+    pub current: Option<String>,
+    pub models: Vec<ModelInfo>,
+}
+
+/// The `select` option with category `model`, else the one with id `model`
+/// (fx names it that way). Grouped options are flattened in order.
+pub(crate) fn model_option(config_options: &serde_json::Value) -> Option<ModelOption> {
+    let all = config_options.as_array()?;
+    let is_select =
+        |o: &&serde_json::Value| o.get("type").and_then(|t| t.as_str()) == Some("select");
+    let pick = all
+        .iter()
+        .filter(is_select)
+        .find(|o| o.get("category").and_then(|c| c.as_str()) == Some("model"))
+        .or_else(|| {
+            all.iter()
+                .filter(is_select)
+                .find(|o| o.get("id").and_then(|c| c.as_str()) == Some("model"))
+        })?;
+    let mut models = Vec::new();
+    let mut push = |o: &serde_json::Value| {
+        if let Some(value) = o.get("value").and_then(|v| v.as_str()) {
+            let name = o.get("name").and_then(|v| v.as_str()).unwrap_or(value);
+            models.push(ModelInfo::new(Some(value), name));
+        }
+    };
+    for o in pick.get("options")?.as_array()? {
+        match o.get("options").and_then(|g| g.as_array()) {
+            Some(group) => group.iter().for_each(&mut push),
+            None => push(o),
+        }
+    }
+    Some(ModelOption {
+        config_id: pick.get("id")?.as_str()?.to_string(),
+        current: pick
+            .get("currentValue")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        models,
+    })
+}
+
+/// What to do about a member's model once `session/new` answered.
+pub(crate) enum ModelPlan {
+    /// Send `session/set_config_option` with these; `fallback` is the
+    /// current model if that fails.
+    Set {
+        config_id: String,
+        value: Arc<str>,
+        fallback: Option<Arc<str>>,
+    },
+    Keep {
+        current: Option<Arc<str>>,
+        applied: Result<(), String>,
+    },
+}
+
+pub(crate) fn plan_model(want: Option<&Arc<str>>, offered: Option<&ModelOption>) -> ModelPlan {
+    let current = offered.and_then(|o| o.current.as_deref()).map(Arc::from);
+    match (want, offered) {
+        (Some(want), Some(opt)) if opt.models.iter().any(|m| m.id.as_deref() == Some(&**want)) => {
+            if opt.current.as_deref() == Some(&**want) {
+                return ModelPlan::Keep {
+                    current,
+                    applied: Ok(()),
+                };
+            }
+            ModelPlan::Set {
+                config_id: opt.config_id.clone(),
+                value: want.clone(),
+                fallback: current,
+            }
+        }
+        (Some(_), None) => ModelPlan::Keep {
+            current: None,
+            applied: Err("it has no model option".into()),
+        },
+        _ => ModelPlan::Keep {
+            current,
+            applied: Ok(()),
+        },
+    }
+}
+
+/// Initialize, open a session with no chat tools, read its model option and
+/// close it again.
+async fn discover_v1(
+    transport: DynConnectTo<Client>,
+    cwd: PathBuf,
+) -> Result<Vec<ModelInfo>, AgentError> {
+    let (tx, rx) = oneshot::channel::<Result<Vec<ModelInfo>, AgentError>>();
+    let tx = Arc::new(Mutex::new(Some(tx)));
+    let send = move |r| {
+        if let Some(tx) = tx.lock().expect("lock").take() {
+            let _ = tx.send(r);
+        }
+    };
+    let send_main = send.clone();
+    let result = Client
+        .builder()
+        .name("chaos-control")
+        .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
+            let init = conn
+                .send_request(
+                    v1::InitializeRequest::new(ProtocolVersion::V1)
+                        .client_capabilities(v1::ClientCapabilities::new())
+                        .client_info(v1::Implementation::new(
+                            "chaos-control",
+                            env!("CARGO_PKG_VERSION"),
+                        )),
+                )
+                .block_task()
+                .await;
+            if let Err(e) = init {
+                send_main(Err(AgentError::new(
+                    error_kind(&e),
+                    format!("initialize: {e}"),
+                )));
+                return Ok(());
+            }
+            let new = match conn
+                .send_request(v1::NewSessionRequest::new(cwd))
+                .block_task()
+                .await
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    send_main(Err(AgentError::new(
+                        error_kind(&e),
+                        format!("session/new: {e}"),
+                    )));
+                    return Ok(());
+                }
+            };
+            let options = serde_json::to_value(&new.config_options).unwrap_or_default();
+            let models = model_option(&options).map(|m| m.models).unwrap_or_default();
+            // Best effort: agents without session/close just exit with us.
+            let _ = conn
+                .send_request(v1::CloseSessionRequest::new(new.session_id.clone()))
+                .block_task()
+                .await;
+            send_main(Ok(models));
+            Ok(())
+        })
+        .await;
+    send(Err(AgentError::new(
+        AgentErrorKind::Spawn,
+        match result {
+            Err(e) => format!("{e}"),
+            Ok(()) => "agent exited while listing models".into(),
+        },
+    )));
+    rx.await
+        .unwrap_or_else(|_| Err(AgentError::new(AgentErrorKind::Transport, "agent exited")))
 }
 
 /// Outcome of trying the v2 draft.
@@ -464,13 +676,14 @@ async fn open_v1(
     transport: DynConnectTo<Client>,
     req: OpenSession,
     pref: ChatToolsPreference,
+    model: Option<Arc<str>>,
 ) -> Result<Arc<dyn AgentSession>, AgentError> {
     let (ready_tx, ready_rx) = oneshot::channel::<Result<SessionInfo, AgentError>>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let tracker = Arc::new(Mutex::new(Tracker::default()));
     let events = req.events.clone();
     tokio::spawn(run_v1(
-        transport, req, pref, tracker, cmd_rx, ready_tx, events,
+        transport, req, pref, model, tracker, cmd_rx, ready_tx, events,
     ));
     let info = ready_rx
         .await
@@ -478,10 +691,12 @@ async fn open_v1(
     Ok(Arc::new(AcpSession { info, cmd: cmd_tx }))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_v1(
     transport: DynConnectTo<Client>,
     req: OpenSession,
     pref: ChatToolsPreference,
+    model: Option<Arc<str>>,
     tracker: Arc<Mutex<Tracker>>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: oneshot::Sender<Result<SessionInfo, AgentError>>,
@@ -613,7 +828,35 @@ async fn run_v1(
                 }
             };
             let session_id = new.session_id.clone();
+            let options = serde_json::to_value(&new.config_options).unwrap_or_default();
+            let offered = model_option(&options);
+            let (current, applied) = match plan_model(model.as_ref(), offered.as_ref()) {
+                ModelPlan::Set {
+                    config_id,
+                    value,
+                    fallback,
+                } => {
+                    let set = conn
+                        .send_request(v1::SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            config_id,
+                            v1::SessionConfigValueId::new(value.clone()),
+                        ))
+                        .block_task()
+                        .await;
+                    match set {
+                        Ok(_) => (Some(value), Ok(())),
+                        Err(e) => (fallback, Err(format!("{e}"))),
+                    }
+                }
+                ModelPlan::Keep { current, applied } => (current, applied),
+            };
+            let models = offered.map(|o| o.models).unwrap_or_default();
+            let model_note = model_outcome(model.as_deref(), &models, applied);
             let info = SessionInfo {
+                model: current,
+                models,
+                model_note,
                 caps,
                 protocol: Arc::from("acp/v1"),
                 native_ref: Arc::from(session_id.to_string()),

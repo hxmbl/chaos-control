@@ -199,6 +199,7 @@ pub(crate) async fn open(
     transport: DynConnectTo<Client>,
     req: &OpenSession,
     pref: ChatToolsPreference,
+    model: Option<Arc<str>>,
 ) -> Result<Arc<dyn AgentSession>, V2Open> {
     let (ready_tx, ready_rx) = oneshot::channel::<Ready>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -208,7 +209,7 @@ pub(crate) async fn open(
     let endpoint = req.chat_tools.clone();
     let gate = req.permissions.clone();
     tokio::spawn(run(
-        transport, cwd, endpoint, pref, tracker, cmd_rx, ready_tx, events, gate,
+        transport, cwd, endpoint, pref, model, tracker, cmd_rx, ready_tx, events, gate,
     ));
     match ready_rx.await {
         Ok(Ready::Session(info)) => Ok(Arc::new(V2Session { info, cmd: cmd_tx })),
@@ -227,6 +228,7 @@ async fn run(
     cwd: std::path::PathBuf,
     endpoint: ChatToolsEndpoint,
     pref: ChatToolsPreference,
+    model: Option<Arc<str>>,
     tracker: Arc<Mutex<Tracker>>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: oneshot::Sender<Ready>,
@@ -401,7 +403,36 @@ async fn run(
                 }
             };
             let session_id = new.session_id.clone();
+            let options = serde_json::to_value(&new.config_options).unwrap_or_default();
+            let offered = crate::acp::model_option(&options);
+            let (current, applied) = match crate::acp::plan_model(model.as_ref(), offered.as_ref())
+            {
+                crate::acp::ModelPlan::Set {
+                    config_id,
+                    value,
+                    fallback,
+                } => {
+                    let set = conn
+                        .send_request(v2::SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            config_id,
+                            v2::SessionConfigValueId::new(value.clone()),
+                        ))
+                        .block_task()
+                        .await;
+                    match set {
+                        Ok(_) => (Some(value), Ok(())),
+                        Err(e) => (fallback, Err(format!("{e}"))),
+                    }
+                }
+                crate::acp::ModelPlan::Keep { current, applied } => (current, applied),
+            };
+            let models = offered.map(|o| o.models).unwrap_or_default();
+            let model_note = crate::adapter::model_outcome(model.as_deref(), &models, applied);
             send_ready(Ready::Session(SessionInfo {
+                model: current,
+                models,
+                model_note,
                 caps,
                 protocol: Arc::from("acp/v2-draft"),
                 native_ref: Arc::from(session_id.to_string()),

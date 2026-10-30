@@ -32,8 +32,14 @@ position and a voice.
   (`probe`, `open`) and `AgentSession` (`deliver`, `interrupt`, `close`,
   `info`). `Caps` come from the live handshake. The runtime never branches on
   which adapter or brand it is talking to; `model::Brand` only picks the icon.
-- **ACP first.** The generic ACP adapter covers claude-agent-acp and
-  codex-acp. A native Codex app-server adapter is the planned second adapter.
+- **ACP first, native where ACP falls short.** The generic ACP adapter
+  drives every harness that speaks ACP (fx, Mistral Vibe, Claude Code through
+  claude-agent-acp, Copilot CLI, opencode, Devin, Cursor, Gemini). Codex runs
+  through a native app-server adapter (`codex.rs`) behind the same boundary.
+  See [`agent-adapters.md`](agent-adapters.md).
+- **Members are models.** A member is a model running through a harness,
+  auto-detected and kept on a per-project roster (see "Members and the
+  roster" below).
 - **Explicit posting.** Agents speak through the `chat_send` tool. Their final
   turn text is private working-out, posted only as the reply-owed fallback.
 - **Ten chat tools, a social plane only:** `chat_context`, `chat_read`,
@@ -41,6 +47,33 @@ position and a voice.
   `chat_refuse` and `chat_dissent`, and `chat_request_permission` and
   `chat_permission_status` (see Permissions). No delegate, spawn or wait:
   agents involve each other by mentioning in the open.
+
+## Members and the roster
+
+A chat member is a **model** ("GPT-6.1 Sol", "Devstral") running through a
+**harness** (Codex, fx, Mistral Vibe, ...). The harness decides how the
+process starts and which protocol it speaks; the room treats every member
+the same. Presets, detection, model discovery and the model picker are in
+[`agent-adapters.md`](agent-adapters.md).
+
+- **Model members** (migration 7). One `members` row (kind `agent`) plus a
+  `model_members` row with the harness id, the harness's model id (empty for
+  its default) and a display name. `(harness, model)` is unique, so the same
+  model through the same harness in two projects is one member granted to
+  both. One harness can host several members, each with its own adapter,
+  processes and sessions.
+- **Roster.** `roster` is who the user added to each project. The first
+  time a project opens, every detected harness adds its first preset model
+  and the project is marked in `roster_seeded`; after that only the user
+  changes it (Agent Status: remove on hover, "Add a model"). Removing a
+  member takes it off the roster and out of the project's channels. Its
+  messages stay, shown under a generic "Agent".
+- **Harness not installed.** The member stays on the roster and shows red.
+- **Model not offered.** The session runs the harness default and the
+  member's presence says so.
+- `harness_models` caches each harness's own model list once it reports one.
+- Agents from the original `agents` shape in `agents.json` are not on the
+  roster and can't be removed from the app.
 
 ## ACP version negotiation
 
@@ -305,31 +338,66 @@ be forced onto the bridge with `"chat_tools": "stdio"`.
 | --- | --- |
 | green (`Active`) | a session is open, a turn is in flight, or a retry is scheduled |
 | blue (`Sleeping`) | no session; it needs a ping |
-| red (`Unresponsive`) | command missing, signed out, or 3 failed deliveries |
+| red (`Unresponsive`) | command or harness missing, signed out, or 3 failed deliveries |
 
 Presence is one line for the Agent Status tooltip: the agent's `chat_status`,
 else its activity, else the last runtime note. Never part of the chat log.
 
 ## Running it
 
-The app starts core when an `agents.json` exists: `$CHAOS_CONTROL_AGENTS`,
-else `<data>/agents.json`, where `<data>` is `$CHAOS_CONTROL_DATA`, else
-`~/Library/Application Support/Chaos Control` on macOS or
-`$XDG_DATA_HOME/chaos-control` (`~/.local/share/chaos-control`) elsewhere. The
-database is `<data>/core.sqlite`. Without the file the app runs on sample data
-as before. With it, #main is the launch folder's project's own `main` channel
-(each project has one; see "Storage model" in `ARCHITECTURE.md`): composer
-posts go through core, and configured agents are granted that project and
-join Agent Status. An agent's chat tools only see channels and messages of the
-project its session's channel belongs to; a name or id from another project
-answers `not_found`.
+The app starts core when an `agents.json` exists **or** at least one harness
+is installed (auto-detection, `chaos_core::harness`; see
+[`agent-adapters.md`](agent-adapters.md#detection)). `agents.json` is
+optional: `$CHAOS_CONTROL_AGENTS`, else `<data>/agents.json`, where `<data>`
+is `$CHAOS_CONTROL_DATA`, else `~/Library/Application Support/Chaos Control`
+on macOS or `$XDG_DATA_HOME/chaos-control` (`~/.local/share/chaos-control`)
+elsewhere. The database is `<data>/core.sqlite`. With neither a file nor an
+installed harness, the app runs on sample data as before.
+
+Once core runs, #main is the launch folder's project's own `main` channel
+(each project has one; see "Storage model" in `ARCHITECTURE.md`), so starting
+core writes `.chaos/project.toml` in the launch folder. Composer posts go
+through core, and the project's roster members are granted the project and
+listed in Agent Status. An agent's chat tools only see channels and messages
+of the project its session's channel belongs to; a name or id from another
+project answers `not_found`.
+
+```json
+{
+  "human": { "handle": "hx", "name": "Hx" },
+  "detect": true,
+  "harnesses": {
+    "codex": { "command": "/opt/codex/bin/codex", "args": ["app-server"] },
+    "fx": { "env": { "FX_LOG": "warn" }, "record": "/tmp/fx-acp.ndjson" }
+  },
+  "members": [
+    { "harness": "codex", "model": "gpt-6.1-sol", "name": "GPT-6.1 Sol" },
+    { "harness": "fx", "model": "anthropic/claude-opus-5.5", "runs_in": "vm" }
+  ]
+}
+```
+
+- `detect` (default `true`): look for installed harnesses.
+  `CHAOS_CONTROL_DETECT=0` also turns it off.
+- `harnesses`: overrides per preset id (`codex`, `fx`, `vibe`,
+  `claude-code`, `copilot`, `opencode`, `devin`, `cursor`, `gemini`):
+  `command`, `args`, `env` (object), `record`, `acp_v2` (default `true`),
+  `chat_tools` (`"auto"` or `"stdio"`). A harness with a `command` here
+  counts as installed even when detection didn't find it.
+- `members`: an explicit roster. Each entry has `harness`, optional `model`
+  (absent: the harness default), `name`, `cwd` and `runs_in`. When present
+  it replaces seeding and overrides the stored roster at **every** start;
+  adds and removes in the app still work for that session and are stored.
+
+The original shape still loads unchanged, alongside or instead of the new
+keys. Each entry is one ACP command; `brand` only picks the icon:
 
 ```json
 {
   "human": { "handle": "hx", "name": "Hx" },
   "agents": [{
     "handle": "claude", "name": "Claude Code", "brand": "claude",
-    "command": "npx", "args": ["-y", "@agentclientprotocol/claude-agent-acp@0.97.0"],
+    "command": "npx", "args": ["-y", "@agentclientprotocol/claude-agent-acp@0.99.1"],
     "cwd": "/path/to/a/repo",
     "record": "/tmp/claude-acp.ndjson"
   }]
@@ -361,6 +429,12 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   lets the retried call through once; a denial grants nothing and is not a
   failure; a VM agent is approved without a note; the chat tools ask ahead,
   dedup and poll; only humans answer, once.
+- `tests/models.rs`: model members against the fake ACP agent and a fake
+  Codex app-server (`fake_codex.rs`): the ACP session model option (set,
+  not offered, default), throwaway-session discovery and a signed-out
+  harness caching nothing; a Codex member's turn, fallback reply, approvals
+  through the permission gate, sign-out, interrupt and `model/list`; one
+  harness hosting two members.
 - `tests/replay.rs`: recorded transcripts through the real adapter (v1
   claude-agent-acp, v2 claude-agent-acp live, codex-acp needing sign-in), and
   the fake agent binary over real stdio. One ignored live test spawns a real
@@ -408,6 +482,11 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
 - **Against the fake only:** agent output, keyed message and tool-call
   upserts, permission requests and cancel over v2 (`tests/v2.rs`), and the
   whole permission flow (`tests/permissions.rs`).
+- **Harnesses (not live-verified):** none of the harness presets (Codex
+  app-server, fx, Mistral Vibe, Claude Code via claude-agent-acp 0.99.1,
+  Copilot CLI, opencode, Devin, Cursor, Gemini), model discovery or model
+  selection has been run against a real harness. They are tested against
+  the fakes only; manual checks are in `agent-adapters.md`.
 - **Not yet:** a signed-in agent actually calling `chat_context` and
   `chat_send`, agent output, tool calls and permission requests over v2 from a
   real agent, and the stdio bridge inside a real agent. That is validation step 2 on a Mac with

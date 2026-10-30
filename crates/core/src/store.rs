@@ -291,6 +291,38 @@ CREATE INDEX permission_requests_by_agent
 CREATE INDEX permission_requests_by_channel
     ON permission_requests (channel_id, state);
 "#,
+    // 7: model members. A chat member is a model running through a harness
+    // (see `harness`); `model_members` says which, `roster` is who the user
+    // added to each project, `roster_seeded` marks projects whose roster was
+    // filled from auto-detection once (after that it is the user's), and
+    // `harness_models` caches each harness's own model list.
+    r#"
+CREATE TABLE model_members (
+    member_id   INTEGER PRIMARY KEY REFERENCES members(id),
+    harness     TEXT NOT NULL,
+    model       TEXT NOT NULL DEFAULT '',
+    model_name  TEXT NOT NULL,
+    UNIQUE (harness, model)
+);
+CREATE TABLE roster (
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    member_id   INTEGER NOT NULL REFERENCES model_members(member_id),
+    added_at    INTEGER NOT NULL,
+    PRIMARY KEY (project_id, member_id)
+);
+CREATE TABLE roster_seeded (
+    project_id  TEXT PRIMARY KEY NOT NULL REFERENCES projects(id),
+    seeded_at   INTEGER NOT NULL
+);
+CREATE TABLE harness_models (
+    harness  TEXT NOT NULL,
+    ord      INTEGER NOT NULL,
+    model    TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    seen_at  INTEGER NOT NULL,
+    PRIMARY KEY (harness, model)
+);
+"#,
 ];
 
 pub struct Store {
@@ -715,7 +747,7 @@ pub fn rename_channel(c: &Connection, id: ChannelId, name: &str) -> Result<bool>
     )? == 1)
 }
 
-fn member_from_row(r: &Row<'_>) -> Result<Member> {
+pub(crate) fn member_from_row(r: &Row<'_>) -> Result<Member> {
     let kind: String = r.get(1)?;
     Ok(Member {
         id: MemberId(r.get(0)?),

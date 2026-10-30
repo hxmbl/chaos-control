@@ -44,10 +44,11 @@ both through `CoreEvent::Agent`; presence is never part of the chat log.
 
 ## Agents
 
-When an `agents.json` exists, `main.rs` starts `chaos-core` in-process on its
-own two-thread tokio runtime (`agents::start`), works out the launch folder's
-project (see Storage model below) and hands the link to
-`ChatStore::attach_core`. From then on the sidebar shows that project's
+When an `agents.json` exists **or** any known harness is installed
+(auto-detection, `chaos_core::harness`), `main.rs` starts `chaos-core`
+in-process on its own two-thread tokio runtime (`agents::start`), works out
+the launch folder's project (see Storage model below) and hands the link to
+`ChatStore::attach_core`. No hand-written `agents.json` is needed. From then on the sidebar shows that project's
 channels from core and #main is the project's own `main` channel:
 
 - composer posts in #main go to `Core::post` and appear when core reports them
@@ -57,6 +58,12 @@ channels from core and #main is the project's own `main` channel:
   `ReplyRef`) and glow/presence onto the agent's pill;
 - history is loaded once at attach and deduplicated against the event stream
   by core message id;
+- members are models running through a harness (Codex, fx, Mistral Vibe,
+  Claude Code, ...): the project's roster is seeded once from the detected
+  harnesses and then edited in Agent Status (remove on hover, "Add a model"
+  opens the model picker in the pane layer, `model_picker.rs`). Presets,
+  detection, model discovery and the picker are in
+  [docs/agent-adapters.md](docs/agent-adapters.md);
 - the same binary is the stdio MCP bridge for agents that can't take HTTP:
   `chaos-control mcp-bridge` (URL and token in its environment).
 
@@ -75,7 +82,8 @@ channels; each channel is a persistent group conversation.
 | --- | --- | --- |
 | Project id (UUID) and display name | `<folder>/.chaos/project.toml` | n/a |
 | Projects, channels, messages, project and channel membership, cursors, delivery state, sessions | `<data>/core.sqlite` | project UUID, channel id |
-| Agent definitions (command, model, persona) | `<data>/agents.json` | handle (global) |
+| Model members (harness + model) and each project's roster, harness model lists | `<data>/core.sqlite` (migration 7) | member id, project UUID |
+| Optional overrides: harness commands, an explicit roster, original-shape agents | `<data>/agents.json` | harness id / handle (global) |
 
 `<data>` is the app data directory (see Agents above). The file holds nothing
 else, so no chat state ever lands in a repository, and agents working in the
@@ -88,7 +96,8 @@ id = "0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59"
 name = "starpoint"
 ```
 
-**Ownership.** Agents (`members`) are global. Membership is per project
+**Ownership.** Agents (`members`) are global; a model member is one per
+`(harness, model)`. Membership is per project
 (`project_members`) and per channel (`memberships`). Channels belong to one
 project: names are unique within it (two projects can each have a #main), and
 each channel has a per-project ordinal, its `::N`. Cursors, batches, triggers,
@@ -165,7 +174,8 @@ Permissions are enforced in core, not by where files sit:
   inside its session's project; anything else answers `not_found`;
 - granting is explicit and only the host does it (`Core::human`,
   `Core::add_agent`, `Core::join_project`); the app grants the person at the
-  keyboard and the agents in `agents.json` the launch project.
+  keyboard and the launch project's roster members (plus any original-shape
+  `agents.json` agents) the launch project.
 
 **Git.** `.chaos/` is appended once to the repository's `.git/info/exclude`
 (found by walking up; a worktree's `.git` file is followed to the common git
