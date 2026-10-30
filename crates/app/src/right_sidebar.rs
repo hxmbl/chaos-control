@@ -306,8 +306,16 @@ impl Render for RightSidebar {
                                 .px(space::X2)
                                 .text_color(t.ink_soft)
                                 .type_style(text::SMALL)
+                                // A second click closes the picker rather
+                                // than wiping what was typed in it.
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.picker.update(cx, |p, cx| p.open(window, cx));
+                                    this.picker.update(cx, |p, cx| {
+                                        if p.is_open() {
+                                            p.close(cx)
+                                        } else {
+                                            p.open(window, cx)
+                                        }
+                                    });
                                 }))
                                 .child(icon(IconName::Plus, icons::MD, t.ink_soft))
                                 .child("Add a model"),
