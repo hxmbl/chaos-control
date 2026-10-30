@@ -227,13 +227,12 @@ impl ModelPicker {
         }
         let eased = 1. - (1. - progress).powi(3);
 
-        let this = cx.entity();
         let field = div()
             .w_full()
             .key_context(KEY_CONTEXT)
-            .on_action(window.listener_for(&this, Self::select_next))
-            .on_action(window.listener_for(&this, Self::select_previous))
-            .on_action(window.listener_for(&this, Self::dismiss))
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::dismiss))
             .child(self.input.clone());
         let header = div()
             .flex()
