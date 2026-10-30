@@ -396,7 +396,7 @@ impl DetectEnv<'_> {
 }
 
 /// An installed harness and the exact command that starts it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Detected {
     pub preset: &'static HarnessPreset,
     /// The binary that showed it is installed.
