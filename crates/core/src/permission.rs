@@ -21,6 +21,16 @@
 //!
 //! Peer model: a declined or denied request is an answer, not a failure. It
 //! never turns an agent red or fails its turn.
+//!
+//! **Reads are always allowed.** A native request for a read-only tool call
+//! (ACP tool kind `read` or `search`) is answered with the agent's allow-once
+//! option straight away, wherever the agent runs, and nothing is recorded:
+//! agents get full access for reading files. Everything else (running
+//! commands, editing, deleting, moving, fetching, an unknown or missing
+//! kind) goes the way above: approved in a VM, else declined at once with a
+//! message saying why and that a human was asked. Codex has no read requests
+//! to answer; its sessions start in a read-only sandbox instead (see
+//! `codex.rs`).
 
 use std::{fmt, sync::Arc};
 
@@ -151,6 +161,9 @@ pub struct PermissionAsk {
     pub turn: Option<BatchId>,
     pub title: Arc<str>,
     pub detail: Option<Arc<str>>,
+    /// The tool call only reads (ACP tool kind `read` or `search`). Reads are
+    /// always allowed; a missing kind is not a read.
+    pub read_only: bool,
 }
 
 /// How the adapter must answer a native permission request, right away.
@@ -158,6 +171,9 @@ pub struct PermissionAsk {
 pub enum PermissionVerdict {
     /// Pick the agent's own allow-once option (VM agent, or a human's grant).
     Allow { request: PermissionId },
+    /// Pick the agent's own allow-once option for a read-only tool call.
+    /// Reads are always allowed and not recorded.
+    AllowRead,
     /// Pick the agent's own decline ("not now") option; the request went to
     /// the humans and the answer arrives later.
     Sent { request: PermissionId },
@@ -212,10 +228,18 @@ pub fn sent_meta(request: PermissionId) -> serde_json::Map<String, Value> {
 
 fn sent_message(request: PermissionId) -> String {
     format!(
-        "Not now: Chaos Control sent this to the humans as permission request #{request}. \
-Carry on with something else or wait. The answer arrives as a message in a later turn \
-(chat_permission_status shows it); once approved, retry the same call and it goes through once."
+        "Declined for now: in Chaos Control you can read files freely, but running commands \
+and editing, moving or deleting files need a human's approval. This one was sent to the humans \
+as permission request #{request}. Don't wait for it: carry on with what you can do by reading, \
+or say in the chat what you would change. If a human approves, the answer arrives as a message \
+in a later turn (chat_permission_status shows it); then retry the same call and it goes through once."
     )
+}
+
+/// Whether an ACP tool kind (as its wire string: `read`, `search`, ...) only
+/// reads. Reads are always allowed; everything else needs approval.
+pub fn is_read_only_kind(kind: &str) -> bool {
+    matches!(kind, "read" | "search")
 }
 
 // ---------- picking the agent's own option ----------
@@ -556,6 +580,10 @@ impl Engine {
         channel: ChannelId,
         ask: PermissionAsk,
     ) -> PermissionVerdict {
+        if ask.read_only {
+            self.rt_note(agent, channel, format!("reading: {}", short(&ask.title)));
+            return PermissionVerdict::AllowRead;
+        }
         match self.ask_permission(
             now,
             agent,

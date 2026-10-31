@@ -73,9 +73,10 @@ Pi was dropped.
   through `npx` (pinned to 0.99.1), which needs Node. With neither
   `claude-agent-acp` nor `npx`, Claude Code counts as not installed.
 
-Chaos Control never overrides a harness's approval, sandbox or mode
-settings (fx's ask/code modes included). The only thing added to a session
-is the chat MCP server.
+Chaos Control adds the chat MCP server to every session and otherwise
+leaves a harness's own settings alone (fx's ask/code modes included), with
+one exception: Codex threads start in its read-only sandbox (below, under
+"Permissions").
 
 ## Detection
 
@@ -103,16 +104,19 @@ is detected. Starting core opens the launch folder's project, which writes
 `.chaos/project.toml` there (see "Storage model" in `ARCHITECTURE.md`).
 With neither, the app runs on sample data as before.
 
-### Seeding a project's roster
+### The roster
 
-The first time a project opens, every detected harness adds one member: its
-first preset model (for Codex and Claude Code that is the harness default).
-The project is then marked seeded (`roster_seeded`), and from then on only
-the user changes the roster, in Agent Status. A member whose harness is no
-longer installed stays on the roster and shows red.
+The roster is `agents.json`'s `members` list, loaded at every start and
+written back by the app whenever a model is added or removed (the full
+rules are in [`agents.md`](agents.md#running-it)). With no `members` yet,
+the first project to open seeds it: every detected harness adds one member,
+its first preset model (for Codex and Claude Code that is the harness
+default), or the roster core kept from an earlier build is carried over.
 
-An explicit `members` list in `agents.json` replaces seeding and is applied
-at every start.
+A member whose harness isn't installed is left out of the room: it isn't in
+Agent Status and can't be woken. It stays in `agents.json`, the model picker
+lists it greyed ("not installed · Devin"), and it comes back at the first
+start after its harness is installed.
 
 ## Model discovery
 
@@ -123,9 +127,27 @@ its own:
   2026-10-28 (plus "Default model").
 - **Everyone else:** only "Default model" until the harness answers.
 
-Discovery runs when the model picker opens (`ChatStore::refresh_models` ->
-`Core::discover_models` -> `AgentAdapter::list_models`) for every harness
-that has only its preset list. It spawns each such harness once:
+Each harness's own list is cached on disk, per harness and version
+(`chaos_core::model_cache`, `<data>/models/<harness>.json`):
+
+- **When core starts**, every installed harness whose cached list is
+  missing, stale (older than a day) or from another version is probed once,
+  in the background (`ChatStore::refresh_models` -> `Core::probe_models` ->
+  `AgentAdapter::list_models`). The answer is written to the cache and lands
+  in the picker.
+- **The picker reads the cache.** Opening it shows the lists the app already
+  has, at once; it never starts a harness. It only asks for a background
+  refresh of lists that are still stale; a harness whose probe failed is left
+  alone for five minutes.
+- **Version** is read from the launch command without running it: the
+  resolved binary path (Homebrew and npm keep a version in it), its size
+  and modification time, and the launch arguments (Claude Code's `npx`
+  package is pinned there). Upgrading a harness replaces its binary, so its
+  list is probed again. A stale or other-version list is still shown until
+  the new one arrives.
+- A live session that reports its harness's models also updates the cache.
+
+A probe spawns the harness once, always on core's own tokio runtime:
 
 - **ACP:** `initialize`, then a throwaway `session/new` with no chat tools,
   reading the session's model selector from `configOptions`: the `select`
@@ -134,9 +156,23 @@ that has only its preset list. It spawns each such harness once:
 - **Codex:** `initialize`, then every page of `model/list` (hidden models
   left out). No thread is started.
 
-A non-empty answer is cached in `harness_models` and replaces the fallback.
 A failure (signed out, timeout) caches nothing, and the picker's filter
 entry for that harness says why.
+
+### The "Add a model" crash (fixed 2026-10-31)
+
+Opening the picker used to run discovery from the app's GPUI executor:
+`Core::discover_models` awaited `AgentAdapter::list_models` inside the
+caller's future, and both adapters do tokio I/O there (the Codex adapter
+calls `tokio::spawn`; spawning the process, its pipes and the 30 s timeout
+need tokio's reactor and timer). GPUI's executor is not a tokio runtime, so
+the first tokio call panicked ("there is no reactor running, must be called
+from the context of a Tokio 1.x runtime") on the main thread, which took the
+app down. Discovery now runs on core's runtime (`Core` keeps its
+`tokio::runtime::Handle` and spawns the adapter call there; a panic inside
+comes back as an error), it only ever runs in the background, and
+`discovery_can_be_awaited_from_outside_the_tokio_runtime` in
+`tests/models.rs` awaits it from a plain executor.
 
 ### Selecting the model for a session
 
@@ -155,14 +191,38 @@ dot, a remove button on hover, and an "Add a model" row that opens the
 picker in the pane layer.
 
 - The picker lists **models**, not harnesses. `harness::Catalog` groups the
-  same model offered by several harnesses into one row.
+  same model offered by several harnesses into one row. Lists come from the
+  cache (see "Model discovery"); opening the picker never starts a harness.
 - A search field on top, a harness filter row ("All" plus one chip per
   installed harness), then the ranked list. Up/Down move the highlight,
   Enter adds, Escape backs out of a step, then closes.
-- A row one harness offers is added straight away. A row several harnesses
-  can run opens a second step asking which one ("via X").
+- A row one installed harness offers is added straight away. A row several
+  installed harnesses can run opens a required second step listing them
+  (Hxmbl, 2026-10-31: no auto-pick, no silent default): Up/Down move the
+  highlight, Enter or a click adds that harness's member, Escape goes back.
+  Nothing is added until a harness is picked. With a harness filter
+  selected, that harness is the choice.
+- Roster members whose harness isn't installed are listed at the bottom,
+  greyed, "not installed · <harness>", and can't be added.
 - A harness that already runs that model as a member is left out of the
   choice; when every harness offering it already does, the row does nothing.
+
+## Permissions: reads are free
+
+Hxmbl's call (2026-10-31): for now the point is talking to many agents, so
+agents may read files freely and nothing else is approved automatically.
+There is no Chaos Control setting that makes a harness approve writes.
+
+| Harness | Reads | Commands, edits, everything else |
+|---|---|---|
+| ACP harnesses (fx, Vibe, Claude Code, Copilot, opencode, Devin, Cursor, Gemini) | A `session/request_permission` whose tool call has kind `read` or `search` gets the agent's allow-once option at once; not recorded | Declined at once with the agent's own "continue without it" option and `_meta.chaosControl.message` saying reads are free, commands and edits need a human, and that request #N went to the humans (don't wait for it). A VM agent is approved. |
+| Codex | Threads start with `sandbox: "read-only"`, `approvalPolicy: "on-request"`: commands run in the read-only sandbox without asking | Codex asks (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`) and gets `decline`; the room gets the request note. |
+
+A missing or unknown tool kind is not a read. The humans' Approve / Deny
+pane and one-shot grants work as before (`agents.md`, "Permissions"); an
+approval lets the agent's retry through once. Code: `permission.rs`
+(`is_read_only_kind`, `PermissionVerdict::AllowRead`), `acp.rs`,
+`acp_v2.rs`, `codex.rs` (`SANDBOX`, `APPROVAL_POLICY`).
 
 ### Credit: T3 Code (MIT)
 
@@ -236,13 +296,30 @@ What to check for each harness:
 1. It shows up in Agent Status with its default model, and its dot goes
    green after `@handle hello`.
 2. It answers in the room through `chat_send`.
-3. "Add a model": its filter chip stops saying "usual models" once it lists
-   its own, and picking one of those models adds a member that actually runs
-   that model (ask it which model it is).
-4. Removing the member takes it out of Agent Status; its old messages stay.
-5. Signed out: the member goes red with one note and no retry loop.
+3. "Add a model" opens at once (no harness starts). Its filter chip stops
+   saying "usual models" once the background probe has listed its own, and
+   `<data>/models/<harness>.json` exists. Picking one of those models adds a
+   member that actually runs that model (ask it which model it is), and
+   `agents.json` gains the entry.
+4. A model two harnesses offer asks which harness (keyboard and click) and
+   adds nothing until one is picked.
+5. Removing the member takes it out of Agent Status and `agents.json`; its
+   old messages stay, signed "Previous agent".
+6. Uninstall (or rename) a harness and restart: its members are gone from
+   Agent Status and listed greyed "not installed" in the picker; reinstall
+   and restart: they're back.
+7. Ask it to read a file (no prompt, it reads) and to edit one or run a
+   command (declined at once with the message; Approve / Deny pane shows).
+8. Signed out: the member goes red with one note and no retry loop.
 
 ## Tests
+
+Roster follow-ups (2026-10-31): `tests/models.rs` awaits discovery from a
+plain (non-tokio) executor, checks Codex's `sandbox` / `approvalPolicy`, and
+probes into the on-disk cache; `tests/permissions.rs` checks reads allowed
+and the rest declined over v1 and v2; `model_cache.rs` and the app's
+`agents_file.rs` and `agents.rs` have unit tests for the cache, the
+`agents.json` write-back and not-installed members.
 
 `cargo test -p chaos-core --test models` covers, against the fakes: an ACP
 member setting its model through the session model option; a model the

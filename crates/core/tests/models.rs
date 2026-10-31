@@ -255,6 +255,9 @@ async fn codex_member_takes_a_turn_and_its_last_message_is_the_fallback_reply() 
     );
     let start = fake.request("thread/start").unwrap();
     assert_eq!(start["model"], "gpt-6.1-sol");
+    // Reads never prompt; anything more asks (and the gate declines it).
+    assert_eq!(start["sandbox"], "read-only");
+    assert_eq!(start["approvalPolicy"], "on-request");
     let mcp = &start["config"]["mcp_servers.chaos-control"];
     assert!(
         mcp["url"]
@@ -268,7 +271,6 @@ async fn codex_member_takes_a_turn_and_its_last_message_is_the_fallback_reply() 
             .unwrap()
             .starts_with("Bearer ")
     );
-    assert!(start.get("approvalPolicy").is_none(), "never overridden");
     let turn = fake.request("turn/start").unwrap();
     assert_eq!(turn["threadId"], "thr_1");
     assert!(
@@ -520,8 +522,12 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     assert_eq!(roster, vec![b.clone()]);
     let members = h.core.members(h.main).await.unwrap();
     assert!(!members.iter().any(|m| m.id == a.member.id));
-    // Its history stays.
+    // Its history stays, and core still knows it was an agent (the app
+    // labels those messages "Previous agent").
     assert_eq!(h.by(a.member.id).await.len(), 1);
+    let agents = h.core.agent_members().await.unwrap();
+    assert!(agents.contains(&a.member.id) && agents.contains(&b.member.id));
+    assert!(!agents.contains(&h.hx.id));
 
     // A mention of the removed member wakes nobody; the other still answers.
     let prompts_before = fake_a.observed.lock().unwrap().prompts.len();
@@ -536,4 +542,95 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     // Seeding happens once per project.
     assert!(h.core.seed_roster_once(&project).await.unwrap());
     assert!(!h.core.seed_roster_once(&project).await.unwrap());
+}
+
+// ---------- discovery off the runtime (the "Add a model" crash) ----------
+
+/// The app awaits core's futures on GPUI's executor, which is not a tokio
+/// runtime. Discovery used to run the adapter's I/O (process spawn,
+/// `tokio::spawn`, timers) inside the caller's future, which panics off a
+/// tokio runtime ("there is no reactor running"): clicking "Add a model"
+/// crashed the app. It now runs on core's own runtime, so any executor can
+/// await it.
+#[test]
+fn discovery_can_be_awaited_from_outside_the_tokio_runtime() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = rt.block_on(Harness::new());
+    let (_fake, codex_adapter) = codex(
+        fake_codex::Script {
+            models: sol_models(),
+            ..Default::default()
+        },
+        None,
+    );
+    let fake = FakeAgent::new(script(models_script()));
+    // Not inside `rt`: like GPUI's foreground executor.
+    let codex_found = futures::executor::block_on(h.core.discover_models(
+        "codex",
+        codex_adapter,
+        std::env::temp_dir(),
+    ))
+    .unwrap();
+    assert_eq!(codex_found.len(), 2);
+    let acp_found = futures::executor::block_on(h.core.discover_models(
+        "fx",
+        acp_adapter(&fake, None),
+        std::env::temp_dir(),
+    ))
+    .unwrap();
+    assert_eq!(acp_found.len(), 2);
+    drop(h);
+    drop(rt);
+}
+
+/// The background probe writes the harness's list to the on-disk cache
+/// under its version, which is what the picker reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_writes_the_model_cache_for_the_picker() {
+    let h = Harness::new().await;
+    let fake = FakeAgent::new(script(models_script()));
+    let dir = std::env::temp_dir().join(format!("chaos-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cached = h
+        .core
+        .probe_models(
+            "fx",
+            "fx 1.2.3",
+            acp_adapter(&fake, None),
+            std::env::temp_dir(),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.models.len(), 2);
+    let back = chaos_core::model_cache::load(&dir, "fx").unwrap();
+    assert_eq!(back, cached);
+    assert_eq!(back.version, "fx 1.2.3");
+    assert_eq!(
+        back.freshness("fx 1.2.3", chaos_core::model_cache::now_secs()),
+        chaos_core::model_cache::Freshness::Fresh
+    );
+
+    // A signed-out harness caches nothing.
+    let signed_out = FakeAgent::new(script(json!({
+        "fail_session_new": "Authentication required", "models": [["a", "A"]]
+    })));
+    let err = h
+        .core
+        .probe_models(
+            "vibe",
+            "v",
+            acp_adapter(&signed_out, None),
+            std::env::temp_dir(),
+            dir.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("Authentication required"), "{err}");
+    assert!(chaos_core::model_cache::load(&dir, "vibe").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -785,6 +785,12 @@ pub fn member(c: &Connection, id: MemberId) -> Result<Option<Member>> {
     .optional()
 }
 
+/// Every agent member core has ever had, current or removed.
+pub fn agent_member_ids(c: &Connection) -> Result<Vec<MemberId>> {
+    let mut stmt = c.prepare_cached("SELECT id FROM members WHERE kind = 'agent' ORDER BY id")?;
+    stmt.query_map([], |r| Ok(MemberId(r.get(0)?)))?.collect()
+}
+
 pub fn members_of(c: &Connection, channel: ChannelId) -> Result<Vec<Member>> {
     let mut stmt = c.prepare_cached(
         "SELECT m.id, m.kind, m.handle, m.name FROM members m

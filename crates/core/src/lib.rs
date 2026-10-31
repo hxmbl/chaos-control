@@ -23,6 +23,7 @@ pub mod fake_codex;
 pub mod harness;
 pub mod host;
 pub mod mcp;
+pub mod model_cache;
 pub mod notify;
 pub mod permission;
 pub mod policy;

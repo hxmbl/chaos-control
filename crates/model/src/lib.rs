@@ -19,6 +19,10 @@ pub use search::{
 
 use std::sync::Arc;
 
+/// How a message from an agent that is no longer a member (removed from the
+/// project's roster) is signed.
+pub const PREVIOUS_AGENT: &str = "Previous agent";
+
 /// Stable identifier for a channel, agent or message. Cheap to copy and hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id(pub u32);

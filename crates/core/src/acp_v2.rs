@@ -145,7 +145,7 @@ fn answer(
         None => v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
     };
     match verdict {
-        PermissionVerdict::Allow { .. } => match pick_allow(&opts) {
+        PermissionVerdict::Allow { .. } | PermissionVerdict::AllowRead => match pick_allow(&opts) {
             Some(ix) => select(ix),
             None => decline(),
         },
@@ -348,11 +348,21 @@ async fn run(
         .on_receive_request(
             async move |r: v2::RequestPermissionRequest, responder, _cx: V2ConnectionTo<Agent>| {
                 let turn = t_perm.lock().expect("lock").turn;
+                let read_only = match &r.subject {
+                    Some(v2::RequestPermissionSubject::ToolCall(s)) => match &s.tool_call.kind {
+                        MaybeUndefined::Value(k) => {
+                            crate::permission::is_read_only_kind(&crate::acp::kind_str(k))
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
                 let verdict = gate
                     .ask(PermissionAsk {
                         turn,
                         title: Arc::from(r.title.as_str()),
                         detail: r.description.as_deref().map(Arc::from),
+                        read_only,
                     })
                     .await;
                 responder.respond(answer(&r, &verdict))

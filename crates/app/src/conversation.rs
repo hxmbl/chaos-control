@@ -100,7 +100,7 @@ impl Conversation {
                     icon(brand_icon(agent.brand), icons::MD, t.ink).into_any_element(),
                     agent.name.clone().into(),
                 ),
-                None => (div().into_any_element(), "Agent".into()),
+                None => (div().into_any_element(), model::PREVIOUS_AGENT.into()),
             },
             Author::Human => (
                 div()

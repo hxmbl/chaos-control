@@ -19,8 +19,10 @@
 //! - `thread/start {cwd, model?, config}`: `config` carries our chat MCP
 //!   server as a `mcp_servers.chaos-control` override (streamable HTTP with
 //!   a bearer header, or the stdio bridge), so the user's own MCP servers
-//!   stay as they are. Nothing else is overridden: Chaos Control never
-//!   changes an agent's approval or sandbox mode.
+//!   stay as they are. `sandbox: "read-only"` and `approvalPolicy:
+//!   "on-request"` are set too, so reading never prompts and anything more
+//!   (writes, the network) asks and is declined by the permission gate
+//!   (see `permission`: reads are free, the rest needs a human).
 //! - `turn/start {threadId, input: [{type: "text", text}]}` per batch;
 //!   `turn/interrupt {threadId, turnId}` to cancel.
 //! - Notifications read: `turn/started`, `item/started` (activity),
@@ -543,6 +545,11 @@ impl AgentSession for CodexSession {
     }
 }
 
+/// The sandbox every Codex thread starts in: read anything, write nothing.
+pub const SANDBOX: &str = "read-only";
+/// Codex asks only when a command needs more than the sandbox allows.
+pub const APPROVAL_POLICY: &str = "on-request";
+
 async fn open(
     pipe: CodexPipe,
     req: OpenSession,
@@ -560,6 +567,12 @@ async fn open(
     let mut params = json!({
         "cwd": req.cwd.to_string_lossy(),
         "config": { format!("mcp_servers.{MCP_NAME}"): mcp },
+        // Reads never prompt: commands run in Codex's read-only sandbox
+        // (reading anywhere is allowed, writing and the network are not)
+        // without asking. Anything that needs more makes Codex ask, and the
+        // permission gate declines it (see `permission`).
+        "sandbox": SANDBOX,
+        "approvalPolicy": APPROVAL_POLICY,
     });
     if let Some(m) = use_model {
         params["model"] = json!(m.as_ref());
@@ -835,15 +848,18 @@ fn on_request(
     if let Some(e) = accepted {
         events.emit(e);
     }
+    // Codex only asks before running a command or changing files, never
+    // for a read: reads happen inside the read-only sandbox without asking.
     let ask = gate.ask(PermissionAsk {
         turn,
         title: Arc::from(title),
         detail: Some(Arc::from(p.to_string())),
+        read_only: false,
     });
     let rpc = rpc.clone();
     tokio::spawn(async move {
         let decision = match ask.await {
-            PermissionVerdict::Allow { .. } => "accept",
+            PermissionVerdict::Allow { .. } | PermissionVerdict::AllowRead => "accept",
             PermissionVerdict::Sent { .. } | PermissionVerdict::Decline => "decline",
         };
         rpc.respond(id, json!({ "decision": decision }));

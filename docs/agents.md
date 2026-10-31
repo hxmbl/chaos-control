@@ -62,16 +62,28 @@ the same. Presets, detection, model discovery and the model picker are in
   model through the same harness in two projects is one member granted to
   both. One harness can host several members, each with its own adapter,
   processes and sessions.
-- **Roster.** `roster` is who the user added to each project. The first
-  time a project opens, every detected harness adds its first preset model
-  and the project is marked in `roster_seeded`; after that only the user
-  changes it (Agent Status: remove on hover, "Add a model"). Removing a
-  member takes it off the roster and out of the project's channels. Its
-  messages stay, shown under a generic "Agent".
-- **Harness not installed.** The member stays on the roster and shows red.
+- **Roster.** The roster is `agents.json`'s `members` list (see "Running
+  it"): loaded at every start, and rewritten whenever the user adds or
+  removes a model in Agent Status ("Add a model", remove on hover). Core's
+  `roster` table follows it: at start every installed member is added to
+  the project and anything else on the project's stored roster leaves it.
+  When the file has no `members` yet, the first project to open seeds it:
+  every detected harness adds its first preset model (`roster_seeded` marks
+  the project), or the roster core kept from an earlier build is carried
+  over, and the result is written to the file. The list is one for every
+  project opened (not per project). Removing a member takes it out of the
+  project's channels; its messages stay, signed "Previous agent".
+- **Harness not installed.** The member leaves the room: it is not in Agent
+  Status, it can't be woken, and it is taken off core's stored roster. It
+  stays in `agents.json`, and the model picker lists it greyed as "not
+  installed · <harness>". It comes back by itself at the first start after
+  its harness is installed.
 - **Model not offered.** The session runs the harness default and the
   member's presence says so.
-- `harness_models` caches each harness's own model list once it reports one.
+- Each harness's own model list is cached on disk, per harness and version
+  (`<data>/models/<harness>.json`, `chaos_core::model_cache`; see
+  [`agent-adapters.md`](agent-adapters.md#model-discovery)). `harness_models`
+  in the store also keeps the latest list a harness reported.
 - Agents from the original `agents` shape in `agents.json` are not on the
   roster and can't be removed from the app.
 
@@ -225,9 +237,34 @@ actions are. The hard boundary is never harming the user's machine or data
 
 ## Permissions: by where the agent runs
 
-Chaos Control never changes an agent's permission mode and never simulates
-one. What happens to a permission request depends on where the agent runs,
-set per agent in `agents.json` (`"runs_in"`, default `"host"`):
+**Reads are always allowed (Hxmbl, 2026-10-31).** The goal for now is
+talking to many agents, so agents get full access for reading files and
+nothing else is approved automatically:
+
+- A native request for a read-only tool call (ACP tool kind `read` or
+  `search`, from the request's tool call on v1 or its `subject` on the v2
+  draft) is answered with the agent's own allow-once option straight away,
+  wherever the agent runs. It is not recorded and nobody is asked; presence
+  shows "reading: <title>".
+- Anything else (kinds `edit`, `delete`, `move`, `execute`, `fetch`,
+  `switch_mode`, `other`, an unknown kind, or no kind at all) is never
+  auto-approved on the host. It is declined **at once** (the agent is never
+  left waiting) with a message in `_meta.chaosControl.message`: reads are
+  free, commands and edits need a human, this one was sent as request #N,
+  don't wait for it. The request still goes to the humans as below.
+- **Codex** asks only before commands and file changes, never for reads, so
+  its threads start with `sandbox: "read-only"` and `approvalPolicy:
+  "on-request"`: commands run in Codex's read-only sandbox (read anything,
+  write nothing, no network) without asking, and anything that needs more
+  makes Codex ask, which the gate declines on the host. Codex's decline has
+  no message field; it hears a plain "decline" and the room gets the system
+  note. A VM agent's Codex still starts read-only and has each write
+  approved when it asks.
+
+Otherwise Chaos Control doesn't change an agent's permission mode or
+simulate one. What happens to a request that isn't a read depends on where
+the agent runs, set per agent in `agents.json` (`"runs_in"`, default
+`"host"`):
 
 | Where | What happens |
 | --- | --- |
@@ -384,10 +421,23 @@ project answers `not_found`.
   `command`, `args`, `env` (object), `record`, `acp_v2` (default `true`),
   `chat_tools` (`"auto"` or `"stdio"`). A harness with a `command` here
   counts as installed even when detection didn't find it.
-- `members`: an explicit roster. Each entry has `harness`, optional `model`
-  (absent: the harness default), `name`, `cwd` and `runs_in`. When present
-  it replaces seeding and overrides the stored roster at **every** start;
-  adds and removes in the app still work for that session and are stored.
+- `members`: the roster (Hxmbl's decision, 2026-10-31). Each entry has
+  `harness`, optional `model` (absent: the harness default), `name`, `cwd`
+  and `runs_in`. It is loaded at every start and the app writes it back as
+  the roster changes:
+  - "Add a model" appends `{harness, model, name}`; removing a member
+    deletes its entry. A missing file is created in `<data>` (or at
+    `$CHAOS_CONTROL_AGENTS`).
+  - Only `members` changes. Other keys, and an entry's own extra fields
+    (`cwd`, `runs_in`, anything unknown), are kept in their order; the file
+    is re-indented with two spaces. Writes are atomic (a temporary file
+    renamed over it) and one at a time, off the UI thread.
+  - A file that isn't valid JSON is never overwritten: the app prints why
+    and the change lives only in core until the file is fixed.
+  - With no `members` key yet, the first start seeds the list (see "Members
+    and the roster") and writes it.
+  - Members whose harness isn't installed stay listed and are skipped (see
+    "Harness not installed").
 
 The original shape still loads unchanged, alongside or instead of the new
 keys. Each entry is one ACP command; `brand` only picks the icon:
@@ -487,6 +537,13 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   Copilot CLI, opencode, Devin, Cursor, Gemini), model discovery or model
   selection has been run against a real harness. They are tested against
   the fakes only; manual checks are in `agent-adapters.md`.
+- **Roster follow-ups (2026-10-31, not live-verified):** reads allowed /
+  everything else declined (`tests/permissions.rs`), Codex's read-only
+  sandbox params, the model cache and background probe, discovery awaited
+  off the tokio runtime (`tests/models.rs`), and `agents.json` write-back
+  (unit tests in the app's `agents_file`). Whether real harnesses label
+  their reads `read`/`search`, and whether Codex's app-server accepts
+  `sandbox`/`approvalPolicy` on `thread/start` as named here, is unchecked.
 - **Not yet:** a signed-in agent actually calling `chat_context` and
   `chat_send`, agent output, tool calls and permission requests over v2 from a
   real agent, and the stdio bridge inside a real agent. That is validation step 2 on a Mac with
