@@ -537,3 +537,46 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     assert!(h.core.seed_roster_once(&project).await.unwrap());
     assert!(!h.core.seed_roster_once(&project).await.unwrap());
 }
+
+// ---------- discovery off the runtime (the "Add a model" crash) ----------
+
+/// The app awaits core's futures on GPUI's executor, which is not a tokio
+/// runtime. Discovery used to run the adapter's I/O (process spawn,
+/// `tokio::spawn`, timers) inside the caller's future, which panics off a
+/// tokio runtime ("there is no reactor running"): clicking "Add a model"
+/// crashed the app. It now runs on core's own runtime, so any executor can
+/// await it.
+#[test]
+fn discovery_can_be_awaited_from_outside_the_tokio_runtime() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let h = rt.block_on(Harness::new());
+    let (_fake, codex_adapter) = codex(
+        fake_codex::Script {
+            models: sol_models(),
+            ..Default::default()
+        },
+        None,
+    );
+    let fake = FakeAgent::new(script(models_script()));
+    // Not inside `rt`: like GPUI's foreground executor.
+    let codex_found = futures::executor::block_on(h.core.discover_models(
+        "codex",
+        codex_adapter,
+        std::env::temp_dir(),
+    ))
+    .unwrap();
+    assert_eq!(codex_found.len(), 2);
+    let acp_found = futures::executor::block_on(h.core.discover_models(
+        "fx",
+        acp_adapter(&fake, None),
+        std::env::temp_dir(),
+    ))
+    .unwrap();
+    assert_eq!(acp_found.len(), 2);
+    drop(h);
+    drop(rt);
+}

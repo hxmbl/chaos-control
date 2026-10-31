@@ -175,6 +175,12 @@ pub struct Core {
     tx: mpsc::UnboundedSender<Cmd>,
     mcp_url: Arc<str>,
     tokens: Arc<Tokens>,
+    /// The tokio runtime core was started on. Anything that touches a
+    /// harness (process spawns, pipes, timers, `tokio::spawn`) runs here,
+    /// never in the caller's future: the app awaits core from GPUI's
+    /// executor, which is not a tokio runtime, and tokio I/O polled there
+    /// panics ("there is no reactor running").
+    rt: tokio::runtime::Handle,
 }
 
 const GONE: &str = "chaos-control core has stopped";
@@ -237,6 +243,7 @@ impl Core {
                 tx,
                 mcp_url: Arc::from(mcp_url),
                 tokens,
+                rt: tokio::runtime::Handle::current(),
             },
             events_rx,
         ))
@@ -527,15 +534,30 @@ impl Core {
     }
 
     /// Asks `adapter` for its harness's models (`AgentAdapter::list_models`)
-    /// and caches a non-empty answer. Spawns a process: call it when the
-    /// user is about to choose a model, not on every start.
+    /// and caches a non-empty answer in the store. Spawns the harness once,
+    /// on core's own runtime (the `rt` handle), so this is safe to await
+    /// from any executor; a panic inside the adapter comes back as an error
+    /// instead of taking the caller down. Callers run it in the background
+    /// (at startup, or when a cached list is stale), never while the user
+    /// waits.
     pub async fn discover_models(
         &self,
         harness: &str,
         adapter: Arc<dyn AgentAdapter>,
         cwd: PathBuf,
     ) -> Result<Vec<crate::harness::ModelInfo>, String> {
-        let found = match adapter.list_models(cwd).await {
+        let listed = self
+            .rt
+            .spawn(async move { adapter.list_models(cwd).await })
+            .await
+            .map_err(|e| {
+                if e.is_panic() {
+                    "the harness adapter panicked while listing models".to_string()
+                } else {
+                    "listing models was cancelled".to_string()
+                }
+            })?;
+        let found = match listed {
             None => return Ok(Vec::new()),
             Some(r) => r.map_err(|e| e.to_string())?,
         };
