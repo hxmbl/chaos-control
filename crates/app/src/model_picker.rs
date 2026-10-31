@@ -568,6 +568,7 @@ impl ModelPicker {
                 query.is_empty()
                     || d.name.to_lowercase().contains(&query)
                     || d.harness_name.to_lowercase().contains(&query)
+                    || d.model.as_ref().is_some_and(|m| m.to_lowercase().contains(&query))
             })
             .enumerate()
             .map(|(n, d)| {
@@ -601,10 +602,12 @@ impl ModelPicker {
                                     .ellipsis()
                                     .type_style(text::CAPTION)
                                     .text_color(t.muted)
-                                    .child(truncated(SharedString::from(format!(
-                                        "not installed · {}",
-                                        d.harness_name
-                                    )))),
+                                    .child(truncated(SharedString::from(match &d.model {
+                                        Some(m) => {
+                                            format!("not installed · {} · {m}", d.harness_name)
+                                        }
+                                        None => format!("not installed · {}", d.harness_name),
+                                    }))),
                             ),
                     )
             })
