@@ -59,11 +59,14 @@ channels from core and #main is the project's own `main` channel:
 - history is loaded once at attach and deduplicated against the event stream
   by core message id;
 - members are models running through a harness (Codex, fx, Mistral Vibe,
-  Claude Code, ...): the project's roster is seeded once from the detected
-  harnesses and then edited in Agent Status (remove on hover, "Add a model"
-  opens the model picker in the pane layer, `model_picker.rs`). Presets,
-  detection, model discovery and the picker are in
-  [docs/agent-adapters.md](docs/agent-adapters.md);
+  Claude Code, ...): the roster is `agents.json`'s `members`, seeded once
+  from the detected harnesses and then edited in Agent Status (remove on
+  hover, "Add a model" opens the model picker in the pane layer,
+  `model_picker.rs`), which writes it back (`agents_file.rs`). Members whose
+  harness isn't installed stay out of the room. Model lists come from an
+  on-disk cache probed in the background on core's tokio runtime, never
+  from the UI thread. Presets, detection, model discovery and the picker
+  are in [docs/agent-adapters.md](docs/agent-adapters.md);
 - the same binary is the stdio MCP bridge for agents that can't take HTTP:
   `chaos-control mcp-bridge` (URL and token in its environment).
 
