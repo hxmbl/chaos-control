@@ -523,8 +523,12 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     assert_eq!(roster, vec![b.clone()]);
     let members = h.core.members(h.main).await.unwrap();
     assert!(!members.iter().any(|m| m.id == a.member.id));
-    // Its history stays.
+    // Its history stays, and core still knows it was an agent (the app
+    // labels those messages "Previous agent").
     assert_eq!(h.by(a.member.id).await.len(), 1);
+    let agents = h.core.agent_members().await.unwrap();
+    assert!(agents.contains(&a.member.id) && agents.contains(&b.member.id));
+    assert!(!agents.contains(&h.hx.id));
 
     // A mention of the removed member wakes nobody; the other still answers.
     let prompts_before = fake_a.observed.lock().unwrap().prompts.len();
@@ -582,4 +586,52 @@ fn discovery_can_be_awaited_from_outside_the_tokio_runtime() {
     assert_eq!(acp_found.len(), 2);
     drop(h);
     drop(rt);
+}
+
+/// The background probe writes the harness's list to the on-disk cache
+/// under its version, which is what the picker reads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_probe_writes_the_model_cache_for_the_picker() {
+    let h = Harness::new().await;
+    let fake = FakeAgent::new(script(models_script()));
+    let dir = std::env::temp_dir().join(format!("chaos-probe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cached = h
+        .core
+        .probe_models(
+            "fx",
+            "fx 1.2.3",
+            acp_adapter(&fake, None),
+            std::env::temp_dir(),
+            dir.clone(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cached.models.len(), 2);
+    let back = chaos_core::model_cache::load(&dir, "fx").unwrap();
+    assert_eq!(back, cached);
+    assert_eq!(back.version, "fx 1.2.3");
+    assert_eq!(
+        back.freshness("fx 1.2.3", chaos_core::model_cache::now_secs()),
+        chaos_core::model_cache::Freshness::Fresh
+    );
+
+    // A signed-out harness caches nothing.
+    let signed_out = FakeAgent::new(script(json!({
+        "fail_session_new": "Authentication required", "models": [["a", "A"]]
+    })));
+    let err = h
+        .core
+        .probe_models(
+            "vibe",
+            "v",
+            acp_adapter(&signed_out, None),
+            std::env::temp_dir(),
+            dir.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.contains("Authentication required"), "{err}");
+    assert!(chaos_core::model_cache::load(&dir, "vibe").is_none());
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -572,6 +572,45 @@ impl Core {
         Ok(found)
     }
 
+    /// Probes `harness` for its models in the background (on core's runtime,
+    /// like [`Core::discover_models`]) and writes a non-empty answer to the
+    /// on-disk model cache in `cache_dir` under `version` (see
+    /// `model_cache`). Returns what was cached.
+    pub async fn probe_models(
+        &self,
+        harness: &str,
+        version: &str,
+        adapter: Arc<dyn AgentAdapter>,
+        cwd: PathBuf,
+        cache_dir: PathBuf,
+    ) -> Result<crate::model_cache::CachedModels, String> {
+        let found = self.discover_models(harness, adapter, cwd).await?;
+        if found.is_empty() {
+            return Err("it listed no models".to_string());
+        }
+        let cached = crate::model_cache::CachedModels::new(
+            harness,
+            version,
+            crate::model_cache::now_secs(),
+            &found,
+        );
+        let to_save = cached.clone();
+        self.rt
+            .spawn_blocking(move || crate::model_cache::save(&cache_dir, &to_save))
+            .await
+            .map_err(|_| "saving the model list was cancelled".to_string())?
+            .map_err(|e| format!("could not save the model list: {e}"))?;
+        Ok(cached)
+    }
+
+    /// Every agent member core has ever had, including removed ones (their
+    /// messages stay, and read as a previous agent's).
+    pub async fn agent_members(&self) -> Result<Vec<MemberId>, String> {
+        self.with_engine(|e, _| crate::store::agent_member_ids(e.conn()))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn post(
         &self,
         author: MemberId,
