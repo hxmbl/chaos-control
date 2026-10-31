@@ -97,7 +97,7 @@ impl PermissionLog {
 
     /// Replaces the whole log (a project opened, core started).
     pub fn reset(&mut self, mut entries: Vec<PermissionLogEntry>) {
-        entries.sort_by(|a, b| b.request.cmp(&a.request));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.request));
         entries.dedup_by_key(|e| e.request);
         entries.truncate(LOG_LEN);
         self.entries = entries;
