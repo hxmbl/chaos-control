@@ -183,6 +183,10 @@ pub struct PermissionPrompt {
     pub detail: Option<Arc<str>>,
     /// Who it was sent to ("Hx"); any human here can answer.
     pub asked: Arc<str>,
+    /// Opened from the permission log: shown read-only with how it ended, no
+    /// Approve / Deny. `None` is a live prompt (unused while requests are
+    /// muted; see `permissions`).
+    pub logged: Option<crate::PermissionOutcome>,
 }
 
 /// What the project-identity pane asks.
@@ -283,7 +287,10 @@ impl PaneContent {
                 ProjectQuestionKind::CopiedFrom(_) => "This folder looks like a copy",
                 ProjectQuestionKind::Imported => "Earlier history found",
             }),
-            PaneContent::Permission(p) => Arc::from(format!("{} asks permission", p.agent)),
+            PaneContent::Permission(p) => Arc::from(match p.logged {
+                Some(outcome) => format!("{} · {}", p.agent, outcome.label()),
+                None => format!("{} asks permission", p.agent),
+            }),
         }
     }
 
@@ -324,6 +331,7 @@ impl PaneContent {
                     PaneAction::new(KeepProject, "Start fresh"),
                 ],
             },
+            PaneContent::Permission(p) if p.logged.is_some() => Vec::new(),
             PaneContent::Permission(_) => vec![
                 PaneAction::new(Approve, "Approve"),
                 PaneAction::new(Deny, "Deny"),
@@ -395,6 +403,7 @@ mod tests {
             reason: None,
             detail: None,
             asked: Arc::from("Hx"),
+            logged: None,
         });
         assert_eq!(&*pane.title(&sample()), "Claude Code asks permission");
         let kinds: Vec<_> = pane.actions().into_iter().map(|a| a.kind).collect();

@@ -244,8 +244,11 @@ nothing else is approved automatically:
 - A native request for a read-only tool call (ACP tool kind `read` or
   `search`, from the request's tool call on v1 or its `subject` on the v2
   draft) is answered with the agent's own allow-once option straight away,
-  wherever the agent runs. It is not recorded and nobody is asked; presence
-  shows "reading: <title>".
+  wherever the agent runs. Nobody is asked; presence shows "reading:
+  <title>". It is kept for the permission log only (below): a row with
+  `read_only = 1` and state `auto_approved`, left out of the agent's own
+  `chat_permission_status`, and only the newest 500 per channel are kept
+  (`permission::READS_KEPT`; older reads are pruned as new ones arrive).
 - Anything else (kinds `edit`, `delete`, `move`, `execute`, `fetch`,
   `switch_mode`, `other`, an unknown kind, or no kind at all) is never
   auto-approved on the host. It is declined **at once** (the agent is never
@@ -292,18 +295,33 @@ blocks the agent until it is answered, so the adapter asks core
 channel, the turn it was asked in, source (`native` or `chat_tool`), title
 (the tool call's title), detail (raw input), reason, state (`pending`,
 `approved`, `denied`, `auto_approved`), who it was routed to, who answered,
-when, an optional note, and `used_at`.
+when, an optional note, and `used_at`. Migration 8 adds `read_only` (allowed
+reads, logged) and the log's indexes.
 
 - **Routing:** to the humans whose messages woke the turn, else every human
   in the channel. Any human member of the channel can answer; agents can't.
 - **Dedup:** asking again for the same title while one is pending reuses it.
 - **Surfacing:** one system note ("@bot asked to run X: permission request #N,
   sent to @hx. Any human here can approve or deny it; @bot carries on
-  meanwhile."), a `CoreEvent::Permission`, and presence "request pending: X
-  (#N)" (never "blocked"; glow is unchanged). The app opens the pane with
-  Approve / Deny quick actions (`model::PaneContent::Permission`) unless the
-  pane is busy with something else, and loads requests still pending at
-  startup. An answer from anywhere closes that pane.
+  meanwhile.") when `Policy::note_permission_requests` is on, a
+  `CoreEvent::Permission` (also for every logged read), and presence
+  "request pending: X (#N)" (never "blocked"; glow is unchanged).
+- **The app mutes requests (Hxmbl, 2026-10-31).** No request opens the
+  pane: `store::PERMISSION_PANE` is `false`, and the app starts core with
+  `note_permission_requests` off, since nothing in the app can approve or
+  deny now. Instead the right sidebar's **Permissions** log lists every
+  request in #main, reads included, newest first: the agent's mark, the
+  tool call's title, the outcome and a relative time. It loads
+  `Core::permission_log(channel, 200)` (`permission::log_in`, newest first by
+  id) when core starts or the project switches, then folds in each
+  `CoreEvent::Permission`. The outcome is `PermissionRequest::outcome()`:
+  `auto_approved` (a read, or a VM agent) shows **Auto-allowed**; `pending`
+  and `denied` show **Declined** (the agent's call was declined at once and
+  nothing ran); `approved` shows **Approved** (only reachable through core
+  for now). Clicking a row opens the pane read-only with the details (no
+  quick actions). The Approve / Deny pane, `Core::answer_permission`, grants
+  and the chat tools below are unchanged and still compile; turning
+  `PERMISSION_PANE` back on (and the note) brings the old flow back.
 - **Answer:** `Core::answer_permission(id, human, approve, note)` records it
   (only a pending request can be answered, once), posts it as a system
   message and delivers it as a wake: one trigger with reason `permission` on

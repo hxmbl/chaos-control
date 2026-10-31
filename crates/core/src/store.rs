@@ -323,6 +323,16 @@ CREATE TABLE harness_models (
     PRIMARY KEY (harness, model)
 );
 "#,
+    // 8: the permission log. Read-only tool calls (ACP kinds `read` and
+    // `search`) are allowed at once and now kept too, flagged `read_only`, so
+    // the right sidebar can list every request newest first. Old reads are
+    // pruned per channel (`permission::READS_KEPT`); nothing else is.
+    r#"
+ALTER TABLE permission_requests ADD COLUMN read_only INTEGER NOT NULL DEFAULT 0
+    CHECK (read_only IN (0, 1));
+CREATE INDEX permission_requests_log ON permission_requests (channel_id, id);
+CREATE INDEX permission_requests_reads ON permission_requests (channel_id, read_only, id);
+"#,
 ];
 
 pub struct Store {
@@ -2218,5 +2228,193 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    // ---------- permission log (migration 8) ----------
+
+    fn request(
+        c: &Connection,
+        agent: MemberId,
+        channel: ChannelId,
+        title: &str,
+        state: crate::permission::PermissionState,
+        now: Millis,
+    ) -> crate::permission::PermissionRequest {
+        crate::permission::insert(
+            c,
+            &crate::permission::NewRequest {
+                agent,
+                channel,
+                batch: None,
+                source: crate::permission::PermissionSource::Native,
+                title,
+                detail: None,
+                reason: None,
+                state,
+                asked_of: &[],
+                now,
+                read_only: false,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn permission_log_lists_reads_and_requests_newest_first() {
+        use crate::permission::{self as perm, LogOutcome, PermissionState as S};
+        let (mut s, ch, hx, bot) = setup();
+        let other = s
+            .tx::<_, rusqlite::Error>(|c| ensure_channel(c, &pid(P1), "side", 0))
+            .unwrap();
+        s.tx::<_, rusqlite::Error>(|c| {
+            let edit = request(c, bot.id, ch.id, "Edit src/main.rs", S::Pending, 10);
+            perm::insert_read(c, bot.id, ch.id, None, "Read src/main.rs", Some("{}"), 20)?;
+            request(c, bot.id, ch.id, "cargo test", S::AutoApproved, 30);
+            let rm = request(c, bot.id, ch.id, "rm -rf build/", S::Pending, 40);
+            perm::insert_read(c, bot.id, other.id, None, "Read elsewhere", None, 50)?;
+            perm::answer(c, rm.id, S::Denied, hx.id, None, 60)?;
+            let _ = edit;
+            Ok(())
+        })
+        .unwrap();
+        let c = s.conn();
+        let log = perm::log_in(c, ch.id, 10).unwrap();
+        let rows: Vec<(&str, LogOutcome, bool)> = log
+            .iter()
+            .map(|r| (&*r.title, r.outcome(), r.read_only))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("rm -rf build/", LogOutcome::Declined, false),
+                ("cargo test", LogOutcome::AutoAllowed, false),
+                ("Read src/main.rs", LogOutcome::AutoAllowed, true),
+                ("Edit src/main.rs", LogOutcome::Declined, false),
+            ]
+        );
+        assert_eq!(log[2].state, S::AutoApproved);
+        assert_eq!(log[2].detail.as_deref(), Some("{}"));
+        assert!(log[2].asked_of.is_empty());
+        assert_eq!(LogOutcome::AutoAllowed.label(), "Auto-allowed");
+        assert_eq!(LogOutcome::Declined.label(), "Declined");
+        // The limit caps from the newest end.
+        let two: Vec<_> = perm::log_in(c, ch.id, 2)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.title.to_string())
+            .collect();
+        assert_eq!(two, ["rm -rf build/", "cargo test"]);
+        // The other channel's read stays there.
+        assert_eq!(perm::log_in(c, other.id, 10).unwrap().len(), 1);
+        // An agent's own status and pending lists never show logged reads.
+        let mine: Vec<_> = perm::of_agent(c, bot.id, ch.id, 20)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.title)
+            .collect();
+        assert!(!mine.iter().any(|t| &**t == "Read src/main.rs"), "{mine:?}");
+        assert_eq!(mine.len(), 3);
+        assert_eq!(perm::pending_in(c, ch.id).unwrap().len(), 1);
+        // An approval reads as approved.
+        s.tx::<_, rusqlite::Error>(|c| {
+            let r = request(c, bot.id, ch.id, "git push", S::Pending, 70);
+            perm::answer(c, r.id, S::Approved, hx.id, None, 80)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            perm::log_in(s.conn(), ch.id, 1).unwrap()[0].outcome(),
+            LogOutcome::Approved
+        );
+    }
+
+    #[test]
+    fn logged_reads_are_pruned_past_the_newest_and_nothing_else_is() {
+        use crate::permission::{self as perm, PermissionState as S};
+        let (mut s, ch, _hx, bot) = setup();
+        let other = s
+            .tx::<_, rusqlite::Error>(|c| ensure_channel(c, &pid(P1), "side", 0))
+            .unwrap();
+        s.tx::<_, rusqlite::Error>(|c| {
+            request(c, bot.id, ch.id, "Edit a", S::Pending, 1);
+            for i in 0..8 {
+                perm::insert_read(c, bot.id, ch.id, None, &format!("Read {i}"), None, 10 + i)?;
+            }
+            perm::insert_read(c, bot.id, other.id, None, "Read there", None, 30)?;
+            request(c, bot.id, ch.id, "Edit b", S::Denied, 40);
+            Ok(())
+        })
+        .unwrap();
+        // insert_read keeps READS_KEPT, far above 8: nothing went yet.
+        assert_eq!(perm::log_in(s.conn(), ch.id, 100).unwrap().len(), 10);
+        let gone = perm::prune_reads(s.conn(), ch.id, 3).unwrap();
+        assert_eq!(gone, 5);
+        let titles: Vec<String> = perm::log_in(s.conn(), ch.id, 100)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.title.to_string())
+            .collect();
+        assert_eq!(titles, ["Edit b", "Read 7", "Read 6", "Read 5", "Edit a"]);
+        // Another channel's reads are its own.
+        assert_eq!(perm::log_in(s.conn(), other.id, 10).unwrap().len(), 1);
+        // Pruning to more than there are is a no-op.
+        assert_eq!(perm::prune_reads(s.conn(), ch.id, 50).unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_read_keeps_at_most_reads_kept_per_channel() {
+        use crate::permission::{self as perm, READS_KEPT};
+        let (mut s, ch, _hx, bot) = setup();
+        s.tx::<_, rusqlite::Error>(|c| {
+            for i in 0..READS_KEPT + 3 {
+                perm::insert_read(
+                    c,
+                    bot.id,
+                    ch.id,
+                    None,
+                    &format!("Read {i}"),
+                    None,
+                    i as Millis,
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+        let log = perm::log_in(s.conn(), ch.id, READS_KEPT + 10).unwrap();
+        assert_eq!(log.len(), READS_KEPT);
+        assert_eq!(&*log[0].title, format!("Read {}", READS_KEPT + 2));
+    }
+
+    #[test]
+    fn a_v7_database_keeps_its_permission_requests_as_non_reads() {
+        let conn = Connection::open_in_memory().unwrap();
+        for m in &MIGRATIONS[..7] {
+            conn.execute_batch(m).unwrap();
+        }
+        conn.execute_batch(
+            r#"
+            PRAGMA user_version = 7;
+            INSERT INTO projects (id, name, root_path, created_at) VALUES
+                ('0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'P', NULL, 1);
+            INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES
+                (3, '0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59', 'main', 1, 1);
+            INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx'), (2, 'agent', 'bot', 'Bot');
+            INSERT INTO permission_requests (agent_id, channel_id, source, title, state, asked_of, created_at)
+                VALUES (2, 3, 'native', 'rm -rf build/', 'pending', '1', 1000);
+            "#,
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let log = crate::permission::log_in(s.conn(), ChannelId(3), 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert!(!log[0].read_only);
+        assert_eq!(log[0].outcome(), crate::permission::LogOutcome::Declined);
+        // The column only takes 0 or 1.
+        assert!(
+            s.conn()
+                .execute("UPDATE permission_requests SET read_only = 2", [])
+                .is_err()
+        );
     }
 }

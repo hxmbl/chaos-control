@@ -9,7 +9,9 @@ use std::time::Duration;
 use chaos_core::{
     engine::CoreEvent,
     mcp,
-    permission::{AnswerError, PermissionId, PermissionRequest, PermissionSource, PermissionState},
+    permission::{
+        AnswerError, LogOutcome, PermissionId, PermissionRequest, PermissionSource, PermissionState,
+    },
     types::*,
 };
 use common::*;
@@ -326,7 +328,7 @@ async fn a_vm_agent_asking_ahead_is_told_to_go_ahead() {
 }
 
 /// Reads are always allowed (ACP tool kinds `read` and `search`), on the host
-/// too, and recorded nowhere; an edit or a command is declined at once with
+/// too, and only kept for the permission log; an edit or a command is declined at once with
 /// the request sent to the humans. Over ACP v1 and the v2 draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
@@ -373,7 +375,7 @@ async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
         }
         // The turn carried on and ended with a reply.
         h.wait_message("the agent carried on", Some(bot.id)).await;
-        // Only the three non-reads were recorded.
+        // Only the three non-reads went to the humans.
         let all = h.core.pending_permissions(h.main).await.unwrap();
         let titles: Vec<&str> = all.iter().map(|r| &*r.title).collect();
         assert_eq!(
@@ -381,5 +383,21 @@ async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
             ["Edit src/main.rs", "cargo test", "no kind given"],
             "v{protocol}"
         );
+        // The permission log has all five, reads included, newest first.
+        let log = h.core.permission_log(h.main, 50).await.unwrap();
+        let rows: Vec<(&str, LogOutcome)> = log.iter().map(|r| (&*r.title, r.outcome())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("no kind given", LogOutcome::Declined),
+                ("cargo test", LogOutcome::Declined),
+                ("Edit src/main.rs", LogOutcome::Declined),
+                ("Search for TODO", LogOutcome::AutoAllowed),
+                ("Read src/main.rs", LogOutcome::AutoAllowed),
+            ],
+            "v{protocol}"
+        );
+        assert!(log[3].read_only && log[4].read_only && !log[0].read_only);
+        assert!(log.iter().all(|r| r.agent == bot.id));
     }
 }

@@ -135,10 +135,11 @@ impl Workspace {
             });
         // The pane layer is drawn here, so redraw when it opens or closes.
         let pane_changed = cx.observe(&pane, |_, _, cx| cx.notify());
-        // An agent's permission request opens the pane with Approve / Deny,
-        // unless the pane is busy with something else (the request also shows
-        // in the chat and in the agent's presence). An answer from anywhere
-        // closes its pane.
+        // Muted for now (`store::PERMISSION_PANE`): requests go to the right
+        // sidebar's permission log and these events never fire. When they
+        // do, an agent's permission request opens the pane with Approve /
+        // Deny unless the pane is busy with something else, and an answer
+        // from anywhere closes its pane.
         let pane_for_store = pane.clone();
         let permissions =
             cx.subscribe_in(&store, window, move |_, _, event, window, cx| match event {
@@ -187,7 +188,8 @@ impl Workspace {
             panels,
             search,
             sidebar: cx.new(|cx| Sidebar::new(store.clone(), pane.clone(), cx)),
-            right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), cx)),
+            right_sidebar: cx
+                .new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), pane.clone(), cx)),
             model_picker,
             conversation: cx.new(|cx| Conversation::new(store.clone(), pane.clone(), cx)),
             pane,

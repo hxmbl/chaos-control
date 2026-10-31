@@ -24,8 +24,11 @@
 //!
 //! **Reads are always allowed.** A native request for a read-only tool call
 //! (ACP tool kind `read` or `search`) is answered with the agent's allow-once
-//! option straight away, wherever the agent runs, and nothing is recorded:
-//! agents get full access for reading files. Everything else (running
+//! option straight away, wherever the agent runs: agents get full access for
+//! reading files. It is recorded for the permission log only (`read_only`,
+//! state `auto_approved`, the newest [`READS_KEPT`] per channel), never as a
+//! request anyone answers, and the agent's own `chat_permission_status` leaves
+//! it out. Everything else (running
 //! commands, editing, deleting, moving, fetching, an unknown or missing
 //! kind) goes the way above: approved in a VM, else declined at once with a
 //! message saying why and that a human was asked. Codex has no read requests
@@ -153,6 +156,43 @@ pub struct PermissionRequest {
     pub answer_note: Option<Arc<str>>,
     /// When an approval was used up by the retried tool call (one-shot grant).
     pub used_at: Option<Millis>,
+    /// A read-only tool call, allowed at once and kept for the log only.
+    pub read_only: bool,
+}
+
+/// How a request ended, as the permission log shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogOutcome {
+    /// Allowed without a human: a read, or anything from an agent in its own VM.
+    AutoAllowed,
+    /// The agent was told "not now" (pending, never answered) or a human denied it.
+    Declined,
+    /// A human approved it (a one-shot grant).
+    Approved,
+}
+
+impl LogOutcome {
+    pub fn label(self) -> &'static str {
+        match self {
+            LogOutcome::AutoAllowed => "Auto-allowed",
+            LogOutcome::Declined => "Declined",
+            LogOutcome::Approved => "Approved",
+        }
+    }
+}
+
+impl PermissionRequest {
+    /// The outcome the permission log shows. A pending request counts as
+    /// declined: the agent's tool call was declined at once, whatever a human
+    /// may say later.
+    pub fn outcome(&self) -> LogOutcome {
+        match self.state {
+            PermissionState::AutoApproved => LogOutcome::AutoAllowed,
+            PermissionState::Approved => LogOutcome::Approved,
+            PermissionState::Pending | PermissionState::Denied => LogOutcome::Declined,
+        }
+    }
 }
 
 /// A native permission request, as the adapter hands it to core.
@@ -290,7 +330,7 @@ pub fn pick_decline(options: &[(OptionKind, &str)]) -> Option<usize> {
 // ---------- store ----------
 
 const COLS: &str = "id, agent_id, channel_id, batch_id, source, title, detail, reason, state, \
-asked_of, created_at, answered_by, answered_at, answer_note, used_at";
+asked_of, created_at, answered_by, answered_at, answer_note, used_at, read_only";
 
 fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
     let asked: String = r.get(9)?;
@@ -314,6 +354,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
         answered_at: r.get::<_, Option<i64>>(12)?.map(|t| t as Millis),
         answer_note: r.get::<_, Option<String>>(13)?.map(Arc::from),
         used_at: r.get::<_, Option<i64>>(14)?.map(|t| t as Millis),
+        read_only: r.get::<_, i64>(15)? != 0,
     })
 }
 
@@ -329,6 +370,7 @@ pub struct NewRequest<'a> {
     pub state: PermissionState,
     pub asked_of: &'a [MemberId],
     pub now: Millis,
+    pub read_only: bool,
 }
 
 pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<PermissionRequest> {
@@ -340,8 +382,9 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
         .join(",");
     c.execute(
         "INSERT INTO permission_requests
-            (agent_id, channel_id, batch_id, source, title, detail, reason, state, asked_of, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (agent_id, channel_id, batch_id, source, title, detail, reason, state, asked_of,
+             created_at, read_only)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             r.agent.0,
             r.channel.0,
@@ -352,7 +395,8 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
             r.reason,
             r.state.as_str(),
             asked,
-            r.now as i64
+            r.now as i64,
+            r.read_only as i64
         ],
     )?;
     let id = PermissionId(c.last_insert_rowid());
@@ -407,7 +451,8 @@ pub fn pending_for(
     .optional()
 }
 
-/// The agent's requests in a channel, newest first.
+/// The agent's requests in a channel, newest first. Logged reads are left
+/// out: nobody asked anyone for them.
 pub fn of_agent(
     c: &Connection,
     agent: MemberId,
@@ -416,7 +461,8 @@ pub fn of_agent(
 ) -> rusqlite::Result<Vec<PermissionRequest>> {
     let mut stmt = c.prepare_cached(&format!(
         "SELECT {COLS} FROM permission_requests
-         WHERE agent_id = ?1 AND channel_id = ?2 ORDER BY id DESC LIMIT ?3"
+         WHERE agent_id = ?1 AND channel_id = ?2 AND read_only = 0
+         ORDER BY id DESC LIMIT ?3"
     ))?;
     stmt.query_map(params![agent.0, channel.0, limit as i64], row)?
         .collect()
@@ -429,6 +475,70 @@ pub fn pending_in(c: &Connection, channel: ChannelId) -> rusqlite::Result<Vec<Pe
          WHERE channel_id = ?1 AND state = 'pending' ORDER BY id"
     ))?;
     stmt.query_map([channel.0], row)?.collect()
+}
+
+/// How many logged reads a channel keeps. Reads are frequent and only
+/// matter for the log, so older ones are pruned as new ones arrive; every
+/// other request is kept.
+pub const READS_KEPT: usize = 500;
+
+/// The permission log for a channel: every request, reads included, newest
+/// first, at most `limit`.
+pub fn log_in(
+    c: &Connection,
+    channel: ChannelId,
+    limit: usize,
+) -> rusqlite::Result<Vec<PermissionRequest>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {COLS} FROM permission_requests
+         WHERE channel_id = ?1 ORDER BY id DESC LIMIT ?2"
+    ))?;
+    stmt.query_map(params![channel.0, limit as i64], row)?
+        .collect()
+}
+
+/// Drops a channel's logged reads past the newest `keep`. Returns how many
+/// went.
+pub fn prune_reads(c: &Connection, channel: ChannelId, keep: usize) -> rusqlite::Result<usize> {
+    c.execute(
+        "DELETE FROM permission_requests
+         WHERE channel_id = ?1 AND read_only = 1 AND id <= (
+             SELECT id FROM permission_requests
+             WHERE channel_id = ?1 AND read_only = 1
+             ORDER BY id DESC LIMIT 1 OFFSET ?2)",
+        params![channel.0, keep as i64],
+    )
+}
+
+/// Records a read-only tool call that was allowed at once, for the log, and
+/// prunes the channel's older reads.
+pub fn insert_read(
+    c: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+    batch: Option<BatchId>,
+    title: &str,
+    detail: Option<&str>,
+    now: Millis,
+) -> rusqlite::Result<PermissionRequest> {
+    let r = insert(
+        c,
+        &NewRequest {
+            agent,
+            channel,
+            batch,
+            source: PermissionSource::Native,
+            title,
+            detail,
+            reason: None,
+            state: PermissionState::AutoApproved,
+            asked_of: &[],
+            now,
+            read_only: true,
+        },
+    )?;
+    prune_reads(c, channel, READS_KEPT)?;
+    Ok(r)
 }
 
 /// Records a human's answer. Only a pending request can be answered; returns
@@ -582,6 +692,7 @@ impl Engine {
     ) -> PermissionVerdict {
         if ask.read_only {
             self.rt_note(agent, channel, format!("reading: {}", short(&ask.title)));
+            self.log_read(now, agent, channel, &ask);
             return PermissionVerdict::AllowRead;
         }
         match self.ask_permission(
@@ -646,6 +757,7 @@ impl Engine {
                         state: PermissionState::AutoApproved,
                         asked_of: &[],
                         now,
+                        read_only: false,
                     },
                 )
             })?;
@@ -693,6 +805,7 @@ impl Engine {
                     state: PermissionState::Pending,
                     asked_of: &asked_of,
                     now,
+                    read_only: false,
                 },
             )
         })?;
@@ -787,6 +900,38 @@ impl Engine {
             .push(Effect::Event(CoreEvent::Permission(req.clone())));
         self.pump(now, agent, channel);
         Ok(req)
+    }
+
+    /// Keeps an allowed read for the permission log. A store error only costs
+    /// the log line: the read is allowed either way.
+    fn log_read(&mut self, now: Millis, agent: MemberId, channel: ChannelId, ask: &PermissionAsk) {
+        let title = ask.title.trim();
+        let title = if title.is_empty() { "a read" } else { title };
+        let turn = match ask.turn {
+            Some(t) => Some(t),
+            None => store::in_flight_batch(self.conn(), agent, channel)
+                .ok()
+                .flatten()
+                .map(|b| b.id),
+        };
+        let detail = ask.detail.as_deref();
+        match self
+            .store
+            .tx(|c| insert_read(c, agent, channel, turn, title, detail, now))
+        {
+            Ok(r) => self.effects.push(Effect::Event(CoreEvent::Permission(r))),
+            Err(e) => self.rt_note(agent, channel, format!("permission log: {e}")),
+        }
+    }
+
+    /// The permission log for `channel`: every request, reads included,
+    /// newest first, at most `limit`.
+    pub fn permission_log(
+        &self,
+        channel: ChannelId,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<PermissionRequest>> {
+        log_in(self.conn(), channel, limit)
     }
 
     /// Pending requests in `channel`, oldest first (for a client starting up).
