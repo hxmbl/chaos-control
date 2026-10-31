@@ -766,7 +766,8 @@ impl Wire {
                 if let Some(k) = kind.and_then(|k| serde_json::from_value(Value::String(k)).ok()) {
                     fields = fields.kind(Some(k));
                 }
-                let call = v1::ToolCallUpdate::new(v1::ToolCallId::new(format!("perm-{n}")), fields);
+                let call =
+                    v1::ToolCallUpdate::new(v1::ToolCallId::new(format!("perm-{n}")), fields);
                 let req = v1::RequestPermissionRequest::new(
                     session.clone(),
                     call,
@@ -812,9 +813,9 @@ impl Wire {
                         ),
                     ],
                 );
-                if let Some(k) = kind.and_then(|k| {
-                    serde_json::from_value::<v2::ToolKind>(Value::String(k)).ok()
-                }) {
+                if let Some(k) =
+                    kind.and_then(|k| serde_json::from_value::<v2::ToolKind>(Value::String(k)).ok())
+                {
                     req = req.subject(v2::RequestPermissionSubject::ToolCall(Box::new(
                         v2::ToolCallPermissionSubject::new(
                             v2::ToolCallUpdate::new(format!("perm-{n}")).kind(k),

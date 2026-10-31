@@ -347,10 +347,25 @@ async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
             .await;
         h.say("@bot look around").await;
         let o = wait_outcomes(&h, "bot", 5).await;
-        assert_eq!(picked(&o[0]), &json!("allow"), "read, v{protocol}: {}", o[0]);
-        assert_eq!(picked(&o[1]), &json!("allow"), "search, v{protocol}: {}", o[1]);
+        assert_eq!(
+            picked(&o[0]),
+            &json!("allow"),
+            "read, v{protocol}: {}",
+            o[0]
+        );
+        assert_eq!(
+            picked(&o[1]),
+            &json!("allow"),
+            "search, v{protocol}: {}",
+            o[1]
+        );
         for (ix, what) in [(2, "edit"), (3, "execute"), (4, "no kind")] {
-            assert_eq!(picked(&o[ix]), &json!("deny"), "{what}, v{protocol}: {}", o[ix]);
+            assert_eq!(
+                picked(&o[ix]),
+                &json!("deny"),
+                "{what}, v{protocol}: {}",
+                o[ix]
+            );
             let message = o[ix]["_meta"]["chaosControl"]["message"]
                 .as_str()
                 .unwrap_or_default();
