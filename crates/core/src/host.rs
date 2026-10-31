@@ -759,6 +759,18 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// The permission log for `channel` (reads included), newest first, at
+    /// most `limit`.
+    pub async fn permission_log(
+        &self,
+        channel: ChannelId,
+        limit: usize,
+    ) -> Result<Vec<PermissionRequest>, String> {
+        self.with_engine(move |e, _| e.permission_log(channel, limit))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     /// Calls a chat tool as the session `scope` would (tests, debugging).
     pub async fn tool(&self, scope: Scope, name: &str, args: Value) -> Result<Value, String> {
         let name = name.to_string();

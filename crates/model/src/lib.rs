@@ -4,12 +4,17 @@
 //! Strings are `Arc<str>` so the UI can turn them into `SharedString`s without copying.
 
 pub mod pane;
+pub mod permissions;
 mod sample;
 pub mod search;
 
 pub use pane::{
     Attachment, PaneAction, PaneActionKind, PaneContent, PermissionPrompt, ProjectQuestion,
     ProjectQuestionKind, ReplyRef, ReviewItem, Settings,
+};
+pub use permissions::{
+    LOG_LEN as PERMISSION_LOG_LEN, PermissionLog, PermissionLogEntry, PermissionOutcome,
+    relative_time,
 };
 pub use sample::{demo_channels, demo_history, sample, sample_history};
 pub use search::{

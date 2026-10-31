@@ -435,6 +435,23 @@ fn permission_text(p: &model::PermissionPrompt) -> String {
         let detail: String = detail.chars().take(600).collect();
         out.push_str(&format!("Details: {detail}\n"));
     }
+    // Opened from the permission log: how it ended, nothing to answer.
+    if let Some(outcome) = p.logged {
+        out.push_str(&match outcome {
+            model::PermissionOutcome::AutoAllowed => format!(
+                "Request #{}: allowed without asking anyone (a read, or an agent in its own VM).",
+                p.request
+            ),
+            model::PermissionOutcome::Declined => format!(
+                "Request #{}: declined at once. {} was told \"not now\" and carried on; nothing ran.",
+                p.request, p.agent
+            ),
+            model::PermissionOutcome::Approved => {
+                format!("Request #{}: approved by a human, once.", p.request)
+            }
+        });
+        return out;
+    }
     let asked = if p.asked.is_empty() {
         "the room"
     } else {

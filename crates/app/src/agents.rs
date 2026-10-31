@@ -81,6 +81,7 @@ use chaos_core::{
     host::{AgentSpec, Core, HostConfig, MemberSpec, SystemClock},
     model_cache::{self, CachedModels},
     permission::RunsIn,
+    policy::Policy,
     roster::ModelMember,
     types::{Channel, ChannelId, MemberId, Project, ProjectId},
 };
@@ -540,6 +541,13 @@ pub fn start_with(
         db: Some(data.join("core.sqlite")),
         bridge,
         default_cwd: std::env::current_dir().unwrap_or_else(|_| data.clone()),
+        // Requests are muted (no Approve / Deny pane), so the chat note
+        // ("any human here can approve or deny it") would ask for something
+        // the app can't do. The right sidebar's permission log shows them.
+        policy: Policy {
+            note_permission_requests: false,
+            ..Policy::default()
+        },
         ..HostConfig::default()
     };
     let folder = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
