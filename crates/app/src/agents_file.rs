@@ -128,7 +128,10 @@ pub fn remove_member(path: &Path, harness: &str, model: Option<&str>) -> io::Res
 
 /// Runs a write off the UI thread; a failure is printed (the roster change
 /// itself already happened in core).
-pub fn in_background(path: Arc<Path>, write: impl FnOnce(&Path) -> io::Result<()> + Send + 'static) {
+pub fn in_background(
+    path: Arc<Path>,
+    write: impl FnOnce(&Path) -> io::Result<()> + Send + 'static,
+) {
     std::thread::spawn(move || {
         if let Err(e) = write(&path) {
             eprintln!(
@@ -144,10 +147,8 @@ mod tests {
     use super::*;
 
     fn temp_file(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "chaos-agents-file-{name}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("chaos-agents-file-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir.join("agents.json")
     }

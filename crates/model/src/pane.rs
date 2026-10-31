@@ -356,7 +356,9 @@ pub fn author_name(ws: &Workspace, author: Author) -> Arc<str> {
     match author {
         Author::Human => Arc::from("Hx"),
         Author::System => Arc::from("Chaos Control"),
-        Author::Agent(id) => ws.agent(id).map_or(Arc::from("Agent"), |a| a.name.clone()),
+        Author::Agent(id) => ws
+            .agent(id)
+            .map_or(Arc::from(crate::PREVIOUS_AGENT), |a| a.name.clone()),
     }
 }
 

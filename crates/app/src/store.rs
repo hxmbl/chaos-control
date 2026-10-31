@@ -8,11 +8,13 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use chaos_core::{
     engine::CoreEvent,
     harness::{self, Catalog, HarnessModels, ModelInfo, ModelSource},
+    model_cache::{self, CachedModels, Freshness},
     permission::{PermissionId, PermissionRequest, PermissionState},
     types as ct,
 };
@@ -24,9 +26,14 @@ use model::{
 };
 
 use crate::{
-    agents::{self, CoreLink, LinkedAgent, OpenProject},
+    agents::{self, CoreLink, DormantMember, LinkedAgent, OpenProject},
+    agents_file,
     project::{self, Confirm, Question, Target},
 };
+
+/// How long after a failed probe (signed out, timed out) a harness is left
+/// alone before the picker opening asks it again.
+const PROBE_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Model ids for things that come from core sit above these, clear of the
 /// sample data and local echoes.
@@ -95,13 +102,21 @@ struct Attached {
     names: HashMap<ct::MemberId, Arc<str>>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
-    /// Each usable harness's models: its preset list until it reports its
-    /// own (a live session, or discovery when the model picker opens).
+    /// Each usable harness's models: its cached list (`model_cache`), else
+    /// its preset list until it reports its own.
     models: HashMap<&'static str, HarnessModels>,
-    /// Harnesses being asked for their models right now.
+    /// Harnesses being asked for their models right now (in the background,
+    /// on core's runtime; never while the user waits).
     discovering: HashSet<&'static str>,
-    /// Members removed this run: their messages still read as an agent's.
-    former: HashSet<ct::MemberId>,
+    /// Harnesses whose cached list is missing, stale or from another
+    /// version: probed in the background.
+    stale: HashSet<&'static str>,
+    /// When a harness's last probe failed, so a signed-out harness isn't
+    /// started again every time the picker opens.
+    failed_at: HashMap<&'static str, Instant>,
+    /// Every agent member core knows, current or removed: their messages
+    /// read as an agent's ("Previous agent" once they're gone).
+    agent_ids: HashSet<ct::MemberId>,
     _events: Task<()>,
 }
 
@@ -316,28 +331,53 @@ impl ChatStore {
         // (and the sample mentions name sample agents).
         self.workspace.agents = link.agents.iter().map(status_agent).collect();
         self.workspace.mentions.clear();
+        // Each harness starts on its cached list when there is one (shown at
+        // once, even if stale), else its preset list. Missing or stale lists
+        // are probed in the background right after this.
+        let now = model_cache::now_secs();
+        let mut stale = HashSet::new();
         let models: HashMap<&'static str, HarnessModels> = link
             .harnesses
             .iter()
             .map(|h| {
-                (
-                    h.preset.id,
-                    HarnessModels {
+                let cached = link.cached_models.get(h.preset.id);
+                if cached.is_none_or(|c| c.freshness(&h.version(), now) != Freshness::Fresh) {
+                    stale.insert(h.preset.id);
+                }
+                let entry = match cached {
+                    Some(c) if !c.models.is_empty() => HarnessModels {
+                        harness: h.preset,
+                        source: ModelSource::Live,
+                        models: with_default(h.preset, c.models()),
+                        note: None,
+                    },
+                    _ => HarnessModels {
                         harness: h.preset,
                         source: ModelSource::Preset,
                         models: harness::preset_models(h.preset),
                         note: None,
                     },
-                )
+                };
+                (h.preset.id, entry)
             })
             .collect();
-        let cached: Vec<&'static str> = models.keys().copied().collect();
         let channel = self.show_project(&link.open, &link.folder, cx);
         let confirm = link.confirm.take();
         let mut events = link.events.take();
         let core = link.core.clone();
         let main = link.main();
         let task = cx.spawn(async move |this, cx| {
+            // Who was ever an agent, before the history that needs it.
+            if let Ok(ids) = core.agent_members().await {
+                let ok = this.update(cx, |store, _| {
+                    if let Some(a) = &mut store.core {
+                        a.agent_ids.extend(ids);
+                    }
+                });
+                if ok.is_err() {
+                    return;
+                }
+            }
             match core.history(main, 200).await {
                 Ok(history) => {
                     let ok = this.update(cx, |store, cx| {
@@ -350,17 +390,6 @@ impl ChatStore {
                     }
                 }
                 Err(e) => eprintln!("chaos-control: could not load #main history: {e}"),
-            }
-            // Model lists harnesses reported earlier, for the picker.
-            for id in cached {
-                if let Ok(list) = core.harness_models(id).await
-                    && !list.is_empty()
-                {
-                    let ok = this.update(cx, |store, cx| store.set_models(id, list, cx));
-                    if ok.is_err() {
-                        return;
-                    }
-                }
             }
             if let Ok(members) = core.members(main).await {
                 let ok = this.update(cx, |store, _| {
@@ -422,9 +451,13 @@ impl ChatStore {
             confirm,
             models,
             discovering: HashSet::new(),
-            former: HashSet::new(),
+            stale,
+            failed_at: HashMap::new(),
+            agent_ids: HashSet::new(),
             _events: task,
         });
+        // Probe the harnesses without a fresh cached list, in the background.
+        self.refresh_models(cx);
         cx.notify();
     }
 
@@ -473,6 +506,15 @@ impl ChatStore {
             .collect()
     }
 
+    /// Roster members whose harness isn't installed (the picker lists them
+    /// greyed, "not installed").
+    pub fn dormant(&self) -> &[DormantMember] {
+        match &self.core {
+            Some(a) => &a.link.dormant,
+            None => &[],
+        }
+    }
+
     /// Whether the member running `model` on `harness` is already here.
     pub fn has_member(&self, harness: &str, model: Option<&str>) -> bool {
         self.core.as_ref().is_some_and(|a| {
@@ -483,41 +525,58 @@ impl ChatStore {
         })
     }
 
-    /// Asks every harness that has only its preset list for its own (the
-    /// model picker just opened). Each answer, or failure, updates the
-    /// picker as it lands; a harness is asked once at a time.
+    /// Probes, in the background, every harness whose cached model list is
+    /// missing, stale or from another version (see `model_cache`). Called
+    /// when core starts and when the model picker opens; it only schedules
+    /// work and returns at once. Each probe spawns its harness once, on
+    /// core's own tokio runtime (`Core::probe_models`), and its answer is
+    /// written to the cache and lands in the picker. A harness whose probe
+    /// failed is left alone for `PROBE_RETRY`.
     pub fn refresh_models(&mut self, cx: &mut Context<Self>) {
         let Some(attached) = &mut self.core else {
             return;
         };
         let core = attached.link.core.clone();
         let folder = attached.link.folder.clone();
+        let cache_dir = attached.link.model_cache_dir.clone();
         let todo: Vec<agents::Harness> = attached
             .link
             .harnesses
             .iter()
+            .filter(|h| attached.stale.contains(h.preset.id))
+            .filter(|h| !attached.discovering.contains(h.preset.id))
             .filter(|h| {
                 attached
-                    .models
+                    .failed_at
                     .get(h.preset.id)
-                    .is_none_or(|m| m.source == ModelSource::Preset)
+                    .is_none_or(|at| at.elapsed() >= PROBE_RETRY)
             })
-            .filter(|h| !attached.discovering.contains(h.preset.id))
             .cloned()
             .collect();
         for h in todo {
             let id = h.preset.id;
             attached.discovering.insert(id);
-            let (core, folder) = (core.clone(), folder.clone());
+            let (core, folder, cache_dir) = (core.clone(), folder.clone(), cache_dir.clone());
             cx.spawn(async move |this, cx| {
-                let found = core.discover_models(id, h.adapter(None), folder).await;
+                let version = h.version();
+                let found = core
+                    .probe_models(id, &version, h.adapter(None), folder, cache_dir)
+                    .await;
                 this.update(cx, |store, cx| {
                     if let Some(a) = &mut store.core {
                         a.discovering.remove(id);
+                        match &found {
+                            Ok(_) => {
+                                a.stale.remove(id);
+                                a.failed_at.remove(id);
+                            }
+                            Err(_) => {
+                                a.failed_at.insert(id, Instant::now());
+                            }
+                        }
                     }
                     match found {
-                        Ok(list) if !list.is_empty() => store.set_models(id, list, cx),
-                        Ok(_) => store.note_models(id, None, cx),
+                        Ok(cached) => store.set_models(id, cached.models(), cx),
                         Err(e) => store.note_models(id, Some(short_reason(&e)), cx),
                     }
                 })
@@ -536,10 +595,7 @@ impl ChatStore {
         let Some(entry) = attached.models.values_mut().find(|m| m.harness.id == id) else {
             return;
         };
-        // Keep "the harness default" first: it is always a valid choice.
-        let mut models = vec![ModelInfo::default_for(entry.harness)];
-        models.extend(list.into_iter().filter(|m| m.id.is_some()));
-        entry.models = models;
+        entry.models = with_default(entry.harness, list);
         entry.source = ModelSource::Live;
         entry.note = None;
         cx.notify();
@@ -577,10 +633,16 @@ impl ChatStore {
         };
         let core = attached.link.core.clone();
         let main = attached.link.main();
+        let path = attached.link.agents_path.clone();
+        let entry = agents_file::Entry::new(harness, model.as_deref(), &name);
         cx.spawn(async move |this, cx| {
             let added = agents::add_member(core, h, model, name, main).await;
             this.update(cx, |store, cx| match added {
-                Ok(linked) => store.linked(linked, cx),
+                Ok(linked) => {
+                    // The roster is agents.json's `members` (see agents_file).
+                    agents_file::in_background(path, move |p| agents_file::add_member(p, &entry));
+                    store.linked(linked, cx)
+                }
                 Err(e) => store.system_note(&format!("Could not add that model: {e}"), cx),
             })
             .ok();
@@ -601,6 +663,7 @@ impl ChatStore {
             return;
         }
         attached.names.insert(linked.member, linked.name.clone());
+        attached.agent_ids.insert(linked.member);
         self.workspace.agents.push(status_agent(&linked));
         attached.link.agents.push(linked);
         cx.notify();
@@ -620,8 +683,16 @@ impl ChatStore {
         else {
             return;
         };
-        let member = attached.link.agents.remove(ix).member;
-        attached.former.insert(member);
+        let removed = attached.link.agents.remove(ix);
+        let member = removed.member;
+        // Its messages stay, and read as a previous agent's.
+        attached.agent_ids.insert(member);
+        if let Some(harness) = removed.harness_id.clone() {
+            let model = removed.model.clone();
+            agents_file::in_background(attached.link.agents_path.clone(), move |p| {
+                agents_file::remove_member(p, &harness, model.as_deref())
+            });
+        }
         self.workspace.agents.retain(|a| a.id != id);
         let core = attached.link.core.clone();
         let project = attached.link.open.project.id.clone();
@@ -838,7 +909,7 @@ impl ChatStore {
                     None => Author::System,
                     Some(id)
                         if attached.link.agents.iter().any(|a| a.member == id)
-                            || attached.former.contains(&id) =>
+                            || attached.agent_ids.contains(&id) =>
                     {
                         Author::Agent(agent_id(id))
                     }
@@ -924,8 +995,27 @@ impl ChatStore {
             // The model has no reactions yet.
             CoreEvent::Reaction { .. } => {}
             CoreEvent::Models { harness, models } => {
-                let id = harness::preset(&harness).map(|p| p.id);
-                if let Some(id) = id {
+                // A live session reported its harness's models: show them and
+                // keep them in the on-disk cache (off the UI thread).
+                let found = attached.link.harness(&harness).map(|h| {
+                    (
+                        h.preset.id,
+                        h.version(),
+                        attached.link.model_cache_dir.clone(),
+                    )
+                });
+                if let Some((id, version, dir)) = found
+                    && !models.is_empty()
+                {
+                    let cached = CachedModels::new(id, &version, model_cache::now_secs(), &models);
+                    std::thread::spawn(move || {
+                        if let Err(e) = model_cache::save(&dir, &cached) {
+                            eprintln!("chaos-control: could not cache the {id} models: {e}");
+                        }
+                    });
+                    if let Some(a) = &mut self.core {
+                        a.stale.remove(id);
+                    }
                     self.set_models(id, models, cx);
                 }
             }
@@ -1033,6 +1123,14 @@ fn status_agent(a: &LinkedAgent) -> Agent {
         harness: a.harness.clone(),
         removable: a.removable,
     }
+}
+
+/// A harness's model list with "the harness default" first: it is always a
+/// valid choice, whatever the harness listed.
+fn with_default(preset: &'static harness::HarnessPreset, list: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let mut models = vec![ModelInfo::default_for(preset)];
+    models.extend(list.into_iter().filter(|m| m.id.is_some()));
+    models
 }
 
 /// A discovery error, short enough for the picker ("signed out").

@@ -546,7 +546,12 @@ pub fn start_with(
     let model_cache_dir = model_cache::dir(&data);
     let cached_models: HashMap<&'static str, CachedModels> = harnesses
         .iter()
-        .filter_map(|h| Some((h.preset.id, model_cache::load(&model_cache_dir, h.preset.id)?)))
+        .filter_map(|h| {
+            Some((
+                h.preset.id,
+                model_cache::load(&model_cache_dir, h.preset.id)?,
+            ))
+        })
         .collect();
     let AgentsConfig {
         human: human_config,
@@ -621,7 +626,9 @@ pub fn start_with(
                 };
                 let entries: Vec<agents_file::Entry> = list
                     .iter()
-                    .map(|m| agents_file::Entry::new(&m.harness, m.model.as_deref(), &entry_name(m)))
+                    .map(|m| {
+                        agents_file::Entry::new(&m.harness, m.model.as_deref(), &entry_name(m))
+                    })
                     .collect();
                 if let Err(e) = agents_file::set_members(&agents_path, &entries) {
                     eprintln!(
@@ -649,10 +656,15 @@ pub fn start_with(
         // another project, a harness no longer installed) leaves the room.
         // Its messages stay.
         for m in core.roster(&project.id).await? {
-            if !linked.iter().any(|(h, model)| *h == m.harness && *model == m.model)
+            if !linked
+                .iter()
+                .any(|(h, model)| *h == m.harness && *model == m.model)
                 && let Err(e) = core.remove_member(&project.id, m.member.id).await
             {
-                eprintln!("chaos-control: could not take {} off the roster: {e}", m.model_name);
+                eprintln!(
+                    "chaos-control: could not take {} off the roster: {e}",
+                    m.model_name
+                );
             }
         }
         let open = describe(&core, project).await?;

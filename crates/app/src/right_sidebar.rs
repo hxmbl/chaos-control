@@ -72,7 +72,7 @@ impl Render for RightSidebar {
             .iter()
             .map(|m| {
                 let agent = ws.agent(m.agent);
-                let name = agent.map_or("Agent".into(), |a| a.name.clone());
+                let name = agent.map_or(model::PREVIOUS_AGENT.into(), |a| a.name.clone());
                 (m.channel, agent.map(|a| a.brand), name, m.text.clone())
             })
             .collect();
