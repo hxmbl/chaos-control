@@ -573,7 +573,7 @@ impl ModelPicker {
             .enumerate()
             .map(|(n, d)| {
                 div()
-                    .id(SharedString::from(format!("dormant-{n}")))
+                    .id(SharedString::from(format!("dormant-{}-{n}", d.harness)))
                     .flex()
                     .items_center()
                     .gap(space::X2)
