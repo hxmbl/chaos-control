@@ -255,6 +255,9 @@ async fn codex_member_takes_a_turn_and_its_last_message_is_the_fallback_reply() 
     );
     let start = fake.request("thread/start").unwrap();
     assert_eq!(start["model"], "gpt-6.1-sol");
+    // Reads never prompt; anything more asks (and the gate declines it).
+    assert_eq!(start["sandbox"], "read-only");
+    assert_eq!(start["approvalPolicy"], "on-request");
     let mcp = &start["config"]["mcp_servers.chaos-control"];
     assert!(
         mcp["url"]

@@ -324,3 +324,47 @@ async fn a_vm_agent_asking_ahead_is_told_to_go_ahead() {
     assert_eq!(r["status"], json!("approved"), "{r}");
     assert_eq!(r["state"], json!("auto_approved"));
 }
+
+/// Reads are always allowed (ACP tool kinds `read` and `search`), on the host
+/// too, and recorded nowhere; an edit or a command is declined at once with
+/// the request sent to the humans. Over ACP v1 and the v2 draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
+    for protocol in [1, 2] {
+        let mut h = Harness::new().await;
+        let bot = h
+            .agent(
+                "bot",
+                script(json!({"protocol": protocol, "turns": [{"steps": [
+                    {"permission_kind": {"title": "Read src/main.rs", "kind": "read"}},
+                    {"permission_kind": {"title": "Search for TODO", "kind": "search"}},
+                    {"permission_kind": {"title": "Edit src/main.rs", "kind": "edit"}},
+                    {"permission_kind": {"title": "cargo test", "kind": "execute"}},
+                    {"permission": "no kind given"},
+                    {"text": "Read what I could."}
+                ]}]})),
+            )
+            .await;
+        h.say("@bot look around").await;
+        let o = wait_outcomes(&h, "bot", 5).await;
+        assert_eq!(picked(&o[0]), &json!("allow"), "read, v{protocol}: {}", o[0]);
+        assert_eq!(picked(&o[1]), &json!("allow"), "search, v{protocol}: {}", o[1]);
+        for (ix, what) in [(2, "edit"), (3, "execute"), (4, "no kind")] {
+            assert_eq!(picked(&o[ix]), &json!("deny"), "{what}, v{protocol}: {}", o[ix]);
+            let message = o[ix]["_meta"]["chaosControl"]["message"]
+                .as_str()
+                .unwrap_or_default();
+            assert!(message.contains("read files freely"), "{message}");
+        }
+        // The turn carried on and ended with a reply.
+        h.wait_message("the agent carried on", Some(bot.id)).await;
+        // Only the three non-reads were recorded.
+        let all = h.core.pending_permissions(h.main).await.unwrap();
+        let titles: Vec<&str> = all.iter().map(|r| &*r.title).collect();
+        assert_eq!(
+            titles,
+            ["Edit src/main.rs", "cargo test", "no kind given"],
+            "v{protocol}"
+        );
+    }
+}

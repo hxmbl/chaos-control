@@ -633,6 +633,14 @@ fn v1_outcome(stop: v1::StopReason) -> TurnOutcome {
     }
 }
 
+/// A tool kind as its wire string (`read`, `search`, `execute`, ...).
+pub(crate) fn kind_str(k: &impl serde::Serialize) -> String {
+    match serde_json::to_value(k) {
+        Ok(serde_json::Value::String(s)) => s,
+        _ => String::new(),
+    }
+}
+
 fn v1_kind(k: &v1::PermissionOptionKind) -> OptionKind {
     match k {
         v1::PermissionOptionKind::AllowOnce => OptionKind::AllowOnce,
@@ -663,7 +671,7 @@ fn v1_answer(
         None => v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled),
     };
     match verdict {
-        PermissionVerdict::Allow { .. } => match pick_allow(&opts) {
+        PermissionVerdict::Allow { .. } | PermissionVerdict::AllowRead => match pick_allow(&opts) {
             Some(ix) => select(ix),
             None => decline(),
         },
@@ -769,11 +777,18 @@ async fn run_v1(
                     .raw_input
                     .as_ref()
                     .map(|v| Arc::from(v.to_string()));
+                let read_only = r
+                    .tool_call
+                    .fields
+                    .kind
+                    .as_ref()
+                    .is_some_and(|k| crate::permission::is_read_only_kind(&kind_str(k)));
                 let verdict = gate
                     .ask(PermissionAsk {
                         turn,
                         title: Arc::from(title),
                         detail,
+                        read_only,
                     })
                     .await;
                 responder.respond(v1_answer(&r, &verdict))
