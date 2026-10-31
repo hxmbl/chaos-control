@@ -17,9 +17,17 @@
 //! # Members are models
 //!
 //! A chat member is a model running through a harness (Codex, fx, Vibe,
-//! Claude Code, ...). The project's roster lives in core's store: the first
-//! time a project opens, every detected harness adds its default model, and
-//! from then on the user adds and removes members in Agent Status.
+//! Claude Code, ...). The roster is `agents.json`'s `members` list, loaded at
+//! every start and written back whenever the user adds or removes a model in
+//! Agent Status (`agents_file`). When the file has no `members` yet, the
+//! first project to open seeds it: every detected harness adds its default
+//! model (or the roster core already kept from before is carried over), and
+//! the result is written to the file.
+//!
+//! A member whose harness isn't installed is left out of the room (it is not
+//! in Agent Status and nobody can wake it) but stays in `agents.json`: the
+//! model picker lists it greyed as "not installed", and it comes back by
+//! itself at the first start after its harness is installed.
 //!
 //! # `agents.json` (optional)
 //!
@@ -47,9 +55,8 @@
 //! - `harnesses`: per-preset overrides (`command`, `args`, `env`, `record`,
 //!   `acp_v2`, `chat_tools`). A harness with a `command` here counts as
 //!   installed even if detection did not find it.
-//! - `members`: an explicit roster. When present it is used as is at every
-//!   start (no seeding from detection); adds and removes in the app still
-//!   work for the session and are kept in the store.
+//! - `members`: the roster, loaded at every start. The app keeps it current:
+//!   adding or removing a model rewrites this list (other keys are kept).
 //! - `agents`: the original shape (one ACP command per agent, `brand` only
 //!   picks the icon). Still loads unchanged; such agents are not on the
 //!   roster and can't be removed from the app.
@@ -70,8 +77,9 @@ use chaos_core::{
     acp::{AcpAdapter, ChatToolsPreference, SpawnTransport},
     adapter::{AgentAdapter, BridgeCommand},
     engine::CoreEvent,
-    harness::{self, AdapterOptions, DetectEnv, HarnessPreset, Transport},
+    harness::{self, AdapterOptions, DetectEnv, HarnessPreset},
     host::{AgentSpec, Core, HostConfig, MemberSpec, SystemClock},
+    model_cache::{self, CachedModels},
     permission::RunsIn,
     roster::ModelMember,
     types::{Channel, ChannelId, MemberId, Project, ProjectId},
@@ -80,7 +88,10 @@ use model::Brand;
 use serde::Deserialize;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::project::{self, Confirm, FileState, Known, Plan, Target};
+use crate::{
+    agents_file,
+    project::{self, Confirm, FileState, Known, Plan, Target},
+};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct AgentsConfig {
@@ -125,8 +136,8 @@ pub struct HarnessOverride {
     pub chat_tools: ChatTools,
 }
 
-/// One member of an explicit roster.
-#[derive(Debug, Deserialize)]
+/// One member of the roster.
+#[derive(Clone, Debug, Deserialize)]
 pub struct MemberConfig {
     pub harness: String,
     /// The harness's model id; absent runs its default model.
@@ -206,22 +217,38 @@ impl Harness {
     pub fn brand(&self) -> Brand {
         parse_brand(Some(self.preset.icon))
     }
+
+    /// The harness's version as the model cache keys it (read from its
+    /// launch command, never by running it; see `model_cache::version_of`).
+    pub fn version(&self) -> String {
+        model_cache::version_of(&self.command, &self.args)
+    }
 }
 
-/// The adapter for a roster member whose harness isn't installed: its probe
-/// fails, so the member shows red ("not found") instead of vanishing.
-fn missing_adapter(preset: &HarnessPreset) -> Arc<dyn AgentAdapter> {
-    let command = match preset.launch.command {
-        harness::BIN => preset.detect[0],
-        c => c,
-    };
-    harness::adapter_for(
-        preset.transport,
-        PathBuf::from(command),
-        Vec::new(),
-        None,
-        AdapterOptions::default(),
-    )
+/// A roster member whose harness isn't installed on this machine.
+#[derive(Clone, Debug)]
+pub struct DormantMember {
+    /// The harness id as written in `agents.json` ("devin").
+    pub harness: Arc<str>,
+    /// Its display name ("Devin CLI"), or the id for a harness this build
+    /// doesn't know.
+    pub harness_name: Arc<str>,
+    pub brand: Brand,
+    pub model: Option<Arc<str>>,
+    pub name: Arc<str>,
+}
+
+impl DormantMember {
+    fn new(m: &MemberConfig, name: &str) -> Self {
+        let preset = harness::preset(&m.harness);
+        DormantMember {
+            harness: Arc::from(m.harness.as_str()),
+            harness_name: Arc::from(preset.map_or(m.harness.as_str(), |p| p.name)),
+            brand: parse_brand(preset.map(|p| p.icon)),
+            model: m.model.as_deref().map(Arc::from),
+            name: Arc::from(name),
+        }
+    }
 }
 
 /// Every harness this run can use: detected ones (unless detection is off)
@@ -318,6 +345,15 @@ pub struct CoreLink {
     pub agents: Vec<LinkedAgent>,
     /// The harnesses this run can start, for the model picker.
     pub harnesses: Vec<Harness>,
+    /// Roster members whose harness isn't installed: left out of the room,
+    /// listed greyed in the model picker.
+    pub dormant: Vec<DormantMember>,
+    /// The file the roster is loaded from and written back to.
+    pub agents_path: Arc<Path>,
+    /// Where each harness's model list is cached (`model_cache`).
+    pub model_cache_dir: PathBuf,
+    /// The cached model list of each harness that has one, read at start.
+    pub cached_models: HashMap<&'static str, CachedModels>,
     pub events: Option<UnboundedReceiver<CoreEvent>>,
     /// Keeps core's tasks alive for as long as the app holds the link.
     _runtime: Arc<tokio::runtime::Runtime>,
@@ -401,7 +437,7 @@ pub fn start() -> Option<CoreLink> {
     if !had_file && found.is_empty() {
         return None;
     }
-    match start_with(config, found) {
+    match start_with(config, found, path) {
         Ok(link) => Some(link),
         Err(e) => {
             eprintln!("chaos-control: agent runtime did not start: {e}");
@@ -410,57 +446,85 @@ pub fn start() -> Option<CoreLink> {
     }
 }
 
-/// The member a fresh project gets for a detected harness: its first preset
-/// model (the harness default).
-fn seed_member(h: &Harness) -> MemberSpec {
+/// The roster entry a fresh project gets for a detected harness: its first
+/// preset model (the harness default).
+fn seed_entry(h: &Harness) -> MemberConfig {
     let first = harness::preset_models(h.preset)
         .into_iter()
         .next()
         .unwrap_or_else(|| harness::ModelInfo::default_for(h.preset));
-    MemberSpec {
+    MemberConfig {
         harness: h.preset.id.to_string(),
         model: first.id.as_deref().map(str::to_string),
-        model_name: first.name.to_string(),
-        adapter: h.adapter(first.id.as_deref()),
+        name: Some(first.name.to_string()),
         cwd: None,
         runs_in: RunsIn::Host,
     }
 }
 
-/// The spec that adds (or re-registers) the member running `model` on
-/// `harness` this run. A harness that isn't installed still gets an adapter,
-/// one whose probe fails, so the member shows red instead of vanishing.
-pub fn spec_for(
+/// A roster entry's display name: its own, else the model id, else
+/// "<harness> default".
+fn entry_name(m: &MemberConfig) -> String {
+    m.name.clone().unwrap_or_else(|| match &m.model {
+        Some(id) => id.clone(),
+        None => format!(
+            "{} default",
+            harness::preset(&m.harness).map_or(m.harness.as_str(), |p| p.name)
+        ),
+    })
+}
+
+/// The spec that adds (or re-registers) a roster entry this run, when its
+/// harness is installed. `None` when it isn't: such members stay out of the
+/// room (see the module docs).
+pub fn spec_for(harnesses: &[Harness], m: &MemberConfig) -> Option<MemberSpec> {
+    let h = harnesses.iter().find(|h| h.preset.id == m.harness)?;
+    Some(MemberSpec {
+        harness: m.harness.clone(),
+        model: m.model.clone(),
+        model_name: entry_name(m),
+        adapter: h.adapter(m.model.as_deref()),
+        cwd: m.cwd.clone(),
+        runs_in: m.runs_in,
+    })
+}
+
+/// The same harness and model listed twice is one member: the first wins.
+fn dedupe(list: Vec<MemberConfig>) -> Vec<MemberConfig> {
+    let mut out: Vec<MemberConfig> = Vec::new();
+    for m in list {
+        if !out
+            .iter()
+            .any(|o| o.harness == m.harness && o.model == m.model)
+        {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// Splits the roster into the members this run can start and the ones whose
+/// harness isn't installed.
+fn split_installed(
     harnesses: &[Harness],
-    harness: &str,
-    model: Option<&str>,
-    name: &str,
-) -> MemberSpec {
-    let adapter = match harnesses.iter().find(|h| h.preset.id == harness) {
-        Some(h) => h.adapter(model),
-        None => match harness::preset(harness) {
-            Some(p) => missing_adapter(p),
-            // A harness this build doesn't know: a command that won't be found.
-            None => harness::adapter_for(
-                Transport::Acp,
-                PathBuf::from(harness),
-                Vec::new(),
-                None,
-                AdapterOptions::default(),
-            ),
-        },
-    };
-    MemberSpec {
-        harness: harness.to_string(),
-        model: model.map(str::to_string),
-        model_name: name.to_string(),
-        adapter,
-        cwd: None,
-        runs_in: RunsIn::Host,
+    roster: &[MemberConfig],
+) -> (Vec<MemberSpec>, Vec<DormantMember>) {
+    let mut specs = Vec::new();
+    let mut dormant = Vec::new();
+    for m in roster {
+        match spec_for(harnesses, m) {
+            Some(spec) => specs.push(spec),
+            None => dormant.push(DormantMember::new(m, &entry_name(m))),
+        }
     }
+    (specs, dormant)
 }
 
-pub fn start_with(config: AgentsConfig, harnesses: Vec<Harness>) -> Result<CoreLink, String> {
+pub fn start_with(
+    config: AgentsConfig,
+    harnesses: Vec<Harness>,
+    agents_path: PathBuf,
+) -> Result<CoreLink, String> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("chaos-core")
@@ -479,18 +543,29 @@ pub fn start_with(config: AgentsConfig, harnesses: Vec<Harness>) -> Result<CoreL
         ..HostConfig::default()
     };
     let folder = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
-    let (core, events, open, confirm, human, agents) = runtime.block_on(async {
+    let model_cache_dir = model_cache::dir(&data);
+    let cached_models: HashMap<&'static str, CachedModels> = harnesses
+        .iter()
+        .filter_map(|h| Some((h.preset.id, model_cache::load(&model_cache_dir, h.preset.id)?)))
+        .collect();
+    let AgentsConfig {
+        human: human_config,
+        members: file_members,
+        agents: plain_agents,
+        ..
+    } = config;
+    let (core, events, open, confirm, human, agents, dormant) = runtime.block_on(async {
         let (core, events) = Core::start(host, Arc::new(SystemClock)).await?;
         let plan = plan_for(&core, &folder).await?;
         let project = apply_plan(&core, &folder, &plan.open, plan.write_file).await?;
         let main = core.channel(&project.id, "main").await?.id;
         let human = core
-            .human(&config.human.handle, &config.human.name, main)
+            .human(&human_config.handle, &human_config.name, main)
             .await?
             .id;
         let mut agents = Vec::new();
         // The original shape: plain ACP agents, not on the roster.
-        for a in config.agents {
+        for a in plain_agents {
             let name = a.name.clone().unwrap_or_else(|| a.handle.clone());
             let transport = SpawnTransport {
                 command: a.command,
@@ -523,50 +598,46 @@ pub fn start_with(config: AgentsConfig, harnesses: Vec<Harness>) -> Result<CoreL
                 removable: false,
             });
         }
-        // Model members.
-        let specs: Vec<MemberSpec> = match config.members {
-            Some(list) => list
-                .into_iter()
-                .map(|m| {
-                    let name = m.name.clone().unwrap_or_else(|| match &m.model {
-                        Some(id) => id.clone(),
-                        None => format!(
-                            "{} default",
-                            harness::preset(&m.harness).map_or(m.harness.as_str(), |p| p.name)
-                        ),
-                    });
-                    MemberSpec {
-                        cwd: m.cwd,
-                        runs_in: m.runs_in,
-                        ..spec_for(&harnesses, &m.harness, m.model.as_deref(), &name)
-                    }
-                })
-                .collect(),
+        // Model members: agents.json's `members`, else (first start) a
+        // seeded roster, or the one core kept from before, written to the
+        // file so it is the source from now on.
+        let roster: Vec<MemberConfig> = match file_members {
+            Some(list) => dedupe(list),
             None => {
-                let mut specs: Vec<MemberSpec> = Vec::new();
-                // A fresh project: every detected harness brings its
-                // default model. After this the roster is the user's.
-                if core.seed_roster_once(&project.id).await? {
-                    for h in &harnesses {
-                        if let Err(e) = core.add_model_member(seed_member(h), main).await {
-                            eprintln!("chaos-control: could not add {}: {e}", h.preset.name);
-                        }
-                    }
+                let list: Vec<MemberConfig> = if core.seed_roster_once(&project.id).await? {
+                    harnesses.iter().map(seed_entry).collect()
+                } else {
+                    core.roster(&project.id)
+                        .await?
+                        .into_iter()
+                        .map(|m| MemberConfig {
+                            harness: m.harness.to_string(),
+                            model: m.model.as_deref().map(str::to_string),
+                            name: Some(m.model_name.to_string()),
+                            cwd: None,
+                            runs_in: RunsIn::Host,
+                        })
+                        .collect()
+                };
+                let entries: Vec<agents_file::Entry> = list
+                    .iter()
+                    .map(|m| agents_file::Entry::new(&m.harness, m.model.as_deref(), &entry_name(m)))
+                    .collect();
+                if let Err(e) = agents_file::set_members(&agents_path, &entries) {
+                    eprintln!(
+                        "chaos-control: could not write the members to {}: {e}",
+                        agents_path.display()
+                    );
                 }
-                for m in core.roster(&project.id).await? {
-                    specs.push(spec_for(
-                        &harnesses,
-                        &m.harness,
-                        m.model.as_deref(),
-                        &m.model_name,
-                    ));
-                }
-                specs
+                dedupe(list)
             }
         };
+        let (specs, dormant) = split_installed(&harnesses, &roster);
+        let mut linked: Vec<(Arc<str>, Option<Arc<str>>)> = Vec::new();
         for spec in specs {
             match core.add_model_member(spec, main).await {
                 Ok(m) => {
+                    linked.push((m.harness.clone(), m.model.clone()));
                     if !agents.iter().any(|a: &LinkedAgent| a.member == m.member.id) {
                         agents.push(LinkedAgent::from_member(&m));
                     }
@@ -574,8 +645,18 @@ pub fn start_with(config: AgentsConfig, harnesses: Vec<Harness>) -> Result<CoreL
                 Err(e) => eprintln!("chaos-control: could not add a member: {e}"),
             }
         }
+        // Whatever else core still has on this project's roster (removed in
+        // another project, a harness no longer installed) leaves the room.
+        // Its messages stay.
+        for m in core.roster(&project.id).await? {
+            if !linked.iter().any(|(h, model)| *h == m.harness && *model == m.model)
+                && let Err(e) = core.remove_member(&project.id, m.member.id).await
+            {
+                eprintln!("chaos-control: could not take {} off the roster: {e}", m.model_name);
+            }
+        }
         let open = describe(&core, project).await?;
-        Ok::<_, String>((core, events, open, plan.confirm, human, agents))
+        Ok::<_, String>((core, events, open, plan.confirm, human, agents, dormant))
     })?;
     Ok(CoreLink {
         core,
@@ -585,6 +666,10 @@ pub fn start_with(config: AgentsConfig, harnesses: Vec<Harness>) -> Result<CoreL
         human,
         agents,
         harnesses,
+        dormant,
+        agents_path: Arc::from(agents_path),
+        model_cache_dir,
+        cached_models,
         events: Some(events),
         _runtime: Arc::new(runtime),
     })
@@ -829,6 +914,36 @@ mod tests {
 
         let off: AgentsConfig = serde_json::from_str(r#"{"detect": false}"#).unwrap();
         assert!(harnesses(&off, &env).is_empty());
+    }
+
+    #[test]
+    fn members_whose_harness_is_missing_stay_out_of_the_room() {
+        let fx = Harness {
+            preset: harness::preset("fx").unwrap(),
+            command: PathBuf::from("/bin/fx"),
+            args: vec!["acp".into()],
+            opts: AdapterOptions::default(),
+        };
+        let c: AgentsConfig = serde_json::from_str(
+            r#"{"members": [{"harness": "fx", "model": "a", "runs_in": "vm"},
+                            {"harness": "devin", "name": "Devin default"},
+                            {"harness": "fx", "model": "a"},
+                            {"harness": "nope"}]}"#,
+        )
+        .unwrap();
+        let roster = dedupe(c.members.unwrap());
+        assert_eq!(roster.len(), 3, "the same harness and model is one member");
+        let (specs, dormant) = split_installed(&[fx], &roster);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].model.as_deref(), Some("a"));
+        assert_eq!(specs[0].runs_in, RunsIn::Vm, "the first entry wins");
+        assert_eq!(dormant.len(), 2);
+        assert_eq!(&*dormant[0].harness, "devin");
+        assert_eq!(&*dormant[0].harness_name, "Devin");
+        assert_eq!(&*dormant[0].name, "Devin default");
+        // A harness this build doesn't know is shown by its id.
+        assert_eq!(&*dormant[1].harness_name, "nope");
+        assert_eq!(&*dormant[1].name, "nope default");
     }
 
     #[test]

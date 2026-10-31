@@ -1,6 +1,7 @@
 //! Chaos Control: a group chat for a project's AI agents and the people running it.
 
 mod agents;
+mod agents_file;
 mod composer;
 mod conversation;
 mod model_picker;
