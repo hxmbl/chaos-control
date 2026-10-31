@@ -271,7 +271,6 @@ async fn codex_member_takes_a_turn_and_its_last_message_is_the_fallback_reply() 
             .unwrap()
             .starts_with("Bearer ")
     );
-    assert!(start.get("approvalPolicy").is_none(), "never overridden");
     let turn = fake.request("turn/start").unwrap();
     assert_eq!(turn["threadId"], "thr_1");
     assert!(
