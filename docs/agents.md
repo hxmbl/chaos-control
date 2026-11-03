@@ -291,12 +291,21 @@ Configurable (`reaction::PingAnswers`), resolved per agent and channel by
 
 1. **The agent's own list**: `"ping_answer_reactions"` on the agent in
    `agents.json`, e.g. `["✅", "👍"]` (`AgentSpec::ping_answers`).
-2. **The project's list**: the `ping_answer_reactions` row in
+2. **A roster member's own list**: for a model member (model + harness),
+   the `ping_answer_reactions` column on `model_members` (migration 11), a
+   JSON list validated exactly like the `agents.json` field. It is per
+   member, so it follows the member into every project whose roster it is
+   on. Set it in the app's Settings pane ("A member's own reactions",
+   `@handle ✅ 👍`, `@handle default` to clear), or with
+   `Core::set_member_ping_answer_reactions(member, Some(list))`; `None`
+   clears it, and a member that isn't a model member is refused.
+   `Core::member_ping_answer_reactions` reads it.
+3. **The project's list**: the `ping_answer_reactions` row in
    `project_settings` (migration 10), keyed by the channel's project. Set it
    in the app's Settings pane, or with `Core::set_ping_answer_reactions
    (project, Some(list))`; `None` clears it. `Core::ping_answer_reactions`
    reads it (`None` means the default).
-3. **The default**: ✅ and 👍 (`reaction::DEFAULT_PING_ANSWERS`). 💀 and
+4. **The default**: ✅ and 👍 (`reaction::DEFAULT_PING_ANSWERS`). 💀 and
    everything else don't answer.
 
 A list holds emoji or `:shortcodes:`, normalised like a reaction (`:+1:` is

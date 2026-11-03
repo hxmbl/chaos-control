@@ -687,6 +687,35 @@ impl Core {
         .await?
     }
 
+    /// A roster model member's own list of reactions that answer a ping, as
+    /// stored, or `None` when it follows the project setting.
+    pub async fn member_ping_answer_reactions(
+        &self,
+        member: MemberId,
+    ) -> Result<Option<Vec<String>>, String> {
+        self.with_engine(move |e, _| e.member_ping_answers(member))
+            .await?
+            .map(|p| p.map(|p| p.to_list()))
+            .map_err(|e| e.to_string())
+    }
+
+    /// Validates and saves a roster model member's own list of reactions
+    /// that answer a ping (`None` clears it). It wins over the project
+    /// setting; an `agents.json` list still wins over it. Returns the
+    /// member's own list now (`None`: it follows the project).
+    pub async fn set_member_ping_answer_reactions(
+        &self,
+        member: MemberId,
+        entries: Option<Vec<String>>,
+    ) -> Result<Option<Vec<String>>, String> {
+        self.with_engine(move |e, _| {
+            e.set_member_ping_answers(member, entries.as_deref())
+                .map(|p| p.map(|p| p.to_list()))
+                .map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
     /// Reactions on the messages of `channel` after `after_seq`, oldest first
     /// (load them with the history they belong to).
     pub async fn reactions(

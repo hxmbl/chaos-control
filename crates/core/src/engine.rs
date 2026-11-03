@@ -116,6 +116,9 @@ impl std::fmt::Display for PostError {
 pub enum SettingError {
     Invalid(PingAnswersError),
     UnknownProject,
+    /// Only roster model members have their own list in the app; an
+    /// `agents.json` agent sets it in that file.
+    NotModelMember,
     Store(String),
 }
 
@@ -124,6 +127,9 @@ impl std::fmt::Display for SettingError {
         match self {
             SettingError::Invalid(e) => e.fmt(f),
             SettingError::UnknownProject => f.write_str("no such project"),
+            SettingError::NotModelMember => f.write_str(
+                "not a roster model member (an agents.json agent sets ping_answer_reactions there)",
+            ),
             SettingError::Store(e) => write!(f, "store error: {e}"),
         }
     }
@@ -845,11 +851,15 @@ impl Engine {
     }
 
     /// Which reactions answer a ping for `agent` in `channel`: the agent's own
-    /// list (`agents.json`), else the channel's project setting, else the
-    /// default (✅, 👍). A stored value that no longer parses counts as unset.
+    /// list (`agents.json`), else a roster model member's own list (stored on
+    /// `model_members`), else the channel's project setting, else the default
+    /// (✅, 👍). A stored value that no longer parses counts as unset.
     pub fn ping_answers(&self, agent: MemberId, channel: ChannelId) -> PingAnswers {
         if let Some(own) = self.ping_answers.get(&agent) {
             return own.clone();
+        }
+        if let Ok(Some(own)) = self.member_ping_answers(agent) {
+            return own;
         }
         store::channel(self.conn(), channel)
             .ok()
@@ -869,6 +879,39 @@ impl Engine {
                 self.ping_answers.remove(&agent);
             }
         }
+    }
+
+    /// A roster model member's own ping-answer list, or `None` when it has
+    /// none (or is not a model member).
+    pub fn member_ping_answers(
+        &self,
+        member: MemberId,
+    ) -> Result<Option<PingAnswers>, rusqlite::Error> {
+        let Some(raw) = crate::roster::ping_answers(self.conn(), member)? else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_str::<Vec<String>>(&raw)
+            .ok()
+            .and_then(|list| PingAnswers::parse(&list).ok()))
+    }
+
+    /// Validates and stores a roster model member's own ping-answer list
+    /// (`None` clears it, back to the project setting). Same validation as
+    /// the project setting and `agents.json`; junk is rejected whole. Returns
+    /// the member's own list now (`None`: it follows the project).
+    pub fn set_member_ping_answers<S: AsRef<str>>(
+        &mut self,
+        member: MemberId,
+        entries: Option<&[S]>,
+    ) -> Result<Option<PingAnswers>, SettingError> {
+        let parsed = entries.map(PingAnswers::parse).transpose()?;
+        let value = parsed
+            .as_ref()
+            .map(|p| serde_json::to_string(&p.to_list()).expect("strings serialise"));
+        if !crate::roster::set_ping_answers(self.conn(), member, value.as_deref())? {
+            return Err(SettingError::NotModelMember);
+        }
+        Ok(parsed)
     }
 
     /// The project's ping-answer setting, or `None` when it uses the default.
