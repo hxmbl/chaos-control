@@ -184,6 +184,33 @@ comes back as an error), it only ever runs in the background, and
 - **Codex:** `model` is passed on `thread/start` when `model/list` contains
   it; otherwise the thread starts on the default and presence says so.
 
+### Devin: workspace trust
+
+`devin acp` refuses to work in a folder the member hasn't trusted. In one
+untrusted folder it hung for 100 s instead of answering (Devin CLI
+3000.11.234). It has no per-folder flag or environment variable:
+`--respect-workspace-trust false` only works on the top-level `devin`, not
+`devin acp`, and `"skip_workspace_trust": true` in
+`~/.config/devin/config.json` turns the check off everywhere, which we don't
+want.
+
+Devin keeps trusted folders in
+`$XDG_DATA_HOME/devin/cli/trusted_workspaces.json` (default
+`~/.local/share/devin/cli/trusted_workspaces.json`) as
+`{"trusted_paths": [...]}`, and a subfolder of a trusted path counts as
+trusted. So before every Devin session start and model lookup, the ACP
+adapter adds the folder (`crate::devin::ensure_trusted`):
+
+- Devin is recognised by the agent binary's name, from the Devin preset's
+  `detect` list; other harnesses are untouched.
+- The folder is canonicalised (absolute) and appended; existing entries and
+  other keys are kept. Nothing is written when the folder or a parent is
+  already listed.
+- The file and its directories are created when missing. A malformed file
+  is left untouched: a warning goes to stderr and the session starts anyway.
+- `XDG_DATA_HOME` is used when set to an absolute path, else
+  `$HOME/.local/share`.
+
 ## The model picker
 
 Agent Status lists the project's members: model name, harness mark, status

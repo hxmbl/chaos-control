@@ -185,6 +185,70 @@ async fn acp_discovery_opens_and_closes_a_throwaway_session_without_chat_tools()
     assert_eq!(h.core.harness_models("fx").await.unwrap().len(), 2);
 }
 
+/// Devin refuses untrusted folders, so the ACP adapter adds the folder to
+/// Devin's trusted workspaces before model discovery and before a session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn devin_folders_are_trusted_before_discovery_and_sessions() {
+    let mut h = Harness::new().await;
+    let root = std::env::temp_dir().join(format!("chaos-devin-trust-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (probe_dir, work_dir) = (root.join("probe"), root.join("work"));
+    std::fs::create_dir_all(&probe_dir).unwrap();
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let trust = root.join("data/devin/cli/trusted_workspaces.json");
+    let fake = FakeAgent::new(script(models_script()));
+    let f = fake.clone();
+    let adapter = Arc::new(
+        AcpAdapter::new(Arc::new(FnTransport("fake devin".into(), move || {
+            fake::in_process(f.clone())
+        })))
+        .prefer_v2(false)
+        .devin_trust_file(trust.clone()),
+    );
+    let trusted = || -> Vec<String> {
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&trust).unwrap()).unwrap();
+        v["trusted_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap().to_string())
+            .collect()
+    };
+    let canon = |p: &std::path::Path| {
+        std::fs::canonicalize(p)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    h.core
+        .discover_models("devin", adapter.clone(), probe_dir.clone())
+        .await
+        .unwrap();
+    assert_eq!(trusted(), vec![canon(&probe_dir)]);
+
+    let m = h
+        .core
+        .add_model_member(
+            MemberSpec {
+                harness: "devin".into(),
+                model: None,
+                model_name: "Devin".into(),
+                adapter,
+                cwd: Some(work_dir.clone()),
+                runs_in: RunsIn::Host,
+            },
+            h.main,
+        )
+        .await
+        .unwrap();
+    h.say(&format!("@{} hello", m.member.handle)).await;
+    h.wait_message("the reply", Some(m.member.id)).await;
+    assert_eq!(trusted(), vec![canon(&probe_dir), canon(&work_dir)]);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_of_a_signed_out_harness_is_an_error_and_caches_nothing() {
     let h = Harness::new().await;
