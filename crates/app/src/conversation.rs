@@ -8,7 +8,7 @@
 
 use gpui::{
     AnyElement, Context, ElementId, Entity, ListAlignment, ListOffset, ListState, SharedString,
-    Subscription, Window, div, list, prelude::*, px,
+    Subscription, WeakEntity, Window, div, list, prelude::*, px,
 };
 use model::{Author, Id, PaneContent, pane};
 use ui::{
@@ -27,10 +27,6 @@ use crate::{
 /// composer can react.
 const QUICK_REACTIONS: [&str; 6] = ["👍", "✅", "👀", "😂", "❤️", "💀"];
 
-/// Every message row is this hover group, so the quick picker shows for the
-/// row under the pointer only.
-const ROW_GROUP: &str = "message-row";
-
 /// The empty state's blurb wraps at about 50 characters.
 const EMPTY_MAX_W: f32 = 384.;
 
@@ -41,6 +37,12 @@ pub struct Conversation {
     list: ListState,
     /// Message picked in search, tinted until the channel changes.
     highlighted: Option<usize>,
+    /// The row under the pointer: the only one that shows the quick picker.
+    /// Tracked here (each row's `on_hover`) rather than with a GPUI hover
+    /// group, whose `invisible` + `group_hover` picker never appeared in this
+    /// cached, `list`-rendered view (STRM-467).
+    hovered: Option<usize>,
+    this: WeakEntity<Self>,
     _store_events: Subscription,
 }
 
@@ -55,6 +57,7 @@ impl Conversation {
                 // Bottom-aligned, so a reset lands on the newest message.
                 this.list.reset(count);
                 this.highlighted = None;
+                this.hovered = None;
                 cx.notify();
             }
             StoreEvent::Reveal { channel, index } if *channel == this.channel => {
@@ -96,6 +99,8 @@ impl Conversation {
             channel,
             list: ListState::new(count, ListAlignment::Bottom, px(600.)),
             highlighted: None,
+            hovered: None,
+            this: cx.entity().downgrade(),
             _store_events: subscription,
         }
     }
@@ -134,6 +139,7 @@ impl Conversation {
 
         let can_react = store.can_react(self.channel, ix);
         let chips = store.reactions(self.channel, ix);
+        let this = self.this.clone();
 
         div()
             .w_full()
@@ -141,7 +147,23 @@ impl Conversation {
             .justify_center()
             .child(
                 div()
-                    .group(ROW_GROUP)
+                    .id(ElementId::Name(format!("message-row-{ix}").into()))
+                    .on_hover(move |over: &bool, _, cx| {
+                        this.update(cx, |c, cx| {
+                            let next = if *over {
+                                Some(ix)
+                            } else if c.hovered == Some(ix) {
+                                None
+                            } else {
+                                c.hovered
+                            };
+                            if next != c.hovered {
+                                c.hovered = next;
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    })
                     .relative()
                     .w_full()
                     .flex()
@@ -257,7 +279,9 @@ impl Conversation {
                                 }
                             }),
                     )
-                    .when(can_react, |row| row.child(self.quick_picker(ix, &t))),
+                    .when(can_react && self.hovered == Some(ix), |row| {
+                        row.child(self.quick_picker(ix, &t))
+                    }),
             )
             .into_any_element()
     }
@@ -341,8 +365,6 @@ impl Conversation {
             .absolute()
             .top(space::X1)
             .right(space::X2)
-            .invisible()
-            .group_hover(ROW_GROUP, |s| s.visible())
             .flex()
             .items_center()
             .gap(space::X0_5)
