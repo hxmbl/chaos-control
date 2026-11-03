@@ -6,7 +6,19 @@
 
 mod common;
 
-use chaos_core::{engine::CoreEvent, engine::PostError, mcp, types::*};
+use std::sync::Arc;
+
+use chaos_core::{
+    acp::{AcpAdapter, FnTransport},
+    engine::CoreEvent,
+    engine::PostError,
+    fake::{self, FakeAgent},
+    host::MemberSpec,
+    mcp,
+    permission::RunsIn,
+    reaction,
+    types::*,
+};
 use common::*;
 use serde_json::{Value, json};
 
@@ -642,4 +654,145 @@ async fn prompts_show_reactions_compactly() {
         !p.contains(&format!("🎉 @hx on #{}", reply.seq)),
         "not listed twice: {p}"
     );
+}
+
+/// A roster model member through a scripted fake ACP harness.
+async fn model_member(h: &Harness, name: &str, script: fake::Script) -> Member {
+    let agent = FakeAgent::new(script);
+    let adapter = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
+        format!("fake:{name}"),
+        move || fake::in_process(agent.clone()),
+    ))));
+    h.core
+        .add_model_member(
+            MemberSpec {
+                harness: "fx".into(),
+                model: Some(name.to_lowercase()),
+                model_name: name.into(),
+                adapter,
+                cwd: Some(std::env::temp_dir()),
+                runs_in: RunsIn::Host,
+            },
+            h.main,
+        )
+        .await
+        .unwrap()
+        .member
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_roster_members_own_list_wins_over_the_project_setting() {
+    let mut h = Harness::new().await;
+    h.core
+        .set_ping_answer_reactions(project_id(), Some(vec!["🚀".into()]))
+        .await
+        .unwrap();
+    let mm = model_member(
+        &h,
+        "Skull One",
+        script(json!({"turns": [{"steps": [react("💀")]}, {"steps": [react("🚀")]}]})),
+    )
+    .await;
+    // No own list yet: the project's applies.
+    assert_eq!(
+        h.core.member_ping_answer_reactions(mm.id).await.unwrap(),
+        None
+    );
+    let ctx = tool(&h, mm.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["🚀"]));
+
+    let set = h
+        .core
+        .set_member_ping_answer_reactions(mm.id, Some(vec![":skull:".into()]))
+        .await
+        .unwrap();
+    assert_eq!(set, Some(vec!["💀".to_string()]));
+    assert_eq!(
+        h.core.member_ping_answer_reactions(mm.id).await.unwrap(),
+        Some(vec!["💀".to_string()])
+    );
+    let ctx = tool(&h, mm.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["💀"]));
+
+    // 💀 answers for the member; the project's 🚀 no longer does.
+    let p1 = h.say(&format!("@{} ship?", mm.handle)).await;
+    settled(&mut h, 1).await;
+    assert_eq!(
+        h.obligation(mm.id, p1.id).await,
+        Some(ObligationState::Satisfied)
+    );
+    let p2 = h.say(&format!("@{} and now?", mm.handle)).await;
+    settled(&mut h, 2).await;
+    assert_eq!(
+        h.obligation(mm.id, p2.id).await,
+        Some(ObligationState::Ignored)
+    );
+
+    // Same validation as agents.json: 👀 in a list is refused whole.
+    let err = h
+        .core
+        .set_member_ping_answer_reactions(mm.id, Some(vec!["✅".into(), "👀".into()]))
+        .await
+        .unwrap_err();
+    assert!(err.contains("invalid ping_answer_reactions"), "{err}");
+    assert_eq!(
+        h.core.member_ping_answer_reactions(mm.id).await.unwrap(),
+        Some(vec!["💀".to_string()])
+    );
+
+    // Clearing it follows the project again, then the default.
+    let cleared = h
+        .core
+        .set_member_ping_answer_reactions(mm.id, None)
+        .await
+        .unwrap();
+    assert_eq!(cleared, None);
+    let ctx = tool(&h, mm.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["🚀"]));
+    h.core
+        .set_ping_answer_reactions(project_id(), None)
+        .await
+        .unwrap();
+    let ctx = tool(&h, mm.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["✅", "👍"]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agents_json_lists_still_win_and_plain_agents_have_no_member_slot() {
+    let mut h = Harness::new().await;
+    let own = h
+        .agent_answering("own", script(json!({"turns": []})), &["✅"])
+        .await;
+    let err = h
+        .core
+        .set_member_ping_answer_reactions(own.id, Some(vec!["💀".into()]))
+        .await
+        .unwrap_err();
+    assert!(err.contains("not a roster model member"), "{err}");
+    let ctx = tool(&h, own.id, "chat_context", json!({})).await;
+    assert_eq!(ctx["ping_answer_reactions"], json!(["✅"]));
+
+    // Order: agents.json list, then the member's own, then the project.
+    let mm = model_member(&h, "Order Two", script(json!({"turns": []}))).await;
+    h.core
+        .set_ping_answer_reactions(project_id(), Some(vec!["🚀".into()]))
+        .await
+        .unwrap();
+    h.core
+        .set_member_ping_answer_reactions(mm.id, Some(vec!["*".into()]))
+        .await
+        .unwrap();
+    let main = h.main;
+    let (member, file) = h
+        .core
+        .with_engine(move |e, _| {
+            let member = e.ping_answers(mm.id, main).to_list();
+            let list = reaction::PingAnswers::parse(&["👍"]).unwrap();
+            e.set_agent_ping_answers(mm.id, Some(list));
+            (member, e.ping_answers(mm.id, main).to_list())
+        })
+        .await
+        .unwrap();
+    assert_eq!(member, vec!["*"]);
+    assert_eq!(file, vec!["👍"]);
 }

@@ -125,7 +125,8 @@ requests; migration 7 adds model members and rosters, migration 8 the
 permission log's `read_only`; migration 9 rebuilds `reactions` with each
 reaction's channel (see "Reactions" in [docs/agents.md](docs/agents.md));
 migration 10 adds `project_settings`, one JSON value per (project, key), holding
-`ping_answer_reactions` so far.
+`ping_answer_reactions` so far; migration 11 adds a roster model member's own
+`ping_answer_reactions` as a column on `model_members`.
 
 **`::N`.** A channel's ordinal is assigned when it is created: the project's
 highest so far plus one, starting at 1 (so a new project's #main is `::1`).
@@ -237,9 +238,11 @@ an agent (see [docs/agents.md](docs/agents.md)).
 
 Which reactions answer a ping (close a pinged agent's reply obligation) is
 a project setting in core (`ping_answer_reactions`, default ✅ 👍, `*` for
-any emoji but 👀), with a per-agent override in `agents.json`; the rules
-are in docs/agents.md ("Which reactions answer a ping"). The app only
-shows and edits the project's list (Settings below).
+any emoji but 👀), with a per-agent override in `agents.json` and a
+per-member one for roster model members (`model_members`); the rules are
+in docs/agents.md ("Which reactions answer a ping"). The app shows and
+edits the project's list and each roster member's own list (Settings
+below); `agents.json` lists are edited in that file.
 
 ## Search
 
@@ -345,6 +348,14 @@ list in effect ("(default)" when unset) and a field: type emoji or
 `default` to clear it, and press Enter. Core validates; a refusal shows
 under the field and the old list stays. Without core the row says it isn't
 available.
+
+The next row, "A member's own reactions", lists each roster model member
+whose own list is set (the rest follow the project) and takes
+`@handle ✅ 👍` or `@handle default` (`ChatStore::member_ping_answers` /
+`set_member_ping_answers`, over `Core::member_ping_answer_reactions` /
+`set_member_ping_answer_reactions`). Same validation and refusal display;
+a handle that isn't on this project's roster (an `agents.json` agent) is
+refused in the app.
 
 ### Search in the pane (experiment)
 

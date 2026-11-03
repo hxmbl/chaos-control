@@ -45,6 +45,8 @@ pub struct PaneHost {
     _copied_timer: Option<Task<()>>,
     /// Settings: the emoji list of reactions that answer a ping.
     ping_input: Entity<TextInput>,
+    /// Settings: a roster member's own list (`@handle ✅ 👍`).
+    member_ping_input: Entity<TextInput>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -53,6 +55,8 @@ impl EventEmitter<PaneEvent> for PaneHost {}
 impl PaneHost {
     pub fn new(store: Entity<ChatStore>, cx: &mut Context<Self>) -> Self {
         let ping_input = cx.new(|cx| TextInput::new("e.g. ✅ 👍, * for any, or default", cx));
+        let member_ping_input =
+            cx.new(|cx| TextInput::new("e.g. @codex ✅ 👍, or @codex default", cx));
         let subscriptions = vec![
             cx.subscribe(&ping_input, |this, input, event, cx| {
                 if let TextInputEvent::Submit = event {
@@ -60,6 +64,17 @@ impl PaneHost {
                     let started = this
                         .store
                         .update(cx, |store, cx| store.set_ping_answers(&text, cx));
+                    if started {
+                        input.update(cx, |input, cx| input.clear(cx));
+                    }
+                }
+            }),
+            cx.subscribe(&member_ping_input, |this, input, event, cx| {
+                if let TextInputEvent::Submit = event {
+                    let text = input.read(cx).text().to_string();
+                    let started = this
+                        .store
+                        .update(cx, |store, cx| store.set_member_ping_answers(&text, cx));
                     if started {
                         input.update(cx, |input, cx| input.clear(cx));
                     }
@@ -75,6 +90,7 @@ impl PaneHost {
             copied_at: None,
             _copied_timer: None,
             ping_input,
+            member_ping_input,
             _subscriptions: subscriptions,
         }
     }
@@ -369,6 +385,7 @@ impl PaneHost {
             .into_any_element(),
             row("Shortcuts", shortcut.into(), true).into_any_element(),
             self.ping_answers_row(cx),
+            self.member_ping_answers_row(cx),
             row(
                 "Agents",
                 "Add Claude Code, Codex and others to this project.".into(),
@@ -389,7 +406,7 @@ impl PaneHost {
                 .type_style(text::CAPTION)
                 .text_color(t.faint)
                 .child(icon(IconName::GearSix, icons::SM, t.faint))
-                .child("Settings aren't saved between launches yet, except reactions that answer a ping (kept with the project).")
+                .child("Settings aren't saved between launches yet, except reactions that answer a ping (kept with the project and its members).")
                 .into_any_element(),
         ]
     }
@@ -416,7 +433,7 @@ impl PaneHost {
                 };
                 let source = if s.is_default { " (default)" } else { "" };
                 format!(
-                    "Now: {list}{source}. 👀 always means \"on it\". An agent's own list in agents.json wins. Type emoji and press Enter."
+                    "Now: {list}{source}. 👀 always means \"on it\". A member's own list (below, or in agents.json) wins. Type emoji and press Enter."
                 )
                 .into()
             }
@@ -452,6 +469,99 @@ impl PaneHost {
                     .type_style(text::BODY)
                     .text_color(t.ink)
                     .child(self.ping_input.clone()),
+            );
+            if let Some(e) = s.error {
+                column = column.child(
+                    div()
+                        .type_style(text::SMALL)
+                        .text_color(t.ink_soft)
+                        .child(SharedString::from(e.to_string())),
+                );
+            }
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap(space::X4)
+            .px(space::X3)
+            .py(space::X2)
+            .rounded(radius::MD)
+            .bg(well)
+            .child(column)
+            .into_any_element()
+    }
+}
+
+impl PaneHost {
+    /// "A member's own reactions": each roster model member's own list
+    /// (which wins over the project's) and one field to set one, as
+    /// `@handle ✅ 👍` (`@handle default` follows the project again). Core
+    /// validates like the project field; a refusal shows under the field.
+    fn member_ping_answers_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.theme();
+        let well = t.glass().well;
+        let setting = self
+            .store
+            .read(cx)
+            .member_ping_answers()
+            .filter(|s| !s.members.is_empty());
+        let about: SharedString = match &setting {
+            None => "A roster member's own list of reactions that answer a ping. Add a model to this project first.".into(),
+            Some(s) => {
+                let own: Vec<String> = s
+                    .members
+                    .iter()
+                    .filter_map(|(handle, list)| {
+                        let list = list.as_ref()?;
+                        let shown = if *list == [chaos_core::reaction::ANY_EMOJI] {
+                            "any emoji but 👀".to_string()
+                        } else if list.is_empty() {
+                            "none".to_string()
+                        } else {
+                            list.join(" ")
+                        };
+                        Some(format!("@{handle}: {shown}"))
+                    })
+                    .collect();
+                let now = if own.is_empty() {
+                    "Every member follows the project.".to_string()
+                } else {
+                    format!("{}; the rest follow the project.", own.join(", "))
+                };
+                format!("{now} Type @handle and emoji, then Enter.").into()
+            }
+        };
+        let available = setting.is_some();
+        let mut column = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(space::X1)
+            .child(
+                div()
+                    .type_style(text::BODY)
+                    .font_weight(text::MEDIUM)
+                    .text_color(if available { t.ink } else { t.muted })
+                    .child("A member's own reactions"),
+            )
+            .child(
+                div()
+                    .type_style(text::SMALL)
+                    .text_color(t.muted)
+                    .child(about),
+            );
+        if let Some(s) = setting {
+            column = column.child(
+                div()
+                    .px(space::X2)
+                    .py(space::X1)
+                    .rounded(radius::MD)
+                    .border_1()
+                    .border_color(t.faint)
+                    .type_style(text::BODY)
+                    .text_color(t.ink)
+                    .child(self.member_ping_input.clone()),
             );
             if let Some(e) = s.error {
                 column = column.child(

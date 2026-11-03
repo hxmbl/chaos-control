@@ -146,6 +146,10 @@ struct Attached {
     /// default), and the last error from saving it.
     ping_answers: Option<Vec<String>>,
     ping_answers_error: Option<Arc<str>>,
+    /// Roster model members' own `ping_answer_reactions` (only those that
+    /// have one), and the last error from saving one.
+    member_ping_answers: HashMap<ct::MemberId, Vec<String>>,
+    member_ping_answers_error: Option<Arc<str>>,
     _events: Task<()>,
 }
 
@@ -183,6 +187,32 @@ pub fn parse_ping_answers_input(text: &str) -> PingAnswersInput {
         [one] if one.eq_ignore_ascii_case("default") => PingAnswersInput::Reset,
         _ => PingAnswersInput::Entries(entries),
     }
+}
+
+/// The Settings pane's view of roster members' own ping-answer lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberPingAnswers {
+    /// Each roster model member's handle and its own list (`None`: it
+    /// follows the project setting), in roster order.
+    pub members: Vec<(Arc<str>, Option<Vec<String>>)>,
+    /// Why the last save was refused, if it was.
+    pub error: Option<Arc<str>>,
+}
+
+/// Splits the member field's `@handle ✅ 👍` (or `@handle default`) into
+/// the handle (without `@`, as typed) and the rest. `None` without a
+/// leading `@handle`.
+pub fn parse_member_ping_answers_input(text: &str) -> Option<(String, PingAnswersInput)> {
+    let text = text.trim_start();
+    let rest = text.strip_prefix('@')?;
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ',')
+        .unwrap_or(rest.len());
+    let (handle, rest) = rest.split_at(end);
+    if handle.is_empty() {
+        return None;
+    }
+    Some((handle.to_string(), parse_ping_answers_input(rest)))
 }
 
 /// One harness in the model picker's filter row.
@@ -649,6 +679,8 @@ impl ChatStore {
             agent_ids: HashSet::new(),
             ping_answers: None,
             ping_answers_error: None,
+            member_ping_answers: HashMap::new(),
+            member_ping_answers_error: None,
             _events: task,
         });
         // Probe the harnesses without a fresh cached list, in the background.
@@ -870,8 +902,21 @@ impl ChatStore {
         };
         let core = attached.link.core.clone();
         let project = attached.link.open.project.id.clone();
+        let members: Vec<ct::MemberId> = attached
+            .link
+            .agents
+            .iter()
+            .filter(|a| a.removable)
+            .map(|a| a.member)
+            .collect();
         cx.spawn(async move |this, cx| {
             let result = core.ping_answer_reactions(project.clone()).await;
+            let mut own = HashMap::new();
+            for m in members {
+                if let Ok(Some(list)) = core.member_ping_answer_reactions(m).await {
+                    own.insert(m, list);
+                }
+            }
             this.update(cx, |store, cx| {
                 let Some(a) = &mut store.core else {
                     return;
@@ -883,6 +928,7 @@ impl ChatStore {
                     Ok(list) => a.ping_answers = list,
                     Err(e) => a.ping_answers_error = Some(Arc::from(e)),
                 }
+                a.member_ping_answers = own;
                 cx.notify();
             })
             .ok();
@@ -906,6 +952,8 @@ impl ChatStore {
         attached.agent_ids.insert(linked.member);
         self.workspace.agents.push(status_agent(&linked));
         attached.link.agents.push(linked);
+        // A re-added member keeps its own ping-answer list.
+        self.load_ping_answers(cx);
         cx.notify();
     }
 
@@ -946,6 +994,86 @@ impl ChatStore {
             }
         })
         .detach();
+    }
+
+    /// Roster model members' own ping-answer lists, for Settings. `None`
+    /// without core.
+    pub fn member_ping_answers(&self) -> Option<MemberPingAnswers> {
+        let attached = self.core.as_ref()?;
+        Some(MemberPingAnswers {
+            members: attached
+                .link
+                .agents
+                .iter()
+                .filter(|a| a.removable)
+                .map(|a| {
+                    (
+                        a.handle.clone(),
+                        attached.member_ping_answers.get(&a.member).cloned(),
+                    )
+                })
+                .collect(),
+            error: attached.member_ping_answers_error.clone(),
+        })
+    }
+
+    /// Saves the Settings member field (`@handle ✅ 👍`, `@handle default`;
+    /// see [`parse_member_ping_answers_input`]) as that roster member's own
+    /// list. Core validates it like the project setting; a refusal is kept
+    /// for the pane to show. Returns whether a save was started.
+    pub fn set_member_ping_answers(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(attached) = &mut self.core else {
+            return false;
+        };
+        let Some((handle, input)) = parse_member_ping_answers_input(text) else {
+            attached.member_ping_answers_error = Some(Arc::from(
+                "Start with the member's @handle, e.g. @codex ✅ 👍",
+            ));
+            cx.notify();
+            return false;
+        };
+        let entries = match input {
+            PingAnswersInput::Nothing => return false,
+            PingAnswersInput::Reset => None,
+            PingAnswersInput::Entries(e) => Some(e),
+        };
+        let Some(member) = attached
+            .link
+            .agents
+            .iter()
+            .find(|a| a.removable && a.handle.eq_ignore_ascii_case(&handle))
+            .map(|a| a.member)
+        else {
+            attached.member_ping_answers_error = Some(Arc::from(format!(
+                "@{handle} isn't a roster member here (an agents.json agent sets ping_answer_reactions in that file)"
+            )));
+            cx.notify();
+            return false;
+        };
+        let core = attached.link.core.clone();
+        cx.spawn(async move |this, cx| {
+            let result = core.set_member_ping_answer_reactions(member, entries).await;
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                match result {
+                    Ok(Some(list)) => {
+                        a.member_ping_answers.insert(member, list);
+                        a.member_ping_answers_error = None;
+                    }
+                    Ok(None) => {
+                        a.member_ping_answers.remove(&member);
+                        a.member_ping_answers_error = None;
+                    }
+                    Err(e) => a.member_ping_answers_error = Some(Arc::from(e)),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        true
     }
 
     /// Saves the Settings field (see [`parse_ping_answers_input`]) as the
@@ -1179,6 +1307,7 @@ impl ChatStore {
         attached.reactions.clear();
         attached.ping_answers = None;
         attached.ping_answers_error = None;
+        attached.member_ping_answers_error = None;
         attached.link.open = open;
         self.core = Some(attached);
         self.load_ping_answers(cx);
@@ -1574,6 +1703,27 @@ fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn member_ping_answers_input_needs_a_handle_first() {
+        assert_eq!(parse_member_ping_answers_input("✅ 👍"), None);
+        assert_eq!(parse_member_ping_answers_input("@ ✅"), None);
+        assert_eq!(
+            parse_member_ping_answers_input(" @codex ✅, 👍"),
+            Some((
+                "codex".into(),
+                PingAnswersInput::Entries(vec!["✅".into(), "👍".into()])
+            ))
+        );
+        assert_eq!(
+            parse_member_ping_answers_input("@gpt-6 default"),
+            Some(("gpt-6".into(), PingAnswersInput::Reset))
+        );
+        assert_eq!(
+            parse_member_ping_answers_input("@gpt-6"),
+            Some(("gpt-6".into(), PingAnswersInput::Nothing))
+        );
+    }
 
     #[test]
     fn ping_answers_input_splits_on_spaces_and_commas() {

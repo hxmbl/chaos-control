@@ -314,6 +314,8 @@ pub fn harnesses(config: &AgentsConfig, env: &DetectEnv) -> Vec<Harness> {
 #[derive(Clone, Debug)]
 pub struct LinkedAgent {
     pub member: MemberId,
+    /// What people type after `@`.
+    pub handle: Arc<str>,
     pub name: Arc<str>,
     /// The harness mark (or the agents.json `brand`).
     pub brand: Brand,
@@ -331,6 +333,7 @@ impl LinkedAgent {
         let preset = harness::preset(&m.harness);
         LinkedAgent {
             member: m.member.id,
+            handle: m.member.handle.clone(),
             name: m.model_name.clone(),
             brand: parse_brand(preset.map(|p| p.icon)),
             harness: preset.map(|p| Arc::from(p.name)),
@@ -629,6 +632,7 @@ pub fn start_with(
                 .await?;
             agents.push(LinkedAgent {
                 member: member.id,
+                handle: member.handle.clone(),
                 name: Arc::from(name),
                 brand: parse_brand(a.brand.as_deref()),
                 harness: None,

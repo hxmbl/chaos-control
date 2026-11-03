@@ -55,6 +55,27 @@ pub fn model_member(c: &Connection, id: MemberId) -> Result<Option<ModelMember>>
     .optional()
 }
 
+/// A model member's own `ping_answer_reactions` as stored (a JSON list), or
+/// `None` when it has none (or `member` is not a model member).
+pub fn ping_answers(c: &Connection, member: MemberId) -> Result<Option<String>> {
+    Ok(c.query_row(
+        "SELECT ping_answer_reactions FROM model_members WHERE member_id = ?1",
+        [member.0],
+        |r| r.get::<_, Option<String>>(0),
+    )
+    .optional()?
+    .flatten())
+}
+
+/// Sets (`Some`, a validated JSON list) or clears a model member's own
+/// `ping_answer_reactions`. False when `member` is not a model member.
+pub fn set_ping_answers(c: &Connection, member: MemberId, value: Option<&str>) -> Result<bool> {
+    Ok(c.execute(
+        "UPDATE model_members SET ping_answer_reactions = ?2 WHERE member_id = ?1",
+        params![member.0, value],
+    )? == 1)
+}
+
 /// The member for `(harness, model)`, created with a fresh unique handle if
 /// new. An existing member keeps its handle; its display name follows
 /// `model_name`.

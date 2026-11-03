@@ -378,6 +378,13 @@ CREATE TABLE project_settings (
     PRIMARY KEY (project_id, key)
 );
 "#,
+    // 11: a roster model member's own `ping_answer_reactions` (STRM-533), the
+    // JSON list as validated by `reaction::PingAnswers` (NULL: none, so the
+    // project setting or the default applies). Per member, so it follows the
+    // member into every project whose roster it is on.
+    r#"
+ALTER TABLE model_members ADD COLUMN ping_answer_reactions TEXT;
+"#,
 ];
 
 pub struct Store {
