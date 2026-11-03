@@ -6,6 +6,7 @@
 //! - [`reaction`]: emoji reactions (what counts as one, grouping).
 //! - [`adapter`]: the `AgentAdapter`/`AgentSession` boundary and `AgentEvent`.
 //! - [`acp`]: the generic ACP adapter (v1, plus the v2 draft).
+//! - [`devin`]: Devin-only setup (per-folder workspace trust).
 //! - [`mcp`]: the chat MCP server and the stdio bridge.
 //! - [`permission`]: permissions by where the agent runs (host: ask the
 //!   humans, non-blocking; own VM: approve).
@@ -18,6 +19,7 @@ pub mod acp;
 mod acp_v2;
 pub mod adapter;
 pub mod codex;
+pub mod devin;
 pub mod engine;
 pub mod fake;
 pub mod fake_codex;

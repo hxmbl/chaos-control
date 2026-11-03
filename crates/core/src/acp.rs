@@ -67,6 +67,11 @@ pub trait AcpTransport: Send + Sync {
     fn probe(&self) -> Probe;
     /// A fresh connection (spawns a process for a real agent).
     fn connect(&self) -> Result<DynConnectTo<Client>, AgentError>;
+    /// The agent binary, when this transport spawns one (used to recognise
+    /// harnesses that need setup before a session, like Devin).
+    fn command(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Spawns an agent binary and speaks ACP over its stdio.
@@ -123,6 +128,10 @@ impl AcpTransport for SpawnTransport {
         }
         Ok(DynConnectTo::new(agent))
     }
+
+    fn command(&self) -> Option<&std::path::Path> {
+        Some(&self.command)
+    }
 }
 
 /// `command` as given if it has a path separator, else the first match on PATH.
@@ -171,6 +180,9 @@ pub struct AcpAdapter {
     /// The model member's model, chosen through the session's model config
     /// option after `session/new`. `None` runs the harness default.
     model: Option<Arc<str>>,
+    /// Devin only: where to record trusted folders instead of Devin's own
+    /// file (see [`AcpAdapter::devin_trust_file`]).
+    devin_trust_file: Option<PathBuf>,
 }
 
 impl AcpAdapter {
@@ -181,6 +193,31 @@ impl AcpAdapter {
             chat_tools: ChatToolsPreference::Auto,
             negotiated: Mutex::new(None),
             model: None,
+            devin_trust_file: None,
+        }
+    }
+
+    /// Treats the agent as Devin and records the folders it is started in to
+    /// `file` instead of Devin's own trusted-workspaces file (for tests).
+    pub fn devin_trust_file(mut self, file: PathBuf) -> Self {
+        self.devin_trust_file = Some(file);
+        self
+    }
+
+    /// The Devin-only hook before every session start and model lookup:
+    /// `devin acp` refuses folders the member hasn't trusted, so `cwd` is
+    /// added to Devin's trusted workspaces (`crate::devin`). Other harnesses
+    /// are left alone.
+    fn before_start(&self, cwd: &std::path::Path) {
+        if let Some(file) = &self.devin_trust_file {
+            if let crate::devin::Trust::Skipped(why) = crate::devin::ensure_trusted_in(file, cwd) {
+                eprintln!(
+                    "chaos-control: couldn't mark {} as trusted for Devin ({why}); continuing",
+                    cwd.display()
+                );
+            }
+        } else if self.transport.command().is_some_and(crate::devin::is_devin) {
+            crate::devin::ensure_trusted(cwd);
         }
     }
 
@@ -218,6 +255,7 @@ impl AgentAdapter for AcpAdapter {
 
     fn open(&self, req: OpenSession) -> BoxFuture<'_, Result<Arc<dyn AgentSession>, AgentError>> {
         Box::pin(async move {
+            self.before_start(&req.cwd);
             let cached = self.negotiated_version();
             if self.prefer_v2 && cached != Some(1) {
                 match crate::acp_v2::open(
@@ -255,6 +293,7 @@ impl AgentAdapter for AcpAdapter {
         cwd: PathBuf,
     ) -> BoxFuture<'_, Option<Result<Vec<ModelInfo>, AgentError>>> {
         Box::pin(async move {
+            self.before_start(&cwd);
             let transport = match self.transport.connect() {
                 Ok(t) => t,
                 Err(e) => return Some(Err(e)),
