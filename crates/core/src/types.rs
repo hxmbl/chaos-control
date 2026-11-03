@@ -407,3 +407,16 @@ pub struct Stance {
     pub runtime: Option<Arc<str>>,
     pub created_at: Millis,
 }
+
+/// One member's emoji on one message. A member can put several different
+/// emoji on a message but each only once (`PRIMARY KEY (message, member,
+/// emoji)`), so adding twice or removing twice changes nothing. Reactions
+/// never wake anyone (see `docs/agents.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Reaction {
+    pub message: MessageId,
+    pub channel: ChannelId,
+    pub member: MemberId,
+    pub emoji: Arc<str>,
+    pub created_at: Millis,
+}

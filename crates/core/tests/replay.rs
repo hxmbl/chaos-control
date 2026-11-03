@@ -219,6 +219,7 @@ async fn claude_agent_acp_selects_v2_and_a_signed_out_turn_goes_red() {
                 adapter,
                 cwd: None,
                 runs_in: RunsIn::Host,
+                ping_answers: None,
             },
             main,
         )
@@ -297,6 +298,7 @@ async fn codex_acp_auth_required_turns_the_agent_red() {
                 adapter,
                 cwd: None,
                 runs_in: RunsIn::Host,
+                ping_answers: None,
             },
             main,
         )
@@ -360,6 +362,7 @@ async fn fake_agent_binary_over_real_stdio() {
                 adapter,
                 cwd: Some(dir.clone()),
                 runs_in: RunsIn::Host,
+                ping_answers: None,
             },
             main,
         )
@@ -434,6 +437,7 @@ async fn live_acp_agent_handshake_and_first_turn() {
                 adapter: adapter.clone(),
                 cwd: Some(std::env::temp_dir()),
                 runs_in: RunsIn::Host,
+                ping_answers: None,
             },
             main,
         )

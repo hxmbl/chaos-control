@@ -1,10 +1,11 @@
 //! The chat MCP server agents use to take part in the room, plus the stdio
 //! bridge for agents that drop HTTP MCP servers.
 //!
-//! Eight tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
+//! Ten tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
 //! `chat_react`, `chat_status`, the peer actions `chat_refuse` and
 //! `chat_dissent` (STRM-343), and `chat_request_permission` and
-//! `chat_permission_status` (STRM-401, see `permission`). Every call is scoped by a bearer token minted
+//! `chat_permission_status` (STRM-401, see `permission`). `chat_react` adds
+//! or removes a reaction and never wakes anyone (STRM-467). Every call is scoped by a bearer token minted
 //! for one session (agent x channel) and revoked when that session closes. The
 //! author of a post is taken from the token, never from the arguments. Channel
 //! names and message ids resolve only inside the session channel's project:
@@ -38,7 +39,7 @@ use serde_json::{Value, json};
 
 use crate::{
     engine::{Engine, PostError, PostRequest, StanceRequest},
-    store,
+    reaction, store,
     types::*,
 };
 
@@ -166,11 +167,12 @@ pub fn tools() -> Vec<Tool> {
         ),
         Tool::new(
             "chat_react",
-            "React to a message. ✅ or 👍 answers a message you owe a reply to; 👀 means you're on it (you still owe the reply).",
+            "React to a message with one emoji, or take your reaction back with remove: true. Reacting is quiet: it wakes and notifies nobody, not even the author. On a message you owe a reply to, an emoji that answers pings (✅ or 👍 unless configured; chat_context lists yours as ping_answer_reactions) answers it; 👀 means you're on it (you still owe the reply), and other emoji are just reactions. The result says whether it answered. Safe to repeat.",
             schema(
                 json!({"type": "object", "required": ["message_id", "emoji"], "properties": {
                     "message_id": {"type": "integer"},
-                    "emoji": {"type": "string"}
+                    "emoji": {"type": "string", "description": "One emoji, e.g. 👍 ✅ 👀 💀, or a :shortcode: like :+1:."},
+                    "remove": {"type": "boolean", "description": "Take this reaction back instead of adding it."}
                 }}),
             ),
         ),
@@ -252,10 +254,54 @@ fn message_view(c: &rusqlite::Connection, m: &Message) -> Value {
     {
         v["stance"] = stance_view(c, &st);
     }
+    let reactions = reaction_views(c, m.id);
+    if !reactions.is_empty() {
+        v["reactions"] = json!(reactions);
+    }
     if truncated {
         v["truncated"] = json!(true);
     }
     v
+}
+
+/// Reactions on one message, grouped by emoji in order of first use, e.g.
+/// `[{"emoji": "👍", "count": 2, "by": ["hx", "claude"]}]`.
+fn reaction_views(c: &rusqlite::Connection, message: MessageId) -> Vec<Value> {
+    let Ok(all) = store::reactions_on(c, message) else {
+        return Vec::new();
+    };
+    reaction::group(&all)
+        .into_iter()
+        .map(|g| {
+            let by: Vec<Arc<str>> = g
+                .members
+                .iter()
+                .filter_map(|m| store::member(c, *m).ok().flatten())
+                .map(|m| m.handle)
+                .collect();
+            json!({"emoji": g.emoji, "count": g.members.len(), "by": by})
+        })
+        .collect()
+}
+
+/// A recent reaction for `chat_context`, e.g. `{"emoji": "💀", "by": "hx",
+/// "message_id": 12, "target_seq": 4, "at": ..., "summary": "Hx reacted 💀
+/// to #4"}`.
+fn recent_reaction_view(c: &rusqlite::Connection, r: &Reaction) -> Value {
+    let by = store::member(c, r.member).ok().flatten();
+    let seq = store::message(c, r.message).ok().flatten().map(|m| m.seq);
+    let name = by
+        .as_ref()
+        .map_or("someone".to_string(), |m| m.name.to_string());
+    let what = seq.map_or_else(|| format!("message {}", r.message), |s| format!("#{s}"));
+    json!({
+        "emoji": r.emoji,
+        "by": by.map(|m| m.handle),
+        "message_id": r.message,
+        "target_seq": seq,
+        "at": r.created_at,
+        "summary": format!("{name} reacted {} to {what}", r.emoji),
+    })
 }
 
 /// A recorded refusal or dissent, e.g. `{"kind": "refusal", "by": {...},
@@ -398,7 +444,12 @@ pub fn call_tool(
                     .iter()
                     .map(|st| stance_view(c, st))
                     .collect::<Vec<_>>(),
-                "norms": "Speak with chat_send (reply_to the message you answer). React ✅ when no words are needed. You may say no (chat_refuse) or disagree (chat_dissent) with your reason; both are fine and nobody overrules them. Mention people only when you need them; no @everyone.",
+                "ping_answer_reactions": engine.ping_answers(scope.agent, scope.channel).to_list(),
+                "recent_reactions": store::recent_reactions(c, scope.channel, 10)?
+                    .iter()
+                    .map(|r| recent_reaction_view(c, r))
+                    .collect::<Vec<_>>(),
+                "norms": "Speak with chat_send (reply_to the message you answer). React (chat_react) when no words are needed; reactions wake nobody. You may say no (chat_refuse) or disagree (chat_dissent) with your reason; both are fine and nobody overrules them. Mention people only when you need them; no @everyone.",
             }))
         }
         "chat_read" => {
@@ -518,6 +569,7 @@ pub fn call_tool(
                 .and_then(Value::as_str)
                 .filter(|e| !e.trim().is_empty())
                 .ok_or_else(|| ToolError("emoji is required".into()))?;
+            let remove = args.get("remove").and_then(Value::as_bool).unwrap_or(false);
             // Only messages in this session's project: an id from another
             // project reads as unknown, like a channel name would.
             let project = scope_project(engine, scope)?;
@@ -527,8 +579,23 @@ pub fn call_tool(
             if !in_scope {
                 return Err(PostError::UnknownMessage.into());
             }
-            engine.react(now, scope.agent, MessageId(id as i64), emoji.trim())?;
-            Ok(json!({"ok": true}))
+            let message = MessageId(id as i64);
+            let done = engine.react(now, scope.agent, message, emoji, !remove)?;
+            let target = store::message(engine.conn(), message)?;
+            let answers_pings = !remove
+                && target.is_some_and(|m| {
+                    engine
+                        .ping_answers(scope.agent, m.channel)
+                        .answers(&done.emoji)
+                });
+            Ok(json!({
+                "ok": true,
+                "emoji": done.emoji,
+                "removed": remove,
+                "changed": done.changed,
+                "answers_pings": answers_pings,
+                "reactions": reaction_views(engine.conn(), message),
+            }))
         }
         "chat_refuse" | "chat_dissent" => {
             let id = arg_u64(args, "message_id")

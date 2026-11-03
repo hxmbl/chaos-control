@@ -11,11 +11,12 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Pixels, SharedString,
-    Task, Window, div, prelude::*, px,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use model::{Author, PaneActionKind, PaneContent, ReplyRef, pane::author_name};
 use ui::{
-    ActiveTheme, IconName, Pane, PaneState, QuickAction, TypeStyleExt, brand_icon, icon, switch,
+    ActiveTheme, IconName, Pane, PaneState, QuickAction, TextInput, TextInputEvent, TypeStyleExt,
+    brand_icon, icon, switch,
     tokens::{icon as icons, radius, space, text},
 };
 
@@ -42,18 +43,39 @@ pub struct PaneHost {
     focus: FocusHandle,
     copied_at: Option<Instant>,
     _copied_timer: Option<Task<()>>,
+    /// Settings: the emoji list of reactions that answer a ping.
+    ping_input: Entity<TextInput>,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl EventEmitter<PaneEvent> for PaneHost {}
 
 impl PaneHost {
     pub fn new(store: Entity<ChatStore>, cx: &mut Context<Self>) -> Self {
+        let ping_input = cx.new(|cx| TextInput::new("e.g. ✅ 👍, * for any, or default", cx));
+        let subscriptions = vec![
+            cx.subscribe(&ping_input, |this, input, event, cx| {
+                if let TextInputEvent::Submit = event {
+                    let text = input.read(cx).text().to_string();
+                    let started = this
+                        .store
+                        .update(cx, |store, cx| store.set_ping_answers(&text, cx));
+                    if started {
+                        input.update(cx, |input, cx| input.clear(cx));
+                    }
+                }
+            }),
+            // The saved list (or a refusal) arrives from core later.
+            cx.observe(&store, |_, _, cx| cx.notify()),
+        ];
         Self {
             store,
             state: PaneState::new(),
             focus: cx.focus_handle(),
             copied_at: None,
             _copied_timer: None,
+            ping_input,
+            _subscriptions: subscriptions,
         }
     }
 
@@ -346,6 +368,7 @@ impl PaneHost {
             )
             .into_any_element(),
             row("Shortcuts", shortcut.into(), true).into_any_element(),
+            self.ping_answers_row(cx),
             row(
                 "Agents",
                 "Add Claude Code, Codex and others to this project.".into(),
@@ -366,9 +389,89 @@ impl PaneHost {
                 .type_style(text::CAPTION)
                 .text_color(t.faint)
                 .child(icon(IconName::GearSix, icons::SM, t.faint))
-                .child("Settings aren't saved between launches yet.")
+                .child("Settings aren't saved between launches yet, except reactions that answer a ping (kept with the project).")
                 .into_any_element(),
         ]
+    }
+}
+
+impl PaneHost {
+    /// "Reactions that answer a ping": the list in effect for this project
+    /// and a field to replace it (emoji or :shortcodes:, `*` for any emoji
+    /// but 👀, `default` to go back to ✅ 👍). Core validates; a refusal shows
+    /// under the field and the old list stays.
+    fn ping_answers_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.theme();
+        let well = t.glass().well;
+        let setting = self.store.read(cx).ping_answers();
+        let about: SharedString = match &setting {
+            None => "Which reactions close a ping as answered. Not available yet: no agents are running.".into(),
+            Some(s) => {
+                let list = if s.list == [chaos_core::reaction::ANY_EMOJI] {
+                    "any emoji but 👀".to_string()
+                } else if s.list.is_empty() {
+                    "none".to_string()
+                } else {
+                    s.list.join(" ")
+                };
+                let source = if s.is_default { " (default)" } else { "" };
+                format!(
+                    "Now: {list}{source}. 👀 always means \"on it\". An agent's own list in agents.json wins. Type emoji and press Enter."
+                )
+                .into()
+            }
+        };
+        let available = setting.is_some();
+        let mut column = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(space::X1)
+            .child(
+                div()
+                    .type_style(text::BODY)
+                    .font_weight(text::MEDIUM)
+                    .text_color(if available { t.ink } else { t.muted })
+                    .child("Reactions that answer a ping"),
+            )
+            .child(
+                div()
+                    .type_style(text::SMALL)
+                    .text_color(t.muted)
+                    .child(about),
+            );
+        if let Some(s) = setting {
+            column = column.child(
+                div()
+                    .px(space::X2)
+                    .py(space::X1)
+                    .rounded(radius::MD)
+                    .border_1()
+                    .border_color(t.faint)
+                    .type_style(text::BODY)
+                    .text_color(t.ink)
+                    .child(self.ping_input.clone()),
+            );
+            if let Some(e) = s.error {
+                column = column.child(
+                    div()
+                        .type_style(text::SMALL)
+                        .text_color(t.ink_soft)
+                        .child(SharedString::from(e.to_string())),
+                );
+            }
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap(space::X4)
+            .px(space::X3)
+            .py(space::X2)
+            .rounded(radius::MD)
+            .bg(well)
+            .child(column)
+            .into_any_element()
     }
 }
 
