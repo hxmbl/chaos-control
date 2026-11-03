@@ -155,7 +155,24 @@ enum Cmd {
         agent: MemberId,
         channel: ChannelId,
     },
+    RemoveMember {
+        project: ProjectId,
+        member: MemberId,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Shutdown(oneshot::Sender<()>),
+}
+
+/// A model member to add (or re-register at startup): which model, through
+/// which harness, and the adapter that harness gets for it.
+pub struct MemberSpec {
+    pub harness: String,
+    /// The harness's model id; `None` runs its default model.
+    pub model: Option<String>,
+    pub model_name: String,
+    pub adapter: Arc<dyn AgentAdapter>,
+    pub cwd: Option<PathBuf>,
+    pub runs_in: RunsIn,
 }
 
 /// Cheap, cloneable handle to the runtime.
@@ -164,6 +181,12 @@ pub struct Core {
     tx: mpsc::UnboundedSender<Cmd>,
     mcp_url: Arc<str>,
     tokens: Arc<Tokens>,
+    /// The tokio runtime core was started on. Anything that touches a
+    /// harness (process spawns, pipes, timers, `tokio::spawn`) runs here,
+    /// never in the caller's future: the app awaits core from GPUI's
+    /// executor, which is not a tokio runtime, and tokio I/O polled there
+    /// panics ("there is no reactor running").
+    rt: tokio::runtime::Handle,
 }
 
 const GONE: &str = "chaos-control core has stopped";
@@ -226,6 +249,7 @@ impl Core {
                 tx,
                 mcp_url: Arc::from(mcp_url),
                 tokens,
+                rt: tokio::runtime::Handle::current(),
             },
             events_rx,
         ))
@@ -425,6 +449,175 @@ impl Core {
         wait.await.map_err(|_| GONE.to_string())?
     }
 
+    /// Adds a model member to `channel`'s project roster and joins it to
+    /// `channel`, like [`Core::add_agent`]. Idempotent: the same harness and
+    /// model is always the same member, so this also re-registers roster
+    /// members at startup. One harness can host many members (one adapter
+    /// each).
+    pub async fn add_model_member(
+        &self,
+        spec: MemberSpec,
+        channel: ChannelId,
+    ) -> Result<crate::roster::ModelMember, String> {
+        let (harness, model, name) = (
+            spec.harness.clone(),
+            spec.model.clone(),
+            spec.model_name.clone(),
+        );
+        let mm = self
+            .with_engine(move |e, now| {
+                let project = crate::store::channel(e.conn(), channel)?
+                    .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+                    .project;
+                e.store_tx(|c| {
+                    let mm =
+                        crate::roster::ensure_model_member(c, &harness, model.as_deref(), &name)?;
+                    crate::roster::roster_add(c, &project, mm.member.id, now)?;
+                    Ok::<_, rusqlite::Error>(mm)
+                })
+            })
+            .await?
+            .map_err(|e| e.to_string())?;
+        self.add_agent(
+            AgentSpec {
+                handle: mm.member.handle.to_string(),
+                name: mm.model_name.to_string(),
+                adapter: spec.adapter,
+                cwd: spec.cwd,
+                runs_in: spec.runs_in,
+                ping_answers: None,
+            },
+            channel,
+        )
+        .await?;
+        Ok(mm)
+    }
+
+    /// Takes a member off `project`'s roster and out of its channels; any
+    /// session it had there is interrupted and closed, and anything still
+    /// owed to it is dropped (see `roster::leave_project`). Its messages
+    /// stay.
+    pub async fn remove_member(&self, project: &ProjectId, member: MemberId) -> Result<(), String> {
+        let (reply, wait) = oneshot::channel();
+        self.tx
+            .send(Cmd::RemoveMember {
+                project: project.clone(),
+                member,
+                reply,
+            })
+            .map_err(|_| GONE.to_string())?;
+        wait.await.map_err(|_| GONE.to_string())?
+    }
+
+    /// The project's model members, in the order they were added.
+    pub async fn roster(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<crate::roster::ModelMember>, String> {
+        let project = project.clone();
+        self.with_engine(move |e, _| crate::roster::roster(e.conn(), &project))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// True the first time it is asked for `project`: the caller then fills
+    /// the roster from auto-detection. Afterwards the roster is the user's.
+    pub async fn seed_roster_once(&self, project: &ProjectId) -> Result<bool, String> {
+        let project = project.clone();
+        self.with_engine(move |e, now| e.store_tx(|c| crate::roster::mark_seeded(c, &project, now)))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// The harness's cached model list (empty until it reported one).
+    pub async fn harness_models(
+        &self,
+        harness: &str,
+    ) -> Result<Vec<crate::harness::ModelInfo>, String> {
+        let harness = harness.to_string();
+        self.with_engine(move |e, _| crate::roster::harness_models(e.conn(), &harness))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Asks `adapter` for its harness's models (`AgentAdapter::list_models`)
+    /// and caches a non-empty answer in the store. Spawns the harness once,
+    /// on core's own runtime (the `rt` handle), so this is safe to await
+    /// from any executor; a panic inside the adapter comes back as an error
+    /// instead of taking the caller down. Callers run it in the background
+    /// (at startup, or when a cached list is stale), never while the user
+    /// waits.
+    pub async fn discover_models(
+        &self,
+        harness: &str,
+        adapter: Arc<dyn AgentAdapter>,
+        cwd: PathBuf,
+    ) -> Result<Vec<crate::harness::ModelInfo>, String> {
+        let listed = self
+            .rt
+            .spawn(async move { adapter.list_models(cwd).await })
+            .await
+            .map_err(|e| {
+                if e.is_panic() {
+                    "the harness adapter panicked while listing models".to_string()
+                } else {
+                    "listing models was cancelled".to_string()
+                }
+            })?;
+        let found = match listed {
+            None => return Ok(Vec::new()),
+            Some(r) => r.map_err(|e| e.to_string())?,
+        };
+        if !found.is_empty() {
+            let (h, models) = (harness.to_string(), found.clone());
+            self.with_engine(move |e, now| {
+                e.store_tx(|c| crate::roster::set_harness_models(c, &h, &models, now))
+            })
+            .await?
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(found)
+    }
+
+    /// Probes `harness` for its models in the background (on core's runtime,
+    /// like [`Core::discover_models`]) and writes a non-empty answer to the
+    /// on-disk model cache in `cache_dir` under `version` (see
+    /// `model_cache`). Returns what was cached.
+    pub async fn probe_models(
+        &self,
+        harness: &str,
+        version: &str,
+        adapter: Arc<dyn AgentAdapter>,
+        cwd: PathBuf,
+        cache_dir: PathBuf,
+    ) -> Result<crate::model_cache::CachedModels, String> {
+        let found = self.discover_models(harness, adapter, cwd).await?;
+        if found.is_empty() {
+            return Err("it listed no models".to_string());
+        }
+        let cached = crate::model_cache::CachedModels::new(
+            harness,
+            version,
+            crate::model_cache::now_secs(),
+            &found,
+        );
+        let to_save = cached.clone();
+        self.rt
+            .spawn_blocking(move || crate::model_cache::save(&cache_dir, &to_save))
+            .await
+            .map_err(|_| "saving the model list was cancelled".to_string())?
+            .map_err(|e| format!("could not save the model list: {e}"))?;
+        Ok(cached)
+    }
+
+    /// Every agent member core has ever had, including removed ones (their
+    /// messages stay, and read as a previous agent's).
+    pub async fn agent_members(&self) -> Result<Vec<MemberId>, String> {
+        self.with_engine(|e, _| crate::store::agent_member_ids(e.conn()))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn post(
         &self,
         author: MemberId,
@@ -618,6 +811,18 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// The permission log for `channel` (reads included), newest first, at
+    /// most `limit`.
+    pub async fn permission_log(
+        &self,
+        channel: ChannelId,
+        limit: usize,
+    ) -> Result<Vec<PermissionRequest>, String> {
+        self.with_engine(move |e, _| e.permission_log(channel, limit))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     /// Calls a chat tool as the session `scope` would (tests, debugging).
     pub async fn tool(&self, scope: Scope, name: &str, args: Value) -> Result<Value, String> {
         let name = name.to_string();
@@ -708,6 +913,14 @@ impl Actor {
                 reply,
             } => {
                 let r = self.add_agent(spec, channel, now);
+                let _ = reply.send(r);
+            }
+            Cmd::RemoveMember {
+                project,
+                member,
+                reply,
+            } => {
+                let r = self.remove_member(&project, member, now);
                 let _ = reply.send(r);
             }
             Cmd::Opened {
@@ -814,6 +1027,36 @@ impl Actor {
             let _ = tx.send(Cmd::Engine(f));
         });
         Ok(member)
+    }
+
+    fn remove_member(
+        &mut self,
+        project: &ProjectId,
+        member: MemberId,
+        now: Millis,
+    ) -> Result<(), String> {
+        let channels = self
+            .engine
+            .leave_project(now, project, member)
+            .map_err(|e| e.to_string())?;
+        for ch in channels {
+            if let Some(slot) = self.slots.remove(&(member, ch)) {
+                self.tokens.revoke(&slot.token);
+                if let SlotState::Ready { session, .. } = slot.state {
+                    tokio::spawn(async move {
+                        let _ = session.interrupt().await;
+                        session.close().await;
+                    });
+                }
+            }
+        }
+        let still_somewhere = crate::roster::project_count(self.engine.conn(), member)
+            .map_err(|e| e.to_string())?
+            > 0;
+        if !still_somewhere {
+            self.agents.remove(&member);
+        }
+        Ok(())
     }
 
     fn apply_effects(&mut self) {

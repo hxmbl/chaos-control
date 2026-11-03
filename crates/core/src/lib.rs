@@ -17,13 +17,18 @@
 pub mod acp;
 mod acp_v2;
 pub mod adapter;
+pub mod codex;
 pub mod engine;
 pub mod fake;
+pub mod fake_codex;
+pub mod harness;
 pub mod host;
 pub mod mcp;
+pub mod model_cache;
 pub mod notify;
 pub mod permission;
 pub mod policy;
 pub mod reaction;
+pub mod roster;
 pub mod store;
 pub mod types;

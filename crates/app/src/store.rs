@@ -5,27 +5,42 @@
 //! view only re-renders (or re-measures list rows) for the part it shows.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     path::Path,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use chaos_core::{
     engine::CoreEvent,
-    permission::{PermissionId, PermissionRequest, PermissionState},
+    harness::{self, Catalog, HarnessModels, ModelInfo, ModelSource},
+    model_cache::{self, CachedModels, Freshness},
+    permission::{LogOutcome, PermissionId, PermissionRequest, PermissionState},
     types as ct,
 };
 use gpui::{Context, EventEmitter, Task};
 use model::{
-    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PaneActionKind, PaneContent,
+    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PERMISSION_LOG_LEN,
+    PaneActionKind, PaneContent, PermissionLog, PermissionLogEntry, PermissionOutcome,
     PermissionPrompt, ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus,
     Stance, Workspace,
 };
 
 use crate::{
-    agents::{self, CoreLink, OpenProject},
+    agents::{self, CoreLink, DormantMember, LinkedAgent, OpenProject},
+    agents_file,
     project::{self, Confirm, Question, Target},
 };
+
+/// Whether an agent's permission request opens the Approve / Deny pane.
+/// Muted (Hxmbl, 2026-10-31): requests are answered at once (reads allowed,
+/// everything else declined) and listed in the right sidebar's permission
+/// log instead. The pane path stays wired for when human approvals return.
+const PERMISSION_PANE: bool = false;
+
+/// How long after a failed probe (signed out, timed out) a harness is left
+/// alone before the picker opening asks it again.
+const PROBE_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Model ids for things that come from core sit above these, clear of the
 /// sample data and local echoes.
@@ -72,6 +87,8 @@ pub struct ChatStore {
     selected: Id,
     next_message_id: u32,
     core: Option<Attached>,
+    /// #main's permission requests, newest first (the right sidebar's log).
+    permissions: PermissionLog,
 }
 
 /// One emoji under a message: how many put it there and who.
@@ -110,6 +127,21 @@ struct Attached {
     reactions: HashMap<ct::MessageId, Vec<ct::Reaction>>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
+    /// Each usable harness's models: its cached list (`model_cache`), else
+    /// its preset list until it reports its own.
+    models: HashMap<&'static str, HarnessModels>,
+    /// Harnesses being asked for their models right now (in the background,
+    /// on core's runtime; never while the user waits).
+    discovering: HashSet<&'static str>,
+    /// Harnesses whose cached list is missing, stale or from another
+    /// version: probed in the background.
+    stale: HashSet<&'static str>,
+    /// When a harness's last probe failed, so a signed-out harness isn't
+    /// started again every time the picker opens.
+    failed_at: HashMap<&'static str, Instant>,
+    /// Every agent member core knows, current or removed: their messages
+    /// read as an agent's ("Previous agent" once they're gone).
+    agent_ids: HashSet<ct::MemberId>,
     /// The project's `ping_answer_reactions` as core stores it (`None`: the
     /// default), and the last error from saving it.
     ping_answers: Option<Vec<String>>,
@@ -153,6 +185,20 @@ pub fn parse_ping_answers_input(text: &str) -> PingAnswersInput {
     }
 }
 
+/// One harness in the model picker's filter row.
+#[derive(Clone, Debug)]
+pub struct HarnessChip {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub brand: model::Brand,
+    /// Asking the harness for its models right now.
+    pub checking: bool,
+    /// Its list is the preset guess, not the harness's own answer.
+    pub preset_only: bool,
+    /// Why its own list is missing ("signed out"), if a discovery failed.
+    pub note: Option<Arc<str>>,
+}
+
 impl EventEmitter<StoreEvent> for ChatStore {}
 
 impl ChatStore {
@@ -169,11 +215,24 @@ impl ChatStore {
             selected,
             next_message_id: 1_000_000,
             core: None,
+            permissions: PermissionLog::default(),
         }
     }
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    /// #main's permission requests, newest first (reads included).
+    pub fn permission_log(&self) -> &PermissionLog {
+        &self.permissions
+    }
+
+    /// Replaces the permission log with what core has stored.
+    fn reset_permission_log(&mut self, rows: Vec<PermissionRequest>, cx: &mut Context<Self>) {
+        let entries = rows.iter().map(|r| self.log_entry(r)).collect();
+        self.permissions.reset(entries);
+        cx.notify();
     }
 
     pub fn selected(&self) -> Id {
@@ -253,7 +312,7 @@ impl ChatStore {
             .map(|g| ReactionChip {
                 count: g.members.len(),
                 mine: g.members.contains(&attached.link.human),
-                names: g.members.iter().map(|m| self.member_name(*m)).collect(),
+                names: g.members.iter().map(|m| self.reactor_name(*m)).collect(),
                 emoji: g.emoji,
             })
             .collect()
@@ -312,7 +371,7 @@ impl ChatStore {
 
     /// A member's display name: "You" for the local human, a linked agent's
     /// name, else what core calls them.
-    fn member_name(&self, member: ct::MemberId) -> Arc<str> {
+    fn reactor_name(&self, member: ct::MemberId) -> Arc<str> {
         let Some(attached) = self.core.as_ref() else {
             return Arc::from("Someone");
         };
@@ -444,21 +503,57 @@ impl ChatStore {
     /// projects, its agents join Agent Status, #main's history loads and its
     /// events flow in from here on.
     pub fn attach_core(&mut self, mut link: CoreLink, cx: &mut Context<Self>) {
-        for a in &link.agents {
-            self.workspace.agents.push(Agent {
-                id: agent_id(a.member),
-                name: a.name.clone(),
-                brand: a.brand,
-                state: AgentState::Sleeping,
-                presence: None,
-            });
-        }
+        // Agent Status is the project's members now, not the sample cast
+        // (and the sample mentions name sample agents).
+        self.workspace.agents = link.agents.iter().map(status_agent).collect();
+        self.workspace.mentions.clear();
+        // Each harness starts on its cached list when there is one (shown at
+        // once, even if stale), else its preset list. Missing or stale lists
+        // are probed in the background right after this.
+        let now = model_cache::now_secs();
+        let mut stale = HashSet::new();
+        let models: HashMap<&'static str, HarnessModels> = link
+            .harnesses
+            .iter()
+            .map(|h| {
+                let cached = link.cached_models.get(h.preset.id);
+                if cached.is_none_or(|c| c.freshness(&h.version(), now) != Freshness::Fresh) {
+                    stale.insert(h.preset.id);
+                }
+                let entry = match cached {
+                    Some(c) if !c.models.is_empty() => HarnessModels {
+                        harness: h.preset,
+                        source: ModelSource::Live,
+                        models: with_default(h.preset, c.models()),
+                        note: None,
+                    },
+                    _ => HarnessModels {
+                        harness: h.preset,
+                        source: ModelSource::Preset,
+                        models: harness::preset_models(h.preset),
+                        note: None,
+                    },
+                };
+                (h.preset.id, entry)
+            })
+            .collect();
         let channel = self.show_project(&link.open, &link.folder, cx);
         let confirm = link.confirm.take();
         let mut events = link.events.take();
         let core = link.core.clone();
         let main = link.main();
         let task = cx.spawn(async move |this, cx| {
+            // Who was ever an agent, before the history that needs it.
+            if let Ok(ids) = core.agent_members().await {
+                let ok = this.update(cx, |store, _| {
+                    if let Some(a) = &mut store.core {
+                        a.agent_ids.extend(ids);
+                    }
+                });
+                if ok.is_err() {
+                    return;
+                }
+            }
             match core.history(main, 200).await {
                 Ok(history) => {
                     let after = history.first().map_or(0, |m| m.seq.saturating_sub(1));
@@ -500,8 +595,17 @@ impl ChatStore {
                     return;
                 }
             }
-            // Requests asked while the app was closed are still pending.
-            if let Ok(pending) = core.pending_permissions(main).await {
+            // The permission log, as core stored it (requests asked while
+            // the app was closed included).
+            if let Ok(log) = core.permission_log(main, PERMISSION_LOG_LEN).await {
+                let ok = this.update(cx, |store, cx| store.reset_permission_log(log, cx));
+                if ok.is_err() {
+                    return;
+                }
+            }
+            // Requests asked while the app was closed are still pending
+            // (they only reach the pane when it isn't muted).
+            if PERMISSION_PANE && let Ok(pending) = core.pending_permissions(main).await {
                 let ok = this.update(cx, |store, cx| {
                     for r in pending {
                         store.apply_core_event(CoreEvent::Permission(r), cx);
@@ -538,12 +642,208 @@ impl ChatStore {
             names: HashMap::new(),
             reactions: HashMap::new(),
             confirm,
+            models,
+            discovering: HashSet::new(),
+            stale,
+            failed_at: HashMap::new(),
+            agent_ids: HashSet::new(),
             ping_answers: None,
             ping_answers_error: None,
             _events: task,
         });
+        // Probe the harnesses without a fresh cached list, in the background.
+        self.refresh_models(cx);
         self.load_ping_answers(cx);
         cx.notify();
+    }
+
+    // ---------- members (models through harnesses) ----------
+
+    /// Whether core runs (so members can be added and removed).
+    pub fn has_core(&self) -> bool {
+        self.core.is_some()
+    }
+
+    /// Every usable harness's models, grouped by model (see
+    /// `harness::Catalog`): the model picker's rows.
+    pub fn catalog(&self) -> Catalog {
+        let Some(attached) = &self.core else {
+            return Catalog::default();
+        };
+        let lists: Vec<HarnessModels> = attached
+            .link
+            .harnesses
+            .iter()
+            .filter_map(|h| attached.models.get(h.preset.id).cloned())
+            .collect();
+        Catalog::build(&lists)
+    }
+
+    /// The picker's harness filter, in preset order.
+    pub fn harness_chips(&self) -> Vec<HarnessChip> {
+        let Some(attached) = &self.core else {
+            return Vec::new();
+        };
+        attached
+            .link
+            .harnesses
+            .iter()
+            .map(|h| {
+                let m = attached.models.get(h.preset.id);
+                HarnessChip {
+                    id: h.preset.id,
+                    name: h.preset.name,
+                    brand: h.brand(),
+                    checking: attached.discovering.contains(h.preset.id),
+                    preset_only: m.is_none_or(|m| m.source == ModelSource::Preset),
+                    note: m.and_then(|m| m.note.clone()),
+                }
+            })
+            .collect()
+    }
+
+    /// Roster members whose harness isn't installed (the picker lists them
+    /// greyed, "not installed").
+    pub fn dormant(&self) -> &[DormantMember] {
+        match &self.core {
+            Some(a) => &a.link.dormant,
+            None => &[],
+        }
+    }
+
+    /// Whether the member running `model` on `harness` is already here.
+    pub fn has_member(&self, harness: &str, model: Option<&str>) -> bool {
+        self.core.as_ref().is_some_and(|a| {
+            a.link
+                .agents
+                .iter()
+                .any(|x| x.harness_id.as_deref() == Some(harness) && x.model.as_deref() == model)
+        })
+    }
+
+    /// Probes, in the background, every harness whose cached model list is
+    /// missing, stale or from another version (see `model_cache`). Called
+    /// when core starts and when the model picker opens; it only schedules
+    /// work and returns at once. Each probe spawns its harness once, on
+    /// core's own tokio runtime (`Core::probe_models`), and its answer is
+    /// written to the cache and lands in the picker. A harness whose probe
+    /// failed is left alone for `PROBE_RETRY`.
+    pub fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let folder = attached.link.folder.clone();
+        let cache_dir = attached.link.model_cache_dir.clone();
+        let todo: Vec<agents::Harness> = attached
+            .link
+            .harnesses
+            .iter()
+            .filter(|h| attached.stale.contains(h.preset.id))
+            .filter(|h| !attached.discovering.contains(h.preset.id))
+            .filter(|h| {
+                attached
+                    .failed_at
+                    .get(h.preset.id)
+                    .is_none_or(|at| at.elapsed() >= PROBE_RETRY)
+            })
+            .cloned()
+            .collect();
+        for h in todo {
+            let id = h.preset.id;
+            attached.discovering.insert(id);
+            let (core, folder, cache_dir) = (core.clone(), folder.clone(), cache_dir.clone());
+            cx.spawn(async move |this, cx| {
+                let version = h.version();
+                let found = core
+                    .probe_models(id, &version, h.adapter(None), folder, cache_dir)
+                    .await;
+                this.update(cx, |store, cx| {
+                    if let Some(a) = &mut store.core {
+                        a.discovering.remove(id);
+                        match &found {
+                            Ok(_) => {
+                                a.stale.remove(id);
+                                a.failed_at.remove(id);
+                            }
+                            Err(_) => {
+                                a.failed_at.insert(id, Instant::now());
+                            }
+                        }
+                    }
+                    match found {
+                        Ok(cached) => store.set_models(id, cached.models(), cx),
+                        Err(e) => store.note_models(id, Some(short_reason(&e)), cx),
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// A harness's own model list arrived.
+    fn set_models(&mut self, id: &str, list: Vec<ModelInfo>, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let Some(entry) = attached.models.values_mut().find(|m| m.harness.id == id) else {
+            return;
+        };
+        entry.models = with_default(entry.harness, list);
+        entry.source = ModelSource::Live;
+        entry.note = None;
+        cx.notify();
+    }
+
+    /// Discovery for `id` ended without a list (`why` when it failed).
+    fn note_models(&mut self, id: &str, why: Option<Arc<str>>, cx: &mut Context<Self>) {
+        if let Some(entry) = self
+            .core
+            .as_mut()
+            .and_then(|a| a.models.values_mut().find(|m| m.harness.id == id))
+        {
+            entry.note = why;
+            cx.notify();
+        }
+    }
+
+    /// Adds the member running `model` on `harness` to this project. It
+    /// shows in Agent Status once core has it (sleeping until pinged).
+    pub fn add_member(
+        &mut self,
+        harness: &str,
+        model: Option<Arc<str>>,
+        name: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        if self.has_member(harness, model.as_deref()) {
+            return;
+        }
+        let Some(h) = attached.link.harness(harness).cloned() else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let main = attached.link.main();
+        let path = attached.link.agents_path.clone();
+        let entry = agents_file::Entry::new(harness, model.as_deref(), &name);
+        cx.spawn(async move |this, cx| {
+            let added = agents::add_member(core, h, model, name, main).await;
+            this.update(cx, |store, cx| match added {
+                Ok(linked) => {
+                    // The roster is agents.json's `members` (see agents_file).
+                    agents_file::in_background(path, move |p| agents_file::add_member(p, &entry));
+                    store.linked(linked, cx)
+                }
+                Err(e) => store.system_note(&format!("Could not add that model: {e}"), cx),
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Which reactions answer a ping in the open project, for Settings.
@@ -586,6 +886,64 @@ impl ChatStore {
                 cx.notify();
             })
             .ok();
+        })
+        .detach();
+    }
+
+    fn linked(&mut self, linked: LinkedAgent, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        if attached
+            .link
+            .agents
+            .iter()
+            .any(|a| a.member == linked.member)
+        {
+            return;
+        }
+        attached.names.insert(linked.member, linked.name.clone());
+        attached.agent_ids.insert(linked.member);
+        self.workspace.agents.push(status_agent(&linked));
+        attached.link.agents.push(linked);
+        cx.notify();
+    }
+
+    /// Takes a roster member out of this project (Agent Status's remove).
+    /// Its messages stay in the chat.
+    pub fn remove_agent(&mut self, id: Id, cx: &mut Context<Self>) {
+        let Some(attached) = &mut self.core else {
+            return;
+        };
+        let Some(ix) = attached
+            .link
+            .agents
+            .iter()
+            .position(|a| agent_id(a.member) == id && a.removable)
+        else {
+            return;
+        };
+        let removed = attached.link.agents.remove(ix);
+        let member = removed.member;
+        // Its messages stay, and read as a previous agent's.
+        attached.agent_ids.insert(member);
+        if let Some(harness) = removed.harness_id.clone() {
+            let model = removed.model.clone();
+            agents_file::in_background(attached.link.agents_path.clone(), move |p| {
+                agents_file::remove_member(p, &harness, model.as_deref())
+            });
+        }
+        self.workspace.agents.retain(|a| a.id != id);
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = core.remove_member(&project, member).await {
+                this.update(cx, |store, cx| {
+                    store.system_note(&format!("Could not remove that member: {e}"), cx)
+                })
+                .ok();
+            }
         })
         .detach();
     }
@@ -800,6 +1158,10 @@ impl ChatStore {
                 })
                 .ok();
             }
+            if let Ok(log) = core.permission_log(main, PERMISSION_LOG_LEN).await {
+                this.update(cx, |store, cx| store.reset_permission_log(log, cx))
+                    .ok();
+            }
         })
         .detach();
     }
@@ -820,6 +1182,8 @@ impl ChatStore {
         attached.link.open = open;
         self.core = Some(attached);
         self.load_ping_answers(cx);
+        // Each project's #main has its own log; it reloads after the switch.
+        self.permissions = PermissionLog::default();
     }
 
     /// Folds one core event into the app's state.
@@ -835,7 +1199,10 @@ impl ChatStore {
                 let author = match m.author {
                     _ if m.origin == ct::Origin::System => Author::System,
                     None => Author::System,
-                    Some(id) if attached.link.agents.iter().any(|a| a.member == id) => {
+                    Some(id)
+                        if attached.link.agents.iter().any(|a| a.member == id)
+                            || attached.agent_ids.contains(&id) =>
+                    {
                         Author::Agent(agent_id(id))
                     }
                     Some(_) => Author::Human,
@@ -910,6 +1277,13 @@ impl ChatStore {
                 if r.channel != attached.link.main() {
                     return;
                 }
+                let entry = self.log_entry(&r);
+                self.permissions.upsert(entry);
+                cx.notify();
+                // Muted: no request opens the pane (see `PERMISSION_PANE`).
+                if !PERMISSION_PANE {
+                    return;
+                }
                 if r.state == PermissionState::Pending {
                     let prompt = self.permission_prompt(&r);
                     cx.emit(StoreEvent::PermissionAsked(PaneContent::Permission(prompt)));
@@ -959,6 +1333,31 @@ impl ChatStore {
                 }
                 cx.notify();
             }
+            CoreEvent::Models { harness, models } => {
+                // A live session reported its harness's models: show them and
+                // keep them in the on-disk cache (off the UI thread).
+                let found = attached.link.harness(&harness).map(|h| {
+                    (
+                        h.preset.id,
+                        h.version(),
+                        attached.link.model_cache_dir.clone(),
+                    )
+                });
+                if let Some((id, version, dir)) = found
+                    && !models.is_empty()
+                {
+                    let cached = CachedModels::new(id, &version, model_cache::now_secs(), &models);
+                    std::thread::spawn(move || {
+                        if let Err(e) = model_cache::save(&dir, &cached) {
+                            eprintln!("chaos-control: could not cache the {id} models: {e}");
+                        }
+                    });
+                    if let Some(a) = &mut self.core {
+                        a.stale.remove(id);
+                    }
+                    self.set_models(id, models, cx);
+                }
+            }
         }
     }
 
@@ -991,29 +1390,73 @@ impl ChatStore {
         cx.notify();
     }
 
-    /// The pane's view of a pending permission request.
-    fn permission_prompt(&self, r: &PermissionRequest) -> PermissionPrompt {
-        let name = |id: ct::MemberId| -> Arc<str> {
-            let attached = self.core.as_ref();
-            attached
-                .and_then(|a| a.link.agents.iter().find(|x| x.member == id))
-                .map(|x| x.name.clone())
-                .or_else(|| attached.and_then(|a| a.names.get(&id).cloned()))
-                .unwrap_or_else(|| Arc::from("An agent"))
-        };
+    /// A core member's display name, if the app knows it.
+    fn member_name(&self, id: ct::MemberId) -> Option<Arc<str>> {
+        let attached = self.core.as_ref()?;
+        attached
+            .link
+            .agents
+            .iter()
+            .find(|x| x.member == id)
+            .map(|x| x.name.clone())
+            .or_else(|| attached.names.get(&id).cloned())
+    }
+
+    /// Who a request was routed to, by name ("Hx").
+    fn asked_names(&self, r: &PermissionRequest) -> Arc<str> {
         let asked = r
             .asked_of
             .iter()
-            .map(|m| name(*m).to_string())
+            .map(|m| {
+                self.member_name(*m)
+                    .map_or_else(|| "someone".to_string(), |n| n.to_string())
+            })
             .collect::<Vec<_>>()
             .join(", ");
+        Arc::from(asked)
+    }
+
+    /// The pane's view of a pending permission request.
+    fn permission_prompt(&self, r: &PermissionRequest) -> PermissionPrompt {
         PermissionPrompt {
             request: r.id.0,
-            agent: name(r.agent),
+            agent: self
+                .member_name(r.agent)
+                .unwrap_or_else(|| Arc::from("An agent")),
             action: r.title.clone(),
             reason: r.reason.clone(),
             detail: r.detail.clone(),
-            asked: Arc::from(asked),
+            asked: self.asked_names(r),
+            logged: None,
+        }
+    }
+
+    /// The permission log's row for a stored request. A member who has left
+    /// reads as "Previous agent", with no mark.
+    fn log_entry(&self, r: &PermissionRequest) -> PermissionLogEntry {
+        let agent = self.workspace.agent(agent_id(r.agent));
+        PermissionLogEntry {
+            request: r.id.0,
+            agent: agent.map(|a| a.id),
+            brand: agent.map(|a| a.brand),
+            agent_name: agent.map_or_else(
+                || {
+                    self.member_name(r.agent)
+                        .unwrap_or_else(|| Arc::from(model::PREVIOUS_AGENT))
+                },
+                |a| a.name.clone(),
+            ),
+            action: r.title.clone(),
+            outcome: match r.outcome() {
+                LogOutcome::AutoAllowed => PermissionOutcome::AutoAllowed,
+                LogOutcome::Declined => PermissionOutcome::Declined,
+                LogOutcome::Approved => PermissionOutcome::Approved,
+            },
+            at: r.created_at / 1000,
+            read_only: r.read_only,
+            reason: r.reason.clone(),
+            detail: r.detail.clone(),
+            asked: self.asked_names(r),
         }
     }
 
@@ -1079,6 +1522,39 @@ fn monogram(name: &str) -> String {
     name.chars()
         .find(|c| c.is_alphanumeric())
         .map_or_else(|| "#".to_string(), |c| c.to_uppercase().collect())
+}
+
+/// How a linked agent shows in Agent Status (sleeping until core says).
+fn status_agent(a: &LinkedAgent) -> Agent {
+    Agent {
+        id: agent_id(a.member),
+        name: a.name.clone(),
+        brand: a.brand,
+        state: AgentState::Sleeping,
+        presence: None,
+        harness: a.harness.clone(),
+        removable: a.removable,
+    }
+}
+
+/// A harness's model list with "the harness default" first: it is always a
+/// valid choice, whatever the harness listed.
+fn with_default(preset: &'static harness::HarnessPreset, list: Vec<ModelInfo>) -> Vec<ModelInfo> {
+    let mut models = vec![ModelInfo::default_for(preset)];
+    models.extend(list.into_iter().filter(|m| m.id.is_some()));
+    models
+}
+
+/// A discovery error, short enough for the picker ("signed out").
+fn short_reason(e: &str) -> Arc<str> {
+    let lower = e.to_lowercase();
+    if ["auth", "login", "log in", "sign in"]
+        .iter()
+        .any(|k| lower.contains(k))
+    {
+        return Arc::from("signed out");
+    }
+    Arc::from(e.chars().take(80).collect::<String>())
 }
 
 fn agent_id(member: ct::MemberId) -> Id {

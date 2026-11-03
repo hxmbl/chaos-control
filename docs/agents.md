@@ -33,8 +33,14 @@ position and a voice.
   (`probe`, `open`) and `AgentSession` (`deliver`, `interrupt`, `close`,
   `info`). `Caps` come from the live handshake. The runtime never branches on
   which adapter or brand it is talking to; `model::Brand` only picks the icon.
-- **ACP first.** The generic ACP adapter covers claude-agent-acp and
-  codex-acp. A native Codex app-server adapter is the planned second adapter.
+- **ACP first, native where ACP falls short.** The generic ACP adapter
+  drives every harness that speaks ACP (fx, Mistral Vibe, Claude Code through
+  claude-agent-acp, Copilot CLI, opencode, Devin, Cursor, Gemini). Codex runs
+  through a native app-server adapter (`codex.rs`) behind the same boundary.
+  See [`agent-adapters.md`](agent-adapters.md).
+- **Members are models.** A member is a model running through a harness,
+  auto-detected and kept on a per-project roster (see "Members and the
+  roster" below).
 - **Explicit posting.** Agents speak through the `chat_send` tool. Their final
   turn text is private working-out, posted only as the reply-owed fallback.
 - **Ten chat tools, a social plane only:** `chat_context`, `chat_read`,
@@ -42,6 +48,45 @@ position and a voice.
   `chat_refuse` and `chat_dissent`, and `chat_request_permission` and
   `chat_permission_status` (see Permissions). No delegate, spawn or wait:
   agents involve each other by mentioning in the open.
+
+## Members and the roster
+
+A chat member is a **model** ("GPT-6.1 Sol", "Devstral") running through a
+**harness** (Codex, fx, Mistral Vibe, ...). The harness decides how the
+process starts and which protocol it speaks; the room treats every member
+the same. Presets, detection, model discovery and the model picker are in
+[`agent-adapters.md`](agent-adapters.md).
+
+- **Model members** (migration 7). One `members` row (kind `agent`) plus a
+  `model_members` row with the harness id, the harness's model id (empty for
+  its default) and a display name. `(harness, model)` is unique, so the same
+  model through the same harness in two projects is one member granted to
+  both. One harness can host several members, each with its own adapter,
+  processes and sessions.
+- **Roster.** The roster is `agents.json`'s `members` list (see "Running
+  it"): loaded at every start, and rewritten whenever the user adds or
+  removes a model in Agent Status ("Add a model", remove on hover). Core's
+  `roster` table follows it: at start every installed member is added to
+  the project and anything else on the project's stored roster leaves it.
+  When the file has no `members` yet, the first project to open seeds it:
+  every detected harness adds its first preset model (`roster_seeded` marks
+  the project), or the roster core kept from an earlier build is carried
+  over, and the result is written to the file. The list is one for every
+  project opened (not per project). Removing a member takes it out of the
+  project's channels; its messages stay, signed "Previous agent".
+- **Harness not installed.** The member leaves the room: it is not in Agent
+  Status, it can't be woken, and it is taken off core's stored roster. It
+  stays in `agents.json`, and the model picker lists it greyed as "not
+  installed · <harness>". It comes back by itself at the first start after
+  its harness is installed.
+- **Model not offered.** The session runs the harness default and the
+  member's presence says so.
+- Each harness's own model list is cached on disk, per harness and version
+  (`<data>/models/<harness>.json`, `chaos_core::model_cache`; see
+  [`agent-adapters.md`](agent-adapters.md#model-discovery)). `harness_models`
+  in the store also keeps the latest list a harness reported.
+- Agents from the original `agents` shape in `agents.json` are not on the
+  roster and can't be removed from the app.
 
 ## ACP version negotiation
 
@@ -203,7 +248,7 @@ actions are. The hard boundary is never harming the user's machine or data
 The room's quietest signal: "I fucked up CI again" gets a 💀 and nobody's
 day is interrupted. Humans and agents react the same way.
 
-- **Stored** in `reactions` (migration 7): message, channel, who (any
+- **Stored** in `reactions` (migration 9): message, channel, who (any
   member, human or agent), emoji and when, one row per (message, member,
   emoji). A member can put several different emoji on one message.
 - **Add and remove, idempotent.** `Engine::react(member, message, emoji,
@@ -247,7 +292,7 @@ Configurable (`reaction::PingAnswers`), resolved per agent and channel by
 1. **The agent's own list**: `"ping_answer_reactions"` on the agent in
    `agents.json`, e.g. `["✅", "👍"]` (`AgentSpec::ping_answers`).
 2. **The project's list**: the `ping_answer_reactions` row in
-   `project_settings` (migration 8), keyed by the channel's project. Set it
+   `project_settings` (migration 10), keyed by the channel's project. Set it
    in the app's Settings pane, or with `Core::set_ping_answer_reactions
    (project, Some(list))`; `None` clears it. `Core::ping_answer_reactions`
    reads it (`None` means the default).
@@ -270,9 +315,37 @@ answer").
 
 ## Permissions: by where the agent runs
 
-Chaos Control never changes an agent's permission mode and never simulates
-one. What happens to a permission request depends on where the agent runs,
-set per agent in `agents.json` (`"runs_in"`, default `"host"`):
+**Reads are always allowed (Hxmbl, 2026-10-31).** The goal for now is
+talking to many agents, so agents get full access for reading files and
+nothing else is approved automatically:
+
+- A native request for a read-only tool call (ACP tool kind `read` or
+  `search`, from the request's tool call on v1 or its `subject` on the v2
+  draft) is answered with the agent's own allow-once option straight away,
+  wherever the agent runs. Nobody is asked; presence shows "reading:
+  <title>". It is kept for the permission log only (below): a row with
+  `read_only = 1` and state `auto_approved`, left out of the agent's own
+  `chat_permission_status`, and only the newest 500 per channel are kept
+  (`permission::READS_KEPT`; older reads are pruned as new ones arrive).
+- Anything else (kinds `edit`, `delete`, `move`, `execute`, `fetch`,
+  `switch_mode`, `other`, an unknown kind, or no kind at all) is never
+  auto-approved on the host. It is declined **at once** (the agent is never
+  left waiting) with a message in `_meta.chaosControl.message`: reads are
+  free, commands and edits need a human, this one was sent as request #N,
+  don't wait for it. The request still goes to the humans as below.
+- **Codex** asks only before commands and file changes, never for reads, so
+  its threads start with `sandbox: "read-only"` and `approvalPolicy:
+  "on-request"`: commands run in Codex's read-only sandbox (read anything,
+  write nothing, no network) without asking, and anything that needs more
+  makes Codex ask, which the gate declines on the host. Codex's decline has
+  no message field; it hears a plain "decline" and the room gets the system
+  note. A VM agent's Codex still starts read-only and has each write
+  approved when it asks.
+
+Otherwise Chaos Control doesn't change an agent's permission mode or
+simulate one. What happens to a request that isn't a read depends on where
+the agent runs, set per agent in `agents.json` (`"runs_in"`, default
+`"host"`):
 
 | Where | What happens |
 | --- | --- |
@@ -300,18 +373,33 @@ blocks the agent until it is answered, so the adapter asks core
 channel, the turn it was asked in, source (`native` or `chat_tool`), title
 (the tool call's title), detail (raw input), reason, state (`pending`,
 `approved`, `denied`, `auto_approved`), who it was routed to, who answered,
-when, an optional note, and `used_at`.
+when, an optional note, and `used_at`. Migration 8 adds `read_only` (allowed
+reads, logged) and the log's indexes.
 
 - **Routing:** to the humans whose messages woke the turn, else every human
   in the channel. Any human member of the channel can answer; agents can't.
 - **Dedup:** asking again for the same title while one is pending reuses it.
 - **Surfacing:** one system note ("@bot asked to run X: permission request #N,
   sent to @hx. Any human here can approve or deny it; @bot carries on
-  meanwhile."), a `CoreEvent::Permission`, and presence "request pending: X
-  (#N)" (never "blocked"; glow is unchanged). The app opens the pane with
-  Approve / Deny quick actions (`model::PaneContent::Permission`) unless the
-  pane is busy with something else, and loads requests still pending at
-  startup. An answer from anywhere closes that pane.
+  meanwhile.") when `Policy::note_permission_requests` is on, a
+  `CoreEvent::Permission` (also for every logged read), and presence
+  "request pending: X (#N)" (never "blocked"; glow is unchanged).
+- **The app mutes requests (Hxmbl, 2026-10-31).** No request opens the
+  pane: `store::PERMISSION_PANE` is `false`, and the app starts core with
+  `note_permission_requests` off, since nothing in the app can approve or
+  deny now. Instead the right sidebar's **Permissions** log lists every
+  request in #main, reads included, newest first: the agent's mark, the
+  tool call's title, the outcome and a relative time. It loads
+  `Core::permission_log(channel, 200)` (`permission::log_in`, newest first by
+  id) when core starts or the project switches, then folds in each
+  `CoreEvent::Permission`. The outcome is `PermissionRequest::outcome()`:
+  `auto_approved` (a read, or a VM agent) shows **Auto-allowed**; `pending`
+  and `denied` show **Declined** (the agent's call was declined at once and
+  nothing ran); `approved` shows **Approved** (only reachable through core
+  for now). Clicking a row opens the pane read-only with the details (no
+  quick actions). The Approve / Deny pane, `Core::answer_permission`, grants
+  and the chat tools below are unchanged and still compile; turning
+  `PERMISSION_PANE` back on (and the note) brings the old flow back.
 - **Answer:** `Core::answer_permission(id, human, approve, note)` records it
   (only a pending request can be answered, once), posts it as a system
   message and delivers it as a wake: one trigger with reason `permission` on
@@ -383,31 +471,79 @@ be forced onto the bridge with `"chat_tools": "stdio"`.
 | --- | --- |
 | green (`Active`) | a session is open, a turn is in flight, or a retry is scheduled |
 | blue (`Sleeping`) | no session; it needs a ping |
-| red (`Unresponsive`) | command missing, signed out, or 3 failed deliveries |
+| red (`Unresponsive`) | command or harness missing, signed out, or 3 failed deliveries |
 
 Presence is one line for the Agent Status tooltip: the agent's `chat_status`,
 else its activity, else the last runtime note. Never part of the chat log.
 
 ## Running it
 
-The app starts core when an `agents.json` exists: `$CHAOS_CONTROL_AGENTS`,
-else `<data>/agents.json`, where `<data>` is `$CHAOS_CONTROL_DATA`, else
-`~/Library/Application Support/Chaos Control` on macOS or
-`$XDG_DATA_HOME/chaos-control` (`~/.local/share/chaos-control`) elsewhere. The
-database is `<data>/core.sqlite`. Without the file the app runs on sample data
-as before. With it, #main is the launch folder's project's own `main` channel
-(each project has one; see "Storage model" in `ARCHITECTURE.md`): composer
-posts go through core, and configured agents are granted that project and
-join Agent Status. An agent's chat tools only see channels and messages of the
-project its session's channel belongs to; a name or id from another project
-answers `not_found`.
+The app starts core when an `agents.json` exists **or** at least one harness
+is installed (auto-detection, `chaos_core::harness`; see
+[`agent-adapters.md`](agent-adapters.md#detection)). `agents.json` is
+optional: `$CHAOS_CONTROL_AGENTS`, else `<data>/agents.json`, where `<data>`
+is `$CHAOS_CONTROL_DATA`, else `~/Library/Application Support/Chaos Control`
+on macOS or `$XDG_DATA_HOME/chaos-control` (`~/.local/share/chaos-control`)
+elsewhere. The database is `<data>/core.sqlite`. With neither a file nor an
+installed harness, the app runs on sample data as before.
+
+Once core runs, #main is the launch folder's project's own `main` channel
+(each project has one; see "Storage model" in `ARCHITECTURE.md`), so starting
+core writes `.chaos/project.toml` in the launch folder. Composer posts go
+through core, and the project's roster members are granted the project and
+listed in Agent Status. An agent's chat tools only see channels and messages
+of the project its session's channel belongs to; a name or id from another
+project answers `not_found`.
+
+```json
+{
+  "human": { "handle": "hx", "name": "Hx" },
+  "detect": true,
+  "harnesses": {
+    "codex": { "command": "/opt/codex/bin/codex", "args": ["app-server"] },
+    "fx": { "env": { "FX_LOG": "warn" }, "record": "/tmp/fx-acp.ndjson" }
+  },
+  "members": [
+    { "harness": "codex", "model": "gpt-6.1-sol", "name": "GPT-6.1 Sol" },
+    { "harness": "fx", "model": "anthropic/claude-opus-5.5", "runs_in": "vm" }
+  ]
+}
+```
+
+- `detect` (default `true`): look for installed harnesses.
+  `CHAOS_CONTROL_DETECT=0` also turns it off.
+- `harnesses`: overrides per preset id (`codex`, `fx`, `vibe`,
+  `claude-code`, `copilot`, `opencode`, `devin`, `cursor`, `gemini`):
+  `command`, `args`, `env` (object), `record`, `acp_v2` (default `true`),
+  `chat_tools` (`"auto"` or `"stdio"`). A harness with a `command` here
+  counts as installed even when detection didn't find it.
+- `members`: the roster (Hxmbl's decision, 2026-10-31). Each entry has
+  `harness`, optional `model` (absent: the harness default), `name`, `cwd`
+  and `runs_in`. It is loaded at every start and the app writes it back as
+  the roster changes:
+  - "Add a model" appends `{harness, model, name}`; removing a member
+    deletes its entry. A missing file is created in `<data>` (or at
+    `$CHAOS_CONTROL_AGENTS`).
+  - Only `members` changes. Other keys, and an entry's own extra fields
+    (`cwd`, `runs_in`, anything unknown), are kept in their order; the file
+    is re-indented with two spaces. Writes are atomic (a temporary file
+    renamed over it) and one at a time, off the UI thread.
+  - A file that isn't valid JSON is never overwritten: the app prints why
+    and the change lives only in core until the file is fixed.
+  - With no `members` key yet, the first start seeds the list (see "Members
+    and the roster") and writes it.
+  - Members whose harness isn't installed stay listed and are skipped (see
+    "Harness not installed").
+
+The original shape still loads unchanged, alongside or instead of the new
+keys. Each entry is one ACP command; `brand` only picks the icon:
 
 ```json
 {
   "human": { "handle": "hx", "name": "Hx" },
   "agents": [{
     "handle": "claude", "name": "Claude Code", "brand": "claude",
-    "command": "npx", "args": ["-y", "@agentclientprotocol/claude-agent-acp@0.97.0"],
+    "command": "npx", "args": ["-y", "@agentclientprotocol/claude-agent-acp@0.99.1"],
     "cwd": "/path/to/a/repo",
     "record": "/tmp/claude-acp.ndjson"
   }]
@@ -451,6 +587,12 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   lets the retried call through once; a denial grants nothing and is not a
   failure; a VM agent is approved without a note; the chat tools ask ahead,
   dedup and poll; only humans answer, once.
+- `tests/models.rs`: model members against the fake ACP agent and a fake
+  Codex app-server (`fake_codex.rs`): the ACP session model option (set,
+  not offered, default), throwaway-session discovery and a signed-out
+  harness caching nothing; a Codex member's turn, fallback reply, approvals
+  through the permission gate, sign-out, interrupt and `model/list`; one
+  harness hosting two members.
 - `tests/replay.rs`: recorded transcripts through the real adapter (v1
   claude-agent-acp, v2 claude-agent-acp live, codex-acp needing sign-in), and
   the fake agent binary over real stdio. One ignored live test spawns a real
@@ -498,6 +640,18 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
 - **Against the fake only:** agent output, keyed message and tool-call
   upserts, permission requests and cancel over v2 (`tests/v2.rs`), and the
   whole permission flow (`tests/permissions.rs`).
+- **Harnesses (not live-verified):** none of the harness presets (Codex
+  app-server, fx, Mistral Vibe, Claude Code via claude-agent-acp 0.99.1,
+  Copilot CLI, opencode, Devin, Cursor, Gemini), model discovery or model
+  selection has been run against a real harness. They are tested against
+  the fakes only; manual checks are in `agent-adapters.md`.
+- **Roster follow-ups (2026-10-31, not live-verified):** reads allowed /
+  everything else declined (`tests/permissions.rs`), Codex's read-only
+  sandbox params, the model cache and background probe, discovery awaited
+  off the tokio runtime (`tests/models.rs`), and `agents.json` write-back
+  (unit tests in the app's `agents_file`). Whether real harnesses label
+  their reads `read`/`search`, and whether Codex's app-server accepts
+  `sandbox`/`approvalPolicy` on `thread/start` as named here, is unchecked.
 - **Not yet:** a signed-in agent actually calling `chat_context` and
   `chat_send`, agent output, tool calls and permission requests over v2 from a
   real agent, and the stdio bridge inside a real agent. That is validation step 2 on a Mac with

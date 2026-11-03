@@ -1,8 +1,10 @@
 //! Chaos Control: a group chat for a project's AI agents and the people running it.
 
 mod agents;
+mod agents_file;
 mod composer;
 mod conversation;
+mod model_picker;
 mod pane_host;
 mod panels;
 mod project;
@@ -31,7 +33,8 @@ fn main() {
         }
         return;
     }
-    // The agent runtime, when an agents.json exists (see agents.rs).
+    // The agent runtime, when a harness is installed or an agents.json
+    // exists (see agents.rs).
     let core = agents::start();
 
     Application::new()
@@ -58,6 +61,21 @@ fn main() {
                 KeyBinding::new("down", search::SelectNext, Some(search::KEY_CONTEXT)),
                 KeyBinding::new("up", search::SelectPrevious, Some(search::KEY_CONTEXT)),
                 KeyBinding::new("escape", search::Dismiss, Some(search::KEY_CONTEXT)),
+                KeyBinding::new(
+                    "down",
+                    model_picker::SelectNext,
+                    Some(model_picker::KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "up",
+                    model_picker::SelectPrevious,
+                    Some(model_picker::KEY_CONTEXT),
+                ),
+                KeyBinding::new(
+                    "escape",
+                    model_picker::Dismiss,
+                    Some(model_picker::KEY_CONTEXT),
+                ),
             ]);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {

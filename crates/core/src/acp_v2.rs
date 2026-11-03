@@ -145,7 +145,7 @@ fn answer(
         None => v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
     };
     match verdict {
-        PermissionVerdict::Allow { .. } => match pick_allow(&opts) {
+        PermissionVerdict::Allow { .. } | PermissionVerdict::AllowRead => match pick_allow(&opts) {
             Some(ix) => select(ix),
             None => decline(),
         },
@@ -199,6 +199,7 @@ pub(crate) async fn open(
     transport: DynConnectTo<Client>,
     req: &OpenSession,
     pref: ChatToolsPreference,
+    model: Option<Arc<str>>,
 ) -> Result<Arc<dyn AgentSession>, V2Open> {
     let (ready_tx, ready_rx) = oneshot::channel::<Ready>();
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
@@ -208,7 +209,7 @@ pub(crate) async fn open(
     let endpoint = req.chat_tools.clone();
     let gate = req.permissions.clone();
     tokio::spawn(run(
-        transport, cwd, endpoint, pref, tracker, cmd_rx, ready_tx, events, gate,
+        transport, cwd, endpoint, pref, model, tracker, cmd_rx, ready_tx, events, gate,
     ));
     match ready_rx.await {
         Ok(Ready::Session(info)) => Ok(Arc::new(V2Session { info, cmd: cmd_tx })),
@@ -227,6 +228,7 @@ async fn run(
     cwd: std::path::PathBuf,
     endpoint: ChatToolsEndpoint,
     pref: ChatToolsPreference,
+    model: Option<Arc<str>>,
     tracker: Arc<Mutex<Tracker>>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: oneshot::Sender<Ready>,
@@ -346,11 +348,21 @@ async fn run(
         .on_receive_request(
             async move |r: v2::RequestPermissionRequest, responder, _cx: V2ConnectionTo<Agent>| {
                 let turn = t_perm.lock().expect("lock").turn;
+                let read_only = match &r.subject {
+                    Some(v2::RequestPermissionSubject::ToolCall(s)) => match &s.tool_call.kind {
+                        MaybeUndefined::Value(k) => {
+                            crate::permission::is_read_only_kind(&crate::acp::kind_str(k))
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
                 let verdict = gate
                     .ask(PermissionAsk {
                         turn,
                         title: Arc::from(r.title.as_str()),
                         detail: r.description.as_deref().map(Arc::from),
+                        read_only,
                     })
                     .await;
                 responder.respond(answer(&r, &verdict))
@@ -401,7 +413,36 @@ async fn run(
                 }
             };
             let session_id = new.session_id.clone();
+            let options = serde_json::to_value(&new.config_options).unwrap_or_default();
+            let offered = crate::acp::model_option(&options);
+            let (current, applied) = match crate::acp::plan_model(model.as_ref(), offered.as_ref())
+            {
+                crate::acp::ModelPlan::Set {
+                    config_id,
+                    value,
+                    fallback,
+                } => {
+                    let set = conn
+                        .send_request(v2::SetSessionConfigOptionRequest::new(
+                            session_id.clone(),
+                            config_id,
+                            v2::SessionConfigValueId::new(value.clone()),
+                        ))
+                        .block_task()
+                        .await;
+                    match set {
+                        Ok(_) => (Some(value), Ok(())),
+                        Err(e) => (fallback, Err(format!("{e}"))),
+                    }
+                }
+                crate::acp::ModelPlan::Keep { current, applied } => (current, applied),
+            };
+            let models = offered.map(|o| o.models).unwrap_or_default();
+            let model_note = crate::adapter::model_outcome(model.as_deref(), &models, applied);
             send_ready(Ready::Session(SessionInfo {
+                model: current,
+                models,
+                model_note,
                 caps,
                 protocol: Arc::from("acp/v2-draft"),
                 native_ref: Arc::from(session_id.to_string()),

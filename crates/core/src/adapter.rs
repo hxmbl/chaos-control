@@ -23,6 +23,7 @@ use std::{fmt, path::PathBuf, sync::Arc};
 
 use futures::future::BoxFuture;
 
+use crate::harness::ModelInfo;
 use crate::permission::PermissionGate;
 use crate::types::{BatchId, ChannelId, MemberId};
 
@@ -107,6 +108,15 @@ pub struct SessionInfo {
     pub unused_extensions: Vec<Arc<str>>,
     /// Which chat-tools transport was injected.
     pub chat_tools: ChatToolsTransport,
+    /// The model the session runs, as the harness named it (`None` when it
+    /// did not say).
+    pub model: Option<Arc<str>>,
+    /// The models the harness offered for this session (ACP session config
+    /// options, Codex `model/list`). Empty when it offered none.
+    pub models: Vec<ModelInfo>,
+    /// Why the member's model could not be applied, if it could not (the
+    /// session then runs the harness default). Shown as presence.
+    pub model_note: Option<Arc<str>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,4 +272,36 @@ pub trait AgentAdapter: Send + Sync {
     fn probe(&self) -> BoxFuture<'_, Probe>;
     /// Starts a session: negotiates the protocol, injects chat tools.
     fn open(&self, req: OpenSession) -> BoxFuture<'_, Result<Arc<dyn AgentSession>, AgentError>>;
+    /// Asks the harness which models it offers, without joining any chat:
+    /// for ACP a throwaway `session/new` (no chat tools) that is closed at
+    /// once, for Codex `model/list`. Spawns a process, so the host only
+    /// calls it when the user opens the model picker, and caches the answer.
+    /// `None` when this adapter cannot list models.
+    fn list_models(
+        &self,
+        cwd: PathBuf,
+    ) -> BoxFuture<'_, Option<Result<Vec<ModelInfo>, AgentError>>> {
+        let _ = cwd;
+        Box::pin(async { None })
+    }
+}
+
+/// Where a member's model choice ended up, for `SessionInfo`.
+pub(crate) fn model_outcome(
+    wanted: Option<&str>,
+    offered: &[ModelInfo],
+    applied: Result<(), String>,
+) -> Option<Arc<str>> {
+    let wanted = wanted?;
+    if !offered.is_empty() && !offered.iter().any(|m| m.id.as_deref() == Some(wanted)) {
+        return Some(Arc::from(format!(
+            "this harness doesn't offer {wanted} now; running its default"
+        )));
+    }
+    match applied {
+        Ok(()) => None,
+        Err(e) => Some(Arc::from(format!(
+            "couldn't switch to {wanted} ({e}); running the harness default"
+        ))),
+    }
 }

@@ -44,10 +44,11 @@ both through `CoreEvent::Agent`; presence is never part of the chat log.
 
 ## Agents
 
-When an `agents.json` exists, `main.rs` starts `chaos-core` in-process on its
-own two-thread tokio runtime (`agents::start`), works out the launch folder's
-project (see Storage model below) and hands the link to
-`ChatStore::attach_core`. From then on the sidebar shows that project's
+When an `agents.json` exists **or** any known harness is installed
+(auto-detection, `chaos_core::harness`), `main.rs` starts `chaos-core`
+in-process on its own two-thread tokio runtime (`agents::start`), works out
+the launch folder's project (see Storage model below) and hands the link to
+`ChatStore::attach_core`. No hand-written `agents.json` is needed. From then on the sidebar shows that project's
 channels from core and #main is the project's own `main` channel:
 
 - composer posts in #main go to `Core::post` and appear when core reports them
@@ -58,6 +59,15 @@ channels from core and #main is the project's own `main` channel:
 - history is loaded once at attach and deduplicated against the event stream
   by core message id, with the reactions on those messages
   (`Core::reactions`); `CoreEvent::Reaction` keeps them current;
+- members are models running through a harness (Codex, fx, Mistral Vibe,
+  Claude Code, ...): the roster is `agents.json`'s `members`, seeded once
+  from the detected harnesses and then edited in Agent Status (remove on
+  hover, "Add a model" opens the model picker in the pane layer,
+  `model_picker.rs`), which writes it back (`agents_file.rs`). Members whose
+  harness isn't installed stay out of the room. Model lists come from an
+  on-disk cache probed in the background on core's tokio runtime, never
+  from the UI thread. Presets, detection, model discovery and the picker
+  are in [docs/agent-adapters.md](docs/agent-adapters.md);
 - the same binary is the stdio MCP bridge for agents that can't take HTTP:
   `chaos-control mcp-bridge` (URL and token in its environment).
 
@@ -76,7 +86,8 @@ channels; each channel is a persistent group conversation.
 | --- | --- | --- |
 | Project id (UUID) and display name | `<folder>/.chaos/project.toml` | n/a |
 | Projects, channels, messages, project and channel membership, cursors, delivery state, sessions | `<data>/core.sqlite` | project UUID, channel id |
-| Agent definitions (command, model, persona) | `<data>/agents.json` | handle (global) |
+| Model members (harness + model) and each project's roster, harness model lists | `<data>/core.sqlite` (migration 7) | member id, project UUID |
+| Optional overrides: harness commands, an explicit roster, original-shape agents | `<data>/agents.json` | harness id / handle (global) |
 
 `<data>` is the app data directory (see Agents above). The file holds nothing
 else, so no chat state ever lands in a repository, and agents working in the
@@ -89,7 +100,8 @@ id = "0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59"
 name = "starpoint"
 ```
 
-**Ownership.** Agents (`members`) are global. Membership is per project
+**Ownership.** Agents (`members`) are global; a model member is one per
+`(harness, model)`. Membership is per project
 (`project_members`) and per channel (`memberships`). Channels belong to one
 project: names are unique within it (two projects can each have a #main), and
 each channel has a per-project ordinal, its `::N`. Cursors, batches, triggers,
@@ -109,9 +121,10 @@ otherwise) and each checks `pragma_foreign_key_check` before it commits.
 Migration 3 adds `projects.unclaimed_import`, set only on that "Imported"
 project, so it can be adopted by one folder, once (see Relinking imported
 history below). Migrations 4 to 6 add read receipts, stances and permission
-requests; migration 7 rebuilds `reactions` with each reaction's channel
-(see "Reactions" in [docs/agents.md](docs/agents.md)); migration 8 adds
-`project_settings`, one JSON value per (project, key), holding
+requests; migration 7 adds model members and rosters, migration 8 the
+permission log's `read_only`; migration 9 rebuilds `reactions` with each
+reaction's channel (see "Reactions" in [docs/agents.md](docs/agents.md));
+migration 10 adds `project_settings`, one JSON value per (project, key), holding
 `ping_answer_reactions` so far.
 
 **`::N`.** A channel's ordinal is assigned when it is created: the project's
@@ -170,7 +183,8 @@ Permissions are enforced in core, not by where files sit:
   inside its session's project; anything else answers `not_found`;
 - granting is explicit and only the host does it (`Core::human`,
   `Core::add_agent`, `Core::join_project`); the app grants the person at the
-  keyboard and the agents in `agents.json` the launch project.
+  keyboard and the launch project's roster members (plus any original-shape
+  `agents.json` agents) the launch project.
 
 **Git.** `.chaos/` is appended once to the repository's `.git/info/exclude`
 (found by walking up; a worktree's `.git` file is followed to the common git
@@ -268,7 +282,8 @@ never moves and there is never more than one.
 
 - **Content is model data.** `model::PaneContent` (GPUI-free) says what is
   shown: `LongMessage`, `Attachment`, `Settings`, `Review`, `Compose`,
-  `Search`. Each knows its title and its quick actions (`PaneAction` /
+  `Search`, `ProjectIdentity`, `Permission` (Approve / Deny, muted for now;
+  read-only when opened from the permission log). Each knows its title and its quick actions (`PaneAction` /
   `PaneActionKind`), so the agent runtime can open a pane by building one and
   calling `PaneHost::open`. The UI only decides how each body looks.
 - **Element and state.** `ui::Pane` is the element: a red macOS-style close dot
@@ -460,6 +475,32 @@ Each sidebar has a mode, `Auto` by default:
   popovers); the grace starts when that ends.
 - Motion: docking and collapsing slide the panel off its edge and reflow the
   column over 180ms (ease-out cubic), reversible mid-slide.
+
+### The right sidebar's permission log
+
+Agents' permission requests no longer open the pane (muted, Hxmbl
+2026-10-31; `store::PERMISSION_PANE = false`). The right sidebar shows them
+instead, in a **Permissions** section between mentions and Agent status:
+
+- One borderless row per request in #main, newest first: the agent's mark
+  (monochrome `ink_soft`, or its initial once the member has left), the tool
+  call's title (first line, ellipsis), the outcome in caption type
+  (**Auto-allowed** or **Declined**; **Approved** only if a human approved
+  through core) and a relative time ("now", "4m", "2h", "3d", "5w",
+  `model::relative_time`, redrawn every 30s while the log has rows). The
+  tooltip has the agent's name, the full title and the request id.
+- The section hugs its rows, caps at five and scrolls past that, like the
+  left sidebar's channel section. It isn't drawn while the log is empty
+  (the sample shell, or no requests yet).
+- Clicking a row opens the pane read-only (`PermissionPrompt::logged`): the
+  title is "<agent> · <outcome>", the body has the title, reason and detail,
+  and there are no quick actions.
+- Data: `ChatStore` keeps a `model::PermissionLog` (200 rows, newest first by
+  request id, updated in place). It loads `Core::permission_log` when core
+  starts and after a project switch, then folds in every
+  `CoreEvent::Permission`, which core now also sends for each allowed read
+  (reads are stored with `read_only = 1`, migration 8; see
+  `docs/agents.md`, "Permissions").
 
 ## Shortcuts
 

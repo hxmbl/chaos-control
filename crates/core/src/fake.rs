@@ -61,6 +61,11 @@ pub struct Script {
     /// draft; a v1 `initialize` still gets v1). See the module docs.
     #[serde(default)]
     pub protocol: Option<u16>,
+    /// v1: offer a model selector (`configOptions`, category `model`) with
+    /// these `[id, name]` pairs, the first one current. `session/set_config_option`
+    /// and `session/close` are recorded in [`Observed`].
+    #[serde(default)]
+    pub models: Option<Vec<(String, String)>>,
 }
 
 fn yes() -> bool {
@@ -90,8 +95,11 @@ pub enum Step {
     /// Call a chat tool over HTTP MCP. In string args, `$TRIGGER` is the first
     /// owed message id from the prompt and `$N` the prompt number.
     Mcp { tool: String, args: Value },
-    /// Ask for permission to run something.
+    /// Ask for permission to run something (no tool kind given).
     Permission(String),
+    /// Ask for permission for a tool call of this ACP kind (`read`,
+    /// `search`, `edit`, `execute`, ...).
+    PermissionKind { title: String, kind: String },
     /// Wait until the test opens this gate (in-process only; no-op otherwise).
     Gate(String),
     /// Real-time sleep.
@@ -135,7 +143,7 @@ impl Gates {
 }
 
 /// What the fake saw, for assertions.
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct Observed {
     pub prompts: Vec<String>,
     pub sessions: Vec<Value>,
@@ -144,6 +152,10 @@ pub struct Observed {
     pub cancels: usize,
     /// The protocol version of each `initialize` the fake answered.
     pub protocols: Vec<u16>,
+    /// `(configId, value)` of each `session/set_config_option`.
+    pub config_sets: Vec<(String, String)>,
+    /// Sessions closed with `session/close`.
+    pub closed: Vec<String>,
 }
 
 /// The chat MCP endpoint (url, bearer token) from the latest `session/new`.
@@ -209,6 +221,22 @@ impl FakeAgent {
         Ok(format!("fake-session-{}", o.sessions.len()))
     }
 
+    /// The scripted model selector, `current` (else the first) selected.
+    fn model_options(&self, current: Option<&str>) -> Option<Vec<v1::SessionConfigOption>> {
+        let models = self.script.models.as_ref()?;
+        let current = current
+            .map(str::to_string)
+            .or_else(|| models.first().map(|m| m.0.clone()))?;
+        let options: Vec<_> = models
+            .iter()
+            .map(|(id, name)| v1::SessionConfigSelectOption::new(id.clone(), name.clone()))
+            .collect();
+        Some(vec![
+            v1::SessionConfigOption::select("model", "Model", current, options)
+                .category(v1::SessionConfigOptionCategory::Model),
+        ])
+    }
+
     fn bearer(value: &str) -> String {
         value.trim_start_matches("Bearer ").to_string()
     }
@@ -267,9 +295,49 @@ impl FakeAgent {
                         });
                         let json = serde_json::to_value(&req).unwrap_or_default();
                         match me2.record_session(json, http, &mcp) {
-                            Ok(id) => responder.respond(v1::NewSessionResponse::new(id)),
+                            Ok(id) => responder.respond(
+                                v1::NewSessionResponse::new(id)
+                                    .config_options(me2.model_options(None)),
+                            ),
                             Err(msg) => responder.respond_with_error(acp::Error::new(-32000, msg)),
                         }
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let me = me3.clone();
+                    async move |req: v1::SetSessionConfigOptionRequest,
+                                responder: Responder<v1::SetSessionConfigOptionResponse>,
+                                _cx| {
+                        let value = match &req.value {
+                            v1::SessionConfigOptionValue::ValueId { value } => value.0.to_string(),
+                            other => format!("{other:?}"),
+                        };
+                        me.observed
+                            .lock()
+                            .expect("lock")
+                            .config_sets
+                            .push((req.config_id.0.to_string(), value.clone()));
+                        let opts = me.model_options(Some(&value)).unwrap_or_default();
+                        responder.respond(v1::SetSessionConfigOptionResponse::new(opts))
+                    }
+                },
+                acp::on_receive_request!(),
+            )
+            .on_receive_request(
+                {
+                    let me = me3.clone();
+                    async move |req: v1::CloseSessionRequest,
+                                responder: Responder<v1::CloseSessionResponse>,
+                                _cx| {
+                        me.observed
+                            .lock()
+                            .expect("lock")
+                            .closed
+                            .push(req.session_id.to_string());
+                        responder.respond(v1::CloseSessionResponse::new())
                     }
                 },
                 acp::on_receive_request!(),
@@ -499,8 +567,13 @@ impl FakeAgent {
                         .tool_results
                         .push(result);
                 }
-                Step::Permission(title) => {
-                    let outcome = wire.permission(n, title).await;
+                Step::Permission(_) | Step::PermissionKind { .. } => {
+                    let (title, kind) = match step {
+                        Step::PermissionKind { title, kind } => (title, Some(kind)),
+                        Step::Permission(title) => (title, None),
+                        _ => unreachable!(),
+                    };
+                    let outcome = wire.permission(n, title, kind).await;
                     self.observed
                         .lock()
                         .expect("lock")
@@ -686,13 +759,15 @@ impl Wire {
     }
 
     /// Asks for permission; returns the client's answer (or the error) as JSON.
-    async fn permission(&mut self, n: usize, title: String) -> Value {
+    async fn permission(&mut self, n: usize, title: String, kind: Option<String>) -> Value {
         match self {
             Wire::V1 { cx, session, .. } => {
-                let call = v1::ToolCallUpdate::new(
-                    v1::ToolCallId::new(format!("perm-{n}")),
-                    v1::ToolCallUpdateFields::new().title(title),
-                );
+                let mut fields = v1::ToolCallUpdateFields::new().title(title);
+                if let Some(k) = kind.and_then(|k| serde_json::from_value(Value::String(k)).ok()) {
+                    fields = fields.kind(Some(k));
+                }
+                let call =
+                    v1::ToolCallUpdate::new(v1::ToolCallId::new(format!("perm-{n}")), fields);
                 let req = v1::RequestPermissionRequest::new(
                     session.clone(),
                     call,
@@ -722,7 +797,7 @@ impl Wire {
                         v2::RequiresActionStateUpdate::new(),
                     )),
                 );
-                let req = v2::RequestPermissionRequest::new(
+                let mut req = v2::RequestPermissionRequest::new(
                     session.clone(),
                     title,
                     vec![
@@ -738,6 +813,15 @@ impl Wire {
                         ),
                     ],
                 );
+                if let Some(k) =
+                    kind.and_then(|k| serde_json::from_value::<v2::ToolKind>(Value::String(k)).ok())
+                {
+                    req = req.subject(v2::RequestPermissionSubject::ToolCall(Box::new(
+                        v2::ToolCallPermissionSubject::new(
+                            v2::ToolCallUpdate::new(format!("perm-{n}")).kind(k),
+                        ),
+                    )));
+                }
                 let outcome = cx.send_request(req).block_task().await;
                 Self::v2_update(
                     cx,

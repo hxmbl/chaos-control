@@ -23,8 +23,10 @@ pub enum IconName {
     Square,
     X,
     BrandClaude,
+    BrandCursor,
     BrandDevin,
     BrandCopilot,
+    BrandGemini,
     BrandGitHub,
     BrandLinear,
     BrandMistral,
@@ -36,7 +38,7 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [IconName; 27] = [
+    pub const ALL: [IconName; 29] = [
         IconName::Archive,
         IconName::ArrowUp,
         IconName::CaretDown,
@@ -54,8 +56,10 @@ impl IconName {
         IconName::Square,
         IconName::X,
         IconName::BrandClaude,
+        IconName::BrandCursor,
         IconName::BrandDevin,
         IconName::BrandCopilot,
+        IconName::BrandGemini,
         IconName::BrandGitHub,
         IconName::BrandLinear,
         IconName::BrandMistral,
@@ -86,8 +90,10 @@ impl IconName {
             IconName::Square => "icons/phosphor/square.svg",
             IconName::X => "icons/phosphor/x.svg",
             IconName::BrandClaude => "icons/brands/claude.svg",
+            IconName::BrandCursor => "icons/brands/cursor.svg",
             IconName::BrandDevin => "icons/brands/devin.svg",
             IconName::BrandCopilot => "icons/brands/github-copilot.svg",
+            IconName::BrandGemini => "icons/brands/gemini.svg",
             IconName::BrandGitHub => "icons/brands/github.svg",
             IconName::BrandLinear => "icons/brands/linear.svg",
             IconName::BrandMistral => "icons/brands/mistral.svg",
@@ -113,6 +119,8 @@ pub fn brand_icon(brand: Brand) -> IconName {
         Brand::Mistral => IconName::BrandMistral,
         Brand::Opencode => IconName::BrandOpencode,
         Brand::Pi => IconName::BrandPi,
+        Brand::Gemini => IconName::BrandGemini,
+        Brand::Cursor => IconName::BrandCursor,
     }
 }
 

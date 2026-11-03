@@ -344,7 +344,9 @@ impl Search {
                 let who = match author {
                     Author::Human => "Hx".into(),
                     Author::System => "Chaos Control".into(),
-                    Author::Agent(id) => ws.agent(*id).map_or("Agent".into(), |a| a.name.clone()),
+                    Author::Agent(id) => ws
+                        .agent(*id)
+                        .map_or(model::PREVIOUS_AGENT.into(), |a| a.name.clone()),
                 };
                 let minutes = sent_at / 60;
                 let time = format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60);
