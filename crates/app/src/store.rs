@@ -81,6 +81,15 @@ pub struct Reader {
     pub read_at: u64,
 }
 
+/// How far an agent has read in the selected channel, for Agent Status.
+#[derive(Clone, Copy, Debug)]
+pub struct AgentSeen {
+    /// When the agent last moved its read cursor, seconds since the Unix epoch.
+    pub read_at: u64,
+    /// Messages after that cursor (0 means it has seen the newest one).
+    pub behind: usize,
+}
+
 pub struct ChatStore {
     workspace: Workspace,
     logs: HashMap<Id, ChannelLog>,
@@ -318,6 +327,20 @@ impl ChatStore {
             .collect();
         out.sort_by(|a, b| a.read_at.cmp(&b.read_at).then(a.name.cmp(&b.name)));
         out
+    }
+
+    /// How far the agent has read in `channel`, if core has a receipt for it
+    /// there. Only core channels have receipts.
+    pub fn agent_seen(&self, channel: Id, agent: Id) -> Option<AgentSeen> {
+        let attached = self.core.as_ref().filter(|a| a.channel == channel)?;
+        let member = ct::MemberId(i64::from(agent.0.checked_sub(CORE_AGENT_BASE)?));
+        let receipt = attached.receipts.get(&member)?;
+        let read_row = row_at(&attached.by_seq, receipt.read_through)?;
+        let len = self.logs.get(&channel).map_or(0, |l| l.len());
+        Some(AgentSeen {
+            read_at: receipt.read_at / 1000,
+            behind: len.saturating_sub(read_row + 1),
+        })
     }
 
     /// The reaction chips under the message at `index` of `channel`, in order

@@ -377,9 +377,15 @@ impl Conversation {
     }
 }
 
-/// Small avatars of who has read up to this message and no further, at the
-/// end of the row (Slack/iMessage style); hover lists names and times. Read
-/// with no reply is a normal outcome, so the marks stay quiet.
+/// How many reader faces fit under a message before the rest collapse into a
+/// "+N" chip. The tooltip always names every reader.
+const READ_MARKS_SHOWN: usize = 4;
+
+/// Who has read up to this message and no further, at the end of the row
+/// (Slack/iMessage style). Each reader is a small initial avatar — an agent's
+/// harness mark says which runtime it uses, not which agent read — and several
+/// readers overlap into a stack. Hover lists every name and time. Read with no
+/// reply is a normal outcome, so the marks stay quiet.
 fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Theme) -> AnyElement {
     let names = readers
         .iter()
@@ -387,14 +393,15 @@ fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Them
         .collect::<Vec<_>>()
         .join(", ");
     let tip = format!("Read by {names}");
-    let marks = readers.iter().map(|r| {
-        let face: AnyElement = match r.author {
-            Author::Agent(id) => match ws.agent(id) {
-                Some(agent) => icon(brand_icon(agent.brand), icons::SM, t.muted).into_any_element(),
-                None => initial(&r.name, t),
-            },
-            _ => initial(&r.name, t),
+    let shown = readers.len().min(READ_MARKS_SHOWN);
+    let more = readers.len().saturating_sub(shown);
+    let marks = readers.iter().take(shown).enumerate().map(|(n, r)| {
+        let name = match r.author {
+            Author::Agent(id) => ws.agent(id).map_or(&*r.name, |a| &a.name),
+            _ => &r.name,
         };
+        // Each face overlaps the one before; a canvas-coloured rim keeps the
+        // stack readable on the message background.
         div()
             .size(size::READ_MARK)
             .flex_none()
@@ -403,26 +410,49 @@ fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Them
             .justify_center()
             .rounded_full()
             .bg(t.sunken)
-            .child(face)
+            .border_2()
+            .border_color(t.canvas)
+            .when(n > 0, |d| d.ml(px(-6.)))
+            .child(initial(name, t))
     });
     div()
         .id(("read-marks", ix))
         .mt(space::X1)
         .flex()
+        .items_center()
         .justify_end()
-        .gap(space::X0_5)
         .children(marks)
+        .when(more > 0, |d| {
+            d.child(
+                div()
+                    .size(size::READ_MARK)
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .ml(px(-6.))
+                    .rounded_full()
+                    .bg(t.sunken)
+                    .border_2()
+                    .border_color(t.canvas)
+                    .type_style(text::CAPTION)
+                    .font_weight(text::MEDIUM)
+                    .text_color(t.muted)
+                    .child(format!("+{more}")),
+            )
+        })
         .tooltip(Tooltip::text(tip))
         .into_any_element()
 }
 
-/// A reader without a brand mark: their first letter.
+/// A reader without a picture: their first letter, dark enough to tell apart
+/// at a glance.
 fn initial(name: &str, t: &ui::Theme) -> AnyElement {
     let c: String = name.chars().take(1).collect();
     div()
         .type_style(text::CAPTION)
         .font_weight(text::SEMIBOLD)
-        .text_color(t.muted)
+        .text_color(t.ink_soft)
         .child(SharedString::from(c))
         .into_any_element()
 }
