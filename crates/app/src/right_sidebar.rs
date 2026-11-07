@@ -181,6 +181,12 @@ fn section(t: &Theme) -> gpui::Div {
         .bg(t.sunken)
 }
 
+/// "21:01" for a receipt time, seconds since the epoch.
+fn clock(secs: u64) -> String {
+    let minutes = secs / 60;
+    format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60)
+}
+
 impl Render for RightSidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
@@ -195,17 +201,32 @@ impl Render for RightSidebar {
                 (m.channel, agent.map(|a| a.brand), name, m.text.clone())
             })
             .collect();
+        // Read state is for the channel on screen: a check when the agent has
+        // seen the newest message, a count when it is behind.
+        let channel = self.store.read(cx).selected();
+        let channel_name = ws.channel(channel).map(|c| c.name.clone());
         let agents: Vec<_> = ws
             .agents
             .iter()
             .map(|a| {
+                let seen = self.store.read(cx).agent_seen(channel, a.id);
+                let mut label = a.status_line();
+                if let Some(seen) = seen {
+                    let chan = channel_name.as_deref().unwrap_or("this channel");
+                    if seen.behind == 0 {
+                        label.push_str(&format!(" · seen {chan} at {}", clock(seen.read_at)));
+                    } else {
+                        label.push_str(&format!(" · {} unread in {chan}", seen.behind));
+                    }
+                }
                 (
                     a.id,
                     a.name.clone(),
                     a.brand,
                     a.state,
-                    a.status_line(),
+                    label,
                     a.removable,
+                    seen,
                 )
             })
             .collect();
@@ -393,7 +414,7 @@ impl Render for RightSidebar {
                             .max_h(px(MENTION_ROW * 6.))
                             .overflow_y_scroll()
                             .children(agents.into_iter().map(
-                                |(id, name, brand, state, label, removable)| {
+                                |(id, name, brand, state, label, removable, seen)| {
                                     let hovered = self.hovered_agent == Some(id);
                                     let dot = t.agent_state(state);
                                     pill(("agent", id.0 as usize), cx)
@@ -418,6 +439,27 @@ impl Render for RightSidebar {
                                                 .type_style(text::SMALL)
                                                 .child(truncated(SharedString::from(name))),
                                         )
+                                        // Seen everything in the open
+                                        // channel: a quiet check. Behind: how
+                                        // many messages it has not read yet.
+                                        .when_some(seen, |row, seen| {
+                                            row.child(if seen.behind == 0 {
+                                                icon(IconName::Check, icons::SM, t.muted)
+                                                    .into_any_element()
+                                            } else {
+                                                div()
+                                                    .flex_none()
+                                                    .type_style(text::CAPTION)
+                                                    .font_weight(text::MEDIUM)
+                                                    .text_color(t.ink_soft)
+                                                    .child(if seen.behind > 99 {
+                                                        SharedString::from("99+")
+                                                    } else {
+                                                        SharedString::from(seen.behind.to_string())
+                                                    })
+                                                    .into_any_element()
+                                            })
+                                        })
                                         .when(hovered && removable, |row| {
                                             row.child(
                                                 div()

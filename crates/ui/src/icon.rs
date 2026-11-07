@@ -12,6 +12,7 @@ pub enum IconName {
     CaretRight,
     CaretUp,
     ChatCircle,
+    Check,
     CopySimple,
     GearSix,
     Hash,
@@ -38,13 +39,14 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [IconName; 29] = [
+    pub const ALL: [IconName; 30] = [
         IconName::Archive,
         IconName::ArrowUp,
         IconName::CaretDown,
         IconName::CaretRight,
         IconName::CaretUp,
         IconName::ChatCircle,
+        IconName::Check,
         IconName::CopySimple,
         IconName::GearSix,
         IconName::Hash,
@@ -78,6 +80,7 @@ impl IconName {
             IconName::CaretRight => "icons/phosphor/caret-right.svg",
             IconName::CaretUp => "icons/phosphor/caret-up.svg",
             IconName::ChatCircle => "icons/phosphor/chat-circle.svg",
+            IconName::Check => "icons/phosphor/check.svg",
             IconName::CopySimple => "icons/phosphor/copy-simple.svg",
             IconName::GearSix => "icons/phosphor/gear-six.svg",
             IconName::Hash => "icons/phosphor/hash.svg",
