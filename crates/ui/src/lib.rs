@@ -1,6 +1,7 @@
 //! Theme, bundled assets and the small set of components the shell is built from.
 
 mod assets;
+mod cursor_animation;
 mod editing;
 mod glass;
 mod icon;

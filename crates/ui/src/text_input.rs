@@ -3,7 +3,8 @@
 //! Adapted from GPUI's `examples/input.rs` (Apache-2.0, Copyright Zed Industries):
 //! platform IME via `EntityInputHandler`, grapheme-aware cursor movement, mouse
 //! selection and clipboard. Added here: placeholder and theme colours, optional
-//! centring, a horizontal scroll that keeps the cursor visible, and events.
+//! centring, a horizontal scroll that keeps the cursor visible, a caret that
+//! animates between offsets, and events.
 
 use std::ops::Range;
 
@@ -11,16 +12,20 @@ use std::time::Instant;
 
 use gpui::{
     App, Bounds, ClipboardItem, Context, CursorStyle, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, KeyBinding,
-    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point,
-    ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle, Window, actions, div,
-    fill, point, prelude::*, px, relative, size,
+    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, Hsla, KeyBinding,
+    LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, PathBuilder,
+    Pixels, Point, ShapedLine, SharedString, Style, TextRun, UTF16Selection, UnderlineStyle,
+    Window, actions, div, fill, point, prelude::*, px, relative, size,
 };
 
 use crate::{
     ActiveTheme,
+    cursor_animation::{CursorAnimation, CursorViewport},
     editing::{self, EditKind, History, Snapshot},
 };
+
+/// The bar is thin enough to read as a caret and wide enough to stretch.
+const CARET_WIDTH: f32 = 1.5;
 
 actions!(
     text_input,
@@ -151,6 +156,7 @@ pub struct TextInput {
     last_origin_x: Pixels,
     is_selecting: bool,
     history: History,
+    cursor_animation: CursorAnimation,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -170,6 +176,7 @@ impl TextInput {
             last_origin_x: px(0.),
             is_selecting: false,
             history: History::default(),
+            cursor_animation: CursorAnimation::default(),
         }
     }
 
@@ -680,8 +687,16 @@ struct TextElement {
 struct PrepaintState {
     line: Option<ShapedLine>,
     origin_x: Pixels,
-    cursor: Option<PaintQuad>,
+    cursor: Option<CursorPaint>,
     selection: Option<PaintQuad>,
+}
+
+/// The caret for this frame. `corners` is set while it is animating: painting
+/// the quad between them gives the bar its trail.
+struct CursorPaint {
+    target: PaintQuad,
+    color: Hsla,
+    corners: Option<[Point<Pixels>; 4]>,
 }
 
 impl IntoElement for TextElement {
@@ -809,18 +824,40 @@ impl Element for TextElement {
             origin_x + cursor_x
         };
 
+        let caret = Bounds::new(
+            point(caret_x, bounds.top()),
+            size(px(CARET_WIDTH), bounds.size.height),
+        );
         let (selection, cursor) = if selected_range.is_empty() {
+            // Animate the caret between offsets, as Zed's editor does, but only
+            // while the bar is actually drawn: a selection and an unfocused
+            // field hide it, and both reset the trail.
+            let corners = self.input.update(cx, |input, _| {
+                if !input.focus_handle.is_focused(window) {
+                    input.cursor_animation.reset();
+                    return None;
+                }
+                input.cursor_animation.update(
+                    input.cursor_offset(),
+                    caret,
+                    CursorViewport::new(origin_x, bounds, window.line_height()),
+                    Instant::now(),
+                )
+            });
+            if corners.is_some() {
+                window.request_animation_frame();
+            }
             (
                 None,
-                Some(fill(
-                    Bounds::new(
-                        point(caret_x, bounds.top()),
-                        size(px(1.5), bounds.size.height),
-                    ),
-                    theme.accent,
-                )),
+                Some(CursorPaint {
+                    target: fill(caret, theme.accent),
+                    color: theme.accent,
+                    corners,
+                }),
             )
         } else {
+            self.input
+                .update(cx, |input, _| input.cursor_animation.reset());
             (
                 Some(fill(
                     Bounds::from_corners(
@@ -879,7 +916,17 @@ impl Element for TextElement {
             if focus_handle.is_focused(window)
                 && let Some(cursor) = prepaint.cursor.take()
             {
-                window.paint_quad(cursor);
+                match cursor.corners {
+                    Some(corners) => {
+                        let mut builder = PathBuilder::fill();
+                        builder.add_polygon(&corners, true);
+                        match builder.build() {
+                            Ok(path) => window.paint_path(path, cursor.color),
+                            Err(_) => window.paint_quad(cursor.target),
+                        }
+                    }
+                    None => window.paint_quad(cursor.target),
+                }
             }
         });
 
