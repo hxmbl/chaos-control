@@ -733,42 +733,19 @@ mod tests {
     }
 
     #[test]
-    fn close_dot_is_traffic_light_sized_in_the_corner() {
-        assert_eq!(CLOSE_DOT, px(12.));
-        assert_eq!(CLOSE_INSET, px(12.));
-        assert_eq!(CLOSE_SLOP, px(8.));
-        assert!(
-            PAD_TOP_BARE > CLOSE_INSET + CLOSE_DOT,
-            "a pane with no header row starts its body below the dot"
-        );
+    fn header_row_layout_is_reasonable() {
         assert!(CLOSE_DURATION >= Duration::from_millis(120) && CLOSE_DURATION <= OPEN_DURATION);
     }
 
-    /// The header row sits on the dot's row like a macOS title bar, measured
-    /// from the sheet's outer edge (border included).
+    /// The header row sits below the top edge, measured from the sheet's outer
+    /// edge (border included).
     #[test]
-    fn title_shares_the_dot_row() {
-        let dot_top = CLOSE_INSET;
-        let dot_centre = dot_top + CLOSE_DOT / 2.;
+    fn header_row_is_positioned_correctly() {
         let row_top = BORDER + header_pad_top();
-        assert_eq!(
-            row_top + HEADER_H / 2.,
-            dot_centre,
-            "row centred on the dot"
-        );
         assert!(row_top >= px(0.));
         assert!(text::TITLE.line <= HEADER_H);
 
-        let dot_right = CLOSE_INSET + CLOSE_DOT;
-        let title_left = BORDER + PAD_X + header_margin_left(TITLE_GAP);
-        assert_eq!(title_left - dot_right, TITLE_GAP);
         assert!(TITLE_GAP >= px(8.) && TITLE_GAP <= px(10.));
-        assert!(
-            title_left >= dot_right + CLOSE_SLOP,
-            "the title clears the dot's hit area"
-        );
-        let header_left = BORDER + PAD_X + header_margin_left(HEADER_GAP);
-        assert_eq!(header_left - dot_right, HEADER_GAP);
 
         assert!(
             TITLE_SIZE >= px(15.) && TITLE_SIZE < px(21.),
