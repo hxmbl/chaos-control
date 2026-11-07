@@ -99,7 +99,12 @@ pub enum Step {
     Permission(String),
     /// Ask for permission for a tool call of this ACP kind (`read`,
     /// `search`, `edit`, `execute`, ...).
-    PermissionKind { title: String, kind: String },
+    PermissionKind {
+        title: String,
+        kind: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// Wait until the test opens this gate (in-process only; no-op otherwise).
     Gate(String),
     /// Real-time sleep.
@@ -568,12 +573,12 @@ impl FakeAgent {
                         .push(result);
                 }
                 Step::Permission(_) | Step::PermissionKind { .. } => {
-                    let (title, kind) = match step {
-                        Step::PermissionKind { title, kind } => (title, Some(kind)),
-                        Step::Permission(title) => (title, None),
+                    let (title, kind, name) = match step {
+                        Step::PermissionKind { title, kind, name } => (title, Some(kind), name),
+                        Step::Permission(title) => (title, None, None),
                         _ => unreachable!(),
                     };
-                    let outcome = wire.permission(n, title, kind).await;
+                    let outcome = wire.permission(n, title, kind, name).await;
                     self.observed
                         .lock()
                         .expect("lock")
@@ -759,12 +764,21 @@ impl Wire {
     }
 
     /// Asks for permission; returns the client's answer (or the error) as JSON.
-    async fn permission(&mut self, n: usize, title: String, kind: Option<String>) -> Value {
+    async fn permission(
+        &mut self,
+        n: usize,
+        title: String,
+        kind: Option<String>,
+        name: Option<String>,
+    ) -> Value {
         match self {
             Wire::V1 { cx, session, .. } => {
                 let mut fields = v1::ToolCallUpdateFields::new().title(title);
                 if let Some(k) = kind.and_then(|k| serde_json::from_value(Value::String(k)).ok()) {
                     fields = fields.kind(Some(k));
+                }
+                if let Some(name) = name {
+                    fields = fields.name(name);
                 }
                 let call =
                     v1::ToolCallUpdate::new(v1::ToolCallId::new(format!("perm-{n}")), fields);
@@ -813,13 +827,19 @@ impl Wire {
                         ),
                     ],
                 );
+                let has_subject = kind.is_some() || name.is_some();
+                let mut tool_call = v2::ToolCallUpdate::new(format!("perm-{n}"));
+                if let Some(name) = name {
+                    tool_call = tool_call.name(name);
+                }
                 if let Some(k) =
                     kind.and_then(|k| serde_json::from_value::<v2::ToolKind>(Value::String(k)).ok())
                 {
+                    tool_call = tool_call.kind(k);
+                }
+                if has_subject {
                     req = req.subject(v2::RequestPermissionSubject::ToolCall(Box::new(
-                        v2::ToolCallPermissionSubject::new(
-                            v2::ToolCallUpdate::new(format!("perm-{n}")).kind(k),
-                        ),
+                        v2::ToolCallPermissionSubject::new(tool_call),
                     )));
                 }
                 let outcome = cx.send_request(req).block_task().await;

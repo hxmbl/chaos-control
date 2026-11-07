@@ -22,18 +22,19 @@
 //! Peer model: a declined or denied request is an answer, not a failure. It
 //! never turns an agent red or fails its turn.
 //!
-//! **Reads are always allowed.** A native request for a read-only tool call
-//! (ACP tool kind `read` or `search`) is answered with the agent's allow-once
-//! option straight away, wherever the agent runs: agents get full access for
-//! reading files. It is recorded for the permission log only (`read_only`,
-//! state `auto_approved`, the newest [`READS_KEPT`] per channel), never as a
-//! request anyone answers, and the agent's own `chat_permission_status` leaves
-//! it out. Everything else (running
-//! commands, editing, deleting, moving, fetching, an unknown or missing
-//! kind) goes the way above: approved in a VM, else declined at once with a
-//! message saying why and that a human was asked. Codex has no read requests
-//! to answer; its sessions start in a read-only sandbox instead (see
-//! `codex.rs`).
+//! **Reads and chat tools are always allowed.** A native request for a
+//! read-only tool call (ACP tool kind `read` or `search`) is answered with the
+//! agent's allow-once option straight away, wherever the agent runs: agents
+//! get full access for reading files. It is recorded for the permission log
+//! only (`read_only`, state `auto_approved`, the newest [`READS_KEPT`] per
+//! channel), never as a request anyone answers, and the agent's own
+//! `chat_permission_status` leaves it out. A native request for one of this
+//! app's named chat MCP tools is also auto-approved and logged by its tool
+//! name. Everything else (running commands, editing, deleting, moving,
+//! fetching, an unknown or missing kind) goes the way above: approved in a
+//! VM, else declined at once with a message saying why and that a human was
+//! asked. Codex has no read requests to answer; its sessions start in a
+//! read-only sandbox instead (see `codex.rs`).
 
 use std::{fmt, sync::Arc};
 
@@ -200,6 +201,8 @@ impl PermissionRequest {
 pub struct PermissionAsk {
     pub turn: Option<BatchId>,
     pub title: Arc<str>,
+    /// ACP's machine-readable tool name, when supplied.
+    pub tool_name: Option<Arc<str>>,
     pub detail: Option<Arc<str>>,
     /// The tool call only reads (ACP tool kind `read` or `search`). Reads are
     /// always allowed; a missing kind is not a read.
@@ -280,6 +283,15 @@ in a later turn (chat_permission_status shows it); then retry the same call and 
 /// reads. Reads are always allowed; everything else needs approval.
 pub fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "read" | "search")
+}
+
+pub(crate) fn permission_title(title: Option<&str>, name: Option<&str>) -> Arc<str> {
+    let title = title.map(str::trim).filter(|s| !s.is_empty());
+    let name = name.map(str::trim).filter(|s| !s.is_empty());
+    Arc::from(match title {
+        Some("a tool") | None => name.unwrap_or("a tool"),
+        Some(title) => title,
+    })
 }
 
 // ---------- picking the agent's own option ----------
@@ -690,6 +702,26 @@ impl Engine {
         channel: ChannelId,
         ask: PermissionAsk,
     ) -> PermissionVerdict {
+        if let Some(name) = ask
+            .tool_name
+            .as_deref()
+            .filter(|name| crate::mcp::TOOL_NAMES.contains(name))
+        {
+            return match self.auto_approve_chat_tool(
+                now,
+                agent,
+                channel,
+                ask.turn,
+                name,
+                ask.detail.as_deref(),
+            ) {
+                Ok(r) => PermissionVerdict::Allow { request: r.id },
+                Err(e) => {
+                    self.rt_note(agent, channel, format!("internal error: {e}"));
+                    PermissionVerdict::Decline
+                }
+            };
+        }
         if ask.read_only {
             self.rt_note(agent, channel, format!("reading: {}", short(&ask.title)));
             self.log_read(now, agent, channel, &ask);
@@ -718,6 +750,47 @@ impl Engine {
                 PermissionVerdict::Decline
             }
         }
+    }
+
+    fn auto_approve_chat_tool(
+        &mut self,
+        now: Millis,
+        agent: MemberId,
+        channel: ChannelId,
+        turn: Option<BatchId>,
+        name: &str,
+        detail: Option<&str>,
+    ) -> Result<PermissionRequest, PostError> {
+        let turn = match turn {
+            Some(t) => Some(t),
+            None => store::in_flight_batch(self.conn(), agent, channel)?.map(|b| b.id),
+        };
+        let r = self.store.tx(|c| {
+            insert(
+                c,
+                &NewRequest {
+                    agent,
+                    channel,
+                    batch: turn,
+                    source: PermissionSource::Native,
+                    title: name,
+                    detail,
+                    reason: None,
+                    state: PermissionState::AutoApproved,
+                    asked_of: &[],
+                    now,
+                    read_only: false,
+                },
+            )
+        })?;
+        self.rt_note(
+            agent,
+            channel,
+            format!("using {} (chat tool, auto-allowed)", short(name)),
+        );
+        self.effects
+            .push(Effect::Event(CoreEvent::Permission(r.clone())));
+        Ok(r)
     }
 
     /// Records a request and works out its state: auto-approved in a VM, the

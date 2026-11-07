@@ -324,9 +324,9 @@ answer").
 
 ## Permissions: by where the agent runs
 
-**Reads are always allowed (Hxmbl, 2026-10-31).** The goal for now is
-talking to many agents, so agents get full access for reading files and
-nothing else is approved automatically:
+**Reads and chat tools are always allowed.** The goal for now is talking to
+many agents, so agents get full access for reading files, and their calls to
+this app's own chat MCP tools do not need a human approval:
 
 - A native request for a read-only tool call (ACP tool kind `read` or
   `search`, from the request's tool call on v1 or its `subject` on the v2
@@ -336,6 +336,9 @@ nothing else is approved automatically:
   `read_only = 1` and state `auto_approved`, left out of the agent's own
   `chat_permission_status`, and only the newest 500 per channel are kept
   (`permission::READS_KEPT`; older reads are pruned as new ones arrive).
+- A native request whose ACP tool name matches one of this app's `chat_*`
+  MCP tools is auto-approved regardless of kind and logged under that exact
+  tool name.
 - Anything else (kinds `edit`, `delete`, `move`, `execute`, `fetch`,
   `switch_mode`, `other`, an unknown kind, or no kind at all) is never
   auto-approved on the host. It is declined **at once** (the agent is never

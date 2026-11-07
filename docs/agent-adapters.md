@@ -234,15 +234,15 @@ picker in the pane layer.
 - A harness that already runs that model as a member is left out of the
   choice; when every harness offering it already does, the row does nothing.
 
-## Permissions: reads are free
+## Permissions: reads and chat tools are free
 
-Hxmbl's call (2026-10-31): for now the point is talking to many agents, so
-agents may read files freely and nothing else is approved automatically.
-There is no Chaos Control setting that makes a harness approve writes.
+For now the point is talking to many agents, so agents may read files freely
+and call this app's chat MCP tools without asking the humans. There is no Chaos
+Control setting that makes a harness approve writes.
 
-| Harness | Reads | Commands, edits, everything else |
+| Harness | Reads and chat tools | Commands, edits, everything else |
 |---|---|---|
-| ACP harnesses (fx, Vibe, Claude Code, Copilot, opencode, Devin, Cursor, Gemini) | A `session/request_permission` whose tool call has kind `read` or `search` gets the agent's allow-once option at once; not recorded | Declined at once with the agent's own "continue without it" option and `_meta.chaosControl.message` saying reads are free, commands and edits need a human, and that request #N went to the humans (don't wait for it). A VM agent is approved. |
+| ACP harnesses (fx, Vibe, Claude Code, Copilot, opencode, Devin, Cursor, Gemini) | A `session/request_permission` whose tool call has kind `read` or `search` gets the agent's allow-once option at once; a call named after one of this app's chat MCP tools is also auto-allowed and logged under that name | Declined at once with the agent's own "continue without it" option and `_meta.chaosControl.message` saying reads are free, commands and edits need a human, and that request #N went to the humans (don't wait for it). A VM agent is approved. |
 | Codex | Threads start with `sandbox: "read-only"`, `approvalPolicy: "on-request"`: commands run in the read-only sandbox without asking | Codex asks (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`) and gets `decline`; the room gets the request note. |
 
 A missing or unknown tool kind is not a read. The humans' Approve / Deny
