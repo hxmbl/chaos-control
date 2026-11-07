@@ -348,19 +348,29 @@ async fn run(
         .on_receive_request(
             async move |r: v2::RequestPermissionRequest, responder, _cx: V2ConnectionTo<Agent>| {
                 let turn = t_perm.lock().expect("lock").turn;
-                let read_only = match &r.subject {
-                    Some(v2::RequestPermissionSubject::ToolCall(s)) => match &s.tool_call.kind {
-                        MaybeUndefined::Value(k) => {
-                            crate::permission::is_read_only_kind(&crate::acp::kind_str(k))
-                        }
-                        _ => false,
-                    },
-                    _ => false,
+                let (tool_name, read_only) = match &r.subject {
+                    Some(v2::RequestPermissionSubject::ToolCall(s)) => {
+                        let name = match &s.tool_call.name {
+                            MaybeUndefined::Value(name) => Some(Arc::from(name.as_str())),
+                            _ => None,
+                        };
+                        let read_only = match &s.tool_call.kind {
+                            MaybeUndefined::Value(k) => {
+                                crate::permission::is_read_only_kind(&crate::acp::kind_str(k))
+                            }
+                            _ => false,
+                        };
+                        (name, read_only)
+                    }
+                    _ => (None, false),
                 };
+                let title =
+                    crate::permission::permission_title(Some(&r.title), tool_name.as_deref());
                 let verdict = gate
                     .ask(PermissionAsk {
                         turn,
-                        title: Arc::from(r.title.as_str()),
+                        title,
+                        tool_name,
                         detail: r.description.as_deref().map(Arc::from),
                         read_only,
                     })

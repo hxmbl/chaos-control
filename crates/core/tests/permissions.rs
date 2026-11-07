@@ -401,3 +401,47 @@ async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
         assert!(log.iter().all(|r| r.agent == bot.id));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn named_chat_tools_are_auto_allowed_and_logged_by_name() {
+    for protocol in [1, 2] {
+        let mut h = Harness::new().await;
+        let bot = h
+            .agent(
+                "bot",
+                script(json!({"protocol": protocol, "turns": [{"steps": [
+                    {"permission_kind": {"title": "a tool", "name": "chat_send", "kind": "execute"}},
+                    {"permission_kind": {"title": "a tool", "name": "external_tool", "kind": "execute"}},
+                    {"text": "The chat tool ran; the other tool needs approval."}
+                ]}]})),
+            )
+            .await;
+        h.say("@bot use the chat tool").await;
+
+        let all = wait_outcomes(&h, "bot", 2).await;
+        assert_eq!(
+            picked(&all[0]),
+            &json!("allow"),
+            "chat tool, v{protocol}: {}",
+            all[0]
+        );
+        assert_eq!(
+            picked(&all[1]),
+            &json!("deny"),
+            "other tool, v{protocol}: {}",
+            all[1]
+        );
+        h.wait_message("the agent carried on", Some(bot.id)).await;
+
+        let pending = h.core.pending_permissions(h.main).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(&*pending[0].title, "external_tool");
+        let log = h.core.permission_log(h.main, 50).await.unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(&*log[0].title, "external_tool");
+        assert_eq!(log[0].state, PermissionState::Pending);
+        assert_eq!(&*log[1].title, "chat_send");
+        assert_eq!(log[1].state, PermissionState::AutoApproved);
+        assert!(!log[1].read_only);
+    }
+}

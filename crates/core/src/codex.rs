@@ -853,6 +853,7 @@ fn on_request(
     let ask = gate.ask(PermissionAsk {
         turn,
         title: Arc::from(title),
+        tool_name: None,
         detail: Some(Arc::from(p.to_string())),
         read_only: false,
     });

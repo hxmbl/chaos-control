@@ -804,12 +804,11 @@ async fn run_v1(
                 if let Some(e) = accepted {
                     ev_perm.emit(e);
                 }
-                let title = r
-                    .tool_call
-                    .fields
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| "a tool".to_string());
+                let tool_name = r.tool_call.fields.name.clone().map(Arc::from);
+                let title = crate::permission::permission_title(
+                    r.tool_call.fields.title.as_deref(),
+                    tool_name.as_deref(),
+                );
                 let detail = r
                     .tool_call
                     .fields
@@ -825,7 +824,8 @@ async fn run_v1(
                 let verdict = gate
                     .ask(PermissionAsk {
                         turn,
-                        title: Arc::from(title),
+                        title,
+                        tool_name,
                         detail,
                         read_only,
                     })
