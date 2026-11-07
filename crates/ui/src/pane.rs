@@ -6,13 +6,11 @@
 //! - [`PaneState`]: plain open/close/focus bookkeeping with no window, so it is
 //!   unit-tested. It remembers where keyboard focus was when the pane opened,
 //!   hands it back on close, and times the open and close animations.
-//! - [`Pane`]: the element. A red close dot pinned into the top-left corner
-//!   (traffic-light sized, with a hover glyph) with a header row beside it,
-//!   like a macOS title bar: the title (or a custom header such as search's
-//!   field) centred on the dot, then a scrollable body that
-//!   takes any element, and optional full-width quick-action rows under a thin
-//!   divider. It closes on the dot, on Escape and on a click outside, and it
-//!   never moves: it sits where its host puts it.
+//! - [`Pane`]: the element. A header row with a title (or a custom header such
+//!   as search's field), then a scrollable body that takes any element, and
+//!   optional full-width quick-action rows under a thin divider. It closes on
+//!   Escape and on a click outside, and it never moves: it sits where its host
+//!   puts it.
 //!
 //! The look comes from [`crate::Glass`] (see `glass.rs` for how the glass is
 //! faked without a backdrop blur).
@@ -24,11 +22,11 @@ use std::{
 
 use gpui::{
     AnyElement, App, ElementId, FocusHandle, IntoElement, KeyBinding, Pixels, SharedString, Window,
-    actions, div, prelude::*, px, rgb, svg,
+    actions, div, prelude::*, px,
 };
 
 use crate::{
-    ActiveTheme, Ellipsis, IconName, TypeStyleExt,
+    ActiveTheme, Ellipsis, TypeStyleExt,
     tokens::{radius, size, space, text},
     truncated,
 };
@@ -346,43 +344,32 @@ impl Pane {
     }
 }
 
-/// macOS close-button red, its rim, and the glyph shown on hover.
-const CLOSE_RED: u32 = 0xff5f57;
-const CLOSE_RIM: u32 = 0xe2463f;
-const CLOSE_GLYPH: u32 = 0x4d0000;
 const RADIUS: Pixels = radius::XL;
-/// The close dot: macOS traffic-light diameter.
-pub const CLOSE_DOT: Pixels = px(12.);
-/// How far the dot sits from the pane's top and left edges.
-pub const CLOSE_INSET: Pixels = space::X3;
-/// Extra hit area around the dot on every side (hover shows the glyph).
-pub const CLOSE_SLOP: Pixels = space::X2;
 /// The sheet's content padding left and right.
 const PAD_X: Pixels = space::X4;
 /// The sheet's border. Padding and absolute offsets both start inside it.
 const BORDER: Pixels = size::HAIRLINE;
-/// Top padding with neither title nor header: the body clears the dot.
-const PAD_TOP_BARE: Pixels = size::BUTTON;
-/// Height of the header row (title or custom header), centred on the dot.
+/// Top padding with neither title nor header.
+const PAD_TOP_BARE: Pixels = px(24.);
+/// Height of the header row (title or custom header).
 const HEADER_H: Pixels = size::BUTTON;
-/// The title, on the dot's row: smaller than a page heading so the row stays
+/// The title, on the header row: smaller than a page heading so the row stays
 /// compact, still clearly the pane's title.
 pub const TITLE_SIZE: Pixels = text::TITLE.size;
-/// Gap between the dot's visual right edge and the title.
+/// Gap from the left edge to the title.
 pub const TITLE_GAP: Pixels = space::X2;
-/// Gap between the dot's visual right edge and a custom header (search's
+/// Gap from the left edge to a custom header (search's
 /// field, which has its own icon to lead with).
 const HEADER_GAP: Pixels = space::X3;
 
-/// Top padding that centres a [`HEADER_H`] row on the dot.
+/// Top padding for the header row.
 fn header_pad_top() -> Pixels {
-    CLOSE_INSET + CLOSE_DOT / 2. - HEADER_H / 2. - BORDER
+    px(18.) - HEADER_H / 2. - BORDER
 }
 
-/// Left margin, inside the content padding, that starts the header row `gap`
-/// past the dot's visual right edge.
+/// Left margin, inside the content padding, that starts the header row.
 fn header_margin_left(gap: Pixels) -> Pixels {
-    CLOSE_INSET + CLOSE_DOT + gap - PAD_X - BORDER
+    gap - PAD_X - BORDER
 }
 
 impl RenderOnce for Pane {
@@ -398,52 +385,10 @@ impl RenderOnce for Pane {
         };
         let close_out = close.clone();
         let close_key = close.clone();
-        let close_dot = close.clone();
 
         let closing = self.closing;
-        let group: SharedString = "pane-close".into();
-        // The hit area: the dot plus CLOSE_SLOP all round, pinned so the dot
-        // itself lands CLOSE_INSET from the top and left edges.
-        let dot = div()
-            .id("pane-close")
-            .group(group.clone())
-            .absolute()
-            // Absolute offsets start inside the 1px border.
-            .top(CLOSE_INSET - CLOSE_SLOP - BORDER)
-            .left(CLOSE_INSET - CLOSE_SLOP - BORDER)
-            .size(CLOSE_DOT + CLOSE_SLOP * 2.)
-            .flex()
-            .items_center()
-            .justify_center()
-            .when(!closing, |d| {
-                d.cursor_pointer().on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    close_dot(window, cx)
-                })
-            })
-            .child(
-                div()
-                    .size(CLOSE_DOT)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .border_1()
-                    .border_color(rgb(CLOSE_RIM))
-                    .bg(rgb(CLOSE_RED))
-                    .child(
-                        div().invisible().group_hover(group, |s| s.visible()).child(
-                            svg()
-                                .path(IconName::X.path())
-                                // Optical: the glyph inside a 12px traffic light.
-                                .size(px(8.))
-                                .text_color(rgb(CLOSE_GLYPH)),
-                        ),
-                    ),
-            );
 
-        // The dot's row, like a macOS title bar: the title (or a custom
-        // header) centred on the dot and starting just past it. The body
+        // The header row: the title (or a custom header). The body
         // follows straight under the row.
         let row = |gap: Pixels| {
             div()
@@ -567,9 +512,7 @@ impl RenderOnce for Pane {
                         .child(div().mb(space::X0_5).h(size::HAIRLINE).bg(glass.divider))
                         .children(rows),
                 )
-            })
-            // Last, so it paints and hit-tests above the header and body.
-            .child(dot);
+            });
 
         div()
             .absolute()
