@@ -211,6 +211,11 @@ impl Render for RightSidebar {
             .map(|a| {
                 let seen = self.store.read(cx).agent_seen(channel, a.id);
                 let mut label = a.status_line();
+                let nicks = self.store.read(cx).agent_nicknames(a.id);
+                if !nicks.is_empty() {
+                    let list: Vec<String> = nicks.iter().map(|n| format!("@{n}")).collect();
+                    label.push_str(&format!(" · also {}", list.join(" ")));
+                }
                 if let Some(seen) = seen {
                     let chan = channel_name.as_deref().unwrap_or("this channel");
                     if seen.behind == 0 {

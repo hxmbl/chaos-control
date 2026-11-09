@@ -149,6 +149,45 @@ impl From<rusqlite::Error> for SettingError {
     }
 }
 
+/// Why a nickname was not added or removed.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NicknameError {
+    /// Its shape: not a mention token, too long, or an @everyone word.
+    Invalid(policy::NicknameShape),
+    /// Someone's handle or nickname already (`by` is that member's handle;
+    /// it may be the member's own handle, or already its nickname).
+    Taken {
+        nickname: String,
+        by: String,
+    },
+    /// The member doesn't have that nickname (remove).
+    NotFound(String),
+    UnknownMember,
+    Store(String),
+}
+
+impl std::fmt::Display for NicknameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NicknameError::Invalid(e) => write!(f, "invalid nickname: {e}"),
+            NicknameError::Taken { nickname, by } => {
+                write!(f, "@{nickname} is taken: it already reaches @{by}")
+            }
+            NicknameError::NotFound(n) => write!(f, "no nickname @{n} to remove"),
+            NicknameError::UnknownMember => f.write_str("no such member"),
+            NicknameError::Store(e) => write!(f, "store error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for NicknameError {}
+
+impl From<rusqlite::Error> for NicknameError {
+    fn from(e: rusqlite::Error) -> Self {
+        NicknameError::Store(e.to_string())
+    }
+}
+
 impl From<rusqlite::Error> for PostError {
     fn from(e: rusqlite::Error) -> Self {
         PostError::Store(e.to_string())
@@ -554,6 +593,7 @@ impl Engine {
         notes: &mut Vec<Arc<str>>,
     ) -> Result<(Vec<MemberId>, bool), PostError> {
         let members = store::members_of(self.conn(), channel)?;
+        let nicknames = store::nicknames_in(self.conn(), channel)?;
         let mut out = Vec::new();
         let mut everyone = false;
         for handle in policy::parse_mentions(body) {
@@ -567,16 +607,81 @@ impl Engine {
                 }
                 continue;
             }
-            if let Some(m) = members
+            // A handle first, then a nickname (STRM-560): `@nick` wakes its
+            // member exactly like `@handle`. The two never collide (see
+            // `add_nickname`), so the order only matters for old data.
+            let id = members
                 .iter()
                 .find(|m| m.handle.eq_ignore_ascii_case(&handle))
-                && m.id != author.id
-                && !out.contains(&m.id)
+                .map(|m| m.id)
+                .or_else(|| {
+                    nicknames
+                        .iter()
+                        .find(|(_, n)| n.eq_ignore_ascii_case(&handle))
+                        .map(|(id, _)| *id)
+                });
+            if let Some(id) = id
+                && id != author.id
+                && !out.contains(&id)
             {
-                out.push(m.id);
+                out.push(id);
             }
         }
         Ok((out, everyone))
+    }
+
+    /// `member`'s nicknames, oldest first.
+    pub fn nicknames(&self, member: MemberId) -> Result<Vec<Arc<str>>, NicknameError> {
+        if store::member(self.conn(), member)?.is_none() {
+            return Err(NicknameError::UnknownMember);
+        }
+        Ok(store::nicknames_of(self.conn(), member)?)
+    }
+
+    /// Gives `member` a nickname that `@` reaches like its handle. Refused
+    /// when it isn't a whole mention token, is an `@everyone` word, or is
+    /// anyone's handle or nickname already (case-insensitive, all members,
+    /// not just one channel's). Returns the member's nicknames now.
+    pub fn add_nickname(
+        &mut self,
+        now: Millis,
+        member: MemberId,
+        nickname: &str,
+    ) -> Result<Vec<Arc<str>>, NicknameError> {
+        let nick = policy::check_nickname(nickname).map_err(NicknameError::Invalid)?;
+        self.store.tx::<_, NicknameError>(|c| {
+            if store::member(c, member)?.is_none() {
+                return Err(NicknameError::UnknownMember);
+            }
+            if let Some(owner) = store::mention_owner(c, &nick)? {
+                let by = store::member(c, owner)?
+                    .map(|m| m.handle.to_string())
+                    .unwrap_or_else(|| "?".into());
+                return Err(NicknameError::Taken { nickname: nick, by });
+            }
+            store::add_nickname(c, member, &nick, now)?;
+            Ok(store::nicknames_of(c, member)?)
+        })
+    }
+
+    /// Takes a nickname (case-insensitive, `@` optional) away from `member`;
+    /// `@nick` stops reaching it. Returns the member's nicknames now.
+    pub fn remove_nickname(
+        &mut self,
+        member: MemberId,
+        nickname: &str,
+    ) -> Result<Vec<Arc<str>>, NicknameError> {
+        let nick = nickname.trim();
+        let nick = nick.strip_prefix('@').unwrap_or(nick).to_string();
+        self.store.tx::<_, NicknameError>(|c| {
+            if store::member(c, member)?.is_none() {
+                return Err(NicknameError::UnknownMember);
+            }
+            if !store::remove_nickname(c, member, &nick)? {
+                return Err(NicknameError::NotFound(nick));
+            }
+            Ok(store::nicknames_of(c, member)?)
+        })
     }
 
     /// Hop of a new message (see `policy` module docs).

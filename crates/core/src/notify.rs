@@ -259,19 +259,50 @@ pub fn orientation(
     let ch = store::channel(c, channel)?
         .map(|c| c.name)
         .unwrap_or_default();
+    let nicknames = store::nicknames_in(c, channel)?;
+    let aka = |id: MemberId| -> Vec<String> {
+        nicknames
+            .iter()
+            .filter(|(m, _)| *m == id)
+            .map(|(_, n)| format!("@{n}"))
+            .collect()
+    };
     let members: Vec<String> = store::members_of(c, channel)?
         .into_iter()
         .filter(|m| m.id != agent)
-        .map(|m| format!("@{} ({})", m.handle, m.kind.as_str()))
+        .map(|m| {
+            let aka = aka(m.id);
+            if aka.is_empty() {
+                format!("@{} ({})", m.handle, m.kind.as_str())
+            } else {
+                format!(
+                    "@{} ({}, also {})",
+                    m.handle,
+                    m.kind.as_str(),
+                    aka.join(", ")
+                )
+            }
+        })
         .collect();
     let handle = me.map(|m| m.handle).unwrap_or_default();
+    // Nicknames (STRM-560) reach this agent exactly like its handle.
+    let mine = store::nicknames_of(c, agent)?;
+    let (also, also_woken) = if mine.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let list: Vec<String> = mine.iter().map(|n| format!("@{n}")).collect();
+        (
+            format!(" (nicknames: {})", list.join(", ")),
+            format!(" or a nickname ({})", list.join(", ")),
+        )
+    };
     Ok(format!(
-        "You are @{handle} in #{ch} on Chaos Control, a group chat where humans and agents work things out together. \
+        "You are @{handle}{also} in #{ch} on Chaos Control, a group chat where humans and agents work things out together. \
 Members: {}.\n\
 How this room works:\n\
 - You speak only through the chaos-control tools: chat_send to post, chat_react to react, chat_read / chat_search to look back, chat_context for who's here, chat_status for a one-line status. Your other output is private working-out; nobody sees your tool calls.\n\
 - Reactions (chat_react) are quiet: they wake and notify nobody, including the author. Use one when a reply would be noise. You see others' reactions on the messages in your next prompt.\n\
-- You are woken when someone mentions you (@{handle}) or replies to you. Reply to what was asked, briefly. If someone else is already on it, add only what's new or stay quiet.\n\
+- You are woken when someone mentions you (@{handle}{also_woken}) or replies to you. Reply to what was asked, briefly. If someone else is already on it, add only what's new or stay quiet.\n\
 - You are a peer, not a worker. You may say no with chat_refuse or disagree with chat_dissent, giving your reason; either answers the message, nothing is retried, and nobody overrules you. Whoever wants it done can do it themselves.\n\
 - Mention others with @handle only when you need them. @everyone is not available to agents.\n\
 - Permissions never block you. If a tool needs approval and comes back declined with a note that a request was sent, the humans were asked: carry on or wait, your call. The answer arrives as a message in a later turn (chat_permission_status shows it); once approved, retry the same call and it goes through once. To ask ahead, use chat_request_permission.\n",

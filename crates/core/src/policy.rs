@@ -184,6 +184,67 @@ pub fn parse_mentions(body: &str) -> Vec<String> {
 
 pub const EVERYONE: &[&str] = &["everyone", "here", "channel"];
 
+/// Longest nickname, in characters.
+pub const MAX_NICKNAME_CHARS: usize = 32;
+
+/// Why a nickname's shape was refused (who else holds it is checked
+/// against the store).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NicknameShape {
+    Empty,
+    TooLong,
+    /// Not a whole mention token: ASCII letters, digits, `_`, `-` and `.`,
+    /// starting with a letter or digit and not ending in `.`.
+    NotAToken,
+    /// `everyone`, `here` or `channel`.
+    Reserved,
+}
+
+impl std::fmt::Display for NicknameShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NicknameShape::Empty => f.write_str("a nickname can't be empty"),
+            NicknameShape::TooLong => {
+                write!(f, "a nickname is at most {MAX_NICKNAME_CHARS} characters")
+            }
+            NicknameShape::NotAToken => f.write_str(
+                "a nickname is letters, digits, _, - and . (starting with a letter or digit, not ending in .)",
+            ),
+            NicknameShape::Reserved => {
+                f.write_str("@everyone, @here and @channel can't be nicknames")
+            }
+        }
+    }
+}
+
+/// Checks that `nick` (without `@`; a leading `@` is ignored) is something
+/// [`parse_mentions`] reads back whole, and is not an `@everyone` word.
+/// Returns it trimmed and without the `@`, as typed (case kept).
+pub fn check_nickname(nick: &str) -> Result<String, NicknameShape> {
+    let nick = nick.trim();
+    let nick = nick.strip_prefix('@').unwrap_or(nick);
+    if nick.is_empty() {
+        return Err(NicknameShape::Empty);
+    }
+    if nick.chars().count() > MAX_NICKNAME_CHARS {
+        return Err(NicknameShape::TooLong);
+    }
+    let first_ok = nick
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    let chars_ok = nick
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if !first_ok || !chars_ok || parse_mentions(&format!("@{nick}")) != [nick.to_lowercase()] {
+        return Err(NicknameShape::NotAToken);
+    }
+    if EVERYONE.contains(&nick.to_lowercase().as_str()) {
+        return Err(NicknameShape::Reserved);
+    }
+    Ok(nick.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,6 +258,20 @@ mod tests {
         );
         assert!(parse_mentions("mail me at a@b.com").is_empty());
         assert!(parse_mentions("no mentions here @ all").is_empty());
+    }
+
+    #[test]
+    fn nicknames_must_be_whole_mention_tokens() {
+        assert_eq!(check_nickname("Cody"), Ok("Cody".to_string()));
+        assert_eq!(check_nickname(" @cx-2.b "), Ok("cx-2.b".to_string()));
+        assert_eq!(check_nickname("@"), Err(NicknameShape::Empty));
+        assert_eq!(check_nickname("co dy"), Err(NicknameShape::NotAToken));
+        assert_eq!(check_nickname("cody."), Err(NicknameShape::NotAToken));
+        assert_eq!(check_nickname("-cody"), Err(NicknameShape::NotAToken));
+        assert_eq!(check_nickname("cödy"), Err(NicknameShape::NotAToken));
+        assert_eq!(check_nickname("Everyone"), Err(NicknameShape::Reserved));
+        assert_eq!(check_nickname("here"), Err(NicknameShape::Reserved));
+        assert_eq!(check_nickname(&"a".repeat(33)), Err(NicknameShape::TooLong));
     }
 
     #[test]
