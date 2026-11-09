@@ -107,8 +107,8 @@ pub fn ensure_model_member(
         }
         None => {
             let taken = |h: &str| -> bool {
-                c.query_row("SELECT 1 FROM members WHERE handle = ?1", [h], |_| Ok(()))
-                    .optional()
+                // Handles and nicknames share one namespace.
+                crate::store::mention_owner(c, h)
                     .map(|o| o.is_some())
                     .unwrap_or(true)
             };

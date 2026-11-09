@@ -421,11 +421,23 @@ pub fn call_tool(
                 .ok_or_else(|| ToolError("not_found: no such channel".into()))?;
             let cursor = store::cursor(c, scope.agent, scope.channel)?;
             let head = store::head_seq(c, scope.channel)?;
+            let nicknames = store::nicknames_in(c, scope.channel)?;
+            let aka = |id: MemberId| -> Vec<Arc<str>> {
+                nicknames
+                    .iter()
+                    .filter(|(m, _)| *m == id)
+                    .map(|(_, n)| n.clone())
+                    .collect()
+            };
             let members: Vec<Value> = store::members_of(c, scope.channel)?
                 .into_iter()
                 .map(|m| {
                     let mut v =
                         json!({"handle": m.handle, "name": m.name, "kind": m.kind.as_str()});
+                    let nicks = aka(m.id);
+                    if !nicks.is_empty() {
+                        v["nicknames"] = json!(nicks);
+                    }
                     if m.kind == MemberKind::Agent {
                         let s = engine.status(m.id, scope.channel);
                         v["presence"] = json!({"glow": s.glow, "status": s.presence});
@@ -434,7 +446,7 @@ pub fn call_tool(
                 })
                 .collect();
             Ok(json!({
-                "me": {"handle": me.handle, "name": me.name},
+                "me": {"handle": me.handle, "name": me.name, "nicknames": store::nicknames_of(c, scope.agent)?},
                 "channel": {"name": ch.name, "head_seq": head},
                 "project": store::project(c, &ch.project)?.map(|p| json!({"name": p.name})),
                 "members": members,

@@ -47,6 +47,8 @@ pub struct PaneHost {
     ping_input: Entity<TextInput>,
     /// Settings: a roster member's own list (`@handle ✅ 👍`).
     member_ping_input: Entity<TextInput>,
+    /// Settings: an agent's nicknames (`@handle cody -cx`).
+    nickname_input: Entity<TextInput>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -57,6 +59,7 @@ impl PaneHost {
         let ping_input = cx.new(|cx| TextInput::new("e.g. ✅ 👍, * for any, or default", cx));
         let member_ping_input =
             cx.new(|cx| TextInput::new("e.g. @codex ✅ 👍, or @codex default", cx));
+        let nickname_input = cx.new(|cx| TextInput::new("e.g. @codex cody, or @codex -cody", cx));
         let subscriptions = vec![
             cx.subscribe(&ping_input, |this, input, event, cx| {
                 if let TextInputEvent::Submit = event {
@@ -80,6 +83,17 @@ impl PaneHost {
                     }
                 }
             }),
+            cx.subscribe(&nickname_input, |this, input, event, cx| {
+                if let TextInputEvent::Submit = event {
+                    let text = input.read(cx).text().to_string();
+                    let started = this
+                        .store
+                        .update(cx, |store, cx| store.edit_nicknames(&text, cx));
+                    if started {
+                        input.update(cx, |input, cx| input.clear(cx));
+                    }
+                }
+            }),
             // The saved list (or a refusal) arrives from core later.
             cx.observe(&store, |_, _, cx| cx.notify()),
         ];
@@ -91,6 +105,7 @@ impl PaneHost {
             _copied_timer: None,
             ping_input,
             member_ping_input,
+            nickname_input,
             _subscriptions: subscriptions,
         }
     }
@@ -386,6 +401,7 @@ impl PaneHost {
             row("Shortcuts", shortcut.into(), true).into_any_element(),
             self.ping_answers_row(cx),
             self.member_ping_answers_row(cx),
+            self.nicknames_row(cx),
             row(
                 "Agents",
                 "Add Claude Code, Codex and others to this project.".into(),
@@ -406,7 +422,7 @@ impl PaneHost {
                 .type_style(text::CAPTION)
                 .text_color(t.faint)
                 .child(icon(IconName::GearSix, icons::SM, t.faint))
-                .child("Settings aren't saved between launches yet, except reactions that answer a ping (kept with the project and its members).")
+                .child("Settings aren't saved between launches yet, except reactions that answer a ping and nicknames (kept with the project and its members).")
                 .into_any_element(),
         ]
     }
@@ -562,6 +578,99 @@ impl PaneHost {
                     .type_style(text::BODY)
                     .text_color(t.ink)
                     .child(self.member_ping_input.clone()),
+            );
+            if let Some(e) = s.error {
+                column = column.child(
+                    div()
+                        .type_style(text::SMALL)
+                        .text_color(t.ink_soft)
+                        .child(SharedString::from(e.to_string())),
+                );
+            }
+        }
+        div()
+            .flex()
+            .items_center()
+            .gap(space::X4)
+            .px(space::X3)
+            .py(space::X2)
+            .rounded(radius::MD)
+            .bg(well)
+            .child(column)
+            .into_any_element()
+    }
+}
+
+impl PaneHost {
+    /// "Nicknames": each agent's nicknames (STRM-560), which `@` reaches
+    /// exactly like its handle, and one field to change them: `@handle cody`
+    /// adds, `@handle -cody` removes. Core refuses a nickname that isn't a
+    /// mention token, is @everyone, or already reaches someone; the refusal
+    /// shows under the field.
+    fn nicknames_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.theme();
+        let well = t.glass().well;
+        let setting = self
+            .store
+            .read(cx)
+            .nicknames()
+            .filter(|s| !s.members.is_empty());
+        let about: SharedString = match &setting {
+            None => {
+                "Other names an agent answers to with @. Add a model to this project first.".into()
+            }
+            Some(s) => {
+                let named: Vec<String> = s
+                    .members
+                    .iter()
+                    .filter(|(_, nicks)| !nicks.is_empty())
+                    .map(|(handle, nicks)| {
+                        let list: Vec<String> = nicks.iter().map(|n| format!("@{n}")).collect();
+                        format!("@{handle}: {}", list.join(" "))
+                    })
+                    .collect();
+                let now = if named.is_empty() {
+                    "No nicknames yet.".to_string()
+                } else {
+                    format!("{}.", named.join(", "))
+                };
+                format!(
+                    "{now} @nickname wakes an agent like its handle. Type @handle and a nickname (-nickname removes), then Enter."
+                )
+                .into()
+            }
+        };
+        let available = setting.is_some();
+        let mut column = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap(space::X1)
+            .child(
+                div()
+                    .type_style(text::BODY)
+                    .font_weight(text::MEDIUM)
+                    .text_color(if available { t.ink } else { t.muted })
+                    .child("Nicknames"),
+            )
+            .child(
+                div()
+                    .type_style(text::SMALL)
+                    .text_color(t.muted)
+                    .child(about),
+            );
+        if let Some(s) = setting {
+            column = column.child(
+                div()
+                    .px(space::X2)
+                    .py(space::X1)
+                    .rounded(radius::MD)
+                    .border_1()
+                    .border_color(t.faint)
+                    .type_style(text::BODY)
+                    .text_color(t.ink)
+                    .child(self.nickname_input.clone()),
             );
             if let Some(e) = s.error {
                 column = column.child(

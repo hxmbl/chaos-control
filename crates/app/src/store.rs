@@ -159,6 +159,10 @@ struct Attached {
     /// have one), and the last error from saving one.
     member_ping_answers: HashMap<ct::MemberId, Vec<String>>,
     member_ping_answers_error: Option<Arc<str>>,
+    /// Each linked agent's nicknames (STRM-560; only those that have any),
+    /// and the last error from changing one.
+    nicknames: HashMap<ct::MemberId, Vec<Arc<str>>>,
+    nicknames_error: Option<Arc<str>>,
     _events: Task<()>,
 }
 
@@ -222,6 +226,53 @@ pub fn parse_member_ping_answers_input(text: &str) -> Option<(String, PingAnswer
         return None;
     }
     Some((handle.to_string(), parse_ping_answers_input(rest)))
+}
+
+/// The Settings pane's view of agents' nicknames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NicknamesSetting {
+    /// Each linked agent's handle and its nicknames, in Agent Status order.
+    pub members: Vec<(Arc<str>, Vec<Arc<str>>)>,
+    /// Why the last change was refused, if it was.
+    pub error: Option<Arc<str>>,
+}
+
+/// One change from the Settings nickname field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NicknameEdit {
+    Add(String),
+    Remove(String),
+}
+
+/// Splits the nickname field's `@handle cody -cx` into the handle (without
+/// `@`, as typed) and its edits: a plain word adds a nickname, `-word`
+/// removes one (a leading `@` on either is dropped; core validates). `None`
+/// without a leading `@handle`.
+pub fn parse_nickname_input(text: &str) -> Option<(String, Vec<NicknameEdit>)> {
+    let text = text.trim_start();
+    let rest = text.strip_prefix('@')?;
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == ',')
+        .unwrap_or(rest.len());
+    let (handle, rest) = rest.split_at(end);
+    if handle.is_empty() {
+        return None;
+    }
+    let edits = rest
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|e| !e.is_empty())
+        .filter_map(|e| match e.strip_prefix('-') {
+            Some(n) => {
+                let n = n.strip_prefix('@').unwrap_or(n);
+                (!n.is_empty()).then(|| NicknameEdit::Remove(n.to_string()))
+            }
+            None => {
+                let n = e.strip_prefix('@').unwrap_or(e);
+                (!n.is_empty()).then(|| NicknameEdit::Add(n.to_string()))
+            }
+        })
+        .collect();
+    Some((handle.to_string(), edits))
 }
 
 /// One harness in the model picker's filter row.
@@ -704,11 +755,14 @@ impl ChatStore {
             ping_answers_error: None,
             member_ping_answers: HashMap::new(),
             member_ping_answers_error: None,
+            nicknames: HashMap::new(),
+            nicknames_error: None,
             _events: task,
         });
         // Probe the harnesses without a fresh cached list, in the background.
         self.refresh_models(cx);
         self.load_ping_answers(cx);
+        self.load_nicknames(cx);
         cx.notify();
     }
 
@@ -975,8 +1029,9 @@ impl ChatStore {
         attached.agent_ids.insert(linked.member);
         self.workspace.agents.push(status_agent(&linked));
         attached.link.agents.push(linked);
-        // A re-added member keeps its own ping-answer list.
+        // A re-added member keeps its own ping-answer list and nicknames.
         self.load_ping_answers(cx);
+        self.load_nicknames(cx);
         cx.notify();
     }
 
@@ -1017,6 +1072,145 @@ impl ChatStore {
             }
         })
         .detach();
+    }
+
+    /// Reads every linked agent's nicknames from core.
+    fn load_nicknames(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        let members: Vec<ct::MemberId> = attached.link.agents.iter().map(|a| a.member).collect();
+        cx.spawn(async move |this, cx| {
+            let mut all = HashMap::new();
+            for m in members {
+                if let Ok(list) = core.nicknames(m).await
+                    && !list.is_empty()
+                {
+                    all.insert(m, list);
+                }
+            }
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                if a.link.open.project.id != project {
+                    return;
+                }
+                a.nicknames = all;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// An Agent Status agent's nicknames (empty without core or when it has
+    /// none).
+    pub fn agent_nicknames(&self, id: Id) -> Vec<Arc<str>> {
+        let Some(attached) = &self.core else {
+            return Vec::new();
+        };
+        attached
+            .link
+            .agents
+            .iter()
+            .find(|a| agent_id(a.member) == id)
+            .and_then(|a| attached.nicknames.get(&a.member).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Every linked agent's nicknames, for Settings. `None` without core.
+    pub fn nicknames(&self) -> Option<NicknamesSetting> {
+        let attached = self.core.as_ref()?;
+        Some(NicknamesSetting {
+            members: attached
+                .link
+                .agents
+                .iter()
+                .map(|a| {
+                    (
+                        a.handle.clone(),
+                        attached
+                            .nicknames
+                            .get(&a.member)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            error: attached.nicknames_error.clone(),
+        })
+    }
+
+    /// Applies the Settings nickname field (`@handle cody -cx`; see
+    /// [`parse_nickname_input`]) to that agent, in order. Core validates
+    /// each one (a mention token, not @everyone, nobody's handle or nickname
+    /// yet); the first refusal stops the rest and is kept for the pane to
+    /// show. Returns whether anything was started.
+    pub fn edit_nicknames(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some(attached) = &mut self.core else {
+            return false;
+        };
+        let Some((handle, edits)) = parse_nickname_input(text) else {
+            attached.nicknames_error = Some(Arc::from(
+                "Start with the agent's @handle, e.g. @codex cody",
+            ));
+            cx.notify();
+            return false;
+        };
+        if edits.is_empty() {
+            return false;
+        }
+        let Some(member) = attached
+            .link
+            .agents
+            .iter()
+            .find(|a| a.handle.eq_ignore_ascii_case(&handle))
+            .map(|a| a.member)
+        else {
+            attached.nicknames_error = Some(Arc::from(format!(
+                "@{handle} isn't an agent in this project"
+            )));
+            cx.notify();
+            return false;
+        };
+        let core = attached.link.core.clone();
+        cx.spawn(async move |this, cx| {
+            let mut now: Option<Vec<Arc<str>>> = None;
+            let mut error: Option<String> = None;
+            for edit in edits {
+                let result = match &edit {
+                    NicknameEdit::Add(n) => core.add_nickname(member, n).await,
+                    NicknameEdit::Remove(n) => core.remove_nickname(member, n).await,
+                };
+                match result {
+                    Ok(list) => now = Some(list),
+                    Err(e) => {
+                        error = Some(e);
+                        break;
+                    }
+                }
+            }
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                if let Some(list) = now {
+                    if list.is_empty() {
+                        a.nicknames.remove(&member);
+                    } else {
+                        a.nicknames.insert(member, list);
+                    }
+                }
+                a.nicknames_error = error.map(Arc::from);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        true
     }
 
     /// Roster model members' own ping-answer lists, for Settings. `None`
@@ -1331,9 +1525,11 @@ impl ChatStore {
         attached.ping_answers = None;
         attached.ping_answers_error = None;
         attached.member_ping_answers_error = None;
+        attached.nicknames_error = None;
         attached.link.open = open;
         self.core = Some(attached);
         self.load_ping_answers(cx);
+        self.load_nicknames(cx);
         // Each project's #main has its own log; it reloads after the switch.
         self.permissions = PermissionLog::default();
     }
@@ -1726,6 +1922,27 @@ fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nickname_input_adds_and_removes() {
+        assert_eq!(
+            parse_nickname_input(" @codex cody, -@cx @Sol"),
+            Some((
+                "codex".to_string(),
+                vec![
+                    NicknameEdit::Add("cody".into()),
+                    NicknameEdit::Remove("cx".into()),
+                    NicknameEdit::Add("Sol".into()),
+                ]
+            ))
+        );
+        assert_eq!(
+            parse_nickname_input("@codex"),
+            Some(("codex".into(), vec![]))
+        );
+        assert_eq!(parse_nickname_input("cody"), None);
+        assert_eq!(parse_nickname_input("@ cody"), None);
+    }
 
     #[test]
     fn member_ping_answers_input_needs_a_handle_first() {

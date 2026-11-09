@@ -385,6 +385,25 @@ CREATE TABLE project_settings (
     r#"
 ALTER TABLE model_members ADD COLUMN ping_answer_reactions TEXT;
 "#,
+    // 12: nicknames (STRM-560). A member may have any number; `@nick` wakes
+    // it exactly like `@handle`. A nickname is unique among nicknames (the
+    // key, case-insensitive) and may not be anyone's handle (the trigger;
+    // a handle created later wins and takes the nickname away, see
+    // `ensure_member`). Its shape (a mention token, not @everyone) is
+    // checked by `policy::check_nickname` before it is written.
+    r#"
+CREATE TABLE member_nicknames (
+    nickname   TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+    member_id  INTEGER NOT NULL REFERENCES members(id),
+    added_at   INTEGER NOT NULL
+);
+CREATE INDEX member_nicknames_by_member ON member_nicknames (member_id, added_at);
+CREATE TRIGGER member_nicknames_not_a_handle BEFORE INSERT ON member_nicknames
+WHEN EXISTS (SELECT 1 FROM members WHERE handle = NEW.nickname)
+BEGIN
+    SELECT RAISE(ABORT, 'nickname_is_a_handle');
+END;
+"#,
 ];
 
 pub struct Store {
@@ -862,17 +881,22 @@ pub(crate) fn member_from_row(r: &Row<'_>) -> Result<Member> {
 
 /// Creates the member if the handle is new; otherwise returns the existing one
 /// (its name is refreshed, its kind never changes).
+///
+/// A handle always wins over a nickname: if `handle` was someone else's
+/// nickname, that nickname is dropped so `@handle` means one member.
 pub fn ensure_member(c: &Connection, kind: MemberKind, handle: &str, name: &str) -> Result<Member> {
     c.execute(
         "INSERT INTO members (kind, handle, name) VALUES (?1, ?2, ?3)
          ON CONFLICT(handle) DO UPDATE SET name = excluded.name",
         params![kind.as_str(), handle, name],
     )?;
-    c.query_row(
+    let m = c.query_row(
         "SELECT id, kind, handle, name FROM members WHERE handle = ?1",
         [handle],
         member_from_row,
-    )
+    )?;
+    c.execute("DELETE FROM member_nicknames WHERE nickname = ?1", [handle])?;
+    Ok(m)
 }
 
 pub fn member(c: &Connection, id: MemberId) -> Result<Option<Member>> {
@@ -897,6 +921,73 @@ pub fn members_of(c: &Connection, channel: ChannelId) -> Result<Vec<Member>> {
          WHERE s.channel_id = ?1 ORDER BY m.id",
     )?;
     stmt.query_map([channel.0], member_from_row)?.collect()
+}
+
+// ---------- nicknames ----------
+
+/// `member`'s nicknames, oldest first, as they were typed.
+pub fn nicknames_of(c: &Connection, member: MemberId) -> Result<Vec<Arc<str>>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT nickname FROM member_nicknames WHERE member_id = ?1 ORDER BY added_at, rowid",
+    )?;
+    stmt.query_map([member.0], |r| Ok(Arc::from(r.get::<_, String>(0)?)))?
+        .collect()
+}
+
+/// The nicknames of `channel`'s members, as `(member, nickname)`, oldest
+/// first per member.
+pub fn nicknames_in(c: &Connection, channel: ChannelId) -> Result<Vec<(MemberId, Arc<str>)>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT n.member_id, n.nickname FROM member_nicknames n
+         JOIN memberships s ON s.member_id = n.member_id
+         WHERE s.channel_id = ?1 ORDER BY n.member_id, n.added_at, n.rowid",
+    )?;
+    stmt.query_map([channel.0], |r| {
+        Ok((MemberId(r.get(0)?), Arc::from(r.get::<_, String>(1)?)))
+    })?
+    .collect()
+}
+
+/// Who answers to `@token`, case-insensitively: the member whose handle it
+/// is, else the member whose nickname it is. `None` if nobody.
+pub fn mention_owner(c: &Connection, token: &str) -> Result<Option<MemberId>> {
+    let by_handle = c
+        .query_row("SELECT id FROM members WHERE handle = ?1", [token], |r| {
+            r.get::<_, i64>(0)
+        })
+        .optional()?;
+    if let Some(id) = by_handle {
+        return Ok(Some(MemberId(id)));
+    }
+    Ok(c.query_row(
+        "SELECT member_id FROM member_nicknames WHERE nickname = ?1",
+        [token],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()?
+    .map(MemberId))
+}
+
+/// Gives `member` the nickname `nickname` (already checked by
+/// `policy::check_nickname`). Fails on the schema's uniqueness rules: the
+/// primary key if it is anyone's nickname, `nickname_is_a_handle` if it is
+/// anyone's handle. Callers check with [`mention_owner`] first for a clear
+/// error; the schema backs that up.
+pub fn add_nickname(c: &Connection, member: MemberId, nickname: &str, now: Millis) -> Result<()> {
+    c.execute(
+        "INSERT INTO member_nicknames (nickname, member_id, added_at) VALUES (?1, ?2, ?3)",
+        params![nickname, member.0, now as i64],
+    )?;
+    Ok(())
+}
+
+/// Takes `nickname` (case-insensitive) away from `member`. False if it
+/// wasn't theirs.
+pub fn remove_nickname(c: &Connection, member: MemberId, nickname: &str) -> Result<bool> {
+    Ok(c.execute(
+        "DELETE FROM member_nicknames WHERE member_id = ?1 AND nickname = ?2",
+        params![member.0, nickname],
+    )? == 1)
 }
 
 /// The channels of `project` that `member` belongs to, in `::N` order.
@@ -1755,6 +1846,36 @@ mod tests {
             })
             .unwrap();
         (s, ch, hx, bot)
+    }
+
+    #[test]
+    fn nicknames_share_the_handle_namespace() {
+        let (s, ch, hx, bot) = setup();
+        let c = s.conn();
+        add_nickname(c, bot.id, "Cody", 1).unwrap();
+        add_nickname(c, bot.id, "cx", 2).unwrap();
+        assert_eq!(
+            nicknames_of(c, bot.id).unwrap(),
+            vec![Arc::<str>::from("Cody"), Arc::from("cx")]
+        );
+        assert_eq!(nicknames_in(c, ch.id).unwrap().len(), 2);
+        assert_eq!(mention_owner(c, "CODY").unwrap(), Some(bot.id));
+        assert_eq!(mention_owner(c, "Claude").unwrap(), Some(bot.id));
+        assert_eq!(mention_owner(c, "nobody").unwrap(), None);
+        // The schema refuses a second holder, whatever the case, and a handle.
+        assert!(add_nickname(c, hx.id, "cody", 3).is_err());
+        let e = add_nickname(c, hx.id, "CLAUDE", 3).unwrap_err();
+        assert!(e.to_string().contains("nickname_is_a_handle"), "{e}");
+        // A handle created later wins: the nickname is dropped.
+        let cx = ensure_member(c, MemberKind::Agent, "CX", "Codex").unwrap();
+        assert_eq!(mention_owner(c, "cx").unwrap(), Some(cx.id));
+        assert_eq!(
+            nicknames_of(c, bot.id).unwrap(),
+            vec![Arc::<str>::from("Cody")]
+        );
+        assert!(remove_nickname(c, bot.id, "cODY").unwrap());
+        assert!(!remove_nickname(c, bot.id, "cody").unwrap());
+        assert!(nicknames_of(c, bot.id).unwrap().is_empty());
     }
 
     fn msg<'a>(ch: ChannelId, author: MemberId, body: &'a str) -> NewMessage<'a> {

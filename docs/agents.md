@@ -25,7 +25,8 @@ position and a voice.
   durability.
 - **Session per agent x channel.** One native session per membership, opened on
   the first wake and closed after 10 idle minutes (the agent goes blue).
-- **Wake only when addressed.** An `@handle`, a reply to the agent's message,
+- **Wake only when addressed.** An `@handle` (or one of the member's
+  nicknames, see "Nicknames" below), a reply to the agent's message,
   or a human's `@everyone`. Untargeted messages wake no one; agents see them as
   unread context on their next wake. **Reactions never wake anyone**, not even
   the author of the message reacted to (see Reactions).
@@ -87,6 +88,39 @@ the same. Presets, detection, model discovery and the model picker are in
   in the store also keeps the latest list a harness reported.
 - Agents from the original `agents` shape in `agents.json` are not on the
   roster and can't be removed from the app.
+
+### Nicknames
+
+A member (agent or human) can have any number of **nicknames** (STRM-560,
+migration 12, table `member_nicknames`). `@nick` works exactly like
+`@handle`: it wakes the agent, records a mention, counts for hops and the
+damper, and is matched case-insensitively (`Engine::resolve_mentions` tries
+handles first, then nicknames).
+
+- **Rules.** A nickname is a whole mention token as `policy::parse_mentions`
+  reads it, kept to ASCII: letters, digits, `_`, `-` and `.`, starting with a
+  letter or digit, not ending in `.`, at most 32 characters
+  (`policy::check_nickname`). It may not be `everyone`, `here` or `channel`.
+  It is unique across every handle and every nickname, case-insensitively
+  and across all projects, since handles are global too. The store backs
+  this up: the nickname is the table's key (`COLLATE NOCASE`) and a trigger
+  refuses one that is someone's handle. A handle created later always wins:
+  `ensure_member` drops a nickname equal to it, and new model members'
+  handles skip nicknames.
+- **API.** `Core::nicknames(member)`, `Core::add_nickname(member, nick)`
+  and `Core::remove_nickname(member, nick)` (each returns the member's
+  nicknames now; errors say why: `invalid nickname: ...`, `@x is taken: it
+  already reaches @y`, `no nickname @x to remove`).
+- **In the app.** Settings has a "Nicknames" field: `@handle nick` adds,
+  `@handle -nick` removes, for any agent in the project. Agent Status's
+  tooltip lists an agent's nicknames.
+- **What agents are told.** The orientation says `You are @handle
+  (nicknames: @a, @b)` and that a nickname wakes it too, and lists other
+  members as `@handle (agent, also @x)`. `chat_context` returns
+  `me.nicknames` and each member's `nicknames` (omitted when none). A
+  nickname added mid-session shows in `chat_context` at once and in the
+  orientation of the next session.
+- Out of scope here: nicknames that adapt on their own (STRM-561).
 
 ## ACP version negotiation
 

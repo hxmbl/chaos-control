@@ -687,6 +687,43 @@ impl Core {
         .await?
     }
 
+    /// `member`'s nicknames (STRM-560), oldest first. Each reaches the member
+    /// with `@` exactly like its handle.
+    pub async fn nicknames(&self, member: MemberId) -> Result<Vec<Arc<str>>, String> {
+        self.with_engine(move |e, _| e.nicknames(member).map_err(|e| e.to_string()))
+            .await?
+    }
+
+    /// Gives `member` a nickname. Refused (with a message saying why) when
+    /// it is not a mention token, is @everyone/@here/@channel, or already
+    /// reaches someone as a handle or nickname. Returns its nicknames now.
+    pub async fn add_nickname(
+        &self,
+        member: MemberId,
+        nickname: &str,
+    ) -> Result<Vec<Arc<str>>, String> {
+        let nickname = nickname.to_string();
+        self.with_engine(move |e, now| {
+            e.add_nickname(now, member, &nickname)
+                .map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
+    /// Takes a nickname away from `member`. Returns its nicknames now.
+    pub async fn remove_nickname(
+        &self,
+        member: MemberId,
+        nickname: &str,
+    ) -> Result<Vec<Arc<str>>, String> {
+        let nickname = nickname.to_string();
+        self.with_engine(move |e, _| {
+            e.remove_nickname(member, &nickname)
+                .map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
     /// A roster model member's own list of reactions that answer a ping, as
     /// stored, or `None` when it follows the project setting.
     pub async fn member_ping_answer_reactions(

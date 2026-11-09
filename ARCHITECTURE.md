@@ -126,7 +126,8 @@ permission log's `read_only`; migration 9 rebuilds `reactions` with each
 reaction's channel (see "Reactions" in [docs/agents.md](docs/agents.md));
 migration 10 adds `project_settings`, one JSON value per (project, key), holding
 `ping_answer_reactions` so far; migration 11 adds a roster model member's own
-`ping_answer_reactions` as a column on `model_members`.
+`ping_answer_reactions` as a column on `model_members`; migration 12 adds
+`member_nicknames` (see "Nicknames" in [docs/agents.md](docs/agents.md)).
 
 **`::N`.** A channel's ordinal is assigned when it is created: the project's
 highest so far plus one, starting at 1 (so a new project's #main is `::1`).
