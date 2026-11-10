@@ -34,6 +34,45 @@ use crate::types::*;
 
 pub type Result<T> = rusqlite::Result<T>;
 
+/// Why [`Store::open`] refused or failed.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The database's schema is newer than every migration this build knows:
+    /// a newer Chaos Control wrote it. Nothing in it was changed.
+    NewerSchema {
+        found: i64,
+        known: i64,
+    },
+    Sqlite(rusqlite::Error),
+}
+
+impl From<rusqlite::Error> for OpenError {
+    fn from(e: rusqlite::Error) -> Self {
+        OpenError::Sqlite(e)
+    }
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OpenError::NewerSchema { found, known } => write!(
+                f,
+                "This data was written by a newer Chaos Control (schema {found}, this build knows {known}). Update the app."
+            ),
+            OpenError::Sqlite(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for OpenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            OpenError::NewerSchema { .. } => None,
+            OpenError::Sqlite(e) => Some(e),
+        }
+    }
+}
+
 /// Ordered migrations. `PRAGMA user_version` records how many have run; add new
 /// ones at the end, never edit old ones.
 const MIGRATIONS: &[&str] = &[
@@ -453,28 +492,37 @@ pub struct Cursor {
 
 impl Store {
     /// Opens (or creates) the database at `path` and runs pending migrations.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Refuses a database from a newer build ([`OpenError::NewerSchema`])
+    /// without changing it.
+    pub fn open(path: &Path) -> std::result::Result<Self, OpenError> {
         Self::init(Connection::open(path)?)
     }
 
     /// A private in-memory database (tests, demos).
-    pub fn open_in_memory() -> Result<Self> {
+    pub fn open_in_memory() -> std::result::Result<Self, OpenError> {
         Self::init(Connection::open_in_memory()?)
     }
 
-    fn init(conn: Connection) -> Result<Self> {
+    fn init(conn: Connection) -> std::result::Result<Self, OpenError> {
+        // Checked before anything writes (the journal mode is stored in the
+        // file), so a refused database is left exactly as it was.
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let known = MIGRATIONS.len() as i64;
+        if version > known {
+            return Err(OpenError::NewerSchema {
+                found: version,
+                known,
+            });
+        }
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
         )?;
         let mut store = Store { conn };
-        store.migrate()?;
+        store.migrate(version as usize)?;
         Ok(store)
     }
 
-    fn migrate(&mut self) -> Result<()> {
-        let version: usize =
-            self.conn
-                .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+    fn migrate(&mut self, version: usize) -> Result<()> {
         if version >= MIGRATIONS.len() {
             return Ok(());
         }
@@ -2001,6 +2049,60 @@ mod tests {
     fn migrations_run_once_and_record_version() {
         let s = Store::open_in_memory().unwrap();
         assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+    }
+
+    #[test]
+    fn a_database_from_a_newer_build_is_refused_and_left_unchanged() {
+        let dir = std::env::temp_dir().join(format!("cc-store-newer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sqlite");
+        let _ = std::fs::remove_file(&path);
+        let newer = MIGRATIONS.len() as i64 + 1;
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TABLE future (x INTEGER); INSERT INTO future VALUES (7);
+                 PRAGMA user_version = {newer};"
+            ))
+            .unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        match Store::open(&path) {
+            Err(OpenError::NewerSchema { found, known }) => {
+                assert_eq!(found, newer);
+                assert_eq!(known, MIGRATIONS.len() as i64);
+            }
+            Err(e) => panic!("expected NewerSchema, got {e}"),
+            Ok(_) => panic!("a newer database opened"),
+        }
+        let message = Store::open(&path).err().unwrap().to_string();
+        assert!(message.contains("newer Chaos Control"), "{message}");
+        assert!(message.contains(&format!("schema {newer}")), "{message}");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let conn = Connection::open(&path).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, newer);
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "delete");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_database_at_this_builds_version_opens() {
+        let dir = std::env::temp_dir().join(format!("cc-store-equal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.sqlite");
+        let _ = std::fs::remove_file(&path);
+        drop(Store::open(&path).unwrap());
+        let s = Store::open(&path).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
