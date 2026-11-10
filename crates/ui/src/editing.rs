@@ -3,6 +3,7 @@
 //! be unit-tested.
 
 use std::{
+    borrow::Cow,
     ops::Range,
     time::{Duration, Instant},
 };
@@ -118,6 +119,51 @@ pub fn word_range_at(text: &str, offset: usize) -> Range<usize> {
     }
     let end_ix = graphemes.get(end).map_or(text.len(), |(ix, _)| *ix);
     graphemes[start].0..end_ix
+}
+
+/// Line breaks as a field stores them: `\r\n` and a lone `\r` become `\n`,
+/// and a single-line field turns every break into a space (pasting a paragraph
+/// into search gives one line).
+pub fn normalize_breaks(text: &str, multiline: bool) -> Cow<'_, str> {
+    if !text.contains(['\r', '\n']) {
+        return Cow::Borrowed(text);
+    }
+    let unified = text.replace("\r\n", "\n").replace('\r', "\n");
+    Cow::Owned(if multiline {
+        unified
+    } else {
+        unified.replace('\n', " ")
+    })
+}
+
+/// How many rows a multi-line field shows: its content's rows, at least one
+/// and at most `max_rows` (after that it scrolls).
+pub fn visible_rows(content_rows: usize, max_rows: usize) -> usize {
+    content_rows.clamp(1, max_rows.max(1))
+}
+
+/// The vertical scroll (pixels from the top of the content) that keeps the
+/// caret row `caret_top..caret_top + caret_height` inside a `viewport`-tall
+/// window onto `content`-tall text, moving as little as possible.
+pub fn scroll_to_reveal(
+    scroll: f32,
+    caret_top: f32,
+    caret_height: f32,
+    viewport: f32,
+    content: f32,
+) -> f32 {
+    let mut scroll = scroll;
+    if caret_top < scroll {
+        scroll = caret_top;
+    } else if caret_top + caret_height > scroll + viewport {
+        scroll = caret_top + caret_height - viewport;
+    }
+    clamp_scroll(scroll, viewport, content)
+}
+
+/// Keeps a scroll offset between the top and the last full viewport.
+pub fn clamp_scroll(scroll: f32, viewport: f32, content: f32) -> f32 {
+    scroll.clamp(0.0, (content - viewport).max(0.0))
 }
 
 /// The text and selection at one moment, as the undo history stores it.
@@ -251,6 +297,47 @@ mod tests {
         assert_eq!(word_range_at(s, 5), 5..6); // the space
         assert_eq!(word_range_at(s, s.len()), 12..17);
         assert_eq!(word_range_at("", 0), 0..0);
+    }
+
+    #[test]
+    fn breaks_are_kept_in_multiline_fields_and_flattened_in_single_line_ones() {
+        assert_eq!(normalize_breaks("one\ntwo", true), "one\ntwo");
+        assert_eq!(
+            normalize_breaks("one\r\ntwo\rthree", true),
+            "one\ntwo\nthree"
+        );
+        assert_eq!(
+            normalize_breaks("one\r\ntwo\nthree", false),
+            "one two three"
+        );
+        assert!(matches!(normalize_breaks("plain", true), Cow::Borrowed(_)));
+        assert!(matches!(normalize_breaks("plain", false), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn the_field_grows_to_its_max_rows_then_stops() {
+        assert_eq!(visible_rows(0, 8), 1);
+        assert_eq!(visible_rows(1, 8), 1);
+        assert_eq!(visible_rows(5, 8), 5);
+        assert_eq!(visible_rows(30, 8), 8);
+        assert_eq!(visible_rows(3, 0), 1);
+    }
+
+    #[test]
+    fn scrolling_keeps_the_caret_row_in_view() {
+        // 10 rows of 20px in a 100px window.
+        let (row, view, content) = (20.0, 100.0, 200.0);
+        // Already visible: no move.
+        assert_eq!(scroll_to_reveal(0.0, 40.0, row, view, content), 0.0);
+        // Below the window: scroll just enough to show the whole row.
+        assert_eq!(scroll_to_reveal(0.0, 120.0, row, view, content), 40.0);
+        // Above it: scroll up to the row's top.
+        assert_eq!(scroll_to_reveal(80.0, 20.0, row, view, content), 20.0);
+        // Never past the last full window, never above the top.
+        assert_eq!(scroll_to_reveal(500.0, 180.0, row, view, content), 100.0);
+        assert_eq!(clamp_scroll(-30.0, view, content), 0.0);
+        // Content shorter than the window never scrolls.
+        assert_eq!(clamp_scroll(10.0, view, 60.0), 0.0);
     }
 
     fn snap(text: &str) -> Snapshot {
