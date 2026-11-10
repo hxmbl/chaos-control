@@ -425,11 +425,33 @@ channel, the turn it was asked in, source (`native` or `chat_tool`), title
 (the tool call's title), detail (raw input), reason, state (`pending`,
 `approved`, `denied`, `auto_approved`), who it was routed to, who answered,
 when, an optional note, and `used_at`. Migration 8 adds `read_only` (allowed
-reads, logged) and the log's indexes.
+reads, logged) and the log's indexes. Migration 13 adds `request_key`
+(STRM-572, below).
+
+- **Request key:** what exactly was asked for, `permission::request_key(kind,
+  payload)`: the tool kind, a `:`, then the SHA-256 (hex) of the payload as
+  canonical JSON (object keys sorted, no whitespace), with the volatile
+  fields stripped first. The request id is never part of it, so an approved
+  call retried with a new tool call id still matches. Per protocol:
+  - **ACP v1:** the whole tool call (title, kind, content, locations,
+    `rawInput`, ...) without `toolCallId`, `terminalId`, `status`,
+    `rawOutput` and `_meta` (at any depth except inside `rawInput`, which is
+    hashed as given).
+  - **ACP v2 draft:** the prompt's `title`, `description` and `subject`,
+    without the same fields.
+  - **Codex:** a command approval hashes the request without `threadId`,
+    `turnId`, `itemId`, `approvalId`, `reason` and `_meta` (kind
+    `command`). A file-change approval hashes the item's `changes` as
+    `item/started` reported them (kind `file_change`); if those weren't
+    seen, the item id, so it only matches that item.
+  - **`chat_request_permission`:** its `action` text (kind `chat`).
+  - Logged reads and auto-allowed chat tools store no key; nor do rows
+    from before migration 13, so an old unused grant matches nothing.
 
 - **Routing:** to the humans whose messages woke the turn, else every human
   in the channel. Any human member of the channel can answer; agents can't.
-- **Dedup:** asking again for the same title while one is pending reuses it.
+- **Dedup:** asking again for the same request (same key) while one is
+  pending reuses it. The same title with another payload is a new request.
 - **Surfacing:** one system note ("@bot asked to run X: permission request #N,
   sent to @hx. Any human here can approve or deny it; @bot carries on
   meanwhile.") when `Policy::note_permission_requests` is on, a
@@ -457,14 +479,18 @@ reads, logged) and the log's indexes.
   that message, no reply owed, merged into the pending batch if the agent is
   busy. A human's answer clears a red state like a human ping.
 - **Grant:** an approval is a **one-shot grant** for that (agent, channel,
-  title). The next native request with the same title is answered with
-  allow-once and the grant is spent (`used_at`). A denial grants nothing.
+  request key). The next native request with the same key is answered with
+  allow-once and the grant is spent (`used_at`); a second identical call is a
+  new request. The same title on another payload (an approved `Edit files`
+  on `a.rs`, then `Edit files` on `b.rs`) is declined and sent as its own
+  request. A denial grants nothing.
 
 **Chat tools.** `chat_request_permission {action, reason?}` asks ahead: on
 the host it answers `{status: "request_sent", request_id, asked}` (or
 `approved` if that action is already approved and unused); in a VM,
-`approved`. Using a tool call's exact title as `action` pre-clears that call
-once. `chat_permission_status {request_id?}` lists the agent's requests in
+`approved`. It is keyed on the `action` text, so it no longer pre-clears a
+tool call with that title (STRM-572): the tool call is approved through its
+own native request. `chat_permission_status {request_id?}` lists the agent's requests in
 the channel with their answers.
 
 **Resuming a declined action (investigated against the published sources,
@@ -477,7 +503,7 @@ lets through:
   without `interrupt`, so Claude sees a refused tool result and keeps going
   in the same turn. It ignores our `_meta`, so the "request sent" context
   reaches it through the room norms in its orientation and the answer
-  message. On the answer's wake it retries the tool call; the same title
+  message. On the answer's wake it retries the tool call; the same call
   (the Bash command, `Edit <path>`, ...) hits the grant.
 - **codex-acp:** exec and patch approvals map options to Codex review
   decisions; we pick "denied" (continue without running it), never "abort"
@@ -487,8 +513,9 @@ lets through:
   an agent offers no decline at all.
 - Limits: sessions close after 10 idle minutes, so an answer that comes
   later wakes a fresh session that only knows what the answer message and
-  its unread context say (title and request id). A grant matches on the
-  title only, so a retried call whose title changes asks again.
+  its unread context say (title and request id). A grant matches the
+  request key, so a retried call that changes anything but its ids (another
+  file, another command) asks again.
 
 ## Room policy
 

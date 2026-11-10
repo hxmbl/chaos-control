@@ -445,3 +445,84 @@ async fn named_chat_tools_are_auto_allowed_and_logged_by_name() {
         assert!(!log[1].read_only);
     }
 }
+
+/// A grant is for the exact request, not its title (STRM-572): after a human
+/// approves "Edit files" on a.rs, "Edit files" on b.rs is still declined,
+/// the identical a.rs call goes through once (with a new tool call id), and
+/// a second identical call is a new request. Over ACP v1 and the v2 draft.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grant_is_for_the_exact_request_not_its_title() {
+    for protocol in [1, 2] {
+        let mut h = Harness::new().await;
+        let edit = |path: &str| {
+            json!({"permission_kind": {
+                "title": "Edit files", "kind": "edit", "raw_input": {"path": path}
+            }})
+        };
+        let bot = h
+            .agent(
+                "bot",
+                script(json!({"protocol": protocol, "turns": [
+                    {"steps": [edit("a.rs"), {"text": "Asked to edit a.rs."}]},
+                    {"steps": [edit("b.rs"), edit("a.rs"), edit("a.rs"), {"text": "Edited a.rs."}]}
+                ]})),
+            )
+            .await;
+        h.say("@bot fix a.rs").await;
+        let req = wait_request(&mut h, PermissionState::Pending).await;
+        assert_eq!(&*req.title, "Edit files");
+        let key = req.request_key.clone().expect("a native request has a key");
+        assert!(key.starts_with("edit:"), "v{protocol}: {key}");
+        h.wait_message("first turn", Some(bot.id)).await;
+
+        h.core
+            .answer_permission(req.id, h.hx.id, true, None)
+            .await
+            .unwrap();
+        let all = wait_outcomes(&h, "bot", 4).await;
+        let id = |o: &Value| o["_meta"]["chaosControl"]["requestId"].clone();
+        assert_eq!(picked(&all[0]), &json!("deny"), "v{protocol}: {}", all[0]);
+        // Same title, another file: declined, and sent as its own request.
+        assert_eq!(
+            picked(&all[1]),
+            &json!("deny"),
+            "b.rs, v{protocol}: {}",
+            all[1]
+        );
+        assert_ne!(id(&all[1]), json!(req.id.0), "v{protocol}");
+        // The identical call (a new tool call id) uses the grant, once.
+        assert_eq!(
+            picked(&all[2]),
+            &json!("allow"),
+            "a.rs, v{protocol}: {}",
+            all[2]
+        );
+        assert_eq!(
+            picked(&all[3]),
+            &json!("deny"),
+            "again, v{protocol}: {}",
+            all[3]
+        );
+        assert_ne!(id(&all[3]), json!(req.id.0), "v{protocol}");
+        assert_ne!(id(&all[3]), id(&all[1]), "v{protocol}");
+        h.until("grant used", move |c| {
+            c.query_row(
+                "SELECT used_at IS NOT NULL FROM permission_requests WHERE id = ?1",
+                [req.id.0],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+        })
+        .await;
+        // b.rs and the second a.rs wait for the humans, with their own keys.
+        let pending = h.core.pending_permissions(h.main).await.unwrap();
+        assert_eq!(pending.len(), 2, "v{protocol}: {pending:#?}");
+        assert!(pending.iter().all(|r| &*r.title == "Edit files"));
+        assert_ne!(
+            pending[0].request_key,
+            Some(key.clone()),
+            "b.rs, v{protocol}"
+        );
+        assert_eq!(pending[1].request_key, Some(key), "a.rs again, v{protocol}");
+    }
+}

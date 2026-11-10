@@ -98,12 +98,15 @@ pub enum Step {
     /// Ask for permission to run something (no tool kind given).
     Permission(String),
     /// Ask for permission for a tool call of this ACP kind (`read`,
-    /// `search`, `edit`, `execute`, ...).
+    /// `search`, `edit`, `execute`, ...), optionally with the tool's raw
+    /// input (v1: the tool call's `rawInput`; v2: its subject's).
     PermissionKind {
         title: String,
         kind: String,
         #[serde(default)]
         name: Option<String>,
+        #[serde(default)]
+        raw_input: Option<Value>,
     },
     /// Wait until the test opens this gate (in-process only; no-op otherwise).
     Gate(String),
@@ -573,12 +576,17 @@ impl FakeAgent {
                         .push(result);
                 }
                 Step::Permission(_) | Step::PermissionKind { .. } => {
-                    let (title, kind, name) = match step {
-                        Step::PermissionKind { title, kind, name } => (title, Some(kind), name),
-                        Step::Permission(title) => (title, None, None),
+                    let (title, kind, name, raw_input) = match step {
+                        Step::PermissionKind {
+                            title,
+                            kind,
+                            name,
+                            raw_input,
+                        } => (title, Some(kind), name, raw_input),
+                        Step::Permission(title) => (title, None, None, None),
                         _ => unreachable!(),
                     };
-                    let outcome = wire.permission(n, title, kind, name).await;
+                    let outcome = wire.permission(n, title, kind, name, raw_input).await;
                     self.observed
                         .lock()
                         .expect("lock")
@@ -770,10 +778,14 @@ impl Wire {
         title: String,
         kind: Option<String>,
         name: Option<String>,
+        raw_input: Option<Value>,
     ) -> Value {
         match self {
             Wire::V1 { cx, session, .. } => {
                 let mut fields = v1::ToolCallUpdateFields::new().title(title);
+                if let Some(raw) = raw_input {
+                    fields = fields.raw_input(raw);
+                }
                 if let Some(k) = kind.and_then(|k| serde_json::from_value(Value::String(k)).ok()) {
                     fields = fields.kind(Some(k));
                 }
@@ -827,8 +839,11 @@ impl Wire {
                         ),
                     ],
                 );
-                let has_subject = kind.is_some() || name.is_some();
+                let has_subject = kind.is_some() || name.is_some() || raw_input.is_some();
                 let mut tool_call = v2::ToolCallUpdate::new(format!("perm-{n}"));
+                if let Some(raw) = raw_input {
+                    tool_call = tool_call.raw_input(raw);
+                }
                 if let Some(name) = name {
                     tool_call = tool_call.name(name);
                 }

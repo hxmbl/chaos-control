@@ -15,9 +15,13 @@
 //! request is approved (VM, or a one-shot grant a human already gave for that
 //! exact request), else with its own decline ("not now") option and a `_meta`
 //! note that a request was sent. An approval becomes a one-shot grant: when the
-//! agent retries the same tool call (same title) in that channel, it goes
-//! through once. Agents can also ask ahead, and poll, through the chat tools
-//! `chat_request_permission` and `chat_permission_status`.
+//! agent retries the exact same tool call in that channel, it goes through
+//! once. "The same" is the request's key ([`request_key`]): the tool kind plus
+//! a SHA-256 of what the call would do, without its ids (STRM-572), so an
+//! approved `Edit files` on `a.rs` never lets an `Edit files` on `b.rs`
+//! through, and a retry with a new tool call id still matches. Agents can
+//! also ask ahead, and poll, through the chat tools `chat_request_permission`
+//! and `chat_permission_status`.
 //!
 //! Peer model: a declined or denied request is an answer, not a failure. It
 //! never turns an agent red or fails its turn.
@@ -36,13 +40,17 @@
 //! asked. Codex has no read requests to answer; its sessions start in a
 //! read-only sandbox instead (see `codex.rs`).
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt::{self, Write as _},
+    sync::Arc,
+};
 
 use futures::future::BoxFuture;
 use rmcp::model::Tool;
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::{
     engine::{CoreEvent, Effect, Engine, PostError},
@@ -159,6 +167,10 @@ pub struct PermissionRequest {
     pub used_at: Option<Millis>,
     /// A read-only tool call, allowed at once and kept for the log only.
     pub read_only: bool,
+    /// What exactly was asked for ([`request_key`]): grants and dedup match
+    /// on it. None for logged reads, auto-allowed chat tools, and requests
+    /// stored before migration 13.
+    pub request_key: Option<Arc<str>>,
 }
 
 /// How a request ended, as the permission log shows it.
@@ -207,6 +219,9 @@ pub struct PermissionAsk {
     /// The tool call only reads (ACP tool kind `read` or `search`). Reads are
     /// always allowed; a missing kind is not a read.
     pub read_only: bool,
+    /// The request's key ([`request_key`]), which a grant must match. None
+    /// falls back to a key on the title alone.
+    pub key: Option<Arc<str>>,
 }
 
 /// How the adapter must answer a native permission request, right away.
@@ -285,6 +300,83 @@ pub fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "read" | "search")
 }
 
+// ---------- request keys ----------
+
+/// The fields of an ACP tool call that differ between two calls of the same
+/// thing: its ids, its progress and what it produced. Left out of the key.
+pub const ACP_VOLATILE: &[&str] = &["toolCallId", "terminalId", "status", "rawOutput", "_meta"];
+
+/// What a request asks for, as a key a grant must match (STRM-572): the tool
+/// kind, a `:`, then the SHA-256 (hex) of `payload` as canonical JSON (object
+/// keys sorted at every depth, no whitespace). Strip the volatile fields
+/// first ([`without`]); a request id must never be part of the payload, so an
+/// approved call retried with a new id still matches.
+pub fn request_key(kind: &str, payload: &Value) -> Arc<str> {
+    let mut canon = String::new();
+    canonical(payload, &mut canon);
+    let digest = Sha256::digest(canon.as_bytes());
+    let kind = kind.trim();
+    let mut key = String::with_capacity(kind.len() + 65);
+    key.push_str(if kind.is_empty() { "none" } else { kind });
+    key.push(':');
+    for b in digest {
+        let _ = write!(key, "{b:02x}");
+    }
+    Arc::from(key)
+}
+
+fn canonical(v: &Value, out: &mut String) {
+    match v {
+        Value::Object(m) => {
+            let mut keys: Vec<&String> = m.keys().collect();
+            keys.sort();
+            out.push('{');
+            for (ix, k) in keys.into_iter().enumerate() {
+                if ix > 0 {
+                    out.push(',');
+                }
+                out.push_str(&Value::String(k.clone()).to_string());
+                out.push(':');
+                canonical(&m[k], out);
+            }
+            out.push('}');
+        }
+        Value::Array(a) => {
+            out.push('[');
+            for (ix, item) in a.iter().enumerate() {
+                if ix > 0 {
+                    out.push(',');
+                }
+                canonical(item, out);
+            }
+            out.push(']');
+        }
+        other => out.push_str(&other.to_string()),
+    }
+}
+
+/// `payload` without the `volatile` fields, at any depth, except inside a
+/// `rawInput`: that is the tool's own input, hashed exactly as given.
+pub fn without(payload: &Value, volatile: &[&str]) -> Value {
+    match payload {
+        Value::Object(m) => Value::Object(
+            m.iter()
+                .filter(|(k, _)| !volatile.contains(&k.as_str()))
+                .map(|(k, v)| {
+                    let v = if k == "rawInput" {
+                        v.clone()
+                    } else {
+                        without(v, volatile)
+                    };
+                    (k.clone(), v)
+                })
+                .collect(),
+        ),
+        Value::Array(a) => Value::Array(a.iter().map(|v| without(v, volatile)).collect()),
+        other => other.clone(),
+    }
+}
+
 pub(crate) fn permission_title(title: Option<&str>, name: Option<&str>) -> Arc<str> {
     let title = title.map(str::trim).filter(|s| !s.is_empty());
     let name = name.map(str::trim).filter(|s| !s.is_empty());
@@ -342,7 +434,7 @@ pub fn pick_decline(options: &[(OptionKind, &str)]) -> Option<usize> {
 // ---------- store ----------
 
 const COLS: &str = "id, agent_id, channel_id, batch_id, source, title, detail, reason, state, \
-asked_of, created_at, answered_by, answered_at, answer_note, used_at, read_only";
+asked_of, created_at, answered_by, answered_at, answer_note, used_at, read_only, request_key";
 
 fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
     let asked: String = r.get(9)?;
@@ -367,6 +459,7 @@ fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
         answer_note: r.get::<_, Option<String>>(13)?.map(Arc::from),
         used_at: r.get::<_, Option<i64>>(14)?.map(|t| t as Millis),
         read_only: r.get::<_, i64>(15)? != 0,
+        request_key: r.get::<_, Option<String>>(16)?.map(Arc::from),
     })
 }
 
@@ -383,6 +476,8 @@ pub struct NewRequest<'a> {
     pub asked_of: &'a [MemberId],
     pub now: Millis,
     pub read_only: bool,
+    /// See [`PermissionRequest::request_key`].
+    pub request_key: Option<&'a str>,
 }
 
 pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<PermissionRequest> {
@@ -395,8 +490,8 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
     c.execute(
         "INSERT INTO permission_requests
             (agent_id, channel_id, batch_id, source, title, detail, reason, state, asked_of,
-             created_at, read_only)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             created_at, read_only, request_key)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             r.agent.0,
             r.channel.0,
@@ -408,7 +503,8 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
             r.state.as_str(),
             asked,
             r.now as i64,
-            r.read_only as i64
+            r.read_only as i64,
+            r.request_key
         ],
     )?;
     let id = PermissionId(c.last_insert_rowid());
@@ -424,40 +520,40 @@ pub fn get(c: &Connection, id: PermissionId) -> rusqlite::Result<Option<Permissi
     .optional()
 }
 
-/// An approved request for exactly this (agent, channel, title) that has not
-/// been used yet: the one-shot grant a retried tool call consumes.
+/// An approved request for exactly this (agent, channel, request key) that
+/// has not been used yet: the one-shot grant a retried tool call consumes.
 pub fn unused_grant(
     c: &Connection,
     agent: MemberId,
     channel: ChannelId,
-    title: &str,
+    key: &str,
 ) -> rusqlite::Result<Option<PermissionId>> {
     c.query_row(
         "SELECT id FROM permission_requests
-         WHERE agent_id = ?1 AND channel_id = ?2 AND title = ?3
+         WHERE agent_id = ?1 AND channel_id = ?2 AND request_key = ?3
            AND state = 'approved' AND used_at IS NULL
          ORDER BY id LIMIT 1",
-        params![agent.0, channel.0, title],
+        params![agent.0, channel.0, key],
         |r| r.get(0).map(PermissionId),
     )
     .optional()
 }
 
-/// A still-pending request for the same thing, so asking twice never sends
-/// the humans two requests.
+/// A still-pending request with the same key, so asking twice for the same
+/// thing never sends the humans two requests.
 pub fn pending_for(
     c: &Connection,
     agent: MemberId,
     channel: ChannelId,
-    title: &str,
+    key: &str,
 ) -> rusqlite::Result<Option<PermissionRequest>> {
     c.query_row(
         &format!(
             "SELECT {COLS} FROM permission_requests
-             WHERE agent_id = ?1 AND channel_id = ?2 AND title = ?3 AND state = 'pending'
+             WHERE agent_id = ?1 AND channel_id = ?2 AND request_key = ?3 AND state = 'pending'
              ORDER BY id LIMIT 1"
         ),
-        params![agent.0, channel.0, title],
+        params![agent.0, channel.0, key],
         row,
     )
     .optional()
@@ -547,6 +643,7 @@ pub fn insert_read(
             asked_of: &[],
             now,
             read_only: true,
+            request_key: None,
         },
     )?;
     prune_reads(c, channel, READS_KEPT)?;
@@ -736,6 +833,7 @@ impl Engine {
             &ask.title,
             ask.detail.as_deref(),
             None,
+            ask.key.as_deref(),
         ) {
             Ok(r) => match r.state {
                 PermissionState::Approved | PermissionState::AutoApproved => {
@@ -780,6 +878,7 @@ impl Engine {
                     asked_of: &[],
                     now,
                     read_only: false,
+                    request_key: None,
                 },
             )
         })?;
@@ -795,7 +894,8 @@ impl Engine {
 
     /// Records a request and works out its state: auto-approved in a VM, the
     /// grant a human already gave (used up here), the same request already
-    /// pending, or a new pending request for the humans.
+    /// pending, or a new pending request for the humans. "The same" means the
+    /// same `key` ([`request_key`]); without one, a key on the title alone.
     #[allow(clippy::too_many_arguments)]
     pub fn ask_permission(
         &mut self,
@@ -807,9 +907,14 @@ impl Engine {
         title: &str,
         detail: Option<&str>,
         reason: Option<&str>,
+        key: Option<&str>,
     ) -> Result<PermissionRequest, PostError> {
         let title = title.trim();
         let title = if title.is_empty() { "a tool" } else { title };
+        let key: Arc<str> = match key {
+            Some(k) => Arc::from(k),
+            None => request_key("title", &json!(title)),
+        };
         let turn = match turn {
             Some(t) => Some(t),
             None => store::in_flight_batch(self.conn(), agent, channel)?.map(|b| b.id),
@@ -831,6 +936,7 @@ impl Engine {
                         asked_of: &[],
                         now,
                         read_only: false,
+                        request_key: Some(&*key),
                     },
                 )
             })?;
@@ -843,7 +949,7 @@ impl Engine {
                 .push(Effect::Event(CoreEvent::Permission(r.clone())));
             return Ok(r);
         }
-        if let Some(grant) = unused_grant(self.conn(), agent, channel, title)? {
+        if let Some(grant) = unused_grant(self.conn(), agent, channel, &key)? {
             if source == PermissionSource::ChatTool {
                 // Asking ahead for something already approved: still approved,
                 // and still unused until the tool call itself runs.
@@ -860,7 +966,7 @@ impl Engine {
                 .push(Effect::Event(CoreEvent::Permission(r.clone())));
             return Ok(r);
         }
-        if let Some(r) = pending_for(self.conn(), agent, channel, title)? {
+        if let Some(r) = pending_for(self.conn(), agent, channel, &key)? {
             return Ok(r);
         }
         let asked_of = self.route(channel, turn);
@@ -879,6 +985,7 @@ impl Engine {
                     asked_of: &asked_of,
                     now,
                     read_only: false,
+                    request_key: Some(&*key),
                 },
             )
         })?;
@@ -914,7 +1021,7 @@ impl Engine {
     /// A human approves or denies a pending request. The answer is posted as
     /// a system message and delivered to the agent as a wake (its next turn,
     /// right away if it is idle). An approval is a one-shot grant for the same
-    /// tool call in this channel.
+    /// request (same key) in this channel.
     pub fn answer_permission(
         &mut self,
         now: Millis,
@@ -1024,7 +1131,7 @@ pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<To
     vec![
         Tool::new(
             "chat_request_permission",
-            "Ask the humans for permission to do something, without blocking. Returns at once with status \"request_sent\" and a request_id (or \"approved\" if you run in your own VM): keep working or wait, your call. The answer arrives as a message in a later turn; chat_permission_status shows it too. If the thing is a tool call that needs approval, use its exact title as `action`: once approved, that call goes through once.",
+            "Ask the humans for permission to do something, without blocking. Returns at once with status \"request_sent\" and a request_id (or \"approved\" if you run in your own VM): keep working or wait, your call. The answer arrives as a message in a later turn; chat_permission_status shows it too. Asking again with the same `action` reuses the request. A tool call that needs approval is asked for by the call itself: once a human approves it, retry that exact call and it goes through once.",
             schema(
                 json!({"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "description": "What you want to do, e.g. the command or the tool call's title."},
@@ -1071,6 +1178,9 @@ pub fn call_tool(
                 .filter(|a| !a.is_empty())
                 .ok_or_else(|| ToolError("action is required".into()))?;
             let reason = args.get("reason").and_then(Value::as_str);
+            // Keyed on the action text: asking again for the same action
+            // finds the same request or grant.
+            let key = request_key("chat", &json!(action));
             let r = engine.ask_permission(
                 now,
                 scope.agent,
@@ -1080,6 +1190,7 @@ pub fn call_tool(
                 action,
                 None,
                 reason,
+                Some(&*key),
             )?;
             let mut v = view(engine.conn(), &r);
             let status = match r.state {
@@ -1151,6 +1262,58 @@ mod tests {
             Some(0)
         );
         assert_eq!(pick_decline(&[(OptionKind::AllowOnce, "Yes")]), None);
+    }
+
+    #[test]
+    fn request_key_is_the_kind_and_a_sha256_of_canonical_json() {
+        let k = request_key("edit", &json!({"b": 1, "a": [true, null, "x"]}));
+        let (kind, hash) = k.split_once(':').unwrap();
+        assert_eq!(kind, "edit");
+        assert_eq!(hash.len(), 64);
+        assert!(
+            hash.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        // Canonical: object keys sorted at every depth, no whitespace.
+        let expected: String = Sha256::digest(br#"{"a":[true,null,"x"],"b":1}"#)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hash, expected);
+        // Key order never matters.
+        let a = json!({"title": "Edit files", "rawInput": {"path": "a.rs", "mode": 1}});
+        let b: Value =
+            serde_json::from_str(r#"{"rawInput":{"mode":1,"path":"a.rs"},"title":"Edit files"}"#)
+                .unwrap();
+        assert_eq!(request_key("edit", &a), request_key("edit", &b));
+        // The kind is part of the key; an empty kind reads "none".
+        assert_ne!(request_key("edit", &a), request_key("execute", &a));
+        assert!(request_key(" ", &a).starts_with("none:"));
+    }
+
+    #[test]
+    fn request_keys_ignore_ids_and_progress_but_not_what_the_call_does() {
+        let call = |id: &str, status: &str, path: &str| {
+            json!({
+                "toolCallId": id,
+                "status": status,
+                "title": "Edit files",
+                "kind": "edit",
+                "rawInput": {"path": path, "status": "keep me"},
+                "rawOutput": {"ok": id},
+                "content": [{"type": "terminal", "terminalId": id}],
+                "_meta": {"seen": id}
+            })
+        };
+        let key = |v: &Value| request_key("edit", &without(v, ACP_VOLATILE));
+        let first = key(&call("call-1", "pending", "a.rs"));
+        assert_eq!(first, key(&call("call-2", "in_progress", "a.rs")));
+        assert_ne!(first, key(&call("call-1", "pending", "b.rs")));
+        // Inside rawInput nothing is stripped: it is the tool's own input.
+        let stripped = without(&call("x", "pending", "a.rs"), ACP_VOLATILE);
+        assert_eq!(stripped["rawInput"]["status"], json!("keep me"));
+        assert!(stripped.get("toolCallId").is_none() && stripped.get("_meta").is_none());
+        assert_eq!(stripped["content"][0], json!({"type": "terminal"}));
     }
 
     #[test]
