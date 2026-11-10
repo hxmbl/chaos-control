@@ -48,6 +48,30 @@ const CORE_AGENT_BASE: u32 = 100_000;
 const CORE_CHANNEL_BASE: u32 = 0x2000_0000;
 const CORE_MESSAGE_BASE: u32 = 0x4000_0000;
 
+/// Shown in the composer where sending is off (see [`SendRoute::Unwired`]).
+pub const UNWIRED_NOTE: &str = "Only #main is live for now";
+
+/// Where a composer message in the selected channel goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SendRoute {
+    /// Core's channel: posted to core, shown when core reports it back.
+    Core,
+    /// Core is attached but this channel isn't wired to it: nothing would
+    /// store or deliver the message, so sending is off (no local echo).
+    Unwired,
+    /// No core (sample data): a local echo.
+    Local,
+}
+
+/// `core_channel` is the app channel core is wired to, if core is attached.
+pub fn send_route(core_channel: Option<Id>, selected: Id) -> SendRoute {
+    match core_channel {
+        Some(channel) if channel == selected => SendRoute::Core,
+        Some(_) => SendRoute::Unwired,
+        None => SendRoute::Local,
+    }
+}
+
 pub enum StoreEvent {
     /// The selected channel changed.
     Selected,
@@ -340,6 +364,11 @@ impl ChatStore {
             .unwrap_or(&self.workspace.channels[0])
     }
 
+    /// Where a message sent in the selected channel would go.
+    pub fn send_route(&self) -> SendRoute {
+        send_route(self.core.as_ref().map(|a| a.channel), self.selected)
+    }
+
     pub fn log(&self, channel: Id) -> Option<&ChannelLog> {
         self.logs.get(&channel)
     }
@@ -560,8 +589,9 @@ impl ChatStore {
     }
 
     /// Sends a composer message. #main goes through core when it is attached
-    /// (the message shows up when core reports it back); everything else is a
-    /// local echo until there is somewhere to send to.
+    /// (the message shows up when core reports it back). Other channels aren't
+    /// wired to core yet, so nothing is sent there; without core (sample
+    /// data) it is a local echo.
     pub fn post_from_human(
         &mut self,
         body: &str,
@@ -570,6 +600,9 @@ impl ChatStore {
     ) {
         let body = body.trim();
         if body.is_empty() {
+            return;
+        }
+        if self.send_route() == SendRoute::Unwired {
             return;
         }
         if let Some(attached) = &self.core
@@ -2021,6 +2054,16 @@ fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_cores_channel_sends_while_core_is_attached() {
+        let (main, design) = (Id(1), Id(2));
+        assert_eq!(send_route(Some(main), main), SendRoute::Core);
+        assert_eq!(send_route(Some(main), design), SendRoute::Unwired);
+        // Sample data, no core: every channel echoes locally.
+        assert_eq!(send_route(None, main), SendRoute::Local);
+        assert_eq!(send_route(None, design), SendRoute::Local);
+    }
 
     #[test]
     fn only_an_agent_removed_from_this_project_reads_as_previous_agent() {
