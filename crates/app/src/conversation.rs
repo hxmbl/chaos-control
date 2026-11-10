@@ -527,9 +527,9 @@ impl Conversation {
     }
 }
 
-/// A message's text as the chat draws it: a mention of an agent that is no
-/// longer a member reads as `@previous-agent`, like its author label
-/// (STRM-561). The stored text, which Copy and Reply use, never changes.
+/// A message's text as the chat draws it: a mention of an agent that was in
+/// this room and has been removed reads as `@previous-agent`, like its
+/// author label (STRM-561); any other mention is drawn as typed. The stored text, which Copy and Reply use, never changes.
 fn shown_body(store: &ChatStore, body: &Arc<str>) -> SharedString {
     match mentions::rewrite_former_mentions(body, |token| store.is_former_agent_mention(token)) {
         Cow::Borrowed(_) => SharedString::from(body.clone()),

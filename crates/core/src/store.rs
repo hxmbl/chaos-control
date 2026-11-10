@@ -914,19 +914,39 @@ pub fn agent_member_ids(c: &Connection) -> Result<Vec<MemberId>> {
     stmt.query_map([], |r| Ok(MemberId(r.get(0)?)))?.collect()
 }
 
-/// Every `@token` that has named an agent member, current or removed: each
-/// agent's handle, then its nicknames, as `(member, token)` in member order.
-/// The chat uses it to show a mention of an agent that has since left as
-/// `@previous-agent` (STRM-561), the way its messages' author reads.
-pub fn agent_mention_tokens(c: &Connection) -> Result<Vec<(MemberId, Arc<str>)>> {
+/// Every `@token` (handle, then nicknames) of an agent that was a member of
+/// `channel` and has since been removed from it, as `(member, token)` in
+/// member order. The chat draws a mention of one as `@previous-agent`
+/// (STRM-561), the way its messages' author reads.
+///
+/// Membership rows are deleted on removal (see `roster::leave_project`), so
+/// "was a member here" comes from what membership leaves behind: the cursor
+/// `join` writes for every agent that joins the channel (never deleted), or
+/// a message the agent authored in it. An agent that was never in this
+/// channel, however well core knows it from another, is not listed: a
+/// mention of it stays as typed and reaches nobody.
+pub fn former_agent_mention_tokens(
+    c: &Connection,
+    channel: ChannelId,
+) -> Result<Vec<(MemberId, Arc<str>)>> {
     let mut stmt = c.prepare_cached(
-        "SELECT id, handle, 0, 0 FROM members WHERE kind = 'agent'
+        "WITH former(id) AS (
+             SELECT m.id FROM members m
+             WHERE m.kind = 'agent'
+               AND NOT EXISTS (SELECT 1 FROM memberships s
+                               WHERE s.channel_id = ?1 AND s.member_id = m.id)
+               AND (EXISTS (SELECT 1 FROM cursors k
+                            WHERE k.channel_id = ?1 AND k.agent_id = m.id)
+                    OR EXISTS (SELECT 1 FROM messages g
+                               WHERE g.channel_id = ?1 AND g.author_id = m.id))
+         )
+         SELECT m.id, m.handle, 0, 0, 0 FROM members m JOIN former f ON f.id = m.id
          UNION ALL
-         SELECT n.member_id, n.nickname, 1, n.added_at FROM member_nicknames n
-         JOIN members m ON m.id = n.member_id WHERE m.kind = 'agent'
-         ORDER BY 1, 3, 4",
+         SELECT n.member_id, n.nickname, 1, n.added_at, n.rowid FROM member_nicknames n
+         JOIN former f ON f.id = n.member_id
+         ORDER BY 1, 3, 4, 5",
     )?;
-    stmt.query_map([], |r| {
+    stmt.query_map([channel.0], |r| {
         Ok((MemberId(r.get(0)?), Arc::from(r.get::<_, String>(1)?)))
     })?
     .collect()
@@ -1897,22 +1917,49 @@ mod tests {
     }
 
     #[test]
-    fn agent_mention_tokens_are_handles_then_nicknames() {
-        let (s, _ch, hx, bot) = setup();
+    fn former_mention_tokens_are_only_agents_removed_from_this_channel() {
+        let (mut s, ch, hx, bot) = setup();
+        let (gone, elsewhere) = s
+            .tx::<_, rusqlite::Error>(|c| {
+                let p = pid(P1);
+                add_nickname(c, bot.id, "Cody", 1)?;
+                add_nickname(c, hx.id, "boss", 2)?;
+                // In this channel, then removed from the project.
+                let gone = ensure_member(c, MemberKind::Agent, "gpt", "GPT")?;
+                join_project(c, &p, gone.id, 0)?;
+                join(c, ch.id, &gone, 20, 0)?;
+                add_nickname(c, gone.id, "g", 3)?;
+                add_nickname(c, gone.id, "jeepy", 4)?;
+                crate::roster::leave_project(c, &p, gone.id, 5)?;
+                // Only ever in another project's channel.
+                let q = ensure_project(c, &pid(P2), "Elsewhere", None, 0)?;
+                let elsewhere = ensure_channel(c, &q.id, "main", 0)?;
+                let other = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
+                join_project(c, &q.id, other.id, 0)?;
+                join(c, elsewhere.id, &other, 20, 0)?;
+                add_nickname(c, other.id, "cx", 6)?;
+                // Known to core, never in any channel.
+                ensure_member(c, MemberKind::Agent, "devin", "Devin")?;
+                Ok((gone, elsewhere.id))
+            })
+            .unwrap();
         let c = s.conn();
-        add_nickname(c, bot.id, "Cody", 1).unwrap();
-        add_nickname(c, hx.id, "boss", 2).unwrap();
-        let cx = ensure_member(c, MemberKind::Agent, "codex", "Codex").unwrap();
-        add_nickname(c, cx.id, "cx", 3).unwrap();
-        // Humans' handles and nicknames are never in it.
+        // Current members (bot, hx), the other project's agent and the
+        // stranger are not in it; humans never are.
         assert_eq!(
-            agent_mention_tokens(c).unwrap(),
+            former_agent_mention_tokens(c, ch.id).unwrap(),
             vec![
-                (bot.id, Arc::<str>::from("claude")),
-                (bot.id, Arc::from("Cody")),
-                (cx.id, Arc::from("codex")),
-                (cx.id, Arc::from("cx")),
+                (gone.id, Arc::<str>::from("gpt")),
+                (gone.id, Arc::from("g")),
+                (gone.id, Arc::from("jeepy")),
             ]
+        );
+        // The other project's channel lists nothing either: codex is still
+        // a member there, and the stranger was never in a channel.
+        assert!(
+            former_agent_mention_tokens(c, elsewhere)
+                .unwrap()
+                .is_empty()
         );
     }
 
