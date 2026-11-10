@@ -618,6 +618,15 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// Every `@token` that has named an agent member, current or removed:
+    /// handles and nicknames as `(member, token)` (see
+    /// [`crate::store::agent_mention_tokens`]).
+    pub async fn agent_mention_tokens(&self) -> Result<Vec<(MemberId, Arc<str>)>, String> {
+        self.with_engine(|e, _| crate::store::agent_mention_tokens(e.conn()))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn post(
         &self,
         author: MemberId,

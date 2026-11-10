@@ -3,6 +3,7 @@
 //! This crate has no UI dependencies so it stays cheap to compile and easy to test.
 //! Strings are `Arc<str>` so the UI can turn them into `SharedString`s without copying.
 
+pub mod mentions;
 pub mod pane;
 pub mod permissions;
 mod sample;

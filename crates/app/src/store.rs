@@ -151,6 +151,10 @@ struct Attached {
     /// Every agent member core knows, current or removed: their messages
     /// read as an agent's ("Previous agent" once they're gone).
     agent_ids: HashSet<ct::MemberId>,
+    /// Every `@token` (handle or nickname) that has named an agent member,
+    /// current or removed, so a mention of one that has left reads as
+    /// `@previous-agent` (STRM-561).
+    agent_tokens: Vec<(ct::MemberId, Arc<str>)>,
     /// The project's `ping_answer_reactions` as core stores it (`None`: the
     /// default), and the last error from saving it.
     ping_answers: Option<Vec<String>>,
@@ -658,6 +662,18 @@ impl ChatStore {
                     return;
                 }
             }
+            // And every @handle or @nickname that named one, so a mention of
+            // an agent that has left reads as @previous-agent.
+            if let Ok(tokens) = core.agent_mention_tokens().await {
+                let ok = this.update(cx, |store, _| {
+                    if let Some(a) = &mut store.core {
+                        a.agent_tokens = tokens;
+                    }
+                });
+                if ok.is_err() {
+                    return;
+                }
+            }
             match core.history(main, 200).await {
                 Ok(history) => {
                     let after = history.first().map_or(0, |m| m.seq.saturating_sub(1));
@@ -751,6 +767,7 @@ impl ChatStore {
             stale,
             failed_at: HashMap::new(),
             agent_ids: HashSet::new(),
+            agent_tokens: Vec::new(),
             ping_answers: None,
             ping_answers_error: None,
             member_ping_answers: HashMap::new(),
@@ -1051,8 +1068,20 @@ impl ChatStore {
         };
         let removed = attached.link.agents.remove(ix);
         let member = removed.member;
-        // Its messages stay, and read as a previous agent's.
+        // Its messages stay, and read as a previous agent's; so do mentions
+        // of it, by handle or by a nickname it got this session.
         attached.agent_ids.insert(member);
+        let mut gone = vec![removed.handle.clone()];
+        gone.extend(attached.nicknames.get(&member).cloned().unwrap_or_default());
+        for token in gone {
+            if !attached
+                .agent_tokens
+                .iter()
+                .any(|(m, t)| *m == member && t.eq_ignore_ascii_case(&token))
+            {
+                attached.agent_tokens.push((member, token));
+            }
+        }
         if let Some(harness) = removed.harness_id.clone() {
             let model = removed.model.clone();
             agents_file::in_background(attached.link.agents_path.clone(), move |p| {
@@ -1119,6 +1148,28 @@ impl ChatStore {
             .find(|a| agent_id(a.member) == id)
             .and_then(|a| attached.nicknames.get(&a.member).cloned())
             .unwrap_or_default()
+    }
+
+    /// True when `@token` (as typed, without `@`) named an agent that is no
+    /// longer a member here: the chat draws it as `@previous-agent`
+    /// (STRM-561). A linked agent's handle or nickname never is, nor is a
+    /// token no agent ever had (a human, `@everyone`, a typo).
+    pub fn is_former_agent_mention(&self, token: &str) -> bool {
+        let Some(attached) = &self.core else {
+            return false;
+        };
+        let agents = &attached.link.agents;
+        former_agent_mention(
+            token,
+            |m| agents.iter().any(|a| a.member == m),
+            agents.iter().map(|a| &a.handle).chain(
+                agents
+                    .iter()
+                    .filter_map(|a| attached.nicknames.get(&a.member))
+                    .flatten(),
+            ),
+            &attached.agent_tokens,
+        )
     }
 
     /// Every linked agent's nicknames, for Settings. `None` without core.
@@ -1905,6 +1956,23 @@ fn short_reason(e: &str) -> Arc<str> {
     Arc::from(e.chars().take(80).collect::<String>())
 }
 
+/// See [`ChatStore::is_former_agent_mention`]: `token` belongs to some agent
+/// in `known` (`(member, handle or nickname)`, current or removed) that is
+/// not `linked`, and isn't one of the `current` linked agents' tokens.
+fn former_agent_mention<'a>(
+    token: &str,
+    linked: impl Fn(ct::MemberId) -> bool,
+    mut current: impl Iterator<Item = &'a Arc<str>>,
+    known: &[(ct::MemberId, Arc<str>)],
+) -> bool {
+    if current.any(|t| t.eq_ignore_ascii_case(token)) {
+        return false;
+    }
+    known
+        .iter()
+        .any(|(m, t)| !linked(*m) && t.eq_ignore_ascii_case(token))
+}
+
 fn agent_id(member: ct::MemberId) -> Id {
     Id(CORE_AGENT_BASE.saturating_add(member.0 as u32))
 }
@@ -1922,6 +1990,35 @@ fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_former_agents_tokens_read_as_previous_agent() {
+        let (codex, claude) = (ct::MemberId(1), ct::MemberId(2));
+        let known = vec![
+            (codex, Arc::<str>::from("codex")),
+            (codex, Arc::from("cody")),
+            (claude, Arc::from("claude")),
+            (claude, Arc::from("cx")),
+        ];
+        // codex was removed; claude is linked, with the nickname "cl" it got
+        // this session (not in `known` yet).
+        let current: Vec<Arc<str>> = vec![Arc::from("claude"), Arc::from("cl")];
+        let former =
+            |token: &str| former_agent_mention(token, |m| m == claude, current.iter(), &known);
+        assert!(former("codex"));
+        assert!(former("CODY"));
+        assert!(!former("claude"));
+        assert!(!former("cl"));
+        // A nickname claude has since dropped still names claude, a member.
+        assert!(!former("cx"));
+        // Nobody's, or not an agent's.
+        assert!(!former("everyone"));
+        assert!(!former("hx"));
+        assert_eq!(
+            model::mentions::rewrite_former_mentions("@codex, @Cody and @claude?", former),
+            "@previous-agent, @previous-agent and @claude?"
+        );
+    }
 
     #[test]
     fn nickname_input_adds_and_removes() {

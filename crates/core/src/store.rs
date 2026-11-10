@@ -914,6 +914,24 @@ pub fn agent_member_ids(c: &Connection) -> Result<Vec<MemberId>> {
     stmt.query_map([], |r| Ok(MemberId(r.get(0)?)))?.collect()
 }
 
+/// Every `@token` that has named an agent member, current or removed: each
+/// agent's handle, then its nicknames, as `(member, token)` in member order.
+/// The chat uses it to show a mention of an agent that has since left as
+/// `@previous-agent` (STRM-561), the way its messages' author reads.
+pub fn agent_mention_tokens(c: &Connection) -> Result<Vec<(MemberId, Arc<str>)>> {
+    let mut stmt = c.prepare_cached(
+        "SELECT id, handle, 0, 0 FROM members WHERE kind = 'agent'
+         UNION ALL
+         SELECT n.member_id, n.nickname, 1, n.added_at FROM member_nicknames n
+         JOIN members m ON m.id = n.member_id WHERE m.kind = 'agent'
+         ORDER BY 1, 3, 4",
+    )?;
+    stmt.query_map([], |r| {
+        Ok((MemberId(r.get(0)?), Arc::from(r.get::<_, String>(1)?)))
+    })?
+    .collect()
+}
+
 pub fn members_of(c: &Connection, channel: ChannelId) -> Result<Vec<Member>> {
     let mut stmt = c.prepare_cached(
         "SELECT m.id, m.kind, m.handle, m.name FROM members m
@@ -1876,6 +1894,26 @@ mod tests {
         assert!(remove_nickname(c, bot.id, "cODY").unwrap());
         assert!(!remove_nickname(c, bot.id, "cody").unwrap());
         assert!(nicknames_of(c, bot.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn agent_mention_tokens_are_handles_then_nicknames() {
+        let (s, _ch, hx, bot) = setup();
+        let c = s.conn();
+        add_nickname(c, bot.id, "Cody", 1).unwrap();
+        add_nickname(c, hx.id, "boss", 2).unwrap();
+        let cx = ensure_member(c, MemberKind::Agent, "codex", "Codex").unwrap();
+        add_nickname(c, cx.id, "cx", 3).unwrap();
+        // Humans' handles and nicknames are never in it.
+        assert_eq!(
+            agent_mention_tokens(c).unwrap(),
+            vec![
+                (bot.id, Arc::<str>::from("claude")),
+                (bot.id, Arc::from("Cody")),
+                (cx.id, Arc::from("codex")),
+                (cx.id, Arc::from("cx")),
+            ]
+        );
     }
 
     fn msg<'a>(ch: ChannelId, author: MemberId, body: &'a str) -> NewMessage<'a> {

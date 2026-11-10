@@ -6,11 +6,13 @@
 //! Messages arrive whole; appending splices rows onto the end of the list state
 //! without touching the heights already measured.
 
+use std::{borrow::Cow, sync::Arc};
+
 use gpui::{
     AnyElement, Context, ElementId, Entity, ListAlignment, ListOffset, ListState, SharedString,
     Subscription, WeakEntity, Window, div, list, prelude::*, px,
 };
-use model::{Author, Id, PaneContent, pane};
+use model::{Author, Id, PaneContent, mentions, pane};
 use ui::{
     ActiveTheme, Elevation, Ellipsis, IconName, Tooltip, TypeStyleExt, brand_icon, icon,
     tokens::{icon as icons, radius, size, space, text},
@@ -263,7 +265,7 @@ impl Conversation {
                                             .min_w_0()
                                             .whitespace_normal()
                                             .text_color(t.ink_soft)
-                                            .child(SharedString::from(message.body.clone())),
+                                            .child(shown_body(store, &message.body)),
                                     )
                                 }
                             })
@@ -462,7 +464,7 @@ impl Conversation {
     /// full in the pane (see `model::pane::is_long` for the threshold).
     fn render_collapsed(&self, ix: usize, message: &model::Message, cx: &gpui::App) -> AnyElement {
         let t = *cx.theme();
-        let preview = pane::preview(&message.body);
+        let preview = pane::preview(&shown_body(self.store.read(cx), &message.body));
         let lines = preview.lines().map(|line| {
             div()
                 .w_full()
@@ -522,6 +524,16 @@ impl Conversation {
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// A message's text as the chat draws it: a mention of an agent that is no
+/// longer a member reads as `@previous-agent`, like its author label
+/// (STRM-561). The stored text, which Copy and Reply use, never changes.
+fn shown_body(store: &ChatStore, body: &Arc<str>) -> SharedString {
+    match mentions::rewrite_former_mentions(body, |token| store.is_former_agent_mention(token)) {
+        Cow::Borrowed(_) => SharedString::from(body.clone()),
+        Cow::Owned(shown) => SharedString::from(shown),
     }
 }
 
