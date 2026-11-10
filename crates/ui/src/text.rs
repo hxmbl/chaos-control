@@ -18,7 +18,15 @@ use gpui::{
 /// colour). This element measures the full line and cuts it once, in prepaint,
 /// against the width it was actually given.
 pub fn truncated(text: impl Into<SharedString>) -> Truncated {
-    Truncated { text: text.into() }
+    let text = text.into();
+    // One line: a message with line breaks (the composer allows them) reads
+    // as spaces here. GPUI's line shaping must not see a `\n`.
+    let text = if text.contains(['\n', '\r']) {
+        text.replace(['\r', '\n'], " ").into()
+    } else {
+        text
+    };
+    Truncated { text }
 }
 
 pub struct Truncated {

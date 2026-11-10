@@ -19,13 +19,19 @@ pub struct Composer {
     _subscriptions: [Subscription; 2],
 }
 
+/// Rows the composer grows to before it scrolls.
+const MAX_LINES: usize = 8;
+
 fn placeholder(store: &ChatStore) -> String {
     format!("Message #{}", store.selected_channel().name)
 }
 
 impl Composer {
     pub fn new(store: Entity<ChatStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| TextInput::new(placeholder(store.read(cx)), cx));
+        // Enter sends, shift-enter starts a new line, and the field grows with
+        // its text (see `TextInput::multiline`).
+        let input =
+            cx.new(|cx| TextInput::new(placeholder(store.read(cx)), cx).multiline(MAX_LINES));
         window.focus(&input.focus_handle(cx));
         let subscriptions = [
             cx.subscribe(&input, |this, _, event, cx| match event {

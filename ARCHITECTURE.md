@@ -533,11 +533,16 @@ macOS and ctrl elsewhere.
 | `escape` | Clear the query; on an empty field, close | Search |
 | `escape` | Close the pane | Pane |
 | `enter` | Send | Composer |
+| `shift-enter` | New line | Composer |
+| `up` / `down` | Move between lines (`shift-` selects) | Composer |
 | `cmd/ctrl-Q` | Quit | Anywhere |
 
 Text editing in the composer and search field (`ui::TextInput`; GPUI 0.2.2
-ships no text field, only an example, so these are ours). Single-line fields,
-so "line" means the whole text.
+ships no text field, only an example, so these are ours). Search is a
+single-line field. The composer is multi-line (`TextInput::multiline`): it
+wraps, grows with its text up to 8 rows and then scrolls, and pasted text keeps
+its line breaks (search turns them into spaces). "Start/end" below means the
+whole text in both.
 
 | Action | macOS | Linux / Windows |
 | --- | --- | --- |
