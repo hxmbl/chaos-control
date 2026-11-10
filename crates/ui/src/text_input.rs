@@ -72,7 +72,7 @@ actions!(
 
 const CONTEXT: &str = "TextInput";
 /// The key context a multi-line field adds, so line keys only apply there.
-const MULTILINE_KEY_CONTEXT: &str = "TextInput multiline";
+pub const MULTILINE_KEY_CONTEXT: &str = "TextInput multiline";
 const MULTILINE: &str = "TextInput && multiline";
 
 /// The editing keys people expect in any text field on their OS. `secondary`
@@ -85,7 +85,9 @@ pub(crate) fn bind_keys(cx: &mut App) {
     cx.bind_keys(bindings());
 }
 
-fn bindings() -> Vec<KeyBinding> {
+/// Every text field binding, for `bind_keys` and for keymap tests (here and
+/// in views that wrap a field, like the composer).
+pub fn bindings() -> Vec<KeyBinding> {
     let ctx = Some(CONTEXT);
     let multiline = Some(MULTILINE);
     // Everywhere.
@@ -372,8 +374,22 @@ impl TextInput {
         self.select_to(self.content.len(), cx);
     }
 
+    /// Enter. While an IME composition is open (marked text, e.g. pinyin or
+    /// kana being converted), Enter confirms it and does not submit.
+    ///
+    /// On macOS GPUI hands keys to the IME first while there is marked text
+    /// (`marked_text_range`), and Linux IMEs grab the keyboard while
+    /// pre-editing, so the IME normally commits and Enter never gets here.
+    /// This guards the case where it does anyway: the composed text is kept
+    /// as typed and the message waits for the next Enter.
     fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
-        cx.emit(TextInputEvent::Submit);
+        match enter(self.marked_range.is_some()) {
+            Enter::ConfirmComposition => {
+                self.marked_range = None;
+                cx.notify();
+            }
+            Enter::Submit => cx.emit(TextInputEvent::Submit),
+        }
     }
 
     /// Shift-enter in a multi-line field. Single-line fields never get it (the
@@ -930,6 +946,22 @@ struct MultiPaint {
 /// The width a multi-line field wraps at: its own, less room for the caret.
 fn wrap_width(width: Pixels) -> Pixels {
     (width - px(CARET_WIDTH)).max(px(1.))
+}
+
+/// What Enter does in a text field.
+#[derive(Debug, PartialEq, Eq)]
+enum Enter {
+    /// An IME composition is open: commit it, don't submit.
+    ConfirmComposition,
+    Submit,
+}
+
+fn enter(composing: bool) -> Enter {
+    if composing {
+        Enter::ConfirmComposition
+    } else {
+        Enter::Submit
+    }
 }
 
 /// The style runs for `run`'s text, with the IME's marked range underlined.
@@ -1656,6 +1688,19 @@ mod tests {
             action_for("shift-enter", MULTILINE_KEY_CONTEXT),
             Some(Newline.name())
         );
+    }
+
+    #[test]
+    fn enter_confirms_an_ime_composition_instead_of_submitting() {
+        assert_eq!(enter(true), Enter::ConfirmComposition);
+        assert_eq!(enter(false), Enter::Submit);
+    }
+
+    #[test]
+    fn esc_is_left_to_the_view_around_the_field() {
+        // The composer (cancel reply) and search (dismiss) bind it themselves.
+        assert_eq!(action_for("escape", MULTILINE_KEY_CONTEXT), None);
+        assert_eq!(action_for("escape", CONTEXT), None);
     }
 
     #[test]

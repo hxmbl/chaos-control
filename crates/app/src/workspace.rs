@@ -36,8 +36,28 @@ const SIDE_RADIUS: Pixels = radius::XL;
 /// The conversation and composer widen with the window between these widths.
 const COLUMN_MIN: Pixels = px(720.);
 const COLUMN_MAX: Pixels = px(960.);
-/// Height kept clear under the conversation for the floating composer.
-const COMPOSER_CLEARANCE: Pixels = px(112.);
+/// The composer's height with one line and no reply chip: borders, padding,
+/// one 22px line of text and the 32px button row (see `composer.rs`). Used
+/// until the composer has been measured.
+const COMPOSER_ONE_LINE: Pixels = px(82.);
+/// Gap between the newest message and the top of the composer.
+const COMPOSER_GAP: Pixels = px(18.);
+/// Height changes smaller than this are layout jitter, not a resize.
+const CLEARANCE_EPSILON: Pixels = px(0.5);
+
+/// Height kept clear under the conversation (and the pane) for the floating
+/// composer: the composer itself, the inset under it and a small gap. Follows
+/// the composer as it grows with its text or shows a reply chip, so a tall
+/// composer never covers the newest messages (STRM-574). A one-line composer
+/// gives the 112px the clearance used to be fixed at.
+fn composer_clearance(composer_height: Pixels) -> Pixels {
+    composer_height.max(COMPOSER_ONE_LINE) + SIDE_INSET + COMPOSER_GAP
+}
+
+/// Whether a newly measured composer height should move the clearance.
+fn composer_height_changed(old: Pixels, new: Pixels) -> bool {
+    (new - old).abs() > CLEARANCE_EPSILON
+}
 pub const TITLEBAR_HEIGHT: Pixels = px(52.);
 
 /// Where the centre column goes: left and right padding plus its maximum width.
@@ -68,6 +88,9 @@ pub struct Workspace {
     model_picker: Entity<ModelPicker>,
     conversation: Entity<Conversation>,
     composer: Entity<Composer>,
+    /// The composer's height on the last paint, which sets the clearance
+    /// under the conversation (see [`composer_clearance`]).
+    composer_height: Pixels,
     /// Tracks keyboard focus anywhere inside each sidebar, so a peek holds
     /// open while the user is typing or tabbing in it.
     side_focus: [FocusHandle; 2],
@@ -194,6 +217,7 @@ impl Workspace {
             conversation: cx.new(|cx| Conversation::new(store.clone(), pane.clone(), cx)),
             pane,
             composer,
+            composer_height: COMPOSER_ONE_LINE,
             side_focus,
             _subscriptions: [
                 appearance,
@@ -235,6 +259,7 @@ impl Render for Workspace {
         let (pad_l, pad_r, column_w) = centre_column(viewport.width, left_space, right_space);
 
         let decorations = window.window_decorations();
+        let clearance = composer_clearance(self.composer_height);
 
         div()
             .id("workspace")
@@ -281,7 +306,9 @@ impl Render for Workspace {
                             .inset_0()
                             .pl(pad_l)
                             .pr(pad_r)
-                            .pb(COMPOSER_CLEARANCE)
+                            // Bottom-aligned list: when it was at the newest
+                            // message it stays there as this changes.
+                            .pb(clearance)
                             .flex()
                             .justify_center()
                             .child(
@@ -302,7 +329,14 @@ impl Render for Workspace {
                             .pr(pad_r)
                             .flex()
                             .justify_center()
-                            .child(div().w_full().max_w(column_w).child(self.composer.clone())),
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .max_w(column_w)
+                                    .child(self.composer.clone())
+                                    .child(self.composer_measure(cx)),
+                            ),
                     )
                     // The pane: between the docked sidebars, under the
                     // titlebar, above the composer. Peeking sidebars (below)
@@ -391,9 +425,40 @@ impl Workspace {
                 .top_0()
                 .left(left)
                 .right(right)
-                .bottom(COMPOSER_CLEARANCE)
+                .bottom(composer_clearance(self.composer_height))
                 .child(pane),
         )
+    }
+
+    /// An invisible canvas laid over the composer that reads its height on
+    /// every frame. When the height changes (more lines, a reply chip), the
+    /// workspace re-renders on the next frame with the new clearance.
+    fn composer_measure(&self, cx: &Context<Self>) -> impl IntoElement {
+        let workspace = cx.entity().downgrade();
+        let current = self.composer_height;
+        canvas(
+            move |bounds, window, cx| {
+                let height = bounds.size.height;
+                if composer_height_changed(current, height) {
+                    // Views can't be invalidated mid-draw, so apply it after.
+                    window.defer(cx, move |_, cx| {
+                        workspace
+                            .update(cx, |this, cx| {
+                                if composer_height_changed(this.composer_height, height) {
+                                    this.composer_height = height;
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
     }
 
     /// One sidebar, docked or peeking. A peek floats over the chat with a
@@ -519,6 +584,33 @@ fn resize_handles() -> impl Iterator<Item = gpui::AnyElement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_line_composer_keeps_the_old_clearance() {
+        assert_eq!(composer_clearance(COMPOSER_ONE_LINE), px(112.));
+        // Before the first measure (or a zero-height glitch) it never shrinks
+        // below the one-line clearance.
+        assert_eq!(composer_clearance(px(0.)), px(112.));
+    }
+
+    #[test]
+    fn the_clearance_follows_a_growing_or_shrinking_composer() {
+        let line = px(22.);
+        let four_lines = composer_clearance(COMPOSER_ONE_LINE + line * 3.);
+        assert_eq!(four_lines, px(112.) + line * 3.);
+        // A reply chip (about 34px) adds its height too.
+        let with_reply = composer_clearance(COMPOSER_ONE_LINE + px(34.));
+        assert_eq!(with_reply, px(146.));
+        // Shrinking back to one line gives the old clearance again.
+        assert_eq!(composer_clearance(COMPOSER_ONE_LINE), px(112.));
+    }
+
+    #[test]
+    fn sub_pixel_jitter_does_not_move_the_clearance() {
+        assert!(!composer_height_changed(px(82.), px(82.3)));
+        assert!(composer_height_changed(px(82.), px(104.)));
+        assert!(composer_height_changed(px(104.), px(82.)));
+    }
 
     #[test]
     fn column_centres_when_there_is_room() {

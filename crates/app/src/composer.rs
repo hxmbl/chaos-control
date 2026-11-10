@@ -1,7 +1,10 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
-use gpui::{Context, Entity, Focusable, SharedString, Subscription, Window, div, prelude::*};
+use gpui::{
+    Context, Entity, Focusable, KeyBinding, SharedString, Subscription, Window, actions, div,
+    prelude::*,
+};
 use model::{ReplyRef, pane::author_name};
 use ui::{
     ActiveTheme, Elevation, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, TypeStyleExt,
@@ -11,6 +14,48 @@ use ui::{
 };
 
 use crate::store::{ChatStore, SendRoute, StoreEvent, UNWIRED_NOTE};
+
+actions!(composer, [Cancel]);
+
+/// Key context of the composer, around its text field.
+pub const KEY_CONTEXT: &str = "Composer";
+
+/// The composer's own keys. Enter and shift-enter are the text field's (see
+/// `ui::TextInput::multiline`); Esc backs out of whatever the composer is in
+/// the middle of, never the typed text.
+pub fn bindings() -> Vec<KeyBinding> {
+    vec![KeyBinding::new("escape", Cancel, Some(KEY_CONTEXT))]
+}
+
+/// What Esc does in the composer, innermost first.
+#[derive(Debug, PartialEq, Eq)]
+enum Escape {
+    /// Close an open suggestion popup (@-mentions) and keep the reply.
+    DismissSuggestions,
+    /// Drop the reply reference. The typed text stays.
+    CancelReply,
+    /// Nothing to back out of: let Esc go on to whatever is behind.
+    Propagate,
+}
+
+/// Esc precedence (STRM-576): a suggestion popup first, then the reply.
+/// Edit mode (Up to edit your last message) slots in after the popup when it
+/// exists. Text is never cleared.
+fn escape(suggestions_open: bool, replying: bool) -> Escape {
+    if suggestions_open {
+        Escape::DismissSuggestions
+    } else if replying {
+        Escape::CancelReply
+    } else {
+        Escape::Propagate
+    }
+}
+
+/// Whether Enter (or the send button) should post `text`: an empty or
+/// whitespace-only composer sends nothing.
+fn sendable(text: &str) -> bool {
+    !text.trim().is_empty()
+}
 
 pub struct Composer {
     store: Entity<ChatStore>,
@@ -71,9 +116,29 @@ impl Composer {
         cx.notify();
     }
 
+    /// Hook for the @-mention popup (STRM-543): true while it is showing,
+    /// so Esc closes it before touching the reply. No popup exists yet.
+    fn suggestions_open(&self) -> bool {
+        false
+    }
+
+    /// Closes the @-mention popup. Nothing to close until it exists.
+    fn dismiss_suggestions(&mut self, _cx: &mut Context<Self>) {}
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        match escape(self.suggestions_open(), self.reply.is_some()) {
+            Escape::DismissSuggestions => self.dismiss_suggestions(cx),
+            Escape::CancelReply => {
+                self.reply = None;
+                cx.notify();
+            }
+            Escape::Propagate => cx.propagate(),
+        }
+    }
+
     fn send(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text().clone();
-        if text.trim().is_empty() || self.unwired(cx) {
+        if !sendable(&text) || self.unwired(cx) {
             return;
         }
         let reply = self.reply.take();
@@ -145,11 +210,13 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
         let unwired = self.unwired(cx);
-        let can_send = !unwired && !self.input.read(cx).text().trim().is_empty();
+        let can_send = !unwired && sendable(self.input.read(cx).text());
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
 
         div()
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::cancel))
             .w_full()
             .flex()
             .flex_col()
@@ -214,5 +281,68 @@ impl Render for Composer {
                             .child(icon(IconName::ArrowUp, icons::MD, t.surface)),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Action as _, KeyContext, Keymap, Keystroke};
+
+    use super::*;
+
+    /// The action `keys` runs with focus in the composer's text field, as
+    /// GPUI's dispatcher would pick it from the whole app keymap.
+    fn action_for(keys: &str) -> Option<&'static str> {
+        let mut all = bindings();
+        all.extend(ui::text_input::bindings());
+        let keymap = Keymap::new(all);
+        let contexts = [
+            KeyContext::parse("Workspace").unwrap(),
+            KeyContext::parse(KEY_CONTEXT).unwrap(),
+            KeyContext::parse(ui::text_input::MULTILINE_KEY_CONTEXT).unwrap(),
+        ];
+        let keystroke = Keystroke::parse(keys).unwrap();
+        let (matched, _) = keymap.bindings_for_input(&[keystroke], &contexts);
+        matched.first().map(|binding| binding.action().name())
+    }
+
+    #[test]
+    fn esc_in_the_composer_cancels() {
+        assert_eq!(action_for("escape"), Some(Cancel.name()));
+    }
+
+    #[test]
+    fn enter_and_shift_enter_still_reach_the_text_field() {
+        assert_eq!(action_for("enter"), Some(ui::text_input::Submit.name()));
+        assert_eq!(
+            action_for("shift-enter"),
+            Some(ui::text_input::Newline.name())
+        );
+    }
+
+    #[test]
+    fn esc_closes_suggestions_before_the_reply() {
+        assert_eq!(escape(true, true), Escape::DismissSuggestions);
+        assert_eq!(escape(true, false), Escape::DismissSuggestions);
+    }
+
+    #[test]
+    fn esc_cancels_a_reply_when_nothing_is_open() {
+        assert_eq!(escape(false, true), Escape::CancelReply);
+    }
+
+    #[test]
+    fn esc_with_nothing_to_cancel_passes_through() {
+        assert_eq!(escape(false, false), Escape::Propagate);
+    }
+
+    #[test]
+    fn empty_or_whitespace_only_text_is_not_sent() {
+        assert!(!sendable(""));
+        assert!(!sendable("   "));
+        assert!(!sendable("\n\n"));
+        assert!(!sendable(" \t\n \r\n"));
+        assert!(sendable("hi"));
+        assert!(sendable("  hi\n"));
     }
 }
