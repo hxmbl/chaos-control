@@ -528,10 +528,13 @@ impl Conversation {
 }
 
 /// A message's text as the chat draws it: a mention of an agent that was in
-/// this room and has been removed reads as `@previous-agent`, like its
-/// author label (STRM-561); any other mention is drawn as typed. The stored text, which Copy and Reply use, never changes.
+/// this project and has been removed from it reads as `@previous-agent`,
+/// like its author label (STRM-561); any other mention is drawn as typed.
+/// The stored text, which Copy and Reply use, never changes.
 fn shown_body(store: &ChatStore, body: &Arc<str>) -> SharedString {
-    match mentions::rewrite_former_mentions(body, |token| store.is_former_agent_mention(token)) {
+    match mentions::rewrite_former_mentions(body, |token| {
+        store.is_former_project_agent_mention(token)
+    }) {
         Cow::Borrowed(_) => SharedString::from(body.clone()),
         Cow::Owned(shown) => SharedString::from(shown),
     }

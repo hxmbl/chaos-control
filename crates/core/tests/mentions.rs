@@ -1,7 +1,9 @@
-//! Mentions of agents that aren't in the room (STRM-561). A mention of an
-//! agent that was never a member here wakes nothing and reaches nobody; it
-//! stays exactly as typed. Only an agent that was a member and has been
-//! removed is listed for the chat to draw as `@previous-agent`.
+//! Mentions of agents that aren't in the project (STRM-561). Agents are
+//! invited to a project, not a channel. A mention of an agent that was never
+//! in this project wakes nothing and reaches nobody; it stays exactly as
+//! typed. Only an agent that was in the project (in any of its channels) and
+//! has been removed from it is listed for the chat to draw as
+//! `@previous-agent`.
 //! Through the real runtime with a scripted ACP agent (see `common`).
 
 mod common;
@@ -28,7 +30,7 @@ async fn triggers_for(h: &Harness, agent: MemberId) -> i64 {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_mention_of_an_agent_from_another_room_pings_nobody() {
+async fn a_mention_of_an_agent_from_another_project_pings_nobody() {
     let mut h = Harness::new().await;
     let claude = h
         .agent(
@@ -40,7 +42,7 @@ async fn a_mention_of_an_agent_from_another_room_pings_nobody() {
         .await;
 
     // codex is a member of another project's #main, with a nickname, and
-    // was never in this room.
+    // was never in this project.
     let elsewhere = ProjectId::parse(ELSEWHERE).unwrap();
     h.core
         .ensure_project(elsewhere.clone(), "Elsewhere", None)
@@ -67,7 +69,7 @@ async fn a_mention_of_an_agent_from_another_room_pings_nobody() {
     // "@codex" exactly as typed.
     assert!(
         h.core
-            .former_agent_mention_tokens(h.main)
+            .former_project_agent_mention_tokens(&project_id())
             .await
             .unwrap()
             .is_empty()
@@ -75,14 +77,14 @@ async fn a_mention_of_an_agent_from_another_room_pings_nobody() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_agent_removed_from_this_room_is_listed_and_not_woken() {
+async fn an_agent_removed_from_this_project_is_listed_and_not_woken() {
     let mut h = Harness::new().await;
     let gpt = h.agent("gpt", script(json!({"turns": []}))).await;
     h.core.add_nickname(gpt.id, "jeepy").await.unwrap();
     let claude = h.agent("claude", script(json!({"turns": []}))).await;
     assert!(
         h.core
-            .former_agent_mention_tokens(h.main)
+            .former_project_agent_mention_tokens(&project_id())
             .await
             .unwrap()
             .is_empty(),
@@ -90,7 +92,11 @@ async fn an_agent_removed_from_this_room_is_listed_and_not_woken() {
     );
 
     h.core.remove_member(&project_id(), gpt.id).await.unwrap();
-    let former = h.core.former_agent_mention_tokens(h.main).await.unwrap();
+    let former = h
+        .core
+        .former_project_agent_mention_tokens(&project_id())
+        .await
+        .unwrap();
     let former: Vec<(MemberId, String)> = former
         .into_iter()
         .map(|(m, t)| (m, t.to_string()))
@@ -107,4 +113,56 @@ async fn an_agent_removed_from_this_room_is_listed_and_not_woken() {
     h.quiesce().await;
     assert_eq!(triggers_for(&h, gpt.id).await, 0);
     assert!(h.prompts("gpt").is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_that_only_spoke_in_another_channel_of_this_project_is_listed() {
+    let mut h = Harness::new().await;
+    // gemini is only ever in this project's #design, where it speaks; it
+    // never joins #main.
+    let design = h.core.channel(&project_id(), "design").await.unwrap().id;
+    let main = h.main;
+    h.main = design;
+    let gemini = h.agent("gemini", script(json!({"turns": []}))).await;
+    h.main = main;
+    h.core.add_nickname(gemini.id, "gem").await.unwrap();
+    h.core
+        .post(gemini.id, design, "design notes are up", None)
+        .await
+        .unwrap();
+    assert!(
+        h.core
+            .former_project_agent_mention_tokens(&project_id())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a current member is never listed"
+    );
+
+    h.core
+        .remove_member(&project_id(), gemini.id)
+        .await
+        .unwrap();
+    let former: Vec<(MemberId, String)> = h
+        .core
+        .former_project_agent_mention_tokens(&project_id())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(m, t)| (m, t.to_string()))
+        .collect();
+    assert_eq!(
+        former,
+        vec![
+            (gemini.id, "gemini".to_string()),
+            (gemini.id, "gem".to_string())
+        ]
+    );
+
+    // A mention of it in #main wakes nobody.
+    let ping = h.say("@gemini @gem are the notes final?").await;
+    assert!(ping.mentions.is_empty());
+    h.quiesce().await;
+    assert_eq!(triggers_for(&h, gemini.id).await, 0);
+    assert!(h.prompts("gemini").is_empty());
 }

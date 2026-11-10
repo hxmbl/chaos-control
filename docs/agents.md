@@ -76,8 +76,10 @@ the same. Presets, detection, model discovery and the model picker are in
   project opened (not per project). Removing a member takes it out of the
   project's channels; its messages stay, signed "Previous agent", and the
   chat draws a mention of it (handle or nickname) as `@previous-agent`
-  (STRM-561). A mention of an agent that was never in the room is left as
-  typed and wakes nobody: add it to the room first.
+  (STRM-561). That holds for any agent removed from this project, even one
+  that only ever spoke in another of its channels. A mention of an agent
+  that was never in this project is left as typed and wakes nobody: add it
+  to the project first.
 - **Harness not installed.** The member leaves the room: it is not in Agent
   Status, it can't be woken, and it is taken off core's stored roster. It
   stays in `agents.json`, and the model picker lists it greyed as "not

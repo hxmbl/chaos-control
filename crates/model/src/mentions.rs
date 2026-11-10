@@ -1,11 +1,12 @@
 //! How inline `@mentions` read in the chat (STRM-561).
 //!
 //! A message keeps the text it was sent with. Only what the chat draws
-//! changes: a mention of an agent that was a member of this room and has
-//! been removed, by its handle or a nickname, reads as `@previous-agent`,
-//! the way that agent's own messages read as "Previous agent". An agent
-//! that was never in the room is left exactly as typed (the mention reaches
-//! nobody); the caller's `is_former` decides which is which.
+//! changes: a mention of an agent that was in this project and has been
+//! removed from it, by its handle or a nickname, reads as `@previous-agent`,
+//! the way that agent's own messages read as "Previous agent". Agents are
+//! invited to a project, not a channel. An agent that was never in the
+//! project is left exactly as typed (the mention reaches nobody); the
+//! caller's `is_former` decides which is which.
 
 use std::borrow::Cow;
 

@@ -151,10 +151,10 @@ struct Attached {
     /// Every agent member core knows, current or removed: their messages
     /// read as an agent's ("Previous agent" once they're gone).
     agent_ids: HashSet<ct::MemberId>,
-    /// Every `@token` (handle or nickname) of an agent that was in #main and
-    /// has been removed from it, so a mention of one reads as
-    /// `@previous-agent` (STRM-561). An agent that was never here isn't in
-    /// it: its mention stays as typed and reaches nobody.
+    /// Every `@token` (handle or nickname) of an agent that was in the open
+    /// project and has been removed from it, so a mention of one reads as
+    /// `@previous-agent` (STRM-561). An agent that was never in this project
+    /// isn't in it: its mention stays as typed and reaches nobody.
     former_tokens: Vec<(ct::MemberId, Arc<str>)>,
     /// The project's `ping_answer_reactions` as core stores it (`None`: the
     /// default), and the last error from saving it.
@@ -663,18 +663,6 @@ impl ChatStore {
                     return;
                 }
             }
-            // And the @handles and @nicknames of agents removed from #main,
-            // so a mention of one reads as @previous-agent.
-            if let Ok(tokens) = core.former_agent_mention_tokens(main).await {
-                let ok = this.update(cx, |store, _| {
-                    if let Some(a) = &mut store.core {
-                        a.former_tokens = tokens;
-                    }
-                });
-                if ok.is_err() {
-                    return;
-                }
-            }
             match core.history(main, 200).await {
                 Ok(history) => {
                     let after = history.first().map_or(0, |m| m.seq.saturating_sub(1));
@@ -781,6 +769,7 @@ impl ChatStore {
         self.refresh_models(cx);
         self.load_ping_answers(cx);
         self.load_nicknames(cx);
+        self.load_former_project_agents(cx);
         cx.notify();
     }
 
@@ -1151,17 +1140,53 @@ impl ChatStore {
             .unwrap_or_default()
     }
 
-    /// True when `@token` (as typed, without `@`) names an agent that was a
-    /// member of #main and has been removed from it: the chat draws it as
-    /// `@previous-agent` (STRM-561). A linked agent's handle or nickname
-    /// never is, nor is an agent that was never in this room (its mention
-    /// stays as typed and wakes nobody), a human, `@everyone` or a typo.
-    pub fn is_former_agent_mention(&self, token: &str) -> bool {
+    /// Reads the open project's removed agents' `@tokens` from core.
+    fn load_former_project_agents(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = &self.core else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let project = attached.link.open.project.id.clone();
+        cx.spawn(async move |this, cx| {
+            let Ok(tokens) = core.former_project_agent_mention_tokens(&project).await else {
+                return;
+            };
+            this.update(cx, |store, cx| {
+                let Some(a) = &mut store.core else {
+                    return;
+                };
+                if a.link.open.project.id != project {
+                    return;
+                }
+                // Keep any removed this session that core's answer predates.
+                for (m, t) in tokens {
+                    if !a
+                        .former_tokens
+                        .iter()
+                        .any(|(fm, ft)| *fm == m && ft.eq_ignore_ascii_case(&t))
+                    {
+                        a.former_tokens.push((m, t));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// True when `@token` (as typed, without `@`) names an agent that was in
+    /// the open project and has been removed from it: the chat draws it as
+    /// `@previous-agent` (STRM-561). Agents are invited to a project, not a
+    /// channel. A linked agent's handle or nickname never is, nor is an
+    /// agent that was never in this project (its mention stays as typed and
+    /// wakes nobody), a human, `@everyone` or a typo.
+    pub fn is_former_project_agent_mention(&self, token: &str) -> bool {
         let Some(attached) = &self.core else {
             return false;
         };
         let agents = &attached.link.agents;
-        former_agent_mention(
+        former_project_agent_mention(
             token,
             |m| agents.iter().any(|a| a.member == m),
             agents.iter().map(|a| &a.handle).chain(
@@ -1579,10 +1604,13 @@ impl ChatStore {
         attached.ping_answers_error = None;
         attached.member_ping_answers_error = None;
         attached.nicknames_error = None;
+        // Agents removed from the last project mean nothing in this one.
+        attached.former_tokens.clear();
         attached.link.open = open;
         self.core = Some(attached);
         self.load_ping_answers(cx);
         self.load_nicknames(cx);
+        self.load_former_project_agents(cx);
         // Each project's #main has its own log; it reloads after the switch.
         self.permissions = PermissionLog::default();
     }
@@ -1958,11 +1986,11 @@ fn short_reason(e: &str) -> Arc<str> {
     Arc::from(e.chars().take(80).collect::<String>())
 }
 
-/// See [`ChatStore::is_former_agent_mention`]: `token` belongs to some agent
-/// in `former` (`(member, handle or nickname)` of agents removed from this
-/// room) that is not `linked` again, and isn't one of the `current` linked
-/// agents' tokens.
-fn former_agent_mention<'a>(
+/// See [`ChatStore::is_former_project_agent_mention`]: `token` belongs to
+/// some agent in `former` (`(member, handle or nickname)` of agents removed
+/// from this project) that is not `linked` again, and isn't one of the
+/// `current` linked agents' tokens.
+fn former_project_agent_mention<'a>(
     token: &str,
     linked: impl Fn(ct::MemberId) -> bool,
     mut current: impl Iterator<Item = &'a Arc<str>>,
@@ -1995,9 +2023,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_agent_removed_from_this_room_reads_as_previous_agent() {
-        let (codex, claude) = (ct::MemberId(1), ct::MemberId(2));
-        // What core lists for #main: codex was in it and was removed. claude
+    fn only_an_agent_removed_from_this_project_reads_as_previous_agent() {
+        let (codex, claude, gemini) = (ct::MemberId(1), ct::MemberId(2), ct::MemberId(3));
+        // What core lists for this project: codex was in #main and was
+        // removed; gemini only ever spoke in #design and was removed. claude
         // was removed too and has been added back this session (so it is
         // linked again), with a nickname it had before and a new one.
         let former = vec![
@@ -2005,17 +2034,20 @@ mod tests {
             (codex, Arc::from("cody")),
             (claude, Arc::from("claude")),
             (claude, Arc::from("cx")),
+            (gemini, Arc::from("gemini")),
         ];
         let current: Vec<Arc<str>> = vec![Arc::from("claude"), Arc::from("cl")];
-        let is_former =
-            |token: &str| former_agent_mention(token, |m| m == claude, current.iter(), &former);
+        let is_former = |token: &str| {
+            former_project_agent_mention(token, |m| m == claude, current.iter(), &former)
+        };
         assert!(is_former("codex"));
         assert!(is_former("CODY"));
+        assert!(is_former("gemini"));
         // Members are never rewritten, by handle or any nickname.
         assert!(!is_former("claude"));
         assert!(!is_former("cl"));
         assert!(!is_former("cx"));
-        // An agent from another room (core never lists it for this one), a
+        // An agent from another project (core never lists it for this one), a
         // human, @everyone and typos stay as typed.
         assert!(!is_former("devin"));
         assert!(!is_former("everyone"));

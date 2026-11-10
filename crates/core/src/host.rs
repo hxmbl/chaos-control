@@ -618,16 +618,19 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
-    /// Every `@token` of an agent that was a member of `channel` and has
-    /// been removed from it, as `(member, token)` (see
-    /// [`crate::store::former_agent_mention_tokens`]).
-    pub async fn former_agent_mention_tokens(
+    /// Every `@token` of an agent that was in `project` and has been
+    /// removed from it, as `(member, token)` (see
+    /// [`crate::store::former_project_agent_mention_tokens`]).
+    pub async fn former_project_agent_mention_tokens(
         &self,
-        channel: ChannelId,
+        project: &ProjectId,
     ) -> Result<Vec<(MemberId, Arc<str>)>, String> {
-        self.with_engine(move |e, _| crate::store::former_agent_mention_tokens(e.conn(), channel))
-            .await?
-            .map_err(|e| e.to_string())
+        let project = project.clone();
+        self.with_engine(move |e, _| {
+            crate::store::former_project_agent_mention_tokens(e.conn(), &project)
+        })
+        .await?
+        .map_err(|e| e.to_string())
     }
 
     pub async fn post(
