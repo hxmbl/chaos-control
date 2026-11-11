@@ -415,6 +415,7 @@ mod tests {
             asked: Arc::from("Hx"),
             logged: None,
             command: None,
+            cwd: None,
             run_state: None,
             run_output: None,
             run_exit_code: None,

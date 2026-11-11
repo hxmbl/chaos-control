@@ -452,7 +452,6 @@ pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
     }
 }
 
-
 // ---------- request keys ----------
 
 /// The fields of an ACP tool call that differ between two calls of the same
@@ -474,10 +473,13 @@ pub fn extract_command(detail: Option<&str>) -> Option<String> {
                     match c {
                         Value::String(s) if !s.trim().is_empty() => return Some(s.clone()),
                         Value::Array(a) => {
-                            let parts: Vec<String> = a
-                                .iter()
-                                .filter_map(|x| x.as_str().map(str::to_string))
-                                .collect();
+                            let mut parts = Vec::with_capacity(a.len());
+                            for x in a {
+                                let Some(s) = x.as_str() else {
+                                    return None;
+                                };
+                                parts.push(s.to_string());
+                            }
                             if !parts.is_empty() {
                                 return Some(shell_join(&parts));
                             }
@@ -941,6 +943,14 @@ fn queue_state_of(req: &PermissionRequest) -> QueueState {
     }
 }
 
+/// Queued commands left running by a previous process (startup recovery).
+pub fn interrupted_runs(c: &Connection) -> rusqlite::Result<Vec<PermissionRequest>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {COLS} FROM permission_requests WHERE run_state = 'running' ORDER BY id"
+    ))?;
+    stmt.query_map([], row)?.collect()
+}
+
 /// How many logged reads a channel keeps. Reads are frequent and only
 /// matter for the log, so older ones are pruned as new ones arrive; every
 /// other request is kept.
@@ -1153,12 +1163,16 @@ impl Engine {
     }
 
     /// Sets the host-side approval mode for `agent` (STRM-542). Persisted.
-    pub fn set_approval_mode(&mut self, agent: MemberId, mode: ApprovalMode) {
-        self.approval_mode.insert(agent, mode);
+    pub fn set_approval_mode(
+        &mut self,
+        agent: MemberId,
+        mode: ApprovalMode,
+    ) -> rusqlite::Result<()> {
         let key = format!("member_approval_mode:{}", agent.0);
-        let _ = self
-            .store
-            .tx(|c| crate::store::set_app_setting(c, &key, Some(mode.as_str())));
+        self.store
+            .tx(|c| crate::store::set_app_setting(c, &key, Some(mode.as_str())))?;
+        self.approval_mode.insert(agent, mode);
+        Ok(())
     }
 
     pub fn approval_mode(&self, agent: MemberId) -> ApprovalMode {
@@ -1470,8 +1484,10 @@ impl Engine {
         let (req_cwd, run_state_seed) = if queued && kind == RequestKind::Execute {
             match command.as_deref() {
                 Some(_) => {
-                    let resolved = extract_cwd(detail)
-                        .or_else(|| self.agent_cwd(agent).map(|p| p.to_string_lossy().into_owned()));
+                    let resolved = extract_cwd(detail).or_else(|| {
+                        self.agent_cwd(agent)
+                            .map(|p| p.to_string_lossy().into_owned())
+                    });
                     match resolved {
                         Some(cwd) => (Some(cwd), Some("queued")),
                         None => (None, Some("unrunnable")),
@@ -1800,6 +1816,23 @@ impl Engine {
         Ok(req)
     }
 
+    /// Marks queued commands left `running` by a previous process as failed
+    /// and notifies the agent (startup recovery).
+    pub fn recover_interrupted_command_runs(&mut self, now: Millis) {
+        let Ok(runs) = interrupted_runs(self.conn()) else {
+            return;
+        };
+        for req in runs {
+            let _ = self.complete_command_run(
+                now,
+                req.id,
+                false,
+                None,
+                "interrupted: Chaos Control restarted while the command was running",
+            );
+        }
+    }
+
     /// A human approves or denies a queued request (STRM-542).
     /// For `ask-all` this is today's `answer_permission` (one-shot grant + wake).
     /// For `accept-edits` commands, approval also *runs the command* and the
@@ -2123,21 +2156,57 @@ mod tests {
 
     #[test]
     fn mode_verdict_covers_all_kinds() {
-        use super::{mode_verdict, ModeOutcome, RequestKind};
+        use super::{ModeOutcome, RequestKind, mode_verdict};
         use crate::types::ApprovalMode;
-        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Read), ModeOutcome::AskHuman);
-        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Edit), ModeOutcome::AskHuman);
-        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Execute), ModeOutcome::AskHuman);
-        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Fetch), ModeOutcome::AskHuman);
-        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Other), ModeOutcome::AskHuman);
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Read),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Edit),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Execute),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Fetch),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Other),
+            ModeOutcome::AskHuman
+        );
 
-        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Read), ModeOutcome::Allow);
-        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Edit), ModeOutcome::Allow);
-        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Execute), ModeOutcome::Queue);
-        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Fetch), ModeOutcome::Queue);
-        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Other), ModeOutcome::Queue);
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Read),
+            ModeOutcome::Allow
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Edit),
+            ModeOutcome::Allow
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Execute),
+            ModeOutcome::Queue
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Fetch),
+            ModeOutcome::Queue
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Other),
+            ModeOutcome::Queue
+        );
 
-        for k in [RequestKind::Read, RequestKind::Edit, RequestKind::Execute, RequestKind::Fetch, RequestKind::Other] {
+        for k in [
+            RequestKind::Read,
+            RequestKind::Edit,
+            RequestKind::Execute,
+            RequestKind::Fetch,
+            RequestKind::Other,
+        ] {
             assert_eq!(mode_verdict(ApprovalMode::Yolo, k), ModeOutcome::Allow);
         }
     }

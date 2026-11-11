@@ -2,7 +2,9 @@
 
 mod common;
 
-use std::time::Duration;
+use std::{sync::Mutex, time::Duration};
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 use chaos_core::{
     engine::CoreEvent,
@@ -13,7 +15,10 @@ use chaos_core::{
 use common::*;
 use serde_json::json;
 
-async fn wait_permission_state(h: &mut Harness, state: PermissionState) -> chaos_core::permission::PermissionRequest {
+async fn wait_permission_state(
+    h: &mut Harness,
+    state: PermissionState,
+) -> chaos_core::permission::PermissionRequest {
     match h
         .wait_for(
             "permission event",
@@ -74,7 +79,13 @@ async fn chat_set_approval_mode_is_not_agent_authorized_or_auto_allowed() {
         let all = {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             loop {
-                let o = h.fake("bot").observed.lock().unwrap().permission_outcomes.clone();
+                let o = h
+                    .fake("bot")
+                    .observed
+                    .lock()
+                    .unwrap()
+                    .permission_outcomes
+                    .clone();
                 if o.len() >= 1 || tokio::time::Instant::now() > deadline {
                     break o;
                 }
@@ -82,7 +93,12 @@ async fn chat_set_approval_mode_is_not_agent_authorized_or_auto_allowed() {
             }
         };
         assert_eq!(all.len(), 1, "v{protocol}: {all:#?}");
-        assert_eq!(all[0]["outcome"]["optionId"], json!("deny"), "v{protocol}: {}", all[0]);
+        assert_eq!(
+            all[0]["outcome"]["optionId"],
+            json!("deny"),
+            "v{protocol}: {}",
+            all[0]
+        );
 
         // The request must not be auto-approved as a named chat tool.
         let log = h.core.permission_log(h.main, 50).await.unwrap();
@@ -90,7 +106,11 @@ async fn chat_set_approval_mode_is_not_agent_authorized_or_auto_allowed() {
             .iter()
             .find(|r| r.title.as_ref() == "chat_set_approval_mode")
             .expect("policy-change request logged");
-        assert_ne!(row.state, PermissionState::AutoApproved, "v{protocol}: {row:#?}");
+        assert_ne!(
+            row.state,
+            PermissionState::AutoApproved,
+            "v{protocol}: {row:#?}"
+        );
 
         // Calling the chat tool directly is also rejected for agents.
         let scope = mcp::Scope {
@@ -135,33 +155,56 @@ async fn approval_mode_override_precedence_applies_to_new_requests() {
         .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
         .await
         .unwrap();
-    let st = h.core.tool(scope, "chat_approval_mode_status", json!({})).await.unwrap();
+    let st = h
+        .core
+        .tool(scope, "chat_approval_mode_status", json!({}))
+        .await
+        .unwrap();
     assert_eq!(st["effective"], json!("accept-edits"), "{st}");
 
     h.core
         .set_workspace_approval_mode(Some(ApprovalMode::Yolo))
         .await
         .unwrap();
-    let st = h.core.tool(scope, "chat_approval_mode_status", json!({})).await.unwrap();
+    let st = h
+        .core
+        .tool(scope, "chat_approval_mode_status", json!({}))
+        .await
+        .unwrap();
     assert_eq!(st["effective"], json!("yolo"), "{st}");
 
     h.core
         .set_project_approval_mode(project_id(), Some(ApprovalMode::AskAll))
         .await
         .unwrap();
-    let st = h.core.tool(scope, "chat_approval_mode_status", json!({})).await.unwrap();
+    let st = h
+        .core
+        .tool(scope, "chat_approval_mode_status", json!({}))
+        .await
+        .unwrap();
     assert_eq!(st["effective"], json!("ask-all"), "{st}");
 
     h.core
         .set_channel_approval_mode(h.main, Some(ApprovalMode::AcceptEdits))
         .await
         .unwrap();
-    let st = h.core.tool(scope, "chat_approval_mode_status", json!({})).await.unwrap();
+    let st = h
+        .core
+        .tool(scope, "chat_approval_mode_status", json!({}))
+        .await
+        .unwrap();
     assert_eq!(st["effective"], json!("accept-edits"), "{st}");
 
     // Clearing a higher-priority override falls back correctly.
-    h.core.set_channel_approval_mode(h.main, None).await.unwrap();
-    let st = h.core.tool(scope, "chat_approval_mode_status", json!({})).await.unwrap();
+    h.core
+        .set_channel_approval_mode(h.main, None)
+        .await
+        .unwrap();
+    let st = h
+        .core
+        .tool(scope, "chat_approval_mode_status", json!({}))
+        .await
+        .unwrap();
     assert_eq!(st["effective"], json!("ask-all"), "{st}");
 }
 
@@ -194,34 +237,55 @@ async fn queued_command_denied_never_executes_and_approval_executes_once() {
     // both queued for execution
     let req1 = h
         .core
-        .with_engine(move |e, _| chaos_core::permission::get(e.conn(), first.id).unwrap().unwrap())
+        .with_engine(move |e, _| {
+            chaos_core::permission::get(e.conn(), first.id)
+                .unwrap()
+                .unwrap()
+        })
         .await
         .unwrap();
     let req2 = h
         .core
-        .with_engine(move |e, _| chaos_core::permission::get(e.conn(), second.id).unwrap().unwrap())
+        .with_engine(move |e, _| {
+            chaos_core::permission::get(e.conn(), second.id)
+                .unwrap()
+                .unwrap()
+        })
         .await
         .unwrap();
     assert_eq!(req1.run_state.as_deref(), Some("queued"), "{req1:#?}");
     assert_eq!(req2.run_state.as_deref(), Some("queued"), "{req2:#?}");
 
-    h.core.answer_permission(req1.id, h.hx.id, false, None).await.unwrap();
+    h.core
+        .answer_permission(req1.id, h.hx.id, false, None)
+        .await
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(
-        !marker.exists(),
-        "denied queued command must never execute"
-    );
+    assert!(!marker.exists(), "denied queued command must never execute");
     let denied = h
         .core
-        .with_engine(move |e, _| chaos_core::permission::get(e.conn(), req1.id).unwrap().unwrap())
+        .with_engine(move |e, _| {
+            chaos_core::permission::get(e.conn(), req1.id)
+                .unwrap()
+                .unwrap()
+        })
         .await
         .unwrap();
     assert_eq!(denied.run_state.as_deref(), Some("denied"), "{denied:#?}");
 
-    h.core.answer_permission(req2.id, h.hx.id, true, None).await.unwrap();
+    h.core
+        .answer_permission(req2.id, h.hx.id, true, None)
+        .await
+        .unwrap();
     let done = wait_run_state(&h, req2.id, "done").await;
     assert_eq!(done.run_exit_code, Some(0), "{done:#?}");
-    assert!(done.run_output.as_deref().unwrap_or("").contains("approved"), "{done:#?}");
+    assert!(
+        done.run_output
+            .as_deref()
+            .unwrap_or("")
+            .contains("approved"),
+        "{done:#?}"
+    );
     let _ = std::fs::remove_file(&marker);
 }
 
@@ -246,27 +310,72 @@ async fn missing_command_or_cwd_fails_closed_for_queued_execution() {
     // To force cwd-unrunnable, we need a case where neither extracted nor agent cwd resolves.
     // We'll still get unrunnable if command missing; for cwd missing case, simulate by having agent cwd unknown:
     // easier: request with command but cwd absent and agent cwd removed.
-    h.core.with_engine(move |e, _| { e.set_agent_cwd(bot.id, std::path::PathBuf::from("/definitely/not/a/real/dir-for-cc-test")); Ok::<(), rusqlite::Error>(()) }).await.unwrap();
+    let _ = h
+        .core
+        .with_engine(move |e, _| {
+            e.set_agent_cwd(
+                bot.id,
+                std::path::PathBuf::from("/definitely/not/a/real/dir-for-cc-test"),
+            );
+            Ok::<(), rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
 
     h.say("@bot queue").await;
     let a = wait_permission_state(&mut h, PermissionState::Pending).await;
     let b = wait_permission_state(&mut h, PermissionState::Pending).await;
-    let ra = h.core.with_engine(move |e, _| chaos_core::permission::get(e.conn(), a.id).unwrap().unwrap()).await.unwrap();
-    let rb = h.core.with_engine(move |e, _| chaos_core::permission::get(e.conn(), b.id).unwrap().unwrap()).await.unwrap();
+    let ra = h
+        .core
+        .with_engine(move |e, _| {
+            chaos_core::permission::get(e.conn(), a.id)
+                .unwrap()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+    let rb = h
+        .core
+        .with_engine(move |e, _| {
+            chaos_core::permission::get(e.conn(), b.id)
+                .unwrap()
+                .unwrap()
+        })
+        .await
+        .unwrap();
     // first has command but cwd resolves to non-existent dir? we stored resolved cwd string if agent_cwd exists;
     // it becomes queued but execution must fail closed at run time (cwd not available). second missing command -> unrunnable.
     assert_eq!(rb.run_state.as_deref(), Some("unrunnable"), "{rb:#?}");
 
     // Approving unrunnable stays unrunnable/does not execute.
-    h.core.answer_permission(rb.id, h.hx.id, true, None).await.unwrap();
-    let rb2 = h.core.with_engine(move |e, _| chaos_core::permission::get(e.conn(), b.id).unwrap().unwrap()).await.unwrap();
+    h.core
+        .answer_permission(rb.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+    let rb2 = h
+        .core
+        .with_engine(move |e, _| {
+            chaos_core::permission::get(e.conn(), b.id)
+                .unwrap()
+                .unwrap()
+        })
+        .await
+        .unwrap();
     assert_eq!(rb2.run_state.as_deref(), Some("unrunnable"), "{rb2:#?}");
 
     // First: queued (cwd was "resolved" to a path string) but directory invalid -> execution fails closed.
-    h.core.answer_permission(ra.id, h.hx.id, true, None).await.unwrap();
+    h.core
+        .answer_permission(ra.id, h.hx.id, true, None)
+        .await
+        .unwrap();
     let failed = wait_run_state(&h, ra.id, "failed").await;
     let out = failed.run_output.as_deref().unwrap_or("").to_lowercase();
-    assert!(out.contains("working directory") || out.contains("not available") || out.contains("refusing"), "{failed:#?}");
+    assert!(
+        out.contains("working directory")
+            || out.contains("not available")
+            || out.contains("refusing"),
+        "{failed:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -283,30 +392,51 @@ async fn non_zero_exit_and_launch_failure_are_reported_to_agent() {
             ]}]})),
         )
         .await;
-    h.core.set_approval_mode(bot.id, ApprovalMode::AcceptEdits).await.unwrap();
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
     h.say("@bot run").await;
     let a = wait_permission_state(&mut h, PermissionState::Pending).await;
     let b = wait_permission_state(&mut h, PermissionState::Pending).await;
 
-    h.core.answer_permission(a.id, h.hx.id, true, None).await.unwrap();
+    h.core
+        .answer_permission(a.id, h.hx.id, true, None)
+        .await
+        .unwrap();
     let failed = wait_run_state(&h, a.id, "failed").await;
     assert_eq!(failed.run_exit_code, Some(7), "{failed:#?}");
-    assert!(failed.run_output.as_deref().unwrap_or("").contains("oops"), "{failed:#?}");
+    assert!(
+        failed.run_output.as_deref().unwrap_or("").contains("oops"),
+        "{failed:#?}"
+    );
 
-    h.core.answer_permission(b.id, h.hx.id, true, None).await.unwrap();
+    h.core
+        .answer_permission(b.id, h.hx.id, true, None)
+        .await
+        .unwrap();
     let failed2 = wait_run_state(&h, b.id, "failed").await;
     let out = failed2.run_output.as_deref().unwrap_or("").to_lowercase();
-    assert!(out.contains("working directory") || out.contains("failed"), "{failed2:#?}");
+    assert!(
+        out.contains("working directory") || out.contains("failed"),
+        "{failed2:#?}"
+    );
 
     // Agent receives result notifications in channel history.
     let history = h.history().await;
     let bodies: Vec<String> = history.iter().map(|m| m.body.to_string()).collect();
-    assert!(bodies.iter().any(|b| b.contains(&format!("#{}", a.id)) && b.contains("failed")), "{bodies:#?}");
+    assert!(
+        bodies
+            .iter()
+            .any(|b| b.contains(&format!("#{}", a.id)) && b.contains("failed")),
+        "{bodies:#?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_and_oversized_output_are_handled() {
-    // SAFETY: tests run in isolated process contexts here; env vars configure behavior.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: serialized by ENV_LOCK to avoid leaking into other tests.
     unsafe {
         std::env::set_var("CHAOS_COMMAND_TIMEOUT_SECS", "1");
         std::env::set_var("CHAOS_COMMAND_MAX_OUTPUT_BYTES", "256");
@@ -323,20 +453,44 @@ async fn timeout_and_oversized_output_are_handled() {
             ]}]})),
         )
         .await;
-    h.core.set_approval_mode(bot.id, ApprovalMode::AcceptEdits).await.unwrap();
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
     h.say("@bot run").await;
     let a = wait_permission_state(&mut h, PermissionState::Pending).await;
     let b = wait_permission_state(&mut h, PermissionState::Pending).await;
 
-    h.core.answer_permission(a.id, h.hx.id, true, None).await.unwrap();
+    h.core
+        .answer_permission(a.id, h.hx.id, true, None)
+        .await
+        .unwrap();
     let timed = wait_run_state(&h, a.id, "failed").await;
-    assert!(timed.run_output.as_deref().unwrap_or("").to_lowercase().contains("timed out"), "{timed:#?}");
+    assert!(
+        timed
+            .run_output
+            .as_deref()
+            .unwrap_or("")
+            .to_lowercase()
+            .contains("timed out"),
+        "{timed:#?}"
+    );
 
-    h.core.answer_permission(b.id, h.hx.id, true, None).await.unwrap();
+    h.core
+        .answer_permission(b.id, h.hx.id, true, None)
+        .await
+        .unwrap();
     let outreq = wait_run_state(&h, b.id, "done").await;
     let out = outreq.run_output.as_deref().unwrap_or("");
-    assert!(out.len() <= 600, "output should be bounded/truncated, got {}", out.len());
-    assert!(out.contains("truncated") || out.contains("A"), "{outreq:#?}");
+    assert!(
+        out.len() <= 600,
+        "output should be bounded/truncated, got {}",
+        out.len()
+    );
+    assert!(
+        out.contains("truncated") || out.contains("A"),
+        "{outreq:#?}"
+    );
 
     unsafe {
         std::env::remove_var("CHAOS_COMMAND_TIMEOUT_SECS");

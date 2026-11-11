@@ -150,7 +150,11 @@ impl RightSidebar {
                 div()
                     .flex_none()
                     .type_style(text::CAPTION)
-                    .text_color(if declined || pending { t.ink_soft } else { t.muted })
+                    .text_color(if declined || pending {
+                        t.ink_soft
+                    } else {
+                        t.muted
+                    })
                     .child(outcome),
             )
             .child(

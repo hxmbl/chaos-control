@@ -10,7 +10,7 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time:
 use futures::future::BoxFuture;
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{mpsc, oneshot, watch, Semaphore};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 use crate::{
     adapter::*,
@@ -160,6 +160,9 @@ enum Cmd {
         channel: ChannelId,
     },
     RunQueued {
+        id: PermissionId,
+    },
+    RunFinished {
         id: PermissionId,
     },
     RemoveMember {
@@ -979,11 +982,8 @@ impl Core {
         agent: MemberId,
         mode: crate::types::ApprovalMode,
     ) -> Result<(), String> {
-        self.with_engine(move |e, _| {
-            e.set_approval_mode(agent, mode);
-            Ok(())
-        })
-        .await?
+        self.with_engine(move |e, _| e.set_approval_mode(agent, mode).map_err(|e| e.to_string()))
+            .await?
     }
 
     /// Sets or clears a channel approval-mode override (STRM-542). Affects new requests.
@@ -1109,7 +1109,10 @@ struct Actor {
 
 impl Actor {
     fn run_queued(&mut self, id: PermissionId) {
-        let Some(req) = crate::permission::get(self.engine.conn(), id).ok().flatten() else {
+        let Some(req) = crate::permission::get(self.engine.conn(), id)
+            .ok()
+            .flatten()
+        else {
             return;
         };
         let Some(command) = req.command.as_deref().map(str::to_string) else {
@@ -1125,7 +1128,10 @@ impl Actor {
         };
         let cwd = PathBuf::from(cwd_str);
         if !cwd.is_dir() {
-            let _ = self.fail_run(id, &format!("working directory is not available: {}", cwd.display()));
+            let _ = self.fail_run(
+                id,
+                &format!("working directory is not available: {}", cwd.display()),
+            );
             return;
         }
         let tx = self.tx.clone();
@@ -1171,14 +1177,22 @@ impl Actor {
             if let Err(err) = e.complete_command_run(now, id, ok, code, &output) {
                 // If the run is no longer in the expected state, surface as a note.
                 if let Ok(Some(req)) = crate::permission::get(e.conn(), id) {
-                    e.rt_note(req.agent, req.channel, format!("command #{id} finished but result delivery failed: {err}"));
+                    e.rt_note(
+                        req.agent,
+                        req.channel,
+                        format!("command #{id} finished but result delivery failed: {err}"),
+                    );
                 }
             }
         });
         let _ = tx.send(Cmd::Engine(f));
+        let _ = tx.send(Cmd::RunFinished { id });
     }
 
-    async fn execute_command(command: String, cwd: PathBuf) -> Result<(bool, Option<i32>, String), String> {
+    async fn execute_command(
+        command: String,
+        cwd: PathBuf,
+    ) -> Result<(bool, Option<i32>, String), String> {
         use std::process::Stdio;
         let timeout_secs: u64 = std::env::var("CHAOS_COMMAND_TIMEOUT_SECS")
             .ok()
@@ -1189,71 +1203,119 @@ impl Actor {
             .and_then(|v| v.parse().ok())
             .unwrap_or(128 * 1024);
         let timeout = Duration::from_secs(timeout_secs.max(1));
+        let io_drain = Duration::from_secs(2);
 
-        let mut child = tokio::process::Command::new("sh")
-            .arg("-lc")
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-lc")
             .arg(&command)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        {
+            cmd.process_group(0);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to execute command: {e}"))?;
 
-        let mut stdout = child.stdout.take().ok_or_else(|| "stdout unavailable".to_string())?;
-        let mut stderr = child.stderr.take().ok_or_else(|| "stderr unavailable".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "stdout unavailable".to_string())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "stderr unavailable".to_string())?;
 
-        let out_task = tokio::spawn(async move {
+        async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
+            mut r: R,
+            max_total: usize,
+        ) -> Vec<u8> {
             let mut buf = Vec::new();
             let mut chunk = [0u8; 8192];
             loop {
-                let n = stdout.read(&mut chunk).await.unwrap_or(0);
-                if n == 0 { break; }
+                let n = match r.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
                 if buf.len() < max_total {
                     let take = (max_total - buf.len()).min(n);
                     buf.extend_from_slice(&chunk[..take]);
                 }
             }
             buf
-        });
-        let err_task = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = stderr.read(&mut chunk).await.unwrap_or(0);
-                if n == 0 { break; }
-                if buf.len() < max_total {
-                    let take = (max_total - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
-                }
-            }
-            buf
-        });
+        }
 
-        let status = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(r) => r.map_err(|e| format!("failed waiting for command: {e}"))?,
+        let out_task = tokio::spawn(read_limited(stdout, max_total));
+        let err_task = tokio::spawn(read_limited(stderr, max_total));
+        let out_abort = out_task.abort_handle();
+        let err_abort = err_task.abort_handle();
+
+        let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(r) => (
+                r.map_err(|e| format!("failed waiting for command: {e}"))?,
+                false,
+            ),
             Err(_) => {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                let out = out_task.await.unwrap_or_default();
-                let err = err_task.await.unwrap_or_default();
-                let mut text = Self::format_output(out, err, max_total);
-                if !text.is_empty() { text.push_str("\n\n"); }
-                text.push_str(&format!("command timed out after {}s and was killed", timeout.as_secs()));
-                return Ok((false, None, text));
+                Self::kill_process_tree(&mut child).await;
+                let st = child.wait().await.ok();
+                (
+                    st.unwrap_or_else(|| std::process::ExitStatus::default()),
+                    true,
+                )
             }
         };
 
-        let out = out_task.await.unwrap_or_default();
-        let err = err_task.await.unwrap_or_default();
+        let (out, err) = match tokio::time::timeout(io_drain, async {
+            (out_task.await, err_task.await)
+        })
+        .await
+        {
+            Ok((o, e)) => (o.unwrap_or_default(), e.unwrap_or_default()),
+            Err(_) => {
+                out_abort.abort();
+                err_abort.abort();
+                (Vec::new(), Vec::new())
+            }
+        };
+
         let total_len = out.len().saturating_add(err.len());
         let mut text = Self::format_output(out, err, max_total);
+        if timed_out {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&format!(
+                "command timed out after {}s and was killed",
+                timeout.as_secs()
+            ));
+        }
         if total_len > max_total {
-            if !text.is_empty() { text.push_str("\n\n"); }
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
             text.push_str("[output truncated]");
         }
-        Ok((status.success(), status.code(), text))
+        Ok((status.success() && !timed_out, status.code(), text))
+    }
+
+    async fn kill_process_tree(child: &mut tokio::process::Child) {
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            let _ = tokio::process::Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .status()
+                .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let _ = tokio::process::Command::new("kill")
+                .args(["-KILL", &format!("-{pid}")])
+                .status()
+                .await;
+        }
+        let _ = child.kill().await;
     }
 
     fn format_output(stdout: Vec<u8>, stderr: Vec<u8>, max_total: usize) -> String {
@@ -1264,7 +1326,9 @@ impl Actor {
             out.push_str(stdout_s.trim_end_matches('\n'));
         }
         if !stderr_s.trim().is_empty() || !stderr.is_empty() {
-            if !out.is_empty() { out.push_str("\n\n"); }
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
             out.push_str("[stderr]\n");
             out.push_str(stderr_s.trim_end_matches('\n'));
         }
@@ -1366,6 +1430,9 @@ impl Actor {
                 }
             }
             Cmd::RunQueued { id } => self.run_queued(id),
+            Cmd::RunFinished { id } => {
+                self.running.remove(&id);
+            }
             Cmd::Shutdown(reply) => {
                 for (_, handle) in self.running.drain() {
                     handle.abort();
@@ -1403,7 +1470,9 @@ impl Actor {
             .join(channel, &member, now)
             .map_err(|e| e.to_string())?;
         self.engine.set_runs_in(member.id, spec.runs_in);
-        self.engine.set_approval_mode(member.id, spec.approval);
+        self.engine
+            .set_approval_mode(member.id, spec.approval)
+            .map_err(|e| e.to_string())?;
         self.engine
             .set_agent_ping_answers(member.id, spec.ping_answers.clone());
         let agent_cwd = spec.cwd.unwrap_or_else(|| self.default_cwd.clone());

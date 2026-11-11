@@ -84,8 +84,14 @@ pub struct PermissionLogEntry {
 }
 
 impl PermissionLogEntry {
-    /// The read-only pane view of this row (no Approve / Deny).
+    /// The pane view of this row. Pending requests stay actionable;
+    /// completed/logged outcomes are read-only.
     pub fn prompt(&self) -> PermissionPrompt {
+        let logged = if self.outcome == PermissionOutcome::Pending {
+            None
+        } else {
+            Some(self.outcome)
+        };
         PermissionPrompt {
             request: self.request,
             agent: self.agent_name.clone(),
@@ -93,7 +99,7 @@ impl PermissionLogEntry {
             reason: self.reason.clone(),
             detail: self.detail.clone(),
             asked: self.asked.clone(),
-            logged: Some(self.outcome),
+            logged,
             command: self.command.clone(),
             cwd: self.cwd.clone(),
             run_state: self.run_state.clone(),
@@ -236,6 +242,17 @@ mod tests {
         assert_eq!(relative_time(500, 100), "now");
     }
 
+    #[test]
+    fn a_pending_entry_opens_actionable() {
+        let p = entry(8, PermissionOutcome::Pending).prompt();
+        assert_eq!(p.logged, None);
+        let pane = crate::PaneContent::Permission(p);
+        let kinds: Vec<_> = pane.actions().into_iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![crate::PaneActionKind::Approve, crate::PaneActionKind::Deny]
+        );
+    }
     #[test]
     fn a_logged_entry_opens_read_only() {
         let p = entry(7, PermissionOutcome::Declined).prompt();

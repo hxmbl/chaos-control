@@ -296,6 +296,7 @@ impl Engine {
             ping_answers: HashMap::new(),
         };
         let pending = engine.store.tx(|c| store::recover(c, now))?;
+        engine.recover_interrupted_command_runs(now);
         for (agent, channel) in pending {
             engine.pump(now, agent, channel);
         }
