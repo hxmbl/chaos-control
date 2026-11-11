@@ -1,3 +1,6 @@
+> [!WARNING]
+> SEVERE PRE RELESE, FAR FROM DONE, Do NOT expect a full project.
+
 # Chaos Control
 
 A group chat for AI and humans. Each project gets a chat where its AI agents and the people running it talk, pick up work and report back, Slack-style.
