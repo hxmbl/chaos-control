@@ -84,7 +84,7 @@ use chaos_core::{
     adapter::{AgentAdapter, BridgeCommand},
     engine::CoreEvent,
     harness::{self, AdapterOptions, DetectEnv, HarnessPreset},
-    host::{AgentSpec, Core, HostConfig, MemberSpec, SystemClock},
+    host::{AgentSpec, Core, HostConfig, MemberSpec, StartError, SystemClock},
     model_cache::{self, CachedModels},
     permission::RunsIn,
     policy::Policy,
@@ -436,21 +436,22 @@ pub fn parse_brand(name: Option<&str>) -> Brand {
 
 /// Starts core if an agents file exists or a harness is installed. Prints
 /// why it did not start otherwise (nothing to run is silent: the app then
-/// runs on sample data alone).
-pub fn start() -> Option<CoreLink> {
+/// runs on sample data alone). The one failure returned is data from a newer
+/// build: the app shows that instead of sample data.
+pub fn start() -> Result<Option<CoreLink>, StartError> {
     let path = agents_file();
     let config = match std::fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str::<AgentsConfig>(&text) {
             Ok(c) => Some(c),
             Err(e) => {
                 eprintln!("chaos-control: {} is not valid: {e}", path.display());
-                return None;
+                return Ok(None);
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
             eprintln!("chaos-control: could not read {}: {e}", path.display());
-            return None;
+            return Ok(None);
         }
     };
     let had_file = config.is_some();
@@ -460,13 +461,14 @@ pub fn start() -> Option<CoreLink> {
     });
     let found = harnesses(&config, &DetectEnv::from_process());
     if !had_file && found.is_empty() {
-        return None;
+        return Ok(None);
     }
     match start_with(config, found, path) {
-        Ok(link) => Some(link),
+        Ok(link) => Ok(Some(link)),
+        Err(e @ StartError::NewerData(_)) => Err(e),
         Err(e) => {
             eprintln!("chaos-control: agent runtime did not start: {e}");
-            None
+            Ok(None)
         }
     }
 }
@@ -549,7 +551,7 @@ pub fn start_with(
     config: AgentsConfig,
     harnesses: Vec<Harness>,
     agents_path: PathBuf,
-) -> Result<CoreLink, String> {
+) -> Result<CoreLink, StartError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .thread_name("chaos-core")
@@ -591,8 +593,9 @@ pub fn start_with(
         agents: plain_agents,
         ..
     } = config;
+    // Started on its own so a refusal keeps its type (see `start`).
+    let (core, events) = runtime.block_on(Core::start(host, Arc::new(SystemClock)))?;
     let (core, events, open, confirm, human, agents, dormant) = runtime.block_on(async {
-        let (core, events) = Core::start(host, Arc::new(SystemClock)).await?;
         let plan = plan_for(&core, &folder).await?;
         let project = apply_plan(&core, &folder, &plan.open, plan.write_file).await?;
         let main = core.channel(&project.id, "main").await?.id;

@@ -8,6 +8,7 @@ mod model_picker;
 mod pane_host;
 mod panels;
 mod project;
+mod refused;
 mod right_sidebar;
 mod search;
 mod settings;
@@ -84,6 +85,14 @@ fn main() {
             })
             .detach();
 
+            let core = match core {
+                Ok(core) => core,
+                Err(e) => {
+                    eprintln!("chaos-control: {e}");
+                    refused::open(e.to_string().into(), cx);
+                    return;
+                }
+            };
             let mut workspace = model::sample();
             if let Some(count) = demo_count("CHAOS_DEMO_CHANNELS") {
                 workspace.channels.extend(model::demo_channels(count));

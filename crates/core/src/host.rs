@@ -23,7 +23,7 @@ use crate::{
     },
     policy::Policy,
     reaction::PingAnswers,
-    store::Store,
+    store::{OpenError, Store},
     types::*,
 };
 
@@ -191,13 +191,39 @@ pub struct Core {
 
 const GONE: &str = "chaos-control core has stopped";
 
+/// Why [`Core::start`] failed.
+#[derive(Debug)]
+pub enum StartError {
+    /// The database was written by a newer build. It was left untouched, and
+    /// the app should say so rather than run without it.
+    NewerData(OpenError),
+    Other(String),
+}
+
+impl std::fmt::Display for StartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StartError::NewerData(e) => write!(f, "{e}"),
+            StartError::Other(e) => f.write_str(e),
+        }
+    }
+}
+
+impl std::error::Error for StartError {}
+
+impl From<String> for StartError {
+    fn from(e: String) -> Self {
+        StartError::Other(e)
+    }
+}
+
 impl Core {
     /// Starts the runtime on the current tokio runtime. Returns the handle and
     /// the stream of UI events.
     pub async fn start(
         config: HostConfig,
         clock: Arc<dyn Clock>,
-    ) -> Result<(Core, mpsc::UnboundedReceiver<CoreEvent>), String> {
+    ) -> Result<(Core, mpsc::UnboundedReceiver<CoreEvent>), StartError> {
         let store = match &config.db {
             Some(path) => {
                 if let Some(dir) = path.parent() {
@@ -207,7 +233,10 @@ impl Core {
             }
             None => Store::open_in_memory(),
         }
-        .map_err(|e| format!("open database: {e}"))?;
+        .map_err(|e| match e {
+            OpenError::NewerSchema { .. } => StartError::NewerData(e),
+            e => StartError::Other(format!("open database: {e}")),
+        })?;
         let engine = Engine::new(store, config.policy.clone(), clock.now())
             .map_err(|e| format!("recover: {e}"))?;
         let (tx, rx) = mpsc::unbounded_channel();
