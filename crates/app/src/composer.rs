@@ -1,4 +1,5 @@
-//! Floating message box. With no backend yet, sending posts the message locally.
+//! Floating message box. Sends to core in #main; in channels core isn't
+//! wired to yet, sending is off and a note says so.
 
 use gpui::{Context, Entity, Focusable, SharedString, Subscription, Window, div, prelude::*};
 use model::{ReplyRef, pane::author_name};
@@ -9,7 +10,7 @@ use ui::{
     truncated,
 };
 
-use crate::store::{ChatStore, StoreEvent};
+use crate::store::{ChatStore, SendRoute, StoreEvent, UNWIRED_NOTE};
 
 pub struct Composer {
     store: Entity<ChatStore>,
@@ -45,6 +46,8 @@ impl Composer {
                     let text = placeholder(store.read(cx));
                     this.input
                         .update(cx, |input, cx| input.set_placeholder(text, cx));
+                    // Sending may have turned on or off with the channel.
+                    cx.notify();
                 }
             }),
         ];
@@ -70,13 +73,18 @@ impl Composer {
 
     fn send(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text().clone();
-        if text.trim().is_empty() {
+        if text.trim().is_empty() || self.unwired(cx) {
             return;
         }
         let reply = self.reply.take();
         self.store
             .update(cx, |store, cx| store.post_from_human(&text, reply, cx));
         self.input.update(cx, |input, cx| input.clear(cx));
+    }
+
+    /// The selected channel isn't wired to core, so sending is off.
+    fn unwired(&self, cx: &Context<Self>) -> bool {
+        self.store.read(cx).send_route() == SendRoute::Unwired
     }
 
     fn render_reply(&self, reply: &ReplyRef, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -136,7 +144,8 @@ impl Composer {
 impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
-        let can_send = !self.input.read(cx).text().trim().is_empty();
+        let unwired = self.unwired(cx);
+        let can_send = !unwired && !self.input.read(cx).text().trim().is_empty();
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
 
@@ -152,6 +161,16 @@ impl Render for Composer {
             .pt(space::X3)
             .pb(space::X2)
             .shadow(t.elevation(Elevation::Float))
+            .when(unwired, |d| {
+                d.child(
+                    div()
+                        .px(space::X2)
+                        .mb(space::X1_5)
+                        .type_style(text::SMALL)
+                        .text_color(t.muted)
+                        .child(UNWIRED_NOTE),
+                )
+            })
             .when_some(self.reply.clone(), |d, reply| {
                 d.child(self.render_reply(&reply, cx))
             })
