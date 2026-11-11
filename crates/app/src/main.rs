@@ -78,6 +78,7 @@ fn main() {
                     Some(model_picker::KEY_CONTEXT),
                 ),
             ]);
+            cx.bind_keys(composer::bindings());
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();
