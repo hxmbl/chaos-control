@@ -99,7 +99,10 @@ impl RightSidebar {
             "{}: {} · {outcome} · #{}",
             entry.agent_name, entry.action, entry.request
         );
-        let declined = entry.outcome == PermissionOutcome::Declined;
+        let declined = matches!(
+            entry.outcome,
+            PermissionOutcome::Declined | PermissionOutcome::Failed
+        );
         let pending = entry.outcome == PermissionOutcome::Pending;
         let initial: SharedString = entry
             .agent_name
@@ -124,7 +127,11 @@ impl RightSidebar {
             });
         let req = entry.request;
         let row = pill(("permission", req as usize), cx)
-            .h(if pending { size::ROW + space::X1 } else { size::ROW })
+            .h(if pending {
+                size::ROW + space::X1
+            } else {
+                size::ROW
+            })
             .flex_none()
             .gap(space::X2)
             .pl(space::X2)

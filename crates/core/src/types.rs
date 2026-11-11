@@ -455,7 +455,6 @@ pub struct Reaction {
     pub created_at: Millis,
 }
 
-
 /// Who or what decided a permission request's outcome (STRM-542).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -483,10 +482,11 @@ impl DecidedBy {
         } else if s == "auto_mode" {
             Some(DecidedBy::AutoMode)
         } else if let Some(rest) = s.strip_prefix("human:") {
-            rest.parse::<i64>().ok().map(|id| DecidedBy::Human(MemberId(id)))
+            rest.parse::<i64>()
+                .ok()
+                .map(|id| DecidedBy::Human(MemberId(id)))
         } else {
             None
         }
     }
 }
-

@@ -18,7 +18,10 @@ use crate::{
         StanceRequest,
     },
     mcp::{self, Scope, Tokens},
-    permission::{AnswerError, PermissionGate, PermissionId, PermissionRequest, PermissionVerdict, QueuedRequest, RunsIn},
+    permission::{
+        AnswerError, PermissionGate, PermissionId, PermissionRequest, PermissionVerdict,
+        QueuedRequest, RunsIn,
+    },
     policy::Policy,
     reaction::PingAnswers,
     store::{OpenError, Store},
@@ -154,6 +157,9 @@ enum Cmd {
     Interrupt {
         agent: MemberId,
         channel: ChannelId,
+    },
+    RunQueued {
+        id: PermissionId,
     },
     RemoveMember {
         project: ProjectId,
@@ -898,7 +904,8 @@ impl Core {
 
     /// A human approves (`approve`) or denies a pending permission request.
     /// Any human member of the request's channel may answer; the answer is
-    /// posted and delivered to the agent as a wake.
+    /// posted and delivered to the agent as a wake. Approved runnable queued
+    /// commands are executed by Chaos Control (STRM-542).
     pub async fn answer_permission(
         &self,
         request: PermissionId,
@@ -907,11 +914,16 @@ impl Core {
         note: Option<&str>,
     ) -> Result<PermissionRequest, AnswerError> {
         let note = note.map(str::to_string);
-        self.with_engine(move |e, now| {
-            e.answer_permission(now, request, by, approve, note.as_deref())
-        })
-        .await
-        .map_err(AnswerError::Store)?
+        let req = self
+            .with_engine(move |e, now| {
+                e.answer_permission(now, request, by, approve, note.as_deref())
+            })
+            .await
+            .map_err(AnswerError::Store)??;
+        if approve && req.command.is_some() && req.run_state.as_deref() == Some("running") {
+            let _ = self.tx.send(Cmd::RunQueued { id: req.id });
+        }
+        Ok(req)
     }
 
     /// Pending permission requests in `channel`, oldest first.
@@ -937,12 +949,54 @@ impl Core {
     }
 
     /// The approval queue for a channel (STRM-542).
-    pub async fn approval_queue(
-        &self,
-        channel: ChannelId,
-    ) -> Result<Vec<QueuedRequest>, String> {
+    pub async fn approval_queue(&self, channel: ChannelId) -> Result<Vec<QueuedRequest>, String> {
         self.with_engine(move |e, _| Ok(e.approval_queue(channel)))
             .await?
+    }
+
+    /// Sets an agent/member's default approval mode (STRM-542). Affects new requests.
+    pub async fn set_approval_mode(
+        &self,
+        agent: MemberId,
+        mode: crate::types::ApprovalMode,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, _| {
+            e.set_approval_mode(agent, mode);
+            Ok(())
+        })
+        .await?
+    }
+
+    /// Sets or clears a channel approval-mode override (STRM-542). Affects new requests.
+    pub async fn set_channel_approval_mode(
+        &self,
+        channel: ChannelId,
+        mode: Option<crate::types::ApprovalMode>,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, _| e.set_channel_approval_mode_override(channel, mode))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Sets or clears a project approval-mode override (STRM-542). Affects new requests.
+    pub async fn set_project_approval_mode(
+        &self,
+        project: ProjectId,
+        mode: Option<crate::types::ApprovalMode>,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, now| e.set_project_approval_mode_override(&project, mode, now))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Sets or clears the workspace approval-mode override (STRM-542). Affects new requests.
+    pub async fn set_workspace_approval_mode(
+        &self,
+        mode: Option<crate::types::ApprovalMode>,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, _| e.set_workspace_approval_mode_override(mode))
+            .await?
+            .map_err(|e| e.to_string())
     }
 
     /// A human approves or denies a queued request (STRM-542).
@@ -1019,6 +1073,58 @@ struct Actor {
 }
 
 impl Actor {
+    fn run_queued(&mut self, id: PermissionId) {
+        let Some(req) = crate::permission::get(self.engine.conn(), id)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
+        let Some(command) = req.command.as_deref().map(str::to_string) else {
+            return;
+        };
+        if req.run_state.as_deref() != Some("running") {
+            return;
+        }
+        let cwd = req
+            .cwd
+            .as_deref()
+            .map(PathBuf::from)
+            .or_else(|| self.agents.get(&req.agent).map(|a| a.cwd.clone()))
+            .unwrap_or_else(|| self.default_cwd.clone());
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let out = tokio::process::Command::new("sh")
+                .arg("-lc")
+                .arg(&command)
+                .current_dir(&cwd)
+                .output()
+                .await;
+            let (ok, code, text) = match out {
+                Ok(o) => {
+                    let mut text = String::new();
+                    if !o.stdout.is_empty() {
+                        text.push_str(&String::from_utf8_lossy(&o.stdout));
+                    }
+                    if !o.stderr.is_empty() {
+                        if !text.is_empty() {
+                            text.push_str("\n");
+                        }
+                        text.push_str("[stderr]\n");
+                        text.push_str(&String::from_utf8_lossy(&o.stderr));
+                    }
+                    let code = o.status.code();
+                    (o.status.success(), code, text)
+                }
+                Err(e) => (false, None, format!("failed to execute command: {e}")),
+            };
+            let f: EngineFn = Box::new(move |e, now| {
+                let _ = e.complete_command_run(now, id, ok, code, &text);
+            });
+            let _ = tx.send(Cmd::Engine(f));
+        });
+    }
+
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         while self.alive {
             let sleep = match self.engine.next_deadline() {
@@ -1110,6 +1216,7 @@ impl Actor {
                     });
                 }
             }
+            Cmd::RunQueued { id } => self.run_queued(id),
             Cmd::Shutdown(reply) => {
                 for (_, slot) in self.slots.drain() {
                     self.tokens.revoke(&slot.token);

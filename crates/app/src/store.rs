@@ -1890,6 +1890,10 @@ impl ChatStore {
             detail: r.detail.clone(),
             asked: self.asked_names(r),
             logged: None,
+            command: r.command.clone(),
+            run_state: r.run_state.clone(),
+            run_output: r.run_output.clone(),
+            run_exit_code: r.run_exit_code,
         }
     }
 
@@ -1914,12 +1918,19 @@ impl ChatStore {
                 LogOutcome::Pending => PermissionOutcome::Pending,
                 LogOutcome::Declined => PermissionOutcome::Declined,
                 LogOutcome::Approved => PermissionOutcome::Approved,
+                LogOutcome::Running => PermissionOutcome::Running,
+                LogOutcome::Done => PermissionOutcome::Done,
+                LogOutcome::Failed => PermissionOutcome::Failed,
             },
             at: r.created_at / 1000,
             read_only: r.read_only,
             reason: r.reason.clone(),
             detail: r.detail.clone(),
             asked: self.asked_names(r),
+            command: r.command.clone(),
+            run_state: r.run_state.clone(),
+            run_output: r.run_output.clone(),
+            run_exit_code: r.run_exit_code,
         }
     }
 

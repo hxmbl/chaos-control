@@ -187,6 +187,14 @@ pub struct PermissionPrompt {
     /// Approve / Deny. `None` is a live prompt (unused while requests are
     /// muted; see `permissions`).
     pub logged: Option<crate::PermissionOutcome>,
+    /// Captured command for queued execution, if any.
+    pub command: Option<Arc<str>>,
+    /// Execution lifecycle state (queued/running/done/failed/unrunnable/denied).
+    pub run_state: Option<Arc<str>>,
+    /// Command output/result when available.
+    pub run_output: Option<Arc<str>>,
+    /// Exit code when execution finished.
+    pub run_exit_code: Option<i32>,
 }
 
 /// What the project-identity pane asks.
@@ -404,6 +412,10 @@ mod tests {
             detail: None,
             asked: Arc::from("Hx"),
             logged: None,
+            command: None,
+            run_state: None,
+            run_output: None,
+            run_exit_code: None,
         });
         assert_eq!(&*pane.title(&sample()), "Claude Code asks permission");
         let kinds: Vec<_> = pane.actions().into_iter().map(|a| a.kind).collect();

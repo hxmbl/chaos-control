@@ -383,12 +383,20 @@ async fn run(
                 );
                 let title =
                     crate::permission::permission_title(Some(&r.title), tool_name.as_deref());
+                let detail = serde_json::to_string(&serde_json::json!({
+                    "title": &r.title,
+                    "description": &r.description,
+                    "subject": &r.subject,
+                }))
+                .ok()
+                .map(Arc::from)
+                .or_else(|| r.description.as_deref().map(Arc::from));
                 let verdict = gate
                     .ask(PermissionAsk {
                         turn,
                         title,
                         tool_name,
-                        detail: r.description.as_deref().map(Arc::from),
+                        detail,
                         read_only,
                         kind: crate::permission::request_kind_from_wire(kind.as_deref()),
                         key: Some(key),

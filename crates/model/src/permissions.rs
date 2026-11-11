@@ -25,6 +25,12 @@ pub enum PermissionOutcome {
     Declined,
     /// A human approved it.
     Approved,
+    /// Approved command currently running (STRM-542).
+    Running,
+    /// Queued command completed (STRM-542).
+    Done,
+    /// Queued command failed or could not be executed (STRM-542).
+    Failed,
 }
 
 impl PermissionOutcome {
@@ -34,6 +40,9 @@ impl PermissionOutcome {
             PermissionOutcome::Pending => "Pending",
             PermissionOutcome::Declined => "Declined",
             PermissionOutcome::Approved => "Approved",
+            PermissionOutcome::Running => "Running",
+            PermissionOutcome::Done => "Done",
+            PermissionOutcome::Failed => "Failed",
         }
     }
 }
@@ -62,6 +71,14 @@ pub struct PermissionLogEntry {
     pub detail: Option<Arc<str>>,
     /// Who it was routed to ("Hx"); empty for reads and VM agents.
     pub asked: Arc<str>,
+    /// Captured command for queued execution, if any.
+    pub command: Option<Arc<str>>,
+    /// Execution lifecycle state.
+    pub run_state: Option<Arc<str>>,
+    /// Command output/result when available.
+    pub run_output: Option<Arc<str>>,
+    /// Exit code when execution finished.
+    pub run_exit_code: Option<i32>,
 }
 
 impl PermissionLogEntry {
@@ -75,6 +92,10 @@ impl PermissionLogEntry {
             detail: self.detail.clone(),
             asked: self.asked.clone(),
             logged: Some(self.outcome),
+            command: self.command.clone(),
+            run_state: self.run_state.clone(),
+            run_output: self.run_output.clone(),
+            run_exit_code: self.run_exit_code,
         }
     }
 }
@@ -156,6 +177,10 @@ mod tests {
             reason: None,
             detail: None,
             asked: Arc::from(""),
+            command: None,
+            run_state: None,
+            run_output: None,
+            run_exit_code: None,
         }
     }
 

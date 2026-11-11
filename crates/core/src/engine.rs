@@ -989,6 +989,43 @@ impl Engine {
         }
     }
 
+    /// Per-channel approval mode override (STRM-542). Affects new requests only.
+    pub fn set_channel_approval_mode_override(
+        &mut self,
+        channel: ChannelId,
+        mode: Option<ApprovalMode>,
+    ) -> Result<(), rusqlite::Error> {
+        self.store
+            .tx(|c| crate::store::set_channel_approval_mode(c, channel, mode.map(|m| m.as_str())))
+    }
+
+    /// Per-project approval mode override (STRM-542). Affects new requests only.
+    pub fn set_project_approval_mode_override(
+        &mut self,
+        project: &ProjectId,
+        mode: Option<ApprovalMode>,
+        now: Millis,
+    ) -> Result<(), rusqlite::Error> {
+        self.store.tx(|c| {
+            crate::store::set_project_setting(
+                c,
+                project,
+                "approval_mode",
+                mode.map(|m| m.as_str()),
+                now,
+            )
+        })
+    }
+
+    /// Workspace-level approval mode override (STRM-542). Affects new requests only.
+    pub fn set_workspace_approval_mode_override(
+        &mut self,
+        mode: Option<ApprovalMode>,
+    ) -> Result<(), rusqlite::Error> {
+        self.store
+            .tx(|c| crate::store::set_app_setting(c, "approval_mode", mode.map(|m| m.as_str())))
+    }
+
     /// A roster model member's own ping-answer list, or `None` when it has
     /// none (or is not a model member).
     pub fn member_ping_answers(

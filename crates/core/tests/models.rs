@@ -263,7 +263,6 @@ async fn discovery_of_a_signed_out_harness_is_an_error_and_caches_nothing() {
     assert!(h.core.harness_models("fx").await.unwrap().is_empty());
 }
 
-
 // ---------- roster ----------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
