@@ -1,5 +1,14 @@
 # Command approval and execution modes (STRM-542)
 
+> Status: foundation landed — `ApprovalMode` + scope resolution,
+> `RequestKind` classification, `decided_by`, pending-as-live requests with
+> sidebar Approve/Deny, and the queued-command fields (`command`,
+> `run_state`, ...) are in. Not yet: core running queued commands and
+> steering results back, `ApprovalCaps`/`decide` are still unused
+> scaffolding, and the "Open decisions" below are partly settled by what
+> shipped (universal decline+grant path; per-member `agents.json` mode with
+> channel/project/workspace overrides).
+
 How Chaos Control decides what an agent may do on the host, and what happens
 to the things it wants to do. This extends the permission system in
 `docs/agents.md` ("Permissions: by where the agent runs"); it does not
@@ -231,10 +240,10 @@ Per-adapter notes (to verify live, not assume):
   `mode_switch`: claude-agent-acp has session mode switching; whether we
   should drive it is a separate question from our own `ApprovalMode`.
 - **codex-acp:** exec approvals are command approvals with structured
-  command text — the best candidate for real queue-then-execute. File
-  changes arrive as `changes` payloads (already hashed for `request_key`).
-- **codex (native app-server):** approval requests are richer (command +
-  cwd + reason); this is where `QueuedRequest.command` gets populated.
+  command text — the best candidate for real queue-then-execute
+  (`QueuedRequest.command`). File changes arrive as `changes` payloads
+  (already hashed for `request_key`). The native app-server adapter was
+  removed in STRM-542; everything arrives over ACP now.
 
 ## Open decisions (need answers before slice 1)
 

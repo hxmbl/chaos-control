@@ -111,6 +111,7 @@ impl Harness {
                     adapter: adapter.clone(),
                     cwd: Some(std::env::temp_dir()),
                     runs_in,
+                    approval: ApprovalMode::AskAll,
                     ping_answers,
                 },
                 self.main,

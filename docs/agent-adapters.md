@@ -6,8 +6,8 @@ reply obligations, permissions) are in [`agents.md`](agents.md); this file
 covers what sits under them.
 
 > **Not live-verified.** Everything below is built and covered by tests
-> against a scripted fake ACP agent and a fake Codex app-server
-> (`crates/core/tests/models.rs`), but none of it has been run against a
+> against a scripted fake ACP agent (`crates/core/tests/`), but none of it
+> has been run against a
 > real harness yet. Hxmbl couldn't test when it landed. Treat every launch
 > command and model detail here as theoretical until the manual checks at
 > the end pass on a real machine.
@@ -28,7 +28,7 @@ harness.
 
 Code: `crates/core/src/harness.rs` (presets, detection, catalog, ranking),
 `crates/core/src/roster.rs` (model members and rosters),
-`crates/core/src/codex.rs` (native Codex adapter), `crates/core/src/acp.rs`
+`crates/core/src/acp.rs`
 (ACP adapter, model option), `crates/app/src/agents.rs` (startup) and
 `crates/app/src/model_picker.rs` (the picker).
 
@@ -40,7 +40,7 @@ Pi was dropped.
 
 | # | Id | Harness | Transport | Detected by | Launch | Model selection |
 |---|---|---|---|---|---|---|
-| 1 | `codex` | Codex | native Codex app-server | `codex` | `codex app-server` | `model/list`; `thread/start {model}` |
+| 1 | `codex` | Codex | ACP | `codex-acp` | `codex-acp` | ACP model config option |
 | 2 | `fx` | fx | ACP | `fx` | `fx acp` | ACP model config option |
 | 3 | `vibe` | Mistral Vibe | ACP | `vibe-acp`, `vibe` | `vibe-acp` (sibling of `vibe`, else on the search path) | ACP model config option |
 | 4 | `claude-code` | Claude Code | ACP via adapter | `claude`, `claude-agent-acp` | `claude-agent-acp`, else `npx -y @agentclientprotocol/claude-agent-acp@0.99.1` | ACP model config option |
@@ -52,19 +52,7 @@ Pi was dropped.
 
 ### Why these transports
 
-- **Codex: native app-server.** ACP only reaches Codex through the
-  `codex-acp` adapter, which lags the app-server and hides its model list.
-  `codex app-server` is what Codex's own IDE extensions and T3 Code drive.
-  `CodexAdapter` speaks its JSON-RPC (one object per line, no `"jsonrpc"`
-  member) behind the same `AgentAdapter` / `AgentSession` boundary as ACP,
-  so the runtime never knows the difference. Wire summary: `initialize` +
-  `initialized`; `model/list` (paged); `thread/start {cwd, model?, config}`
-  with our chat MCP server added as `mcp_servers.chaos-control`;
-  `turn/start` per batch; `turn/interrupt` to cancel. Approval requests
-  (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`)
-  go through the permission gate and are answered `accept` or `decline`.
-  The module docs in `codex.rs` have the full method list and the
-  acceptance point.
+- **Codex: ACP.** Native Codex app-server integration was removed (STRM-542). Codex is supported through its ACP-compatible agent (`codex-acp`) like other harnesses.
 - **Everything else: ACP.** Each harness's own ACP entry point
   (`fx acp`, `vibe-acp`, `copilot --acp`, ...), all through the existing
   `AcpAdapter` (v2 draft offered first, v1 fallback; see `agents.md`).
@@ -74,9 +62,7 @@ Pi was dropped.
   `claude-agent-acp` nor `npx`, Claude Code counts as not installed.
 
 Chaos Control adds the chat MCP server to every session and otherwise
-leaves a harness's own settings alone (fx's ask/code modes included), with
-one exception: Codex threads start in its read-only sandbox (below, under
-"Permissions").
+leaves a harness's own settings alone, while enforcing Chaos Control's own approval policy (STRM-542).
 
 ## Detection
 
@@ -152,9 +138,8 @@ A probe spawns the harness once, always on core's own tokio runtime:
 - **ACP:** `initialize`, then a throwaway `session/new` with no chat tools,
   reading the session's model selector from `configOptions`: the `select`
   option whose category is `model`, else the one with id `model`. The
-  session is closed straight away. Times out after 30 s.
-- **Codex:** `initialize`, then every page of `model/list` (hidden models
-  left out). No thread is started.
+  session is closed straight away. Times out after 30 s. (Codex included:
+  `codex-acp` is an ACP harness like the rest.)
 
 A failure (signed out, timeout) caches nothing, and the picker's filter
 entry for that harness says why.
@@ -163,9 +148,9 @@ entry for that harness says why.
 
 Opening the picker used to run discovery from the app's GPUI executor:
 `Core::discover_models` awaited `AgentAdapter::list_models` inside the
-caller's future, and both adapters do tokio I/O there (the Codex adapter
-calls `tokio::spawn`; spawning the process, its pipes and the 30 s timeout
-need tokio's reactor and timer). GPUI's executor is not a tokio runtime, so
+caller's future, and the adapter does tokio I/O there (spawning the
+process, its pipes and the 30 s timeout need tokio's reactor and timer).
+GPUI's executor is not a tokio runtime, so
 the first tokio call panicked ("there is no reactor running, must be called
 from the context of a Tokio 1.x runtime") on the main thread, which took the
 app down. Discovery now runs on core's runtime (`Core` keeps its
@@ -181,8 +166,6 @@ comes back as an error), it only ever runs in the background, and
   the harness doesn't offer it, the session runs the harness default and
   the member's presence says so ("running its default"). A member with no
   model sets nothing.
-- **Codex:** `model` is passed on `thread/start` when `model/list` contains
-  it; otherwise the thread starts on the default and presence says so.
 
 ### Devin: workspace trust
 
@@ -242,14 +225,13 @@ Control setting that makes a harness approve writes.
 
 | Harness | Reads and chat tools | Commands, edits, everything else |
 |---|---|---|
-| ACP harnesses (fx, Vibe, Claude Code, Copilot, opencode, Devin, Cursor, Gemini) | A `session/request_permission` whose tool call has kind `read` or `search` gets the agent's allow-once option at once; a call named after one of this app's chat MCP tools is also auto-allowed and logged under that name | Declined at once with the agent's own "continue without it" option and `_meta.chaosControl.message` saying reads are free, commands and edits need a human, and that request #N went to the humans (don't wait for it). A VM agent is approved. |
-| Codex | Threads start with `sandbox: "read-only"`, `approvalPolicy: "on-request"`: commands run in the read-only sandbox without asking | Codex asks (`item/commandExecution/requestApproval`, `item/fileChange/requestApproval`) and gets `decline`; the room gets the request note. |
+| ACP harnesses (fx, Vibe, Claude Code, Copilot, opencode, Devin, Cursor, Gemini, Codex via `codex-acp`) | A `session/request_permission` whose tool call has kind `read` or `search` gets the agent's allow-once option at once; a call named after one of this app's chat MCP tools is also auto-allowed and logged under that name | Decided by the agent's approval mode (STRM-542): `ask-all` (default) declines the call at once with the agent's own "continue without it" option and `_meta.chaosControl.message` saying the request went to the approval queue (don't wait for it); `accept-edits` allows edits and queues commands; `yolo` allows. A VM agent is approved. codex-acp maps the decline to a Codex review decision ("denied": continue without running, never "abort"). |
 
 A missing or unknown tool kind is not a read. The humans' Approve / Deny
-pane and one-shot grants work as before (`agents.md`, "Permissions"); an
-approval lets the agent's retry through once. Code: `permission.rs`
-(`is_read_only_kind`, `PermissionVerdict::AllowRead`), `acp.rs`,
-`acp_v2.rs`, `codex.rs` (`SANDBOX`, `APPROVAL_POLICY`).
+(in the sidebar's Permissions list) and one-shot grants work as before
+(`agents.md`, "Permissions"); an approval lets the agent's retry through
+once. Code: `permission.rs` (`is_read_only_kind`, `mode_verdict`,
+`PermissionVerdict`), `acp.rs`, `acp_v2.rs`.
 
 ### Credit: T3 Code (MIT)
 
@@ -259,9 +241,6 @@ approval lets the agent's retry through once. Code: `permission.rs`
   `ModelPickerSidebar.tsx`: search on top, harness filter, ranked list. T3
   draws the filter as a side rail; our narrower pane draws it as a row.
 - **Search ranking** (`harness::rank`), ported from `modelPickerSearch.ts`.
-- **Codex app-server method names and payload shapes**, from
-  `CodexAdapterV2.ts` and `CodexProvider.ts`. Studied, not copied:
-  `codex.rs` is a fresh Rust client.
 - **Fallback model names** for Codex and Claude Code, from T3's model
   manifest of 2026-10-28.
 
@@ -294,13 +273,11 @@ Swap `fx acp` for each launch command:
 | Cursor Agent | `cursor-agent acp` |
 | Gemini CLI | `gemini --acp` |
 
-Codex app-server (no `"jsonrpc"` member):
+Codex via `codex-acp` (ACP, like the others — the native app-server
+adapter was removed in STRM-542):
 
 ```sh
-printf '%s\n' \
-  '{"id":1,"method":"initialize","params":{"clientInfo":{"name":"chaos-control","version":"0.0.1"}}}' \
-  '{"method":"initialized"}' \
-  '{"id":2,"method":"model/list","params":{}}' | codex app-server
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}' | codex-acp
 ```
 
 Live through core's ignored replay test (any ACP harness):
@@ -342,9 +319,9 @@ What to check for each harness:
 ## Tests
 
 Roster follow-ups (2026-10-31): `tests/models.rs` awaits discovery from a
-plain (non-tokio) executor, checks Codex's `sandbox` / `approvalPolicy`, and
-probes into the on-disk cache; `tests/permissions.rs` checks reads allowed
-and the rest declined over v1 and v2; `model_cache.rs` and the app's
+plain (non-tokio) executor and probes into the on-disk cache;
+`tests/permissions.rs` checks reads allowed and the rest going to the
+approval queue over v1 and v2; `model_cache.rs` and the app's
 `agents_file.rs` and `agents.rs` have unit tests for the cache, the
 `agents.json` write-back and not-installed members.
 
@@ -352,10 +329,7 @@ and the rest declined over v1 and v2; `model_cache.rs` and the app's
 member setting its model through the session model option; a model the
 harness doesn't offer running the default and saying so; a default member
 setting nothing; ACP discovery opening and closing a throwaway session
-without chat tools; a signed-out harness's discovery caching nothing; a
-Codex member taking a turn with its last message as the fallback reply; a
-Codex model missing from `model/list` starting on the default; Codex
-approvals going through the permission gate; Codex signed out going red
-without retries; Codex interrupt ending the turn cancelled; Codex listing
-models without starting a thread; and one harness hosting two members.
+without chat tools; a signed-out harness's discovery caching nothing;
+discovery awaited off the tokio runtime; the probe writing the on-disk
+model cache; and one harness hosting two members.
 Detection, catalog grouping and ranking have unit tests in `harness.rs`.

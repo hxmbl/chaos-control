@@ -77,7 +77,7 @@ impl RightSidebar {
     }
 
     /// One row of the permission log. Clicking it opens the pane read-only
-    /// with the request's details.
+    /// with the request's details. Pending requests can be approved/denied.
     fn permission_row(
         &self,
         entry: PermissionLogEntry,
@@ -100,6 +100,7 @@ impl RightSidebar {
             entry.agent_name, entry.action, entry.request
         );
         let declined = entry.outcome == PermissionOutcome::Declined;
+        let pending = entry.outcome == PermissionOutcome::Pending;
         let initial: SharedString = entry
             .agent_name
             .chars()
@@ -121,8 +122,9 @@ impl RightSidebar {
                     .text_color(t.ink_soft)
                     .child(initial),
             });
-        pill(("permission", entry.request as usize), cx)
-            .h(size::ROW)
+        let req = entry.request;
+        let row = pill(("permission", req as usize), cx)
+            .h(if pending { size::ROW + space::X1 } else { size::ROW })
             .flex_none()
             .gap(space::X2)
             .pl(space::X2)
@@ -140,8 +142,43 @@ impl RightSidebar {
                 this.pane.update(cx, |p, cx| p.open(content, window, cx));
             }))
             .child(mark)
-            .child(div().flex_1().min_w_0().ellipsis().child(truncated(action)))
-            .child(
+            .child(div().flex_1().min_w_0().ellipsis().child(truncated(action)));
+
+        if pending {
+            let store_a = self.store.clone();
+            let store_d = self.store.clone();
+            row.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(space::X1)
+                    .child(
+                        pill(("perm-approve", req as usize), cx)
+                            .px(space::X2)
+                            .h(size::BUTTON_SM)
+                            .type_style(text::CAPTION)
+                            .font_weight(text::MEDIUM)
+                            .child("Approve")
+                            .on_click(move |_, _, cx| {
+                                store_a.update(cx, |s, cx| s.answer_permission(req, true, cx));
+                            }),
+                    )
+                    .child(
+                        pill(("perm-deny", req as usize), cx)
+                            .px(space::X2)
+                            .h(size::BUTTON_SM)
+                            .type_style(text::CAPTION)
+                            .font_weight(text::MEDIUM)
+                            .text_color(t.ink_soft)
+                            .child("Deny")
+                            .on_click(move |_, _, cx| {
+                                store_d.update(cx, |s, cx| s.answer_permission(req, false, cx));
+                            }),
+                    ),
+            )
+        } else {
+            row.child(
                 div()
                     .flex_none()
                     .type_style(text::CAPTION)
@@ -155,6 +192,7 @@ impl RightSidebar {
                     .text_color(t.muted)
                     .child(when),
             )
+        }
     }
 }
 

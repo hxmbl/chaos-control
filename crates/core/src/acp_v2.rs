@@ -390,6 +390,7 @@ async fn run(
                         tool_name,
                         detail: r.description.as_deref().map(Arc::from),
                         read_only,
+                        kind: crate::permission::request_kind_from_wire(kind.as_deref()),
                         key: Some(key),
                     })
                     .await;

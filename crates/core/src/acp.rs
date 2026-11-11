@@ -838,6 +838,7 @@ async fn run_v1(
                         tool_name,
                         detail,
                         read_only,
+                        kind: crate::permission::request_kind_from_wire(kind.as_deref()),
                         key: Some(key),
                     })
                     .await;

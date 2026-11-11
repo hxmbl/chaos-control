@@ -464,7 +464,7 @@ pub enum DecidedBy {
     Human(MemberId),
     /// Auto-approved by the agent running in its own VM.
     AutoVm,
-    /// Auto-approved by the `yolo` execution mode.
+    /// Auto-approved by an approval mode (`accept-edits` edits, `yolo`).
     AutoMode,
 }
 

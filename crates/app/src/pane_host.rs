@@ -771,6 +771,10 @@ fn permission_text(p: &model::PermissionPrompt) -> String {
             model::PermissionOutcome::Approved => {
                 format!("Request #{}: approved by a human, once.", p.request)
             }
+            model::PermissionOutcome::Pending => format!(
+                "Request #{}: waiting for a human to approve or deny.",
+                p.request
+            ),
         });
         return out;
     }

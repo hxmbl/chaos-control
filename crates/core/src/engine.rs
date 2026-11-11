@@ -263,6 +263,8 @@ pub struct Engine {
     pub(crate) effects: Vec<Effect>,
     /// Where each agent runs (see `permission`); absent means the host.
     pub(crate) runs_in: HashMap<MemberId, RunsIn>,
+    /// Host-side approval mode per agent (STRM-542). Absent means AskAll.
+    pub(crate) approval_mode: HashMap<MemberId, ApprovalMode>,
     /// Per-agent ping-answer lists from `agents.json`; absent means the
     /// project's setting, then the default (see [`Engine::ping_answers`]).
     ping_answers: HashMap<MemberId, PingAnswers>,
@@ -287,6 +289,7 @@ impl Engine {
             rt: HashMap::new(),
             effects: Vec::new(),
             runs_in: HashMap::new(),
+            approval_mode: HashMap::new(),
             ping_answers: HashMap::new(),
         };
         let pending = engine.store.tx(|c| store::recover(c, now))?;

@@ -19,9 +19,11 @@ pub const LOG_LEN: usize = 200;
 pub enum PermissionOutcome {
     /// Allowed without asking anyone: a read, or an agent in its own VM.
     AutoAllowed,
-    /// Declined at once (never answered), or denied by a human.
+    /// Waiting for a human decision (STRM-542).
+    Pending,
+    /// Declined/denied by a human.
     Declined,
-    /// A human approved it (only possible through core for now).
+    /// A human approved it.
     Approved,
 }
 
@@ -29,6 +31,7 @@ impl PermissionOutcome {
     pub fn label(self) -> &'static str {
         match self {
             PermissionOutcome::AutoAllowed => "Auto-allowed",
+            PermissionOutcome::Pending => "Pending",
             PermissionOutcome::Declined => "Declined",
             PermissionOutcome::Approved => "Approved",
         }

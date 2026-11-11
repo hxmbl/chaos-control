@@ -1911,6 +1911,7 @@ impl ChatStore {
             action: r.title.clone(),
             outcome: match r.outcome() {
                 LogOutcome::AutoAllowed => PermissionOutcome::AutoAllowed,
+                LogOutcome::Pending => PermissionOutcome::Pending,
                 LogOutcome::Declined => PermissionOutcome::Declined,
                 LogOutcome::Approved => PermissionOutcome::Approved,
             },

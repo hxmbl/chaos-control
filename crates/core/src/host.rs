@@ -113,6 +113,8 @@ pub struct AgentSpec {
     /// Where the agent runs: on the host its permission requests go to the
     /// humans; in its own VM they are approved (see `permission`).
     pub runs_in: RunsIn,
+    /// How much host-side work a human signs off on (STRM-542).
+    pub approval: crate::types::ApprovalMode,
     /// The agent's own list of reactions that answer a ping
     /// (`ping_answer_reactions` in `agents.json`); `None` uses the project's
     /// setting, then the default (see `Engine::ping_answers`).
@@ -171,6 +173,8 @@ pub struct MemberSpec {
     pub adapter: Arc<dyn AgentAdapter>,
     pub cwd: Option<PathBuf>,
     pub runs_in: RunsIn,
+    /// How much host-side work a human signs off on (STRM-542).
+    pub approval: crate::types::ApprovalMode,
 }
 
 /// Cheap, cloneable handle to the runtime.
@@ -512,6 +516,7 @@ impl Core {
                 adapter: spec.adapter,
                 cwd: spec.cwd,
                 runs_in: spec.runs_in,
+                approval: spec.approval,
                 ping_answers: None,
             },
             channel,
@@ -1139,6 +1144,7 @@ impl Actor {
             .join(channel, &member, now)
             .map_err(|e| e.to_string())?;
         self.engine.set_runs_in(member.id, spec.runs_in);
+        self.engine.set_approval_mode(member.id, spec.approval);
         self.engine
             .set_agent_ping_answers(member.id, spec.ping_answers.clone());
         let adapter = spec.adapter.clone();

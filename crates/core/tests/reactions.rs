@@ -672,6 +672,7 @@ async fn model_member(h: &Harness, name: &str, script: fake::Script) -> Member {
                 adapter,
                 cwd: Some(std::env::temp_dir()),
                 runs_in: RunsIn::Host,
+                approval: ApprovalMode::AskAll,
             },
             h.main,
         )
