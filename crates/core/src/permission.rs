@@ -564,10 +564,10 @@ pub fn extract_command(detail: Option<&str>) -> Option<String> {
                 "fields",
                 "content",
             ] {
-                if let Some(inner) = obj.get(key) {
-                    if let Some(found) = find(inner) {
-                        return Some(found);
-                    }
+                if let Some(inner) = obj.get(key)
+                    && let Some(found) = find(inner)
+                {
+                    return Some(found);
                 }
             }
             // Some ACP tool calls put command in title/description-like fields? no, avoid guessing.
@@ -615,10 +615,10 @@ pub fn extract_cwd(detail: Option<&str>) -> Option<String> {
                 "tool_call",
                 "fields",
             ] {
-                if let Some(inner) = obj.get(key) {
-                    if let Some(found) = find(inner) {
-                        return Some(found);
-                    }
+                if let Some(inner) = obj.get(key)
+                    && let Some(found) = find(inner)
+                {
+                    return Some(found);
                 }
             }
         } else if let Some(arr) = v.as_array() {
@@ -1372,7 +1372,7 @@ impl Engine {
             format!("using {} (chat tool, auto-allowed)", short(name)),
         );
         self.effects
-            .push(Effect::Event(CoreEvent::Permission(r.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
         Ok(r)
     }
 
@@ -1434,7 +1434,7 @@ impl Engine {
                 format!("ran {} (own VM, auto-approved)", short(title)),
             );
             self.effects
-                .push(Effect::Event(CoreEvent::Permission(r.clone())));
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
             return Ok(r);
         }
         // STRM-542: apply host-side approval mode. Reads are handled upstream.
@@ -1470,7 +1470,7 @@ impl Engine {
                 format!("ran {} (auto-approved, {mode_label})", short(title)),
             );
             self.effects
-                .push(Effect::Event(CoreEvent::Permission(r.clone())));
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
             return Ok(r);
         }
         if let Some(grant) = unused_grant(self.conn(), agent, channel, &key)? {
@@ -1487,7 +1487,7 @@ impl Engine {
                 format!("running {} (approved, #{grant})", short(title)),
             );
             self.effects
-                .push(Effect::Event(CoreEvent::Permission(r.clone())));
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
             return Ok(r);
         }
         if let Some(r) = pending_for(self.conn(), agent, channel, &key)? {
@@ -1578,7 +1578,7 @@ impl Engine {
             )?;
         }
         self.effects
-            .push(Effect::Event(CoreEvent::Permission(r.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
         self.publish_status(agent, channel);
         Ok(r)
     }
@@ -1666,7 +1666,7 @@ impl Engine {
         // A human's answer is a fresh start, like a human ping.
         self.human_fresh_start(agent, channel);
         self.effects
-            .push(Effect::Event(CoreEvent::Permission(req.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Permission(req.clone()))));
         self.pump(now, agent, channel);
         Ok(req)
     }
@@ -1688,7 +1688,9 @@ impl Engine {
             .store
             .tx(|c| insert_read(c, agent, channel, turn, title, detail, now))
         {
-            Ok(r) => self.effects.push(Effect::Event(CoreEvent::Permission(r))),
+            Ok(r) => self
+                .effects
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r)))),
             Err(e) => self.rt_note(agent, channel, format!("permission log: {e}")),
         }
     }
@@ -1802,7 +1804,7 @@ impl Engine {
         })?;
         self.human_fresh_start(agent, channel);
         self.effects
-            .push(Effect::Event(CoreEvent::Permission(req.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Permission(req.clone()))));
         self.pump(now, agent, channel);
         Ok(req)
     }

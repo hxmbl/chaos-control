@@ -1108,7 +1108,7 @@ impl Actor {
                     }
                     if !o.stderr.is_empty() {
                         if !text.is_empty() {
-                            text.push_str("\n");
+                            text.push('\n');
                         }
                         text.push_str("[stderr]\n");
                         text.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -1312,7 +1312,7 @@ impl Actor {
             for effect in effects {
                 match effect {
                     Effect::Event(e) => {
-                        let _ = self.events.send(e);
+                        let _ = self.events.send(*e);
                     }
                     Effect::Dispatch(d) => self.dispatch(d),
                     Effect::Close { agent, channel } => {

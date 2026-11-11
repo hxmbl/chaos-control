@@ -31,7 +31,7 @@ pub enum Effect {
     /// Close the session for agent x channel (idle).
     Close { agent: MemberId, channel: ChannelId },
     /// Tell the UI.
-    Event(CoreEvent),
+    Event(Box<CoreEvent>),
 }
 
 #[derive(Clone, Debug)]
@@ -478,7 +478,8 @@ impl Engine {
         let rt = self.rt.entry((agent, channel)).or_default();
         if rt.last_status.as_ref() != Some(&key) {
             rt.last_status = Some(key);
-            self.effects.push(Effect::Event(CoreEvent::Agent(status)));
+            self.effects
+                .push(Effect::Event(Box::new(CoreEvent::Agent(status))));
         }
     }
 
@@ -559,7 +560,7 @@ impl Engine {
             )?)
         })?;
         self.effects
-            .push(Effect::Event(CoreEvent::Message(message.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Message(message.clone()))));
         if author.kind == MemberKind::Agent {
             self.on_agent_sent(&author, &message, cause)?;
         } else {
@@ -901,7 +902,7 @@ impl Engine {
             )?)
         })?;
         self.effects
-            .push(Effect::Event(CoreEvent::Message(m.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Message(m.clone()))));
         Ok(m)
     }
 
@@ -947,13 +948,14 @@ impl Engine {
             Ok(changed)
         })?;
         if changed {
-            self.effects.push(Effect::Event(CoreEvent::Reaction {
-                channel: m.channel,
-                message,
-                member,
-                emoji: emoji.clone(),
-                added: add,
-            }));
+            self.effects
+                .push(Effect::Event(Box::new(CoreEvent::Reaction {
+                    channel: m.channel,
+                    message,
+                    member,
+                    emoji: emoji.clone(),
+                    added: add,
+                })));
         }
         Ok(Reacted { emoji, changed })
     }
@@ -1287,10 +1289,10 @@ impl Engine {
                 .store
                 .tx(|c| crate::roster::set_harness_models(c, &mm.harness, &info.models, now));
             if saved.is_ok() {
-                self.effects.push(Effect::Event(CoreEvent::Models {
+                self.effects.push(Effect::Event(Box::new(CoreEvent::Models {
                     harness: mm.harness.clone(),
                     models: info.models.clone(),
-                }));
+                })));
             }
         }
         self.publish_status(agent, channel);
@@ -1644,7 +1646,7 @@ impl Engine {
         rt.idle_since = Some(now);
         if let Some((m, author)) = fallback_message {
             self.effects
-                .push(Effect::Event(CoreEvent::Message(m.clone())));
+                .push(Effect::Event(Box::new(CoreEvent::Message(m.clone()))));
             self.create_triggers(now, &m, &author, false)?;
         }
         Ok(())
@@ -1724,12 +1726,13 @@ impl Engine {
             return;
         };
         if let Some(read_at) = cursor.read_at {
-            self.effects.push(Effect::Event(CoreEvent::Read(Receipt {
-                member,
-                channel,
-                read_through: cursor.read_through,
-                read_at,
-            })));
+            self.effects
+                .push(Effect::Event(Box::new(CoreEvent::Read(Receipt {
+                    member,
+                    channel,
+                    read_through: cursor.read_through,
+                    read_at,
+                }))));
         }
     }
 }
