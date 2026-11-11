@@ -1,5 +1,5 @@
 > [!WARNING]
-> SEVERE PRE RELESE, FAR FROM DONE, Do NOT expect a full project.
+> Very early pre-release. Many features missing. Continue at your own risk.
 
 # Chaos Control
 
