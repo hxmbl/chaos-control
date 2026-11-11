@@ -756,6 +756,9 @@ fn permission_text(p: &model::PermissionPrompt) -> String {
     if let Some(cmd) = &p.command {
         out.push_str(&format!("Command: {cmd}\n"));
     }
+    if let Some(cwd) = &p.cwd {
+        out.push_str(&format!("Working directory: {cwd}\n"));
+    }
     if let Some(state) = &p.run_state {
         out.push_str(&format!("Run state: {state}\n"));
     }

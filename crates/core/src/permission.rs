@@ -280,10 +280,6 @@ pub enum PermissionVerdict {
     /// Pick the agent's own decline ("not now") option; the request went to
     /// the humans and the answer arrives later.
     Sent { request: PermissionId },
-    /// The request is queued for deferred execution (accept-edits mode).
-    DeferredQueue { request: PermissionId },
-    /// The request is held open for blocking queue (when caps.hold_request).
-    Hold { request: PermissionId },
     /// No core to ask (replay tests): decline, nothing recorded.
     Decline,
 }
@@ -357,24 +353,6 @@ pub enum ProposedChange {
     },
     /// A unified diff blob, when that's all the agent sent.
     Unified { path: Arc<str>, patch: Arc<str> },
-}
-
-/// What one live session's protocol can actually do for us with permission
-/// requests (STRM-542). Sampled from the handshake/negotiation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ApprovalCaps {
-    /// The agent sends a structured diff we can show a human.
-    pub proposed_diffs: bool,
-    /// The permission call can be held open past the initial ask
-    /// (true queue, blocking). Vanilla ACP: false.
-    pub hold_request: bool,
-    /// The harness can execute an approved command itself and report
-    /// output back through a channel we can read (rare; most agents
-    /// only retry through their own tool call).
-    pub deferred_execute: bool,
-    /// The agent's "accept edits"-style mode can be set through the
-    /// protocol rather than only mimicked by us.
-    pub mode_switch: bool,
 }
 
 /// One thing an agent wants to do that a human (or a mode) hasn't settled.
@@ -474,44 +452,6 @@ pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
     }
 }
 
-/// The decision the gate makes, given caps. Fail closed: a capability
-/// we don't have means we decline-and-ask, never allow-and-hope (STRM-542).
-pub fn decide(caps: ApprovalCaps, mode: ApprovalMode, kind: RequestKind) -> PermissionVerdict {
-    match mode_verdict(mode, kind) {
-        ModeOutcome::Allow => PermissionVerdict::Allow {
-            request: PermissionId(0), // placeholder, set by caller
-        },
-        ModeOutcome::AskHuman => {
-            if caps.hold_request {
-                // True blocking queue: keep the ACP call open, answer
-                // when the human resolves. Agent waits — acceptable only
-                // because the agent (or mode) opted into hold semantics.
-                PermissionVerdict::Hold {
-                    request: PermissionId(0), // placeholder, set by caller
-                }
-            } else {
-                // Universal path: decline now with "request sent #N",
-                // grant on retry. Today's behavior, kept.
-                PermissionVerdict::Sent {
-                    request: PermissionId(0), // placeholder, set by caller
-                }
-            }
-        }
-        ModeOutcome::Queue => {
-            if caps.deferred_execute {
-                PermissionVerdict::DeferredQueue {
-                    request: PermissionId(0), // placeholder, set by caller
-                }
-            } else {
-                // Can't run it for them: queue the *ask*, agent retries
-                // on approval like ask-all, output comes back as a wake.
-                PermissionVerdict::Sent {
-                    request: PermissionId(0), // placeholder, set by caller
-                }
-            }
-        }
-    }
-}
 
 // ---------- request keys ----------
 
@@ -1212,34 +1152,61 @@ impl Engine {
         self.runs_in.get(&agent).copied().unwrap_or_default()
     }
 
-    /// Sets the host-side approval mode for `agent` (STRM-542).
+    /// Sets the host-side approval mode for `agent` (STRM-542). Persisted.
     pub fn set_approval_mode(&mut self, agent: MemberId, mode: ApprovalMode) {
         self.approval_mode.insert(agent, mode);
+        let key = format!("member_approval_mode:{}", agent.0);
+        let _ = self
+            .store
+            .tx(|c| crate::store::set_app_setting(c, &key, Some(mode.as_str())));
     }
 
     pub fn approval_mode(&self, agent: MemberId) -> ApprovalMode {
+        let key = format!("member_approval_mode:{}", agent.0);
+        if let Ok(Some(m)) = crate::store::app_setting(self.conn(), &key) {
+            return ApprovalMode::parse(&m);
+        }
         self.approval_mode
             .get(&agent)
             .copied()
             .unwrap_or(ApprovalMode::AskAll)
     }
 
+    /// Records the agent's working directory for command execution.
+    pub fn set_agent_cwd(&mut self, agent: MemberId, cwd: std::path::PathBuf) {
+        self.agent_cwd.insert(agent, cwd);
+    }
+
+    pub fn agent_cwd(&self, agent: MemberId) -> Option<std::path::PathBuf> {
+        self.agent_cwd.get(&agent).cloned()
+    }
+
     /// Effective approval mode for a new request in `channel` (STRM-542):
     /// channel override > project override > workspace override > member default.
+    /// Fails closed to `ask-all` if a higher-priority override cannot be read.
     pub fn effective_approval_mode(&self, agent: MemberId, channel: ChannelId) -> ApprovalMode {
-        if let Ok(Some(m)) = crate::store::channel_approval_mode(self.conn(), channel) {
-            return ApprovalMode::parse(&m);
+        match crate::store::channel_approval_mode(self.conn(), channel) {
+            Ok(Some(m)) => return ApprovalMode::parse(&m),
+            Err(_) => return ApprovalMode::AskAll,
+            Ok(None) => {}
         }
-        if let Ok(Some(ch)) = crate::store::channel(self.conn(), channel)
-            && let Ok(Some(m)) =
-                crate::store::project_setting(self.conn(), &ch.project, "approval_mode")
-        {
-            return ApprovalMode::parse(&m);
+        let project = match crate::store::channel(self.conn(), channel) {
+            Ok(Some(ch)) => Some(ch.project),
+            Ok(None) => None,
+            Err(_) => return ApprovalMode::AskAll,
+        };
+        if let Some(project) = project {
+            match crate::store::project_setting(self.conn(), &project, "approval_mode") {
+                Ok(Some(m)) => return ApprovalMode::parse(&m),
+                Err(_) => return ApprovalMode::AskAll,
+                Ok(None) => {}
+            }
         }
-        if let Ok(Some(m)) = crate::store::app_setting(self.conn(), "approval_mode") {
-            return ApprovalMode::parse(&m);
+        match crate::store::app_setting(self.conn(), "approval_mode") {
+            Ok(Some(m)) => ApprovalMode::parse(&m),
+            Ok(None) => self.approval_mode(agent),
+            Err(_) => ApprovalMode::AskAll,
         }
-        self.approval_mode(agent)
     }
 
     /// The humans a request from `agent` goes to: whoever woke the turn it was
@@ -1282,7 +1249,7 @@ impl Engine {
         if let Some(name) = ask
             .tool_name
             .as_deref()
-            .filter(|name| crate::mcp::TOOL_NAMES.contains(name))
+            .filter(|name| AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(name))
         {
             return match self.auto_approve_chat_tool(
                 now,
@@ -1500,19 +1467,20 @@ impl Engine {
         } else {
             None
         };
-        let req_cwd = if command.is_some() {
-            extract_cwd(detail)
+        let (req_cwd, run_state_seed) = if queued && kind == RequestKind::Execute {
+            match command.as_deref() {
+                Some(_) => {
+                    let resolved = extract_cwd(detail)
+                        .or_else(|| self.agent_cwd(agent).map(|p| p.to_string_lossy().into_owned()));
+                    match resolved {
+                        Some(cwd) => (Some(cwd), Some("queued")),
+                        None => (None, Some("unrunnable")),
+                    }
+                }
+                None => (None, Some("unrunnable")),
+            }
         } else {
-            None
-        };
-        let run_state_seed = if queued && kind == RequestKind::Execute {
-            Some(if command.is_some() {
-                "queued"
-            } else {
-                "unrunnable"
-            })
-        } else {
-            None
+            (None, None)
         };
         let r = self.store.tx(|c| {
             let r = insert(
@@ -1611,13 +1579,21 @@ impl Engine {
             return Err(AnswerError::AlreadyAnswered(now_state));
         }
         let mut req = get(self.conn(), id)?.expect("answered");
-        let was_queued_cmd = req.run_state.as_deref() == Some("queued") && req.command.is_some();
-        let unrunnable_queued = req.run_state.as_deref() == Some("unrunnable");
+        let was_queued_cmd = req.run_state.as_deref() == Some("queued")
+            && req.command.is_some()
+            && req.cwd.is_some();
+        let unrunnable_queued = req.run_state.as_deref() == Some("unrunnable")
+            || (req.run_state.as_deref() == Some("queued")
+                && (req.command.is_none() || req.cwd.is_none()));
         let runnable = approve && was_queued_cmd;
+        if approve && req.run_state.as_deref() == Some("queued") && !was_queued_cmd {
+            self.store.tx(|c| set_run_state(c, id, "unrunnable"))?;
+            req = get(self.conn(), id)?.expect("answered");
+        }
         if runnable {
             self.store.tx(|c| set_run_state(c, id, "running"))?;
             req = get(self.conn(), id)?.expect("answered");
-        } else if !approve && (was_queued_cmd || unrunnable_queued) {
+        } else if !approve && (req.run_state.as_deref() == Some("queued") || unrunnable_queued) {
             self.store.tx(|c| set_run_state(c, id, "denied"))?;
             req = get(self.conn(), id)?.expect("answered");
         }
@@ -1744,7 +1720,7 @@ impl Engine {
     }
 
     /// Records completion of a Chaos-Control-executed queued command and steers
-    /// the result to the agent (STRM-542).
+    /// the result to the agent (STRM-542). Persists result and notification together.
     pub fn complete_command_run(
         &mut self,
         now: Millis,
@@ -1764,9 +1740,6 @@ impl Engine {
         } else {
             Some(output)
         };
-        self.store
-            .tx(|c| set_run_result(c, id, state, out_store, exit_code, now))?;
-        let req = get(self.conn(), id)?.expect("updated");
         let (agent, channel) = (req.agent, req.channel);
         let handle = handle_of(self.conn(), agent);
         let status = match (ok, exit_code) {
@@ -1791,17 +1764,35 @@ impl Engine {
             "@{handle} queued command #{id} ({}) {status}.\nOutput:\n{shown}",
             short(&req.title)
         );
-        let m = self.system_note(now, channel, &body)?;
-        let t = TriggerId {
-            agent,
-            channel,
-            message: m.id,
-        };
-        self.store.tx::<_, PostError>(|c| {
+        let (req, msg) = self.store.tx::<_, rusqlite::Error>(|c| {
+            set_run_result(c, id, state, out_store, exit_code, now)?;
+            let msg = store::insert_message(
+                c,
+                &crate::store::NewMessage {
+                    channel,
+                    author: None,
+                    origin: Origin::System,
+                    body: &body,
+                    reply_to: None,
+                    mentions: &[],
+                    hop: 0,
+                    cause_batch: None,
+                    client_request_id: None,
+                    sent_at: now,
+                },
+            )?;
             let batch = store::pending_batch_or_create(c, agent, channel, now)?;
+            let t = TriggerId {
+                agent,
+                channel,
+                message: msg.id,
+            };
             store::insert_trigger(c, t, WakeReason::Permission, 0, batch.id, now)?;
-            Ok(())
+            let req = get(c, id)?.expect("updated");
+            Ok((req, msg))
         })?;
+        self.effects
+            .push(Effect::Event(Box::new(CoreEvent::Message(msg))));
         self.human_fresh_start(agent, channel);
         self.effects
             .push(Effect::Event(Box::new(CoreEvent::Permission(req.clone()))));
@@ -1858,6 +1849,22 @@ pub const TOOL_NAMES: [&str; 4] = [
     "chat_permission_status",
     "chat_approval_mode_status",
     "chat_set_approval_mode",
+];
+
+/// Named chat tools that are safe to auto-approve when requested natively.
+/// Policy changes are excluded: they must be human-authorized.
+pub const AUTO_ALLOWED_CHAT_TOOL_NAMES: [&str; 11] = [
+    "chat_context",
+    "chat_read",
+    "chat_search",
+    "chat_send",
+    "chat_react",
+    "chat_refuse",
+    "chat_dissent",
+    "chat_status",
+    "chat_request_permission",
+    "chat_permission_status",
+    "chat_approval_mode_status",
 ];
 
 pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<Tool> {
@@ -1948,58 +1955,11 @@ pub fn call_tool(
             }))
         }
         "chat_set_approval_mode" => {
-            let scope_kind = args
-                .get("scope")
-                .and_then(Value::as_str)
-                .unwrap_or("member");
-            let mode_val = args.get("mode");
-            let mode = match mode_val {
-                Some(Value::Null) => None,
-                Some(Value::String(s)) => Some(ApprovalMode::parse(s)),
-                _ => {
-                    return Err(ToolError(
-                        "mode must be 'ask-all', 'accept-edits', 'yolo', or null".into(),
-                    ));
-                }
-            };
-            match scope_kind {
-                "member" => {
-                    let Some(m) = mode else {
-                        return Err(ToolError("member default mode cannot be cleared".into()));
-                    };
-                    engine.set_approval_mode(scope.agent, m);
-                }
-                "channel" => {
-                    engine
-                        .set_channel_approval_mode_override(scope.channel, mode)
-                        .map_err(|e| ToolError(e.to_string()))?;
-                }
-                "project" => {
-                    let ch = crate::store::channel(engine.conn(), scope.channel)?
-                        .ok_or_else(|| ToolError("channel not found".into()))?;
-                    engine
-                        .set_project_approval_mode_override(&ch.project, mode, now)
-                        .map_err(|e| ToolError(e.to_string()))?;
-                }
-                "workspace" => {
-                    engine
-                        .set_workspace_approval_mode_override(mode)
-                        .map_err(|e| ToolError(e.to_string()))?;
-                }
-                _ => {
-                    return Err(ToolError(
-                        "scope must be channel, project, workspace, or member".into(),
-                    ));
-                }
-            }
-            let effective = engine.effective_approval_mode(scope.agent, scope.channel);
-            Ok(json!({
-                "ok": true,
-                "scope": scope_kind,
-                "mode": mode.map(|m| m.as_str().to_string()),
-                "effective_now": effective.as_str(),
-                "note": "Affects new requests only."
-            }))
+            // Policy changes are human-authorized. Agents must not be able to
+            // elevate their own effective permissions or change broader scopes.
+            Err(ToolError(
+                "only a human may change approval policy (use the app settings)".into(),
+            ))
         }
         "chat_request_permission" => {
             let action = args
@@ -2159,5 +2119,26 @@ mod tests {
             RunsIn::Host
         );
         assert_eq!(RunsIn::default(), RunsIn::Host);
+    }
+
+    #[test]
+    fn mode_verdict_covers_all_kinds() {
+        use super::{mode_verdict, ModeOutcome, RequestKind};
+        use crate::types::ApprovalMode;
+        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Read), ModeOutcome::AskHuman);
+        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Edit), ModeOutcome::AskHuman);
+        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Execute), ModeOutcome::AskHuman);
+        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Fetch), ModeOutcome::AskHuman);
+        assert_eq!(mode_verdict(ApprovalMode::AskAll, RequestKind::Other), ModeOutcome::AskHuman);
+
+        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Read), ModeOutcome::Allow);
+        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Edit), ModeOutcome::Allow);
+        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Execute), ModeOutcome::Queue);
+        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Fetch), ModeOutcome::Queue);
+        assert_eq!(mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Other), ModeOutcome::Queue);
+
+        for k in [RequestKind::Read, RequestKind::Edit, RequestKind::Execute, RequestKind::Fetch, RequestKind::Other] {
+            assert_eq!(mode_verdict(ApprovalMode::Yolo, k), ModeOutcome::Allow);
+        }
     }
 }

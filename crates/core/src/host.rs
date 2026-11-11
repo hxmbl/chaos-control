@@ -5,11 +5,12 @@
 //! call is a message to the actor, every answer comes back on a channel, and UI
 //! updates arrive as [`CoreEvent`]s.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::io::AsyncReadExt;
+use tokio::sync::{mpsc, oneshot, watch, Semaphore};
 
 use crate::{
     adapter::*,
@@ -279,6 +280,8 @@ impl Core {
             tx: tx.clone(),
             events: events_tx,
             alive: true,
+            run_limit: Arc::new(Semaphore::new(4)),
+            running: HashMap::new(),
         };
         tokio::spawn(actor.run(rx));
         Ok((
@@ -920,10 +923,26 @@ impl Core {
             })
             .await
             .map_err(AnswerError::Store)??;
-        if approve && req.command.is_some() && req.run_state.as_deref() == Some("running") {
-            let _ = self.tx.send(Cmd::RunQueued { id: req.id });
+        if req.run_state.as_deref() == Some("running") {
+            self.enqueue_run(req.id).await;
         }
         Ok(req)
+    }
+
+    async fn enqueue_run(&self, id: PermissionId) {
+        if self.tx.send(Cmd::RunQueued { id }).is_err() {
+            let _ = self
+                .with_engine(move |e, now| {
+                    e.complete_command_run(
+                        now,
+                        id,
+                        false,
+                        None,
+                        "failed to schedule command execution (runtime stopped)",
+                    )
+                })
+                .await;
+        }
     }
 
     /// Pending permission requests in `channel`, oldest first.
@@ -1008,9 +1027,23 @@ impl Core {
         note: Option<&str>,
     ) -> Result<QueuedRequest, AnswerError> {
         let note = note.map(str::to_string);
-        self.with_engine(move |e, now| e.resolve_queued(now, request, by, approve, note.as_deref()))
+        let queued = self
+            .with_engine(move |e, now| e.resolve_queued(now, request, by, approve, note.as_deref()))
             .await
-            .map_err(|e| AnswerError::Store(e.to_string()))?
+            .map_err(|e| AnswerError::Store(e.to_string()))??;
+        let running = self
+            .with_engine(move |e, _| {
+                crate::permission::get(e.conn(), request)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|r| r.run_state.as_deref() == Some("running"))
+            })
+            .await
+            .map_err(AnswerError::Store)?;
+        if running {
+            self.enqueue_run(request).await;
+        }
+        Ok(queued)
     }
 
     /// Calls a chat tool as the session `scope` would (tests, debugging).
@@ -1070,59 +1103,175 @@ struct Actor {
     tx: mpsc::UnboundedSender<Cmd>,
     events: mpsc::UnboundedSender<CoreEvent>,
     alive: bool,
+    run_limit: Arc<Semaphore>,
+    running: HashMap<PermissionId, tokio::task::AbortHandle>,
 }
 
 impl Actor {
     fn run_queued(&mut self, id: PermissionId) {
-        let Some(req) = crate::permission::get(self.engine.conn(), id)
-            .ok()
-            .flatten()
-        else {
+        let Some(req) = crate::permission::get(self.engine.conn(), id).ok().flatten() else {
             return;
         };
         let Some(command) = req.command.as_deref().map(str::to_string) else {
+            let _ = self.fail_run(id, "command is missing");
             return;
         };
         if req.run_state.as_deref() != Some("running") {
             return;
         }
-        let cwd = req
-            .cwd
-            .as_deref()
-            .map(PathBuf::from)
-            .or_else(|| self.agents.get(&req.agent).map(|a| a.cwd.clone()))
-            .unwrap_or_else(|| self.default_cwd.clone());
+        let Some(cwd_str) = req.cwd.as_deref() else {
+            let _ = self.fail_run(id, "working directory was not resolved; refusing to run");
+            return;
+        };
+        let cwd = PathBuf::from(cwd_str);
+        if !cwd.is_dir() {
+            let _ = self.fail_run(id, &format!("working directory is not available: {}", cwd.display()));
+            return;
+        }
         let tx = self.tx.clone();
-        tokio::spawn(async move {
-            let out = tokio::process::Command::new("sh")
-                .arg("-lc")
-                .arg(&command)
-                .current_dir(&cwd)
-                .output()
-                .await;
-            let (ok, code, text) = match out {
-                Ok(o) => {
-                    let mut text = String::new();
-                    if !o.stdout.is_empty() {
-                        text.push_str(&String::from_utf8_lossy(&o.stdout));
-                    }
-                    if !o.stderr.is_empty() {
-                        if !text.is_empty() {
-                            text.push('\n');
-                        }
-                        text.push_str("[stderr]\n");
-                        text.push_str(&String::from_utf8_lossy(&o.stderr));
-                    }
-                    let code = o.status.code();
-                    (o.status.success(), code, text)
+        let limit = self.run_limit.clone();
+        let handle = tokio::spawn(async move {
+            let permit = match limit.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => {
+                    Self::send_run_result(&tx, id, false, None, "command runner is shutting down");
+                    return;
                 }
-                Err(e) => (false, None, format!("failed to execute command: {e}")),
             };
-            let f: EngineFn = Box::new(move |e, now| {
-                let _ = e.complete_command_run(now, id, ok, code, &text);
-            });
-            let _ = tx.send(Cmd::Engine(f));
+            let result = Self::execute_command(command, cwd).await;
+            drop(permit);
+            match result {
+                Ok((ok, code, text)) => Self::send_run_result(&tx, id, ok, code, &text),
+                Err(e) => Self::send_run_result(&tx, id, false, None, &e),
+            }
         });
+        self.running.insert(id, handle.abort_handle());
+    }
+
+    fn fail_run(&mut self, id: PermissionId, msg: &str) -> bool {
+        let now = self.clock.now();
+        match self.engine.complete_command_run(now, id, false, None, msg) {
+            Ok(_) => {
+                self.apply_effects();
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn send_run_result(
+        tx: &mpsc::UnboundedSender<Cmd>,
+        id: PermissionId,
+        ok: bool,
+        code: Option<i32>,
+        text: &str,
+    ) {
+        let output = text.to_string();
+        let f: EngineFn = Box::new(move |e, now| {
+            if let Err(err) = e.complete_command_run(now, id, ok, code, &output) {
+                // If the run is no longer in the expected state, surface as a note.
+                if let Ok(Some(req)) = crate::permission::get(e.conn(), id) {
+                    e.rt_note(req.agent, req.channel, format!("command #{id} finished but result delivery failed: {err}"));
+                }
+            }
+        });
+        let _ = tx.send(Cmd::Engine(f));
+    }
+
+    async fn execute_command(command: String, cwd: PathBuf) -> Result<(bool, Option<i32>, String), String> {
+        use std::process::Stdio;
+        let timeout_secs: u64 = std::env::var("CHAOS_COMMAND_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10 * 60);
+        let max_total: usize = std::env::var("CHAOS_COMMAND_MAX_OUTPUT_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128 * 1024);
+        let timeout = Duration::from_secs(timeout_secs.max(1));
+
+        let mut child = tokio::process::Command::new("sh")
+            .arg("-lc")
+            .arg(&command)
+            .current_dir(&cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|e| format!("failed to execute command: {e}"))?;
+
+        let mut stdout = child.stdout.take().ok_or_else(|| "stdout unavailable".to_string())?;
+        let mut stderr = child.stderr.take().ok_or_else(|| "stderr unavailable".to_string())?;
+
+        let out_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = stdout.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 { break; }
+                if buf.len() < max_total {
+                    let take = (max_total - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+            buf
+        });
+        let err_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                let n = stderr.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 { break; }
+                if buf.len() < max_total {
+                    let take = (max_total - buf.len()).min(n);
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+            buf
+        });
+
+        let status = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(r) => r.map_err(|e| format!("failed waiting for command: {e}"))?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let out = out_task.await.unwrap_or_default();
+                let err = err_task.await.unwrap_or_default();
+                let mut text = Self::format_output(out, err, max_total);
+                if !text.is_empty() { text.push_str("\n\n"); }
+                text.push_str(&format!("command timed out after {}s and was killed", timeout.as_secs()));
+                return Ok((false, None, text));
+            }
+        };
+
+        let out = out_task.await.unwrap_or_default();
+        let err = err_task.await.unwrap_or_default();
+        let total_len = out.len().saturating_add(err.len());
+        let mut text = Self::format_output(out, err, max_total);
+        if total_len > max_total {
+            if !text.is_empty() { text.push_str("\n\n"); }
+            text.push_str("[output truncated]");
+        }
+        Ok((status.success(), status.code(), text))
+    }
+
+    fn format_output(stdout: Vec<u8>, stderr: Vec<u8>, max_total: usize) -> String {
+        let mut out = String::new();
+        let stdout_s = String::from_utf8_lossy(&stdout);
+        let stderr_s = String::from_utf8_lossy(&stderr);
+        if !stdout_s.trim().is_empty() || !stdout.is_empty() {
+            out.push_str(stdout_s.trim_end_matches('\n'));
+        }
+        if !stderr_s.trim().is_empty() || !stderr.is_empty() {
+            if !out.is_empty() { out.push_str("\n\n"); }
+            out.push_str("[stderr]\n");
+            out.push_str(stderr_s.trim_end_matches('\n'));
+        }
+        if out.len() > max_total {
+            out.truncate(max_total);
+        }
+        out
     }
 
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
@@ -1218,6 +1367,9 @@ impl Actor {
             }
             Cmd::RunQueued { id } => self.run_queued(id),
             Cmd::Shutdown(reply) => {
+                for (_, handle) in self.running.drain() {
+                    handle.abort();
+                }
                 for (_, slot) in self.slots.drain() {
                     self.tokens.revoke(&slot.token);
                     if let SlotState::Ready { session, .. } = slot.state {
@@ -1254,13 +1406,15 @@ impl Actor {
         self.engine.set_approval_mode(member.id, spec.approval);
         self.engine
             .set_agent_ping_answers(member.id, spec.ping_answers.clone());
+        let agent_cwd = spec.cwd.unwrap_or_else(|| self.default_cwd.clone());
+        self.engine.set_agent_cwd(member.id, agent_cwd.clone());
         let adapter = spec.adapter.clone();
         self.agents.insert(
             member.id,
             AgentEntry {
                 handle: member.handle.clone(),
                 adapter: spec.adapter,
-                cwd: spec.cwd.unwrap_or_else(|| self.default_cwd.clone()),
+                cwd: agent_cwd,
             },
         );
         let tx = self.tx.clone();

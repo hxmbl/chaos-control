@@ -126,12 +126,8 @@ impl RightSidebar {
                     .child(initial),
             });
         let req = entry.request;
-        let row = pill(("permission", req as usize), cx)
-            .h(if pending {
-                size::ROW + space::X1
-            } else {
-                size::ROW
-            })
+        pill(("permission", req as usize), cx)
+            .h(size::ROW)
             .flex_none()
             .gap(space::X2)
             .pl(space::X2)
@@ -149,47 +145,12 @@ impl RightSidebar {
                 this.pane.update(cx, |p, cx| p.open(content, window, cx));
             }))
             .child(mark)
-            .child(div().flex_1().min_w_0().ellipsis().child(truncated(action)));
-
-        if pending {
-            let store_a = self.store.clone();
-            let store_d = self.store.clone();
-            row.child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap(space::X1)
-                    .child(
-                        pill(("perm-approve", req as usize), cx)
-                            .px(space::X2)
-                            .h(size::BUTTON_SM)
-                            .type_style(text::CAPTION)
-                            .font_weight(text::MEDIUM)
-                            .child("Approve")
-                            .on_click(move |_, _, cx| {
-                                store_a.update(cx, |s, cx| s.answer_permission(req, true, cx));
-                            }),
-                    )
-                    .child(
-                        pill(("perm-deny", req as usize), cx)
-                            .px(space::X2)
-                            .h(size::BUTTON_SM)
-                            .type_style(text::CAPTION)
-                            .font_weight(text::MEDIUM)
-                            .text_color(t.ink_soft)
-                            .child("Deny")
-                            .on_click(move |_, _, cx| {
-                                store_d.update(cx, |s, cx| s.answer_permission(req, false, cx));
-                            }),
-                    ),
-            )
-        } else {
-            row.child(
+            .child(div().flex_1().min_w_0().ellipsis().child(truncated(action)))
+            .child(
                 div()
                     .flex_none()
                     .type_style(text::CAPTION)
-                    .text_color(if declined { t.ink_soft } else { t.muted })
+                    .text_color(if declined || pending { t.ink_soft } else { t.muted })
                     .child(outcome),
             )
             .child(
@@ -199,7 +160,6 @@ impl RightSidebar {
                     .text_color(t.muted)
                     .child(when),
             )
-        }
     }
 }
 

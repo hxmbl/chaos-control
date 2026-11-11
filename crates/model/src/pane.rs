@@ -189,6 +189,8 @@ pub struct PermissionPrompt {
     pub logged: Option<crate::PermissionOutcome>,
     /// Captured command for queued execution, if any.
     pub command: Option<Arc<str>>,
+    /// Working directory the command would run in (resolved/persisted), if known.
+    pub cwd: Option<Arc<str>>,
     /// Execution lifecycle state (queued/running/done/failed/unrunnable/denied).
     pub run_state: Option<Arc<str>>,
     /// Command output/result when available.

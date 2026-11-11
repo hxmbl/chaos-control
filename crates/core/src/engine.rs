@@ -8,7 +8,7 @@
 //! The rules (triggers, batches, acceptance, obligations, fallback) are written
 //! up in `docs/agents.md`; the comments here point at the code that enforces them.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use rusqlite::Connection;
 
@@ -265,6 +265,8 @@ pub struct Engine {
     pub(crate) runs_in: HashMap<MemberId, RunsIn>,
     /// Host-side approval mode per agent (STRM-542). Absent means AskAll.
     pub(crate) approval_mode: HashMap<MemberId, ApprovalMode>,
+    /// The agent's working directory, when known (used for command execution).
+    pub(crate) agent_cwd: HashMap<MemberId, PathBuf>,
     /// Per-agent ping-answer lists from `agents.json`; absent means the
     /// project's setting, then the default (see [`Engine::ping_answers`]).
     ping_answers: HashMap<MemberId, PingAnswers>,
@@ -290,6 +292,7 @@ impl Engine {
             effects: Vec::new(),
             runs_in: HashMap::new(),
             approval_mode: HashMap::new(),
+            agent_cwd: HashMap::new(),
             ping_answers: HashMap::new(),
         };
         let pending = engine.store.tx(|c| store::recover(c, now))?;

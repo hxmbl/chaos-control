@@ -73,6 +73,8 @@ pub struct PermissionLogEntry {
     pub asked: Arc<str>,
     /// Captured command for queued execution, if any.
     pub command: Option<Arc<str>>,
+    /// Working directory the command would run in (resolved/persisted), if known.
+    pub cwd: Option<Arc<str>>,
     /// Execution lifecycle state.
     pub run_state: Option<Arc<str>>,
     /// Command output/result when available.
@@ -93,6 +95,7 @@ impl PermissionLogEntry {
             asked: self.asked.clone(),
             logged: Some(self.outcome),
             command: self.command.clone(),
+            cwd: self.cwd.clone(),
             run_state: self.run_state.clone(),
             run_output: self.run_output.clone(),
             run_exit_code: self.run_exit_code,
@@ -178,6 +181,7 @@ mod tests {
             detail: None,
             asked: Arc::from(""),
             command: None,
+            cwd: None,
             run_state: None,
             run_output: None,
             run_exit_code: None,

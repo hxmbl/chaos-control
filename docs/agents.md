@@ -528,6 +528,13 @@ lets through:
   answer's wake it re-issues the command, codex-acp asks again, and the grant
   answers "approved". `cancelled` would map to abort, so it is only used when
   an agent offers no decline at all.
+- **Codex ACP sandbox/permissions (migration):** the old native Codex path
+  configured a read-only sandbox and on-request approval policy; those native
+  settings are removed. Do **not** assume `codex-acp` preserves the same
+  effective filesystem or command restrictions. Before relying on it, verify a
+  real Codex ACP session's effective permissions (reads, writes, command
+  execution, and approval behavior) and update this document with the observed
+  behavior.
 - Limits: sessions close after 10 idle minutes, so an answer that comes
   later wakes a fresh session that only knows what the answer message and
   its unread context say (title and request id). A grant matches the

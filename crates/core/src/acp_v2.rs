@@ -149,10 +149,7 @@ fn answer(
             Some(ix) => select(ix),
             None => decline(),
         },
-        PermissionVerdict::Sent { request } | PermissionVerdict::DeferredQueue { request } => {
-            decline().meta(sent_meta(*request))
-        }
-        PermissionVerdict::Hold { request } => decline().meta(sent_meta(*request)),
+        PermissionVerdict::Sent { request } => decline().meta(sent_meta(*request)),
         PermissionVerdict::Decline => decline(),
     }
 }
