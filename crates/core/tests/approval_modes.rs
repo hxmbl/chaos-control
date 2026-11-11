@@ -497,3 +497,36 @@ async fn timeout_and_oversized_output_are_handled() {
         std::env::remove_var("CHAOS_COMMAND_MAX_OUTPUT_BYTES");
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_process_inheriting_pipes_does_not_hang_runner() {
+    let mut h = Harness::new().await;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                exec_perm("sleep 30 &", &cwd),
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot run").await;
+    let req = wait_permission_state(&mut h, PermissionState::Pending).await;
+    h.core
+        .answer_permission(req.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+    // Shell exits immediately but background child inherits stdio; runner must
+    // terminate the process group and report completion instead of hanging.
+    let done = wait_run_state(&h, req.id, "failed").await;
+    let out = done.run_output.as_deref().unwrap_or("").to_lowercase();
+    assert!(
+        out.contains("background processes were terminated") || out.contains("did not close"),
+        "{done:#?}"
+    );
+}

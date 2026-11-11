@@ -1177,13 +1177,15 @@ impl Engine {
 
     pub fn approval_mode(&self, agent: MemberId) -> ApprovalMode {
         let key = format!("member_approval_mode:{}", agent.0);
-        if let Ok(Some(m)) = crate::store::app_setting(self.conn(), &key) {
-            return ApprovalMode::parse(&m);
+        match crate::store::app_setting(self.conn(), &key) {
+            Ok(Some(m)) => ApprovalMode::parse(&m),
+            Ok(None) => self
+                .approval_mode
+                .get(&agent)
+                .copied()
+                .unwrap_or(ApprovalMode::AskAll),
+            Err(_) => ApprovalMode::AskAll,
         }
-        self.approval_mode
-            .get(&agent)
-            .copied()
-            .unwrap_or(ApprovalMode::AskAll)
     }
 
     /// Records the agent's working directory for command execution.
@@ -1707,9 +1709,8 @@ impl Engine {
 
     /// The approval queue for a channel: pending, running, and recent outcomes.
     /// This is what the sidebar's Permissions pane binds to (STRM-542).
-    pub fn approval_queue(&self, channel: ChannelId) -> Vec<QueuedRequest> {
-        queue_in(self.conn(), channel, 100)
-            .unwrap_or_default()
+    pub fn approval_queue(&self, channel: ChannelId) -> rusqlite::Result<Vec<QueuedRequest>> {
+        Ok(queue_in(self.conn(), channel, 100)?
             .into_iter()
             .map(|req| QueuedRequest {
                 id: req.id,
@@ -1732,7 +1733,7 @@ impl Engine {
                 command: req.command.clone(),
                 proposed_change: None,
             })
-            .collect()
+            .collect())
     }
 
     /// Records completion of a Chaos-Control-executed queued command and steers
@@ -1968,13 +1969,13 @@ pub fn call_tool(
             let member_mode = engine.approval_mode(scope.agent);
             let channel_mode = crate::store::channel_approval_mode(engine.conn(), channel)?
                 .map(|m| ApprovalMode::parse(&m).as_str().to_string());
-            let project_mode = crate::store::channel(engine.conn(), channel)?
-                .and_then(|ch| {
-                    crate::store::project_setting(engine.conn(), &ch.project, "approval_mode")
-                        .ok()
-                        .flatten()
-                })
-                .map(|m| ApprovalMode::parse(&m).as_str().to_string());
+            let project_mode = match crate::store::channel(engine.conn(), channel)? {
+                Some(ch) => {
+                    crate::store::project_setting(engine.conn(), &ch.project, "approval_mode")?
+                        .map(|m| ApprovalMode::parse(&m).as_str().to_string())
+                }
+                None => None,
+            };
             let workspace_mode = crate::store::app_setting(engine.conn(), "approval_mode")?
                 .map(|m| ApprovalMode::parse(&m).as_str().to_string());
             let effective = engine.effective_approval_mode(scope.agent, channel);

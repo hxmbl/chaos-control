@@ -162,6 +162,10 @@ enum Cmd {
     RunQueued {
         id: PermissionId,
     },
+    RunStarted {
+        id: PermissionId,
+        pgid: Option<u32>,
+    },
     RunFinished {
         id: PermissionId,
     },
@@ -972,7 +976,7 @@ impl Core {
 
     /// The approval queue for a channel (STRM-542).
     pub async fn approval_queue(&self, channel: ChannelId) -> Result<Vec<QueuedRequest>, String> {
-        self.with_engine(move |e, _| Ok(e.approval_queue(channel)))
+        self.with_engine(move |e, _| e.approval_queue(channel).map_err(|e| e.to_string()))
             .await?
     }
 
@@ -1104,7 +1108,12 @@ struct Actor {
     events: mpsc::UnboundedSender<CoreEvent>,
     alive: bool,
     run_limit: Arc<Semaphore>,
-    running: HashMap<PermissionId, tokio::task::AbortHandle>,
+    running: HashMap<PermissionId, RunningCommand>,
+}
+
+struct RunningCommand {
+    abort: tokio::task::AbortHandle,
+    pgid: Option<u32>,
 }
 
 impl Actor {
@@ -1144,14 +1153,20 @@ impl Actor {
                     return;
                 }
             };
-            let result = Self::execute_command(command, cwd).await;
+            let result = Self::execute_command(command, cwd, tx.clone(), id).await;
             drop(permit);
             match result {
                 Ok((ok, code, text)) => Self::send_run_result(&tx, id, ok, code, &text),
                 Err(e) => Self::send_run_result(&tx, id, false, None, &e),
             }
         });
-        self.running.insert(id, handle.abort_handle());
+        self.running.insert(
+            id,
+            RunningCommand {
+                abort: handle.abort_handle(),
+                pgid: None,
+            },
+        );
     }
 
     fn fail_run(&mut self, id: PermissionId, msg: &str) -> bool {
@@ -1192,6 +1207,8 @@ impl Actor {
     async fn execute_command(
         command: String,
         cwd: PathBuf,
+        tx: mpsc::UnboundedSender<Cmd>,
+        id: PermissionId,
     ) -> Result<(bool, Option<i32>, String), String> {
         use std::process::Stdio;
         let timeout_secs: u64 = std::env::var("CHAOS_COMMAND_TIMEOUT_SECS")
@@ -1220,6 +1237,9 @@ impl Actor {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to execute command: {e}"))?;
+
+        let pgid = child.id();
+        let _ = tx.send(Cmd::RunStarted { id, pgid });
 
         let stdout = child
             .stdout
@@ -1260,7 +1280,7 @@ impl Actor {
                 false,
             ),
             Err(_) => {
-                Self::kill_process_tree(&mut child).await;
+                Self::kill_process_tree(pgid, &mut child).await;
                 let st = child.wait().await.ok();
                 (
                     st.unwrap_or_else(|| std::process::ExitStatus::default()),
@@ -1269,16 +1289,18 @@ impl Actor {
             }
         };
 
-        let (out, err) = match tokio::time::timeout(io_drain, async {
+        let (out, err, io_timed_out) = match tokio::time::timeout(io_drain, async {
             (out_task.await, err_task.await)
         })
         .await
         {
-            Ok((o, e)) => (o.unwrap_or_default(), e.unwrap_or_default()),
+            Ok((o, e)) => (o.unwrap_or_default(), e.unwrap_or_default(), false),
             Err(_) => {
                 out_abort.abort();
                 err_abort.abort();
-                (Vec::new(), Vec::new())
+                // Descendants may still hold stdio pipes; terminate the group.
+                Self::kill_process_tree(pgid, &mut child).await;
+                (Vec::new(), Vec::new(), true)
             }
         };
 
@@ -1293,29 +1315,54 @@ impl Actor {
                 timeout.as_secs()
             ));
         }
+        if io_timed_out {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(
+                "output pipes did not close in time; background processes were terminated",
+            );
+        }
         if total_len > max_total {
             if !text.is_empty() {
                 text.push_str("\n\n");
             }
             text.push_str("[output truncated]");
         }
-        Ok((status.success() && !timed_out, status.code(), text))
+        Ok((
+            status.success() && !timed_out && !io_timed_out,
+            status.code(),
+            text,
+        ))
     }
 
-    async fn kill_process_tree(child: &mut tokio::process::Child) {
+    async fn kill_process_tree(pgid: Option<u32>, child: &mut tokio::process::Child) {
         #[cfg(unix)]
-        if let Some(pid) = child.id() {
+        if let Some(pgid) = pgid {
             let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &format!("-{pid}")])
+                .args(["-TERM", &format!("-{pgid}")])
                 .status()
                 .await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &format!("-{pid}")])
+                .args(["-KILL", &format!("-{pgid}")])
                 .status()
                 .await;
         }
         let _ = child.kill().await;
+    }
+
+    fn kill_pgid(pgid: u32) {
+        #[cfg(unix)]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-KILL", &format!("-{pgid}")])
+                .status();
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pgid;
+        }
     }
 
     fn format_output(stdout: Vec<u8>, stderr: Vec<u8>, max_total: usize) -> String {
@@ -1430,12 +1477,29 @@ impl Actor {
                 }
             }
             Cmd::RunQueued { id } => self.run_queued(id),
+            Cmd::RunStarted { id, pgid } => {
+                if let Some(r) = self.running.get_mut(&id) {
+                    r.pgid = pgid;
+                }
+            }
             Cmd::RunFinished { id } => {
                 self.running.remove(&id);
             }
             Cmd::Shutdown(reply) => {
-                for (_, handle) in self.running.drain() {
-                    handle.abort();
+                let running: Vec<(PermissionId, Option<u32>, tokio::task::AbortHandle)> = self
+                    .running
+                    .drain()
+                    .map(|(id, run)| (id, run.pgid, run.abort))
+                    .collect();
+                for (id, pgid, abort) in running {
+                    if let Some(pgid) = pgid {
+                        Self::kill_pgid(pgid);
+                    }
+                    abort.abort();
+                    let _ = self.fail_run(
+                        id,
+                        "interrupted: Chaos Control shut down while the command was running",
+                    );
                 }
                 for (_, slot) in self.slots.drain() {
                     self.tokens.revoke(&slot.token);
