@@ -18,15 +18,20 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use chaos_core::types::ApprovalMode;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// One roster entry as `agents.json` writes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Entry {
     pub harness: String,
     /// The harness's model id; `None` runs its default.
     pub model: Option<String>,
     pub name: String,
+    /// The approval mode for this agent (STRM-542). Defaults to `AskAll`.
+    #[serde(default)]
+    pub approval: ApprovalMode,
 }
 
 impl Entry {
@@ -35,6 +40,7 @@ impl Entry {
             harness: harness.to_string(),
             model: model.map(str::to_string),
             name: name.to_string(),
+            approval: ApprovalMode::AskAll,
         }
     }
 
@@ -45,6 +51,10 @@ impl Entry {
             m.insert("model".into(), json!(model));
         }
         m.insert("name".into(), json!(self.name));
+        // Only include approval if it's not the default
+        if self.approval != ApprovalMode::AskAll {
+            m.insert("approval".into(), json!(self.approval.as_str()));
+        }
         Value::Object(m)
     }
 }

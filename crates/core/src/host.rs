@@ -18,9 +18,7 @@ use crate::{
         StanceRequest,
     },
     mcp::{self, Scope, Tokens},
-    permission::{
-        AnswerError, PermissionGate, PermissionId, PermissionRequest, PermissionVerdict, RunsIn,
-    },
+    permission::{AnswerError, PermissionGate, PermissionId, PermissionRequest, PermissionVerdict, QueuedRequest, RunsIn},
     policy::Policy,
     reaction::PingAnswers,
     store::{OpenError, Store},
@@ -931,6 +929,29 @@ impl Core {
         self.with_engine(move |e, _| e.permission_log(channel, limit))
             .await?
             .map_err(|e| e.to_string())
+    }
+
+    /// The approval queue for a channel (STRM-542).
+    pub async fn approval_queue(
+        &self,
+        channel: ChannelId,
+    ) -> Result<Vec<QueuedRequest>, String> {
+        self.with_engine(move |e, _| Ok(e.approval_queue(channel)))
+            .await?
+    }
+
+    /// A human approves or denies a queued request (STRM-542).
+    pub async fn resolve_queued(
+        &self,
+        request: PermissionId,
+        by: MemberId,
+        approve: bool,
+        note: Option<&str>,
+    ) -> Result<QueuedRequest, AnswerError> {
+        let note = note.map(str::to_string);
+        self.with_engine(move |e, now| e.resolve_queued(now, request, by, approve, note.as_deref()))
+            .await
+            .map_err(|e| AnswerError::Store(e.to_string()))?
     }
 
     /// Calls a chat tool as the session `scope` would (tests, debugging).

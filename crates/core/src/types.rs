@@ -2,12 +2,12 @@
 
 use std::{fmt, sync::Arc};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 macro_rules! id_type {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(transparent)]
         pub struct $name(pub i64);
 
@@ -68,6 +68,40 @@ pub struct Member {
     /// What people type after `@`. Unique, case-insensitive.
     pub handle: Arc<str>,
     pub name: Arc<str>,
+}
+
+/// How much of an agent's host-side work a human signs off on (STRM-542).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ApprovalMode {
+    /// Every non-read request waits for a human. Today's behavior,
+    /// minus the immediate decline: the request stays live.
+    #[default]
+    AskAll,
+    /// Edits and reads go through; commands queue for later execution
+    /// and their output is steered back to the agent.
+    AcceptEdits,
+    /// Nothing asks. Recorded for the log as auto-approved-by-mode,
+    /// distinct from a VM's auto-approval so the log can tell them apart.
+    Yolo,
+}
+
+impl ApprovalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalMode::AskAll => "ask-all",
+            ApprovalMode::AcceptEdits => "accept-edits",
+            ApprovalMode::Yolo => "yolo",
+        }
+    }
+
+    pub fn parse(s: &str) -> ApprovalMode {
+        match s {
+            "accept-edits" => ApprovalMode::AcceptEdits,
+            "yolo" => ApprovalMode::Yolo,
+            _ => ApprovalMode::AskAll,
+        }
+    }
 }
 
 /// A project's stable identity: a lowercase UUID, as written in a folder's
@@ -420,3 +454,39 @@ pub struct Reaction {
     pub emoji: Arc<str>,
     pub created_at: Millis,
 }
+
+
+/// Who or what decided a permission request's outcome (STRM-542).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DecidedBy {
+    /// A human member approved or denied it.
+    Human(MemberId),
+    /// Auto-approved by the agent running in its own VM.
+    AutoVm,
+    /// Auto-approved by the `yolo` execution mode.
+    AutoMode,
+}
+
+impl DecidedBy {
+    pub fn as_str(self) -> String {
+        match self {
+            DecidedBy::Human(m) => format!("human:{}", m),
+            DecidedBy::AutoVm => "auto_vm".to_string(),
+            DecidedBy::AutoMode => "auto_mode".to_string(),
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        if s == "auto_vm" {
+            Some(DecidedBy::AutoVm)
+        } else if s == "auto_mode" {
+            Some(DecidedBy::AutoMode)
+        } else if let Some(rest) = s.strip_prefix("human:") {
+            rest.parse::<i64>().ok().map(|id| DecidedBy::Human(MemberId(id)))
+        } else {
+            None
+        }
+    }
+}
+

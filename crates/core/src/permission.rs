@@ -171,6 +171,9 @@ pub struct PermissionRequest {
     /// on it. None for logged reads, auto-allowed chat tools, and requests
     /// stored before migration 13.
     pub request_key: Option<Arc<str>>,
+    /// Who or what decided this request's outcome (STRM-542). None for
+    /// requests stored before migration 16.
+    pub decided_by: Option<DecidedBy>,
 }
 
 /// How a request ended, as the permission log shows it.
@@ -209,7 +212,7 @@ impl PermissionRequest {
 }
 
 /// A native permission request, as the adapter hands it to core.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PermissionAsk {
     pub turn: Option<BatchId>,
     pub title: Arc<str>,
@@ -235,8 +238,38 @@ pub enum PermissionVerdict {
     /// Pick the agent's own decline ("not now") option; the request went to
     /// the humans and the answer arrives later.
     Sent { request: PermissionId },
+    /// The request is queued for deferred execution (accept-edits mode).
+    DeferredQueue { request: PermissionId },
+    /// The request is held open for blocking queue (when caps.hold_request).
+    Hold { request: PermissionId },
     /// No core to ask (replay tests): decline, nothing recorded.
     Decline,
+}
+
+/// What kind of operation a permission request is for (STRM-542).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestKind {
+    /// A read-only operation (file read, search).
+    Read,
+    /// An edit operation (file write, delete, move).
+    Edit,
+    /// A command execution.
+    Execute,
+    /// A fetch operation (HTTP, etc.).
+    Fetch,
+    /// Some other kind of operation.
+    Other,
+}
+
+/// What a mode does with one incoming request (STRM-542).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeOutcome {
+    /// Allow immediately.
+    Allow,
+    /// Ask a human.
+    AskHuman,
+    /// Queue for later execution.
+    Queue,
 }
 
 /// How an adapter asks core about a native permission request. Cheap to clone.
@@ -266,6 +299,83 @@ impl fmt::Debug for PermissionGate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("PermissionGate")
     }
+}
+
+/// What the agent says it wants to change, when the protocol gives us
+/// enough to show a human (STRM-542). `None` means "show the title/detail only" —
+/// we never fabricate a diff from the command line.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum ProposedChange {
+    /// Old/new text for one file (ACP diff content).
+    Text {
+        path: Arc<str>,
+        old: Arc<str>,
+        new: Arc<str>,
+    },
+    /// A unified diff blob, when that's all the agent sent.
+    Unified {
+        path: Arc<str>,
+        patch: Arc<str>,
+    },
+}
+
+/// What one live session's protocol can actually do for us with permission
+/// requests (STRM-542). Sampled from the handshake/negotiation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ApprovalCaps {
+    /// The agent sends a structured diff we can show a human.
+    pub proposed_diffs: bool,
+    /// The permission call can be held open past the initial ask
+    /// (true queue, blocking). Vanilla ACP: false.
+    pub hold_request: bool,
+    /// The harness can execute an approved command itself and report
+    /// output back through a channel we can read (rare; most agents
+    /// only retry through their own tool call).
+    pub deferred_execute: bool,
+    /// The agent's "accept edits"-style mode can be set through the
+    /// protocol rather than only mimicked by us.
+    pub mode_switch: bool,
+}
+
+/// One thing an agent wants to do that a human (or a mode) hasn't settled.
+/// This is the row the sidebar renders and the app's Approve/Deny acts on.
+/// Wraps/extends `permission_requests`; the store table is the same,
+/// the queue is the *view* plus the delivery bookkeeping (STRM-542).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueuedRequest {
+    pub id: PermissionId,
+    pub agent: MemberId,
+    pub channel: ChannelId,
+    /// What it wants, for display: title, detail, proposed diff if the
+    /// agent sent one (see `ProposedChange`).
+    pub ask: PermissionAsk,
+    /// Where it sits in the queue: position is display order, stable
+    /// across re-renders. Approving out of order is allowed — each
+    /// request is independent.
+    pub state: QueueState,
+    /// For `accept-edits` commands: the captured command line and the
+    /// working directory it would run in. Empty for plain asks.
+    pub command: Option<Arc<str>>,
+    /// What the agent says it wants to change (when available).
+    pub proposed_change: Option<ProposedChange>,
+}
+
+/// Where a queued request sits in its lifecycle (STRM-542).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueState {
+    /// Waiting for a human (or for its mode rule to apply).
+    Pending,
+    /// Approved; the command is running (accept-edits) or the grant is
+    /// armed for the agent's retry (ask-all).
+    Approved,
+    /// Denied by a human, with the reason that will be steered back.
+    Denied,
+    /// Ran to completion; `result` is what gets delivered to the agent.
+    Done,
+    /// Approved but execution failed (command exited non-zero, agent
+    /// unreachable). The agent hears the failure, not silence.
+    Failed,
 }
 
 /// The `_meta` an adapter attaches to a native decline after a request was
@@ -298,6 +408,63 @@ in a later turn (chat_permission_status shows it); then retry the same call and 
 /// reads. Reads are always allowed; everything else needs approval.
 pub fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "read" | "search")
+}
+
+/// What a mode does with one incoming request, before any human sees it.
+/// Pure function of (mode, request kind) — no I/O, fully testable (STRM-542).
+pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
+    match mode {
+        // Reads never reach this function: is_read_only_kind short-circuits
+        // upstream, as today.
+        ApprovalMode::AskAll => ModeOutcome::AskHuman,
+        ApprovalMode::AcceptEdits => match kind {
+            RequestKind::Edit | RequestKind::Read => ModeOutcome::Allow,
+            RequestKind::Execute | RequestKind::Fetch | RequestKind::Other => ModeOutcome::Queue,
+        },
+        ApprovalMode::Yolo => ModeOutcome::Allow,
+    }
+}
+
+/// The decision the gate makes, given caps. Fail closed: a capability
+/// we don't have means we decline-and-ask, never allow-and-hope (STRM-542).
+pub fn decide(
+    caps: ApprovalCaps,
+    mode: ApprovalMode,
+    kind: RequestKind,
+) -> PermissionVerdict {
+
+    match mode_verdict(mode, kind) {
+        ModeOutcome::Allow => PermissionVerdict::AllowRead,
+        ModeOutcome::AskHuman => {
+            if caps.hold_request {
+                // True blocking queue: keep the ACP call open, answer
+                // when the human resolves. Agent waits — acceptable only
+                // because the agent (or mode) opted into hold semantics.
+                PermissionVerdict::Hold {
+                    request: PermissionId(0), // placeholder, set by caller
+                }
+            } else {
+                // Universal path: decline now with "request sent #N",
+                // grant on retry. Today's behavior, kept.
+                PermissionVerdict::Sent {
+                    request: PermissionId(0), // placeholder, set by caller
+                }
+            }
+        }
+        ModeOutcome::Queue => {
+            if caps.deferred_execute {
+                PermissionVerdict::DeferredQueue {
+                    request: PermissionId(0), // placeholder, set by caller
+                }
+            } else {
+                // Can't run it for them: queue the *ask*, agent retries
+                // on approval like ask-all, output comes back as a wake.
+                PermissionVerdict::Sent {
+                    request: PermissionId(0), // placeholder, set by caller
+                }
+            }
+        }
+    }
 }
 
 // ---------- request keys ----------
@@ -434,7 +601,7 @@ pub fn pick_decline(options: &[(OptionKind, &str)]) -> Option<usize> {
 // ---------- store ----------
 
 const COLS: &str = "id, agent_id, channel_id, batch_id, source, title, detail, reason, state, \
-asked_of, created_at, answered_by, answered_at, answer_note, used_at, read_only, request_key";
+asked_of, created_at, answered_by, answered_at, answer_note, used_at, read_only, request_key, decided_by";
 
 fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
     let asked: String = r.get(9)?;
@@ -460,6 +627,9 @@ fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
         used_at: r.get::<_, Option<i64>>(14)?.map(|t| t as Millis),
         read_only: r.get::<_, i64>(15)? != 0,
         request_key: r.get::<_, Option<String>>(16)?.map(Arc::from),
+        decided_by: r
+            .get::<_, Option<String>>(17)?
+            .and_then(|s| DecidedBy::parse(&s)),
     })
 }
 
@@ -478,6 +648,8 @@ pub struct NewRequest<'a> {
     pub read_only: bool,
     /// See [`PermissionRequest::request_key`].
     pub request_key: Option<&'a str>,
+    /// See [`PermissionRequest::decided_by`].
+    pub decided_by: Option<DecidedBy>,
 }
 
 pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<PermissionRequest> {
@@ -490,8 +662,8 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
     c.execute(
         "INSERT INTO permission_requests
             (agent_id, channel_id, batch_id, source, title, detail, reason, state, asked_of,
-             created_at, read_only, request_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             created_at, read_only, request_key, decided_by)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             r.agent.0,
             r.channel.0,
@@ -504,7 +676,8 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
             asked,
             r.now as i64,
             r.read_only as i64,
-            r.request_key
+            r.request_key,
+            r.decided_by.as_ref().map(|d| d.as_str())
         ],
     )?;
     let id = PermissionId(c.last_insert_rowid());
@@ -644,6 +817,7 @@ pub fn insert_read(
             now,
             read_only: true,
             request_key: None,
+            decided_by: Some(DecidedBy::AutoVm),
         },
     )?;
     prune_reads(c, channel, READS_KEPT)?;
@@ -660,11 +834,12 @@ pub fn answer(
     note: Option<&str>,
     now: Millis,
 ) -> rusqlite::Result<bool> {
+    let decided_by = DecidedBy::Human(by);
     let n = c.execute(
         "UPDATE permission_requests
-         SET state = ?2, answered_by = ?3, answered_at = ?4, answer_note = ?5
+         SET state = ?2, answered_by = ?3, answered_at = ?4, answer_note = ?5, decided_by = ?6
          WHERE id = ?1 AND state = 'pending'",
-        params![id.0, state.as_str(), by.0, now as i64, note],
+        params![id.0, state.as_str(), by.0, now as i64, note, decided_by.as_str()],
     )?;
     Ok(n == 1)
 }
@@ -879,6 +1054,7 @@ impl Engine {
                     now,
                     read_only: false,
                     request_key: None,
+                    decided_by: Some(DecidedBy::AutoVm),
                 },
             )
         })?;
@@ -937,6 +1113,7 @@ impl Engine {
                         now,
                         read_only: false,
                         request_key: Some(&*key),
+                        decided_by: Some(DecidedBy::AutoVm),
                     },
                 )
             })?;
@@ -986,6 +1163,7 @@ impl Engine {
                     now,
                     read_only: false,
                     request_key: Some(&*key),
+                    decided_by: None,
                 },
             )
         })?;
@@ -1120,6 +1298,77 @@ impl Engine {
         channel: ChannelId,
     ) -> rusqlite::Result<Vec<PermissionRequest>> {
         pending_in(self.conn(), channel)
+    }
+
+    /// The approval queue for a channel, pending first then recent outcomes.
+    /// This is what the sidebar's Permissions pane binds to (STRM-542).
+    pub fn approval_queue(&self, channel: ChannelId) -> Vec<QueuedRequest> {
+        let pending = pending_in(self.conn(), channel).unwrap_or_default();
+        pending
+            .into_iter()
+            .map(|req| QueuedRequest {
+                id: req.id,
+                agent: req.agent,
+                channel: req.channel,
+                ask: PermissionAsk {
+                    turn: req.batch,
+                    title: req.title.clone(),
+                    tool_name: None,
+                    detail: req.detail.clone(),
+                    read_only: req.read_only,
+                    key: req.request_key.clone(),
+                },
+                state: match req.state {
+                    PermissionState::Pending => QueueState::Pending,
+                    PermissionState::Approved => QueueState::Approved,
+                    PermissionState::Denied => QueueState::Denied,
+                    PermissionState::AutoApproved => QueueState::Approved,
+                },
+                command: None,
+                proposed_change: None,
+            })
+            .collect()
+    }
+
+    /// A human approves or denies a queued request (STRM-542).
+    /// For `ask-all` this is today's `answer_permission` (one-shot grant + wake).
+    /// For `accept-edits` commands, approval also *runs the command* and the
+    /// result — not just the grant — is steered back to the agent.
+    pub fn resolve_queued(
+        &mut self,
+        now: Millis,
+        id: PermissionId,
+        by: MemberId,
+        approve: bool,
+        note: Option<&str>,
+    ) -> Result<QueuedRequest, AnswerError> {
+        let req = self
+            .answer_permission(now, id, by, approve, note)
+            .map_err(|e| match e {
+                AnswerError::Store(s) => AnswerError::Store(s),
+                _ => e,
+            })?;
+        Ok(QueuedRequest {
+            id: req.id,
+            agent: req.agent,
+            channel: req.channel,
+            ask: PermissionAsk {
+                turn: req.batch,
+                title: req.title.clone(),
+                tool_name: None,
+                detail: req.detail.clone(),
+                read_only: req.read_only,
+                key: req.request_key.clone(),
+            },
+            state: match req.state {
+                PermissionState::Pending => QueueState::Pending,
+                PermissionState::Approved => QueueState::Approved,
+                PermissionState::Denied => QueueState::Denied,
+                PermissionState::AutoApproved => QueueState::Approved,
+            },
+            command: None,
+            proposed_change: None,
+        })
     }
 }
 

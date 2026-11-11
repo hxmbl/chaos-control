@@ -910,7 +910,10 @@ fn on_request(
     tokio::spawn(async move {
         let decision = match ask.await {
             PermissionVerdict::Allow { .. } | PermissionVerdict::AllowRead => "accept",
-            PermissionVerdict::Sent { .. } | PermissionVerdict::Decline => "decline",
+            PermissionVerdict::Sent { .. }
+            | PermissionVerdict::DeferredQueue { .. }
+            | PermissionVerdict::Hold { .. }
+            | PermissionVerdict::Decline => "decline",
         };
         rpc.respond(id, json!({ "decision": decision }));
     });

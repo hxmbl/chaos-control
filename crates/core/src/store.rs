@@ -455,6 +455,10 @@ ALTER TABLE permission_requests ADD COLUMN request_key TEXT;
 CREATE INDEX permission_requests_by_key
     ON permission_requests (agent_id, channel_id, request_key, state);
 "#,
+    // 16: decided_by column for tracking who/what decided a permission request (STRM-542).
+    r#"
+ALTER TABLE permission_requests ADD COLUMN decided_by TEXT;
+"#,
 ];
 
 pub struct Store {
