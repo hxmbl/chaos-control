@@ -65,7 +65,7 @@ use tokio::{
 use crate::acp::{ChatToolsPreference, auth_like, resolve_command};
 use crate::adapter::*;
 use crate::harness::ModelInfo;
-use crate::permission::{PermissionAsk, PermissionGate, PermissionVerdict};
+use crate::permission::{PermissionAsk, PermissionGate, PermissionVerdict, request_key, without};
 use crate::types::BatchId;
 
 /// The name our chat MCP server is registered under inside Codex.
@@ -488,6 +488,9 @@ struct Turn {
     native: Option<String>,
     accepted: bool,
     text: String,
+    /// Each `fileChange` item's `changes`, by item id, as `item/started`
+    /// reported them: what a file-change approval for that item is keyed on.
+    changes: HashMap<String, Value>,
 }
 
 impl Turn {
@@ -737,6 +740,12 @@ fn on_notification(state: &Mutex<Turn>, method: &str, p: &Value) -> Vec<AgentEve
         }
         "item/started" => {
             let item = p.get("item").unwrap_or(&Value::Null);
+            if item.get("type").and_then(|v| v.as_str()) == Some("fileChange")
+                && let Some(id) = item.get("id").and_then(|v| v.as_str())
+            {
+                let changes = item.get("changes").cloned().unwrap_or(Value::Null);
+                t.changes.insert(id.to_string(), changes);
+            }
             let label = match item.get("type").and_then(|v| v.as_str()) {
                 Some("commandExecution") => item
                     .get("command")
@@ -816,6 +825,53 @@ fn on_notification(state: &Mutex<Turn>, method: &str, p: &Value) -> Vec<AgentEve
     out
 }
 
+/// The fields of a command approval that differ between two asks for the
+/// same command: ids, the agent's wording of why, and `_meta`.
+const CODEX_VOLATILE: &[&str] = &[
+    "threadId",
+    "turnId",
+    "itemId",
+    "approvalId",
+    "reason",
+    "_meta",
+];
+
+/// An approval request's title and request key (STRM-572), or None for a
+/// method Chaos Control doesn't answer. A command approval is keyed on the
+/// request without its ids and reason; a file-change approval on the
+/// `changes` its item reported at `item/started`, or, if those weren't seen,
+/// on the item id (so it can only match a retry of that very item).
+fn approval(
+    method: &str,
+    p: &Value,
+    changes: &HashMap<String, Value>,
+) -> Option<(String, Arc<str>)> {
+    match method {
+        "item/commandExecution/requestApproval" => {
+            let title = p
+                .get("command")
+                .and_then(|c| c.as_str())
+                .or_else(|| p.get("reason").and_then(|c| c.as_str()))
+                .unwrap_or("run a command")
+                .to_string();
+            Some((title, request_key("command", &without(p, CODEX_VOLATILE))))
+        }
+        "item/fileChange/requestApproval" => {
+            let title = match p.get("reason").and_then(|c| c.as_str()) {
+                Some(r) => format!("Edit files: {r}"),
+                None => "Edit files".to_string(),
+            };
+            let item = p.get("itemId").and_then(|v| v.as_str());
+            let key = match item.and_then(|i| changes.get(i)) {
+                Some(c) => request_key("file_change", &json!({ "changes": c })),
+                None => request_key("file_change", &json!({ "itemId": item })),
+            };
+            Some((title, key))
+        }
+        _ => None,
+    }
+}
+
 fn on_request(
     rpc: &Rpc,
     state: &Arc<Mutex<Turn>>,
@@ -825,21 +881,13 @@ fn on_request(
     p: &Value,
     events: &EventSink,
 ) {
-    let title = match method {
-        "item/commandExecution/requestApproval" => p
-            .get("command")
-            .and_then(|c| c.as_str())
-            .or_else(|| p.get("reason").and_then(|c| c.as_str()))
-            .unwrap_or("run a command")
-            .to_string(),
-        "item/fileChange/requestApproval" => match p.get("reason").and_then(|c| c.as_str()) {
-            Some(r) => format!("Edit files: {r}"),
-            None => "Edit files".to_string(),
-        },
-        _ => {
-            rpc.respond_error(id, -32601, "not supported by Chaos Control");
-            return;
-        }
+    let found = {
+        let t = state.lock().expect("lock");
+        approval(method, p, &t.changes)
+    };
+    let Some((title, key)) = found else {
+        rpc.respond_error(id, -32601, "not supported by Chaos Control");
+        return;
     };
     let (accepted, turn) = {
         let mut t = state.lock().expect("lock");
@@ -856,6 +904,7 @@ fn on_request(
         tool_name: None,
         detail: Some(Arc::from(p.to_string())),
         read_only: false,
+        key: Some(key),
     });
     let rpc = rpc.clone();
     tokio::spawn(async move {
@@ -971,6 +1020,57 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn approvals_are_keyed_on_what_they_would_do_not_their_ids() {
+        let none = HashMap::new();
+        let cmd = |item: &str, approval: &str, command: &str| {
+            json!({
+                "threadId": "th", "turnId": item, "itemId": item, "approvalId": approval,
+                "reason": format!("because {item}"), "_meta": {"n": item},
+                "command": command, "cwd": "/repo"
+            })
+        };
+        let m = "item/commandExecution/requestApproval";
+        let (title, key) = approval(m, &cmd("i1", "a1", "cargo test"), &none).unwrap();
+        assert_eq!(title, "cargo test");
+        assert!(key.starts_with("command:"), "{key}");
+        let (_, retry) = approval(m, &cmd("i2", "a2", "cargo test"), &none).unwrap();
+        assert_eq!(key, retry, "a retry with new ids matches");
+        let (_, other) = approval(m, &cmd("i1", "a1", "rm -rf /"), &none).unwrap();
+        assert_ne!(key, other);
+        assert!(approval("item/tool/requestUserInput", &json!({}), &none).is_none());
+    }
+
+    #[test]
+    fn file_change_approvals_are_keyed_on_the_items_changes() {
+        let s = turn_state();
+        on_notification(&s, "turn/started", &json!({"turn": {"id": "t1"}}));
+        for (id, path) in [("f1", "a.rs"), ("f2", "a.rs"), ("f3", "b.rs")] {
+            on_notification(
+                &s,
+                "item/started",
+                &json!({"turnId": "t1", "item": {"type": "fileChange", "id": id,
+                    "changes": [{"path": path, "kind": "update", "diff": "+x"}]}}),
+            );
+        }
+        let changes = s.lock().unwrap().changes.clone();
+        let m = "item/fileChange/requestApproval";
+        let key = |item: &str| {
+            approval(m, &json!({"itemId": item, "reason": "edit"}), &changes)
+                .unwrap()
+                .1
+        };
+        assert_eq!(key("f1"), key("f2"), "same changes, same key");
+        assert_ne!(key("f1"), key("f3"), "another file, another key");
+        assert!(key("f1").starts_with("file_change:"));
+        // Changes never seen: keyed on the item id alone.
+        assert_eq!(key("unseen"), key("unseen"));
+        assert_ne!(key("unseen"), key("unseen-2"));
+        assert_ne!(key("unseen"), key("f1"));
+        let (title, _) = approval(m, &json!({"itemId": "f1"}), &changes).unwrap();
+        assert_eq!(title, "Edit files");
     }
 
     #[test]

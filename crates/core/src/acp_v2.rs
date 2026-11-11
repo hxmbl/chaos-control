@@ -348,22 +348,36 @@ async fn run(
         .on_receive_request(
             async move |r: v2::RequestPermissionRequest, responder, _cx: V2ConnectionTo<Agent>| {
                 let turn = t_perm.lock().expect("lock").turn;
-                let (tool_name, read_only) = match &r.subject {
+                let (tool_name, kind) = match &r.subject {
                     Some(v2::RequestPermissionSubject::ToolCall(s)) => {
                         let name = match &s.tool_call.name {
                             MaybeUndefined::Value(name) => Some(Arc::from(name.as_str())),
                             _ => None,
                         };
-                        let read_only = match &s.tool_call.kind {
-                            MaybeUndefined::Value(k) => {
-                                crate::permission::is_read_only_kind(&crate::acp::kind_str(k))
-                            }
-                            _ => false,
+                        let kind = match &s.tool_call.kind {
+                            MaybeUndefined::Value(k) => Some(crate::acp::kind_str(k)),
+                            _ => None,
                         };
-                        (name, read_only)
+                        (name, kind)
                     }
-                    _ => (None, false),
+                    _ => (None, None),
                 };
+                let read_only = kind
+                    .as_deref()
+                    .is_some_and(crate::permission::is_read_only_kind);
+                // The key: the prompt's title, description and subject minus
+                // ids and progress, so a retry with a new id still matches.
+                let key = crate::permission::request_key(
+                    kind.as_deref().unwrap_or("none"),
+                    &crate::permission::without(
+                        &serde_json::json!({
+                            "title": &r.title,
+                            "description": &r.description,
+                            "subject": &r.subject,
+                        }),
+                        crate::permission::ACP_VOLATILE,
+                    ),
+                );
                 let title =
                     crate::permission::permission_title(Some(&r.title), tool_name.as_deref());
                 let verdict = gate
@@ -373,6 +387,7 @@ async fn run(
                         tool_name,
                         detail: r.description.as_deref().map(Arc::from),
                         read_only,
+                        key: Some(key),
                     })
                     .await;
                 responder.respond(answer(&r, &verdict))

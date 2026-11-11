@@ -404,6 +404,18 @@ BEGIN
     SELECT RAISE(ABORT, 'nickname_is_a_handle');
 END;
 "#,
+    // 13: request keys (STRM-572). A grant used to match on the tool call's
+    // title alone, so an approved "Edit files" let any later "Edit files"
+    // through. `request_key` is what exactly was asked for
+    // (`permission::request_key`: the tool kind plus a SHA-256 of the call
+    // without its ids); grants and dedup match on it. NULL for logged reads,
+    // auto-allowed chat tools and rows from before this migration, so an old
+    // unused grant matches nothing.
+    r#"
+ALTER TABLE permission_requests ADD COLUMN request_key TEXT;
+CREATE INDEX permission_requests_by_key
+    ON permission_requests (agent_id, channel_id, request_key, state);
+"#,
 ];
 
 pub struct Store {
@@ -2766,6 +2778,7 @@ mod tests {
                 asked_of: &[],
                 now,
                 read_only: false,
+                request_key: None,
             },
         )
         .unwrap()

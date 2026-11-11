@@ -815,12 +815,19 @@ async fn run_v1(
                     .raw_input
                     .as_ref()
                     .map(|v| Arc::from(v.to_string()));
-                let read_only = r
-                    .tool_call
-                    .fields
-                    .kind
-                    .as_ref()
-                    .is_some_and(|k| crate::permission::is_read_only_kind(&kind_str(k)));
+                let kind = r.tool_call.fields.kind.as_ref().map(kind_str);
+                let read_only = kind
+                    .as_deref()
+                    .is_some_and(crate::permission::is_read_only_kind);
+                // The key: the whole tool call minus its ids and progress, so
+                // a retry with a new tool call id still matches a grant.
+                let key = crate::permission::request_key(
+                    kind.as_deref().unwrap_or("none"),
+                    &crate::permission::without(
+                        &serde_json::to_value(&r.tool_call).unwrap_or_default(),
+                        crate::permission::ACP_VOLATILE,
+                    ),
+                );
                 let verdict = gate
                     .ask(PermissionAsk {
                         turn,
@@ -828,6 +835,7 @@ async fn run_v1(
                         tool_name,
                         detail,
                         read_only,
+                        key: Some(key),
                     })
                     .await;
                 responder.respond(v1_answer(&r, &verdict))
