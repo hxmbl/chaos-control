@@ -4,6 +4,8 @@ mod agents;
 mod agents_file;
 mod composer;
 mod conversation;
+#[cfg(target_os = "macos")]
+mod dock;
 mod model_picker;
 mod pane_host;
 mod panels;
@@ -15,8 +17,6 @@ mod settings;
 mod sidebar;
 mod store;
 mod titlebar;
-#[cfg(target_os = "macos")]
-mod tray;
 mod workspace;
 
 use gpui::{
@@ -81,8 +81,9 @@ fn main() {
                 ),
             ]);
             cx.bind_keys(composer::bindings());
+            // The menu bar item is disabled for now (see tray.rs).
             #[cfg(target_os = "macos")]
-            tray::init(cx);
+            dock::init();
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();

@@ -1,3 +1,7 @@
+// DISABLED for now: this file is not in the module tree (no `mod tray;` in
+// main.rs) and its tray-icon/futures/image dependencies were removed from
+// Cargo.toml. Kept for later; re-add both to turn the menu bar item back on.
+
 //! macOS menu bar item: the mark as a template glyph, no menu. A left click
 //! brings Chaos Control forward and activates its window.
 
