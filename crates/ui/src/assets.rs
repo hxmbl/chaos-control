@@ -12,6 +12,7 @@ macro_rules! embed {
 
 /// (path, bytes) for every bundled asset. Paths are what `svg().path(..)` takes.
 static FILES: &[(&str, &[u8])] = embed![
+    "icons/chaos-control.svg",
     "icons/phosphor/archive.svg",
     "icons/phosphor/arrow-up.svg",
     "icons/phosphor/caret-down.svg",

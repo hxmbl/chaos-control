@@ -218,7 +218,7 @@ impl Titlebar {
             .absolute()
             .inset_0()
             .child(
-                toggle("toggle-left-sidebar", IconName::SidebarLeft, left_open)
+                toggle("toggle-left-sidebar", IconName::AppMark, left_open)
                     .top(space::X3)
                     .left(left_x)
                     .tooltip(Tooltip::text(left_tip))
