@@ -1144,7 +1144,7 @@ fn paint_cursor(cursor: CursorPaint, window: &mut Window) {
             let mut builder = PathBuilder::fill();
             builder.add_polygon(&corners, true);
             match builder.build() {
-                Ok(path) => window.paint_path(path, cursor.color),
+                Ok(path) => window.paint_path(path, cursor.color.alpha(0.5)),
                 Err(_) => window.paint_quad(cursor.target),
             }
         }
