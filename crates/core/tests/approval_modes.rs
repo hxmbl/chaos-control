@@ -583,15 +583,35 @@ async fn background_process_with_redirected_pipes_is_terminated() {
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
-        let alive = std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
+        let alive = process_alive(pid);
         if !alive || tokio::time::Instant::now() >= deadline {
             assert!(!alive, "background child {pid} survived command completion");
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether `pid` is still running. A zombie has exited and only waits for its
+/// (possibly non-reaping) new parent, so it does not count.
+fn process_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        let state = stat
+            .rfind(')')
+            .and_then(|i| stat[i + 1..].split_whitespace().next())
+            .unwrap_or("");
+        !matches!(state, "Z" | "X" | "")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

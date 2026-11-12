@@ -1367,74 +1367,44 @@ impl Actor {
         ))
     }
 
+    /// Whether any live (non-zombie) process is still in the command's group.
+    /// Zombies are ignored: they have already exited and only wait to be reaped,
+    /// which on Linux CI may never happen when the orphan's new parent does not reap.
     async fn process_group_exists(pgid: Option<u32>) -> Result<bool, String> {
         #[cfg(unix)]
         if let Some(pgid) = pgid {
-            // Prefer counting members: after the leader exits, `kill -0 -<pgid>`
-            // can be unreliable in some environments; any remaining member means
-            // background work is still alive in the process group.
-            match tokio::process::Command::new("ps")
-                .args(["-o", "pid=", "-g", &pgid.to_string()])
-                .output()
-                .await
-            {
-                Ok(result) if result.status.success() => {
-                    let any = String::from_utf8_lossy(&result.stdout)
-                        .lines()
-                        .any(|line| !line.trim().is_empty());
-                    return Ok(any);
-                }
-                Ok(_) | Err(_) => {
-                    // Fall back to kill -0 if ps is unavailable or fails.
-                }
-            }
-            let result = tokio::process::Command::new("kill")
-                .args(["-0", &format!("-{pgid}")])
-                .output()
+            return tokio::task::spawn_blocking(move || group_has_live_members(pgid))
                 .await
                 .map_err(|e| format!("failed to inspect command process group: {e}"))?;
-            if result.status.success() {
-                return Ok(true);
-            }
-            if String::from_utf8_lossy(&result.stderr).contains("Operation not permitted") {
-                return Err(format!(
-                    "permission denied inspecting command process group {pgid}"
-                ));
-            }
         }
+        #[cfg(not(unix))]
+        let _ = pgid;
         Ok(false)
     }
 
+    /// TERM the group, give it a moment, then KILL it and wait (briefly) until no
+    /// live member remains.
     async fn kill_process_tree(pgid: Option<u32>, child: &mut tokio::process::Child) {
         #[cfg(unix)]
         if let Some(pgid) = pgid {
-            let _ = tokio::process::Command::new("kill")
-                .args(["-TERM", &format!("-{pgid}")])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            signal_group(pgid, libc::SIGTERM);
             tokio::time::sleep(Duration::from_millis(200)).await;
-            let _ = tokio::process::Command::new("kill")
-                .args(["-KILL", &format!("-{pgid}")])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .await;
+            signal_group(pgid, libc::SIGKILL);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            while matches!(Self::process_group_exists(Some(pgid)).await, Ok(true))
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
         let _ = child.kill().await;
     }
 
     fn kill_pgid(pgid: u32) {
         #[cfg(unix)]
-        {
-            let _ = std::process::Command::new("kill")
-                .args(["-KILL", &format!("-{pgid}")])
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        signal_group(pgid, libc::SIGKILL);
         #[cfg(not(unix))]
-        {
-            let _ = pgid;
-        }
+        let _ = pgid;
     }
 
     fn format_output(stdout: Vec<u8>, stderr: Vec<u8>, max_total: usize) -> String {
@@ -1858,5 +1828,87 @@ impl Actor {
                 self.engine.session_closed(agent, channel);
             }
         }
+    }
+}
+
+/// Sends `sig` to every process in group `pgid`. Uses killpg(2) directly: the
+/// `kill` binary's handling of negative pids differs between implementations.
+#[cfg(unix)]
+fn signal_group(pgid: u32, sig: libc::c_int) {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return;
+    };
+    if pgid <= 1 {
+        return;
+    }
+    // SAFETY: killpg only takes plain integers and has no memory effects.
+    unsafe {
+        libc::killpg(pgid, sig);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn group_has_live_members(pgid: u32) -> Result<bool, String> {
+    let entries = std::fs::read_dir("/proc").map_err(|e| format!("failed to read /proc: {e}"))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if let Some((state, pgrp)) = parse_proc_stat(&stat)
+            && pgrp == pgid
+            && state != 'Z'
+            && state != 'X'
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// `(state, pgrp)` from a /proc/<pid>/stat line. The command name may contain
+/// spaces and parentheses, so fields are read after the last `)`.
+#[cfg(target_os = "linux")]
+fn parse_proc_stat(stat: &str) -> Option<(char, u32)> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let _ppid = fields.next()?;
+    let pgrp = fields.next()?.parse().ok()?;
+    Some((state, pgrp))
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_has_live_members(pgid: u32) -> Result<bool, String> {
+    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
+        return Ok(false);
+    };
+    // SAFETY: signal 0 only checks for existence and permission.
+    if unsafe { libc::killpg(pgid, 0) } == 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Err(format!(
+            "permission denied inspecting command process group {pgid}"
+        )),
+        _ => Ok(false),
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod proc_stat_tests {
+    use super::parse_proc_stat;
+
+    #[test]
+    fn parses_state_and_pgrp_past_odd_names() {
+        let line = "4242 (we(ird) name) Z 1 4200 4200 0 -1 4194560";
+        assert_eq!(parse_proc_stat(line), Some(('Z', 4200)));
+        assert_eq!(parse_proc_stat("7 (sh) S 3 7 7 0"), Some(('S', 7)));
+        assert_eq!(parse_proc_stat("garbage"), None);
     }
 }
