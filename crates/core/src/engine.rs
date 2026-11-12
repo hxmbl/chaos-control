@@ -48,6 +48,8 @@ pub struct Dispatch {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CoreEvent {
     Message(Message),
+    /// A message body was edited in place (id/seq unchanged).
+    MessageEdited(Message),
     /// A reaction was added (`added`) or removed. Never a wake: nobody is
     /// notified or delivered anything because of it.
     Reaction {
@@ -108,6 +110,37 @@ impl std::fmt::Display for PostError {
             }
             PostError::Store(e) => write!(f, "store error: {e}"),
         }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditError {
+    Empty,
+    NotMember,
+    UnknownChannel,
+    UnknownMessage,
+    NotAuthor,
+    NotEligible,
+    Store(String),
+}
+
+impl std::fmt::Display for EditError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EditError::Empty => f.write_str("empty message"),
+            EditError::NotMember => f.write_str("not a member of that channel"),
+            EditError::UnknownChannel => f.write_str("no such channel"),
+            EditError::UnknownMessage => f.write_str("no such message"),
+            EditError::NotAuthor => f.write_str("not the author of that message"),
+            EditError::NotEligible => f.write_str("message is not editable"),
+            EditError::Store(e) => write!(f, "store error: {e}"),
+        }
+    }
+}
+
+impl From<rusqlite::Error> for EditError {
+    fn from(e: rusqlite::Error) -> Self {
+        EditError::Store(e.to_string())
     }
 }
 
@@ -1103,6 +1136,67 @@ impl Engine {
             now,
         )?;
         Ok(parsed.unwrap_or_default())
+    }
+
+    /// Edits a human-authored message in place. Only the author's latest
+    /// message in the channel is eligible.
+    pub fn edit_message(
+        &mut self,
+        now: Millis,
+        author: MemberId,
+        channel: ChannelId,
+        message: MessageId,
+        body: &str,
+    ) -> Result<Message, EditError> {
+        let body = body.trim();
+        if body.is_empty() {
+            return Err(EditError::Empty);
+        }
+        let author_m = store::member(self.conn(), author)?.ok_or(EditError::NotMember)?;
+        if author_m.kind != MemberKind::Human {
+            return Err(EditError::NotEligible);
+        }
+        let _channel = store::channel(self.conn(), channel)?.ok_or(EditError::UnknownChannel)?;
+        if !store::is_member(self.conn(), channel, author_m.id)? {
+            return Err(EditError::NotMember);
+        }
+        let current = store::message(self.conn(), message)?.ok_or(EditError::UnknownMessage)?;
+        if current.channel != channel {
+            return Err(EditError::UnknownMessage);
+        }
+        if current.author != Some(author_m.id) || current.origin != Origin::Composer {
+            return Err(EditError::NotEligible);
+        }
+        let latest = store::last_message_by_author(self.conn(), channel, author_m.id)?
+            .ok_or(EditError::NotEligible)?;
+        if latest.id != message {
+            return Err(EditError::NotEligible);
+        }
+        let mut notes = Vec::new();
+        let (mentions, everyone) = self
+            .resolve_mentions(channel, &author_m, body, &mut notes)
+            .map_err(|e| match e {
+                PostError::Empty => EditError::Empty,
+                PostError::NotMember => EditError::NotMember,
+                PostError::UnknownChannel => EditError::UnknownChannel,
+                PostError::UnknownMessage => EditError::UnknownMessage,
+                PostError::InvalidEmoji => EditError::Store("invalid emoji".into()),
+                PostError::RateLimited { .. } => EditError::Store("rate limited".into()),
+                PostError::Store(s) => EditError::Store(s),
+            })?;
+        let edited = self.store.tx::<_, EditError>(|c| {
+            Ok(store::edit_message_body(c, message, body, &mentions, now)?)
+        })?;
+        self.effects
+            .push(Effect::Event(Box::new(CoreEvent::MessageEdited(
+                edited.clone(),
+            ))));
+        // Newly mentioned agents (and added @everyone targets) may wake; existing
+        // triggers for this message are deduped by trigger identity.
+        self.create_triggers(now, &edited, &author_m, everyone)
+            .map_err(|e| EditError::Store(e.to_string()))?;
+        self.advance_read(now, author_m.id, channel, edited.seq);
+        Ok(edited)
     }
 
     /// A member refuses or dissents from `target`: posts `reason` as a reply
