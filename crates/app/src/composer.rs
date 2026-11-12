@@ -529,7 +529,7 @@ mod tests {
         } else {
             drafts.insert(b, empty.clone());
         }
-        assert!(drafts.get(&b).is_none());
+        assert!(!drafts.contains_key(&b));
         assert_eq!(drafts.get(&b).cloned().unwrap_or_else(Draft::empty), empty);
 
         // Reply makes an otherwise empty text draft worth keeping.
