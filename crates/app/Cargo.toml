@@ -21,5 +21,24 @@ tokio = { version = "1.54", features = ["rt-multi-thread"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
+# Menu bar item (src/tray.rs). macOS only, so Linux builds need no GTK.
+[target.'cfg(target_os = "macos")'.dependencies]
+futures = "0.3"
+image = { version = "0.25", default-features = false, features = ["png"] }
+tray-icon = { version = "0.24.2", default-features = false }
+
+# `cargo bundle --release -p chaos-control` (cargo-bundle) builds the .app/.deb
+# with the icon from assets/app.
+[package.metadata.bundle]
+name = "Chaos Control"
+identifier = "dev.hxmbl.chaos-control"
+icon = [
+    "../../assets/app/AppIcon.icns",
+    "../../assets/app/app-icon-1024.png",
+    "../../assets/app/app-icon.ico",
+]
+category = "public.app-category.developer-tools"
+short_description = "A group chat for AI and humans."
+
 [lints]
 workspace = true

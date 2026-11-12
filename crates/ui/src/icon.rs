@@ -6,6 +6,8 @@ use model::Brand;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IconName {
+    /// The Chaos Control mark (single colour, like the rest).
+    AppMark,
     Archive,
     ArrowUp,
     CaretDown,
@@ -39,7 +41,8 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [IconName; 30] = [
+    pub const ALL: [IconName; 31] = [
+        IconName::AppMark,
         IconName::Archive,
         IconName::ArrowUp,
         IconName::CaretDown,
@@ -74,6 +77,7 @@ impl IconName {
 
     pub fn path(self) -> &'static str {
         match self {
+            IconName::AppMark => "icons/chaos-control.svg",
             IconName::Archive => "icons/phosphor/archive.svg",
             IconName::ArrowUp => "icons/phosphor/arrow-up.svg",
             IconName::CaretDown => "icons/phosphor/caret-down.svg",
