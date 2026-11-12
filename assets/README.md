@@ -8,6 +8,7 @@ Everything here is compiled into the binary by `crates/ui/src/assets.rs`.
 | `icons/phosphor/*.svg` | [Phosphor Icons](https://github.com/phosphor-icons/core), only the ones the UI uses | MIT, see `icons/phosphor/LICENSE` |
 | `icons/brands/*.svg` | Brand marks via [Iconify](https://iconify.design): [Simple Icons](https://github.com/simple-icons/simple-icons) and [SVG Logos](https://github.com/gilbarbara/logos) (Devin) | CC0-1.0, see `icons/brands/NOTICE.md` |
 | `icons/chaos-control.svg` | The Chaos Control mark, drawn for this project | Same as the repo |
+| `app/*` | App icon (`app-icon.svg` source, 1024 PNG, `AppIcon.icns`, `app-icon.ico`) and macOS menu bar template glyph (`trayTemplate.png`, `@2x`), made from the mark. Not wired into a bundle yet | Same as the repo |
 
 To add a Phosphor icon, copy its SVG from `phosphor-icons/core/assets/<weight>/`,
 then add it to `FILES` in `assets.rs` and to `IconName` in `icon.rs`. The
