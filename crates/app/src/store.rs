@@ -94,6 +94,8 @@ pub enum StoreEvent {
     /// A permission request was answered (here or by someone else): close its
     /// pane if it is still showing.
     PermissionAnswered { request: i64 },
+    /// Sending a human message failed; the composer keeps its draft.
+    SendFailed { channel: Id, error: Arc<str> },
 }
 
 /// Someone who has read up to a message (Slack/iMessage-style read marks).
@@ -612,10 +614,16 @@ impl ChatStore {
             let (author, channel) = (attached.link.human, attached.link.main());
             let reply = reply_to.and_then(|r| core_message_id(r.message));
             let body = body.to_string();
+            let app_channel = self.selected;
             cx.spawn(async move |this, cx| {
                 if let Err(e) = core.post(author, channel, &body, reply).await {
+                    let error: Arc<str> = Arc::from(e.to_string());
                     this.update(cx, |store, cx| {
-                        store.system_note(&format!("Not sent: {e}"), cx)
+                        store.system_note(&format!("Not sent: {error}"), cx);
+                        cx.emit(StoreEvent::SendFailed {
+                            channel: app_channel,
+                            error,
+                        });
                     })
                     .ok();
                 }

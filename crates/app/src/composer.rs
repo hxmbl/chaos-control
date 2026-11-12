@@ -1,11 +1,13 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
+use std::{collections::HashMap, ops::Range};
+
 use gpui::{
     Context, Entity, Focusable, KeyBinding, SharedString, Subscription, Window, actions, div,
     prelude::*,
 };
-use model::{ReplyRef, pane::author_name};
+use model::{Id, ReplyRef, pane::author_name};
 use ui::{
     ActiveTheme, Elevation, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, TypeStyleExt,
     icon,
@@ -57,11 +59,35 @@ fn sendable(text: &str) -> bool {
     !text.trim().is_empty()
 }
 
+#[derive(Clone)]
+struct Draft {
+    text: SharedString,
+    selection: Range<usize>,
+    reversed: bool,
+    reply: Option<ReplyRef>,
+}
+
+impl Draft {
+    fn empty() -> Self {
+        Self {
+            text: SharedString::default(),
+            selection: 0..0,
+            reversed: false,
+            reply: None,
+        }
+    }
+}
+
 pub struct Composer {
     store: Entity<ChatStore>,
     input: Entity<TextInput>,
+    /// The channel the composer is showing a draft for.
+    channel: Id,
     /// "Reply" in the pane: the message the next send answers.
     reply: Option<ReplyRef>,
+    drafts: HashMap<Id, Draft>,
+    /// A core send in flight: restored if the send fails.
+    pending: Option<(Id, Draft)>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -79,33 +105,135 @@ impl Composer {
         let input =
             cx.new(|cx| TextInput::new(placeholder(store.read(cx)), cx).multiline(MAX_LINES));
         window.focus(&input.focus_handle(cx));
+        let channel = store.read(cx).selected();
         let subscriptions = [
             cx.subscribe(&input, |this, _, event, cx| match event {
                 TextInputEvent::Submit => this.send(cx),
-                TextInputEvent::Changed => cx.notify(),
-            }),
-            cx.subscribe(&store, |this, store, event, cx| {
-                if let StoreEvent::Selected = event {
-                    // A reply belongs to the channel it was started in.
-                    this.reply = None;
-                    let text = placeholder(store.read(cx));
-                    this.input
-                        .update(cx, |input, cx| input.set_placeholder(text, cx));
-                    // Sending may have turned on or off with the channel.
-                    cx.notify();
+                TextInputEvent::Changed => {
+                    if let Some((ch, draft)) = &this.pending {
+                        if *ch == this.channel
+                            && this.input.read(cx).text().as_ref() != draft.text.as_ref()
+                        {
+                            this.pending = None;
+                        }
+                    }
+                    cx.notify()
                 }
+            }),
+            cx.subscribe(&store, |this, store, event, cx| match event {
+                StoreEvent::Selected => {
+                    let next = store.read(cx).selected();
+                    this.switch_channel(next, store, cx);
+                }
+                StoreEvent::SendFailed { channel, .. } => {
+                    if this.pending.as_ref().is_some_and(|(ch, _)| ch == channel) {
+                        let (_, draft) = this.pending.take().unwrap();
+                        // Keep the text if the send failed.
+                        this.drafts.insert(*channel, draft.clone());
+                        if this.channel == *channel {
+                            this.reply = draft.reply.clone();
+                            this.input.update(cx, |input, cx| {
+                                input.restore_draft_state(
+                                    draft.text,
+                                    draft.selection,
+                                    draft.reversed,
+                                    cx,
+                                );
+                            });
+                            cx.notify();
+                        }
+                    }
+                }
+                StoreEvent::Appended { channel, .. } => {
+                    // A successful core send shows up as an appended message.
+                    if let Some((ch, draft)) = this.pending.as_ref() {
+                        if ch == channel {
+                            let sent = store
+                                .read(cx)
+                                .log(*channel)
+                                .and_then(|log| log.get(log.len().saturating_sub(1)))
+                                .is_some_and(|m| {
+                                    matches!(m.author, model::Author::Human)
+                                        && m.body.as_ref() == draft.text.as_ref()
+                                });
+                            if sent {
+                                this.pending = None;
+                                if this.channel == *channel {
+                                    this.input.update(cx, |input, cx| input.clear(cx));
+                                    this.reply = None;
+                                    this.drafts.remove(channel);
+                                    cx.notify();
+                                } else {
+                                    this.drafts.remove(channel);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }),
         ];
         Self {
             store,
             input,
+            channel,
             reply: None,
+            drafts: HashMap::new(),
+            pending: None,
             _subscriptions: subscriptions,
         }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.input.focus_handle(cx));
+    }
+
+    fn snapshot(&self, cx: &Context<Self>) -> Draft {
+        let (text, selection, reversed) = self.input.read(cx).draft_state();
+        Draft {
+            text,
+            selection,
+            reversed,
+            reply: self.reply.clone(),
+        }
+    }
+
+    fn is_empty_draft(draft: &Draft) -> bool {
+        draft.text.as_ref().trim().is_empty() && draft.reply.is_none()
+    }
+
+    fn save_current(&mut self, cx: &Context<Self>) {
+        let draft = self.snapshot(cx);
+        if Self::is_empty_draft(&draft) {
+            self.drafts.remove(&self.channel);
+        } else {
+            self.drafts.insert(self.channel, draft);
+        }
+    }
+
+    fn restore_for(&mut self, channel: Id, cx: &mut Context<Self>) {
+        let draft = self
+            .drafts
+            .get(&channel)
+            .cloned()
+            .unwrap_or_else(Draft::empty);
+        self.reply = draft.reply;
+        self.input.update(cx, |input, cx| {
+            input.restore_draft_state(draft.text, draft.selection, draft.reversed, cx);
+        });
+    }
+
+    fn switch_channel(&mut self, next: Id, store: Entity<ChatStore>, cx: &mut Context<Self>) {
+        if next == self.channel {
+            return;
+        }
+        self.save_current(cx);
+        self.channel = next;
+        let placeholder = placeholder(store.read(cx));
+        self.input
+            .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
+        self.restore_for(next, cx);
+        cx.notify();
     }
 
     /// Starts a reply to a message (the pane's "Reply"): shows the reference
@@ -130,6 +258,7 @@ impl Composer {
             Escape::DismissSuggestions => self.dismiss_suggestions(cx),
             Escape::CancelReply => {
                 self.reply = None;
+                self.save_current(cx);
                 cx.notify();
             }
             Escape::Propagate => cx.propagate(),
@@ -141,10 +270,31 @@ impl Composer {
         if !sendable(&text) || self.unwired(cx) {
             return;
         }
+        let route = self.store.read(cx).send_route();
         let reply = self.reply.take();
+        // Keep a copy so a failed send can be restored.
+        let (draft_text, selection, reversed) = self.input.read(cx).draft_state();
+        let recovery = Draft {
+            text: draft_text,
+            selection,
+            reversed,
+            reply: reply.clone(),
+        };
         self.store
             .update(cx, |store, cx| store.post_from_human(&text, reply, cx));
-        self.input.update(cx, |input, cx| input.clear(cx));
+        match route {
+            SendRoute::Core => {
+                // Keep the draft until the send is known to have failed; core
+                // reports success by echoing the message back.
+                self.pending = Some((self.channel, recovery));
+            }
+            _ => {
+                self.input.update(cx, |input, cx| input.clear(cx));
+                self.reply = None;
+                self.drafts.remove(&self.channel);
+            }
+        }
+        cx.notify();
     }
 
     /// The selected channel isn't wired to core, so sending is off.
