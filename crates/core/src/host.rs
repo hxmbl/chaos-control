@@ -1370,6 +1370,24 @@ impl Actor {
     async fn process_group_exists(pgid: Option<u32>) -> Result<bool, String> {
         #[cfg(unix)]
         if let Some(pgid) = pgid {
+            // Prefer counting members: after the leader exits, `kill -0 -<pgid>`
+            // can be unreliable in some environments; any remaining member means
+            // background work is still alive in the process group.
+            match tokio::process::Command::new("ps")
+                .args(["-o", "pid=", "-g", &pgid.to_string()])
+                .output()
+                .await
+            {
+                Ok(result) if result.status.success() => {
+                    let any = String::from_utf8_lossy(&result.stdout)
+                        .lines()
+                        .any(|line| !line.trim().is_empty());
+                    return Ok(any);
+                }
+                Ok(_) | Err(_) => {
+                    // Fall back to kill -0 if ps is unavailable or fails.
+                }
+            }
             let result = tokio::process::Command::new("kill")
                 .args(["-0", &format!("-{pgid}")])
                 .output()
