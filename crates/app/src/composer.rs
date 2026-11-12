@@ -15,18 +15,21 @@ use ui::{
     truncated,
 };
 
-use crate::store::{ChatStore, SendRoute, StoreEvent, UNWIRED_NOTE};
+use crate::store::{ChatStore, MentionCandidate, SendRoute, StoreEvent, UNWIRED_NOTE};
 
-actions!(composer, [Cancel]);
+actions!(composer, [Cancel, AcceptMention]);
 
 /// Key context of the composer, around its text field.
 pub const KEY_CONTEXT: &str = "Composer";
 
 /// The composer's own keys. Enter and shift-enter are the text field's (see
 /// `ui::TextInput::multiline`); Esc backs out of whatever the composer is in
-/// the middle of, never the typed text.
+/// the middle of, never the typed text. Tab accepts an open @-mention.
 pub fn bindings() -> Vec<KeyBinding> {
-    vec![KeyBinding::new("escape", Cancel, Some(KEY_CONTEXT))]
+    vec![
+        KeyBinding::new("escape", Cancel, Some(KEY_CONTEXT)),
+        KeyBinding::new("tab", AcceptMention, Some(KEY_CONTEXT)),
+    ]
 }
 
 /// What Esc does in the composer, innermost first.
@@ -100,6 +103,53 @@ impl Draft {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MentionState {
+    /// Byte range in the draft text: `@` through the cursor.
+    range: Range<usize>,
+    query: String,
+    matches: Vec<MentionCandidate>,
+    selected: usize,
+}
+
+fn mention_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let before = &text[..cursor];
+    let at = before.rfind('@')?;
+    if at < cursor && before[at..].chars().skip(1).any(char::is_whitespace) {
+        return None;
+    }
+    if at > 0 {
+        let prev = before[..at].chars().last()?;
+        if !(prev.is_whitespace() || "([{\"'".contains(prev)) {
+            return None;
+        }
+    }
+    let query = &before[at + 1..];
+    if query.contains(|c: char| c.is_whitespace()) {
+        return None;
+    }
+    Some((at..cursor, query.to_string()))
+}
+
+fn filter_mentions(candidates: &[MentionCandidate], query: &str) -> Vec<MentionCandidate> {
+    let q = query.to_ascii_lowercase();
+    candidates
+        .iter()
+        .filter(|c| {
+            c.handle.to_ascii_lowercase().contains(&q)
+                || c.name.to_ascii_lowercase().contains(&q)
+                || c.nicknames
+                    .iter()
+                    .any(|n| n.to_ascii_lowercase().contains(&q))
+        })
+        .cloned()
+        .collect()
+}
+
 pub struct Composer {
     store: Entity<ChatStore>,
     input: Entity<TextInput>,
@@ -110,6 +160,7 @@ pub struct Composer {
     drafts: HashMap<Id, Draft>,
     /// A core send in flight: restored if the send fails.
     pending: Option<(Id, Draft)>,
+    mention: Option<MentionState>,
     _subscriptions: [Subscription; 2],
 }
 
@@ -130,8 +181,14 @@ impl Composer {
         let channel = store.read(cx).selected();
         let subscriptions = [
             cx.subscribe(&input, |this, _, event, cx| match event {
-                TextInputEvent::Submit => this.send(cx),
-                TextInputEvent::Changed => cx.notify(),
+                TextInputEvent::Submit => {
+                    if this.suggestions_open() {
+                        this.accept_mention(cx);
+                    } else {
+                        this.send(cx);
+                    }
+                }
+                TextInputEvent::Changed => this.refresh_mention(cx),
             }),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
@@ -190,6 +247,7 @@ impl Composer {
             reply: None,
             drafts: HashMap::new(),
             pending: None,
+            mention: None,
             _subscriptions: subscriptions,
         }
     }
@@ -239,6 +297,8 @@ impl Composer {
         self.input
             .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
         self.restore_for(next, cx);
+        self.mention = None;
+        self.refresh_mention(cx);
         cx.notify();
     }
 
@@ -251,13 +311,82 @@ impl Composer {
     }
 
     /// Hook for the @-mention popup (STRM-543): true while it is showing,
-    /// so Esc closes it before touching the reply. No popup exists yet.
+    /// so Esc closes it before touching the reply.
     fn suggestions_open(&self) -> bool {
-        false
+        self.mention.is_some()
     }
 
-    /// Closes the @-mention popup. Nothing to close until it exists.
-    fn dismiss_suggestions(&mut self, _cx: &mut Context<Self>) {}
+    /// Closes the @-mention popup.
+    fn dismiss_suggestions(&mut self, cx: &mut Context<Self>) {
+        self.mention = None;
+        cx.notify();
+    }
+
+    fn refresh_mention(&mut self, cx: &mut Context<Self>) {
+        let (text, selection, _) = self.input.read(cx).draft_state();
+        let cursor = selection.end.min(text.len());
+        let Some((range, query)) = mention_query(text.as_ref(), cursor) else {
+            if self.mention.take().is_some() {
+                cx.notify();
+            }
+            return;
+        };
+        let candidates = self.store.read(cx).mention_candidates();
+        let matches = filter_mentions(&candidates, &query);
+        if matches.is_empty() {
+            if self.mention.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
+        let selected = self
+            .mention
+            .as_ref()
+            .filter(|m| m.range == range)
+            .map(|m| m.selected.min(matches.len().saturating_sub(1)))
+            .unwrap_or(0);
+        self.mention = Some(MentionState {
+            range,
+            query,
+            matches,
+            selected,
+        });
+        cx.notify();
+    }
+
+    fn accept_mention(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.mention.clone() else {
+            return false;
+        };
+        let Some(candidate) = state.matches.get(state.selected) else {
+            self.mention = None;
+            return false;
+        };
+        let (text, selection, _reversed) = self.input.read(cx).draft_state();
+        let cursor = selection.end.min(text.len());
+        if state.range.end != cursor
+            || state.range.start > state.range.end
+            || state.range.end > text.len()
+        {
+            self.refresh_mention(cx);
+            return false;
+        }
+        let handle = candidate.handle.to_string();
+        let mut new = String::with_capacity(text.len() - state.range.len() + handle.len() + 2);
+        new.push_str(&text.as_ref()[..state.range.start]);
+        new.push('@');
+        new.push_str(&handle);
+        let insert_end = new.len();
+        new.push(' ');
+        new.push_str(&text.as_ref()[state.range.end..]);
+        let caret = insert_end + 1;
+        self.input.update(cx, |input, cx| {
+            input.restore_draft_state(SharedString::from(new), caret..caret, false, cx);
+        });
+        self.mention = None;
+        self.refresh_mention(cx);
+        true
+    }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
         match escape(self.suggestions_open(), self.reply.is_some()) {
@@ -268,6 +397,12 @@ impl Composer {
                 cx.notify();
             }
             Escape::Propagate => cx.propagate(),
+        }
+    }
+
+    fn accept_mention_action(&mut self, _: &AcceptMention, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.accept_mention(cx) {
+            cx.propagate();
         }
     }
 
@@ -351,10 +486,95 @@ impl Composer {
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.reply = None;
                         this.focus(window, cx);
+                        this.save_current(cx);
                         cx.notify();
                     }))
                     .child(icon(IconName::X, icons::SM, t.muted)),
             )
+    }
+
+    fn render_mentions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let state = self.mention.as_ref()?;
+        let t = *cx.theme();
+        let hover = t.hover;
+        let rows = state.matches.iter().enumerate().map(|(ix, m)| {
+            let selected = ix == state.selected;
+            let handle = format!("@{}", m.handle);
+            let nick = if m.nicknames.is_empty() {
+                None
+            } else {
+                Some(
+                    m.nicknames
+                        .iter()
+                        .map(|n| format!("@{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                )
+            };
+            let idx = ix;
+            div()
+                .id(("mention", ix))
+                .px(space::X2)
+                .py(space::X1_5)
+                .rounded(radius::MD)
+                .bg(if selected { t.selected } else { t.surface })
+                .hover(move |s| s.bg(if selected { t.selected } else { hover }))
+                .cursor_pointer()
+                .flex()
+                .flex_col()
+                .gap(space::X0_5)
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _, _, cx| {
+                        if let Some(state) = &mut this.mention {
+                            state.selected = idx;
+                        }
+                        this.accept_mention(cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(space::X2)
+                        .child(
+                            div()
+                                .type_style(text::SMALL)
+                                .font_weight(text::SEMIBOLD)
+                                .text_color(t.ink)
+                                .child(handle),
+                        )
+                        .child(
+                            div()
+                                .type_style(text::SMALL)
+                                .text_color(t.muted)
+                                .child(SharedString::from(m.name.clone())),
+                        ),
+                )
+                .when_some(nick, |d, nick| {
+                    d.child(
+                        div()
+                            .type_style(text::CAPTION)
+                            .text_color(t.muted)
+                            .child(nick),
+                    )
+                })
+        });
+        Some(
+            div()
+                .mx(space::X1)
+                .mb(space::X2)
+                .p(space::X1)
+                .rounded(radius::MD)
+                .bg(t.surface)
+                .border_1()
+                .border_color(t.line)
+                .shadow(t.elevation(Elevation::Overlay))
+                .flex()
+                .flex_col()
+                .gap(space::X0_5)
+                .children(rows),
+        )
     }
 }
 
@@ -369,6 +589,7 @@ impl Render for Composer {
         div()
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::accept_mention_action))
             .w_full()
             .flex()
             .flex_col()
@@ -390,6 +611,7 @@ impl Render for Composer {
                         .child(UNWIRED_NOTE),
                 )
             })
+            .children(self.render_mentions(cx))
             .when_some(self.reply.clone(), |d, reply| {
                 d.child(self.render_reply(&reply, cx))
             })

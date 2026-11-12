@@ -272,6 +272,15 @@ pub struct NicknamesSetting {
     pub error: Option<Arc<str>>,
 }
 
+/// A project member the composer can @-mention.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MentionCandidate {
+    /// The token inserted after `@`.
+    pub handle: Arc<str>,
+    pub name: Arc<str>,
+    pub nicknames: Vec<Arc<str>>,
+}
+
 /// One change from the Settings nickname field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NicknameEdit {
@@ -1265,6 +1274,28 @@ impl ChatStore {
                 .collect(),
             error: attached.nicknames_error.clone(),
         })
+    }
+
+    /// Current project members that can be @-mentioned: linked agents with
+    /// their handles, names and nicknames. Removed agents are not offered.
+    pub fn mention_candidates(&self) -> Vec<MentionCandidate> {
+        let Some(attached) = &self.core else {
+            return Vec::new();
+        };
+        attached
+            .link
+            .agents
+            .iter()
+            .map(|a| MentionCandidate {
+                handle: a.handle.clone(),
+                name: a.name.clone(),
+                nicknames: attached
+                    .nicknames
+                    .get(&a.member)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// Applies the Settings nickname field (`@handle cody -cx`; see
