@@ -807,4 +807,41 @@ mod tests {
         // Different body does not match.
         assert!(!echo_matches_in(Some(&log), 0..log.len(), "other"));
     }
+
+    #[test]
+    fn mention_query_parses_at_token() {
+        assert_eq!(
+            mention_query("hello @cod", 10),
+            Some((6..10, "cod".to_string()))
+        );
+        assert_eq!(
+            mention_query("@al", 3),
+            Some((0..3, "al".to_string()))
+        );
+        assert_eq!(mention_query("email test@example.com", 20), None);
+        assert_eq!(mention_query("hi @foo bar", 9), None);
+        assert_eq!(mention_query("hello", 5), None);
+        assert_eq!(mention_query("( @", 3), Some((2..3, String::new())));
+    }
+
+    #[test]
+    fn mention_filter_matches_handle_name_or_nickname() {
+        let candidates = vec![
+            MentionCandidate {
+                handle: "claude".into(),
+                name: "Claude Code".into(),
+                nicknames: vec!["cx".into(), "cc".into()],
+            },
+            MentionCandidate {
+                handle: "codex".into(),
+                name: "Codex CLI".into(),
+                nicknames: vec![],
+            },
+        ];
+        assert_eq!(filter_mentions(&candidates, "cla").len(), 1);
+        assert_eq!(filter_mentions(&candidates, "cli").len(), 1);
+        assert_eq!(filter_mentions(&candidates, "CX").len(), 1);
+        assert_eq!(filter_mentions(&candidates, "").len(), 2);
+        assert!(filter_mentions(&candidates, "zzz").is_empty());
+    }
 }
