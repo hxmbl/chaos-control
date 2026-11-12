@@ -21,11 +21,12 @@ tokio = { version = "1.54", features = ["rt-multi-thread"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 
-# Menu bar item (src/tray.rs). macOS only, so Linux builds need no GTK.
+# Dock icon (src/dock.rs), macOS only. The menu bar item (src/tray.rs) is
+# disabled for now; re-add futures, image and tray-icon 0.24.2 to bring it back.
 [target.'cfg(target_os = "macos")'.dependencies]
-futures = "0.3"
-image = { version = "0.25", default-features = false, features = ["png"] }
-tray-icon = { version = "0.24.2", default-features = false }
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
 
 # `cargo bundle --release -p chaos-control` (cargo-bundle) builds the .app/.deb
 # with the icon from assets/app.
