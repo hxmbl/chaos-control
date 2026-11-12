@@ -4,8 +4,8 @@
 use std::{collections::HashMap, ops::Range};
 
 use gpui::{
-    Context, Entity, Focusable, KeyBinding, SharedString, Subscription, Window, actions, div,
-    prelude::*,
+    Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
+    actions, div, prelude::*,
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
@@ -105,8 +105,9 @@ impl Draft {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MentionState {
-    /// Byte range in the draft text: `@` through the cursor.
+    /// Byte range in the draft text to replace: `@` through the mention token.
     range: Range<usize>,
+    /// Text typed after `@` up to the cursor, used for filtering.
     query: String,
     matches: Vec<MentionCandidate>,
     selected: usize,
@@ -119,7 +120,8 @@ fn mention_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
     }
     let before = &text[..cursor];
     let at = before.rfind('@')?;
-    if at < cursor && before[at..].chars().skip(1).any(char::is_whitespace) {
+    let prefix = &before[at + 1..];
+    if prefix.chars().any(char::is_whitespace) {
         return None;
     }
     if at > 0 {
@@ -128,11 +130,14 @@ fn mention_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
             return None;
         }
     }
-    let query = &before[at + 1..];
-    if query.contains(|c: char| c.is_whitespace()) {
-        return None;
-    }
-    Some((at..cursor, query.to_string()))
+    let after = &text[cursor..];
+    let suffix_len = after
+        .chars()
+        .take_while(|c| !c.is_whitespace())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let end = cursor + suffix_len;
+    Some((at..end, prefix.to_string()))
 }
 
 fn filter_mentions(candidates: &[MentionCandidate], query: &str) -> Vec<MentionCandidate> {
@@ -161,7 +166,7 @@ pub struct Composer {
     /// A core send in flight: restored if the send fails.
     pending: Option<(Id, Draft)>,
     mention: Option<MentionState>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 /// Rows the composer grows to before it scrolls.
@@ -190,6 +195,7 @@ impl Composer {
                 }
                 TextInputEvent::Changed => this.refresh_mention(cx),
             }),
+            cx.observe(&input, |this, _, cx| this.refresh_mention(cx)),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
                     let next = store.read(cx).selected();
@@ -324,6 +330,12 @@ impl Composer {
 
     fn refresh_mention(&mut self, cx: &mut Context<Self>) {
         let (text, selection, _) = self.input.read(cx).draft_state();
+        if selection.start != selection.end {
+            if self.mention.take().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         let cursor = selection.end.min(text.len());
         let Some((range, query)) = mention_query(text.as_ref(), cursor) else {
             if self.mention.take().is_some() {
@@ -342,16 +354,38 @@ impl Composer {
         let selected = self
             .mention
             .as_ref()
-            .filter(|m| m.range == range)
-            .map(|m| m.selected.min(matches.len().saturating_sub(1)))
+            .filter(|m| m.query == query)
+            .and_then(|m| {
+                m.matches
+                    .get(m.selected)
+                    .and_then(|keep| matches.iter().position(|c| c.handle == keep.handle))
+            })
             .unwrap_or(0);
-        self.mention = Some(MentionState {
+        let next = MentionState {
             range,
             query,
             matches,
             selected,
-        });
+        };
+        if self.mention.as_ref() == Some(&next) {
+            return;
+        }
+        self.mention = Some(next);
         cx.notify();
+    }
+
+    fn move_mention_selection(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(state) = &mut self.mention else {
+            return false;
+        };
+        let len = state.matches.len();
+        if len == 0 {
+            return false;
+        }
+        let cur = state.selected as isize;
+        state.selected = (cur + delta).rem_euclid(len as isize) as usize;
+        cx.notify();
+        true
     }
 
     fn accept_mention(&mut self, cx: &mut Context<Self>) -> bool {
@@ -363,10 +397,17 @@ impl Composer {
             return false;
         };
         let (text, selection, _reversed) = self.input.read(cx).draft_state();
+        if selection.start != selection.end {
+            self.refresh_mention(cx);
+            return false;
+        }
         let cursor = selection.end.min(text.len());
-        if state.range.end != cursor
-            || state.range.start > state.range.end
+        if cursor < state.range.start
+            || cursor > state.range.end
             || state.range.end > text.len()
+            || !text.is_char_boundary(state.range.start)
+            || !text.is_char_boundary(state.range.end)
+            || !text.is_char_boundary(cursor)
         {
             self.refresh_mention(cx);
             return false;
@@ -590,6 +631,17 @@ impl Render for Composer {
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::accept_mention_action))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if !this.suggestions_open() {
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
+                    "down" if this.move_mention_selection(1, cx) => cx.stop_propagation(),
+                    _ => {}
+                }
+            }))
             .w_full()
             .flex()
             .flex_col()
@@ -816,9 +868,18 @@ mod tests {
         );
         assert_eq!(mention_query("@al", 3), Some((0..3, "al".to_string())));
         assert_eq!(mention_query("email test@example.com", 20), None);
-        assert_eq!(mention_query("hi @foo bar", 9), None);
+        // Cursor moved into the token: query is the prefix, range covers the whole mention token.
+        assert_eq!(
+            mention_query("hi @foo bar", 5),
+            Some((3..7, "f".to_string()))
+        );
         assert_eq!(mention_query("hello", 5), None);
         assert_eq!(mention_query("( @", 3), Some((2..3, String::new())));
+        // Insertion/edit halfway through an existing mention keeps replacement over the full token.
+        assert_eq!(
+            mention_query("hi @claude there", 6),
+            Some((3..10, "cl".to_string()))
+        );
     }
 
     #[test]
