@@ -475,9 +475,7 @@ pub fn extract_command(detail: Option<&str>) -> Option<String> {
                         Value::Array(a) => {
                             let mut parts = Vec::with_capacity(a.len());
                             for x in a {
-                                let Some(s) = x.as_str() else {
-                                    return None;
-                                };
+                                let s = x.as_str()?;
                                 parts.push(s.to_string());
                             }
                             if !parts.is_empty() {

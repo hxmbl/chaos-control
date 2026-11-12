@@ -1282,10 +1282,7 @@ impl Actor {
             Err(_) => {
                 Self::kill_process_tree(pgid, &mut child).await;
                 let st = child.wait().await.ok();
-                (
-                    st.unwrap_or_else(|| std::process::ExitStatus::default()),
-                    true,
-                )
+                (st.unwrap_or_else(std::process::ExitStatus::default), true)
             }
         };
 

@@ -2,9 +2,9 @@
 
 mod common;
 
-use std::{sync::Mutex, time::Duration};
+use std::time::Duration;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 use chaos_core::{
     engine::CoreEvent,
@@ -86,7 +86,7 @@ async fn chat_set_approval_mode_is_not_agent_authorized_or_auto_allowed() {
                     .unwrap()
                     .permission_outcomes
                     .clone();
-                if o.len() >= 1 || tokio::time::Instant::now() > deadline {
+                if !o.is_empty() || tokio::time::Instant::now() > deadline {
                     break o;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -435,7 +435,7 @@ async fn non_zero_exit_and_launch_failure_are_reported_to_agent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn timeout_and_oversized_output_are_handled() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = ENV_LOCK.lock().await;
     // SAFETY: serialized by ENV_LOCK to avoid leaking into other tests.
     unsafe {
         std::env::set_var("CHAOS_COMMAND_TIMEOUT_SECS", "1");
