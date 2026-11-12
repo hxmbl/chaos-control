@@ -36,9 +36,18 @@
 //! app's named chat MCP tools is also auto-approved and logged by its tool
 //! name. Everything else (running commands, editing, deleting, moving,
 //! fetching, an unknown or missing kind) goes the way above: approved in a
-//! VM, else declined at once with a message saying why and that a human was
-//! asked. Codex has no read requests to answer; its sessions start in a
-//! read-only sandbox instead (see `codex.rs`).
+//! VM, else decided by the agent's approval mode (STRM-542, below).
+//!
+//! **Approval modes (STRM-542).** On the host, `ApprovalMode` decides what a
+//! non-read request becomes: `ask-all` sends it to the humans (pending,
+//! answerable live); `accept-edits` allows edits and reads but queues
+//! commands for later execution; `yolo` allows everything, recorded as
+//! auto-approved-by-mode (`DecidedBy::AutoMode`). The effective mode is the
+//! channel override, then the project override, then the workspace override,
+//! then the member's `agents.json` `"approval"` (default `ask-all`). Mode
+//! changes are not retroactive. `mode_verdict` is the pure decision;
+//! `decide`/`ApprovalCaps` are the capability-contract groundwork for
+//! adapters that can hold or defer a request (see `docs/command-approval.md`).
 
 use std::{
     fmt::{self, Write as _},
@@ -171,6 +180,21 @@ pub struct PermissionRequest {
     /// on it. None for logged reads, auto-allowed chat tools, and requests
     /// stored before migration 13.
     pub request_key: Option<Arc<str>>,
+    /// Who or what decided this request's outcome (STRM-542). None for
+    /// requests stored before migration 16.
+    pub decided_by: Option<DecidedBy>,
+    /// Captured command line for queued/runnable commands (STRM-542).
+    pub command: Option<Arc<str>>,
+    /// Working directory for command execution (STRM-542).
+    pub cwd: Option<Arc<str>>,
+    /// Execution lifecycle state: queued/running/done/failed (STRM-542).
+    pub run_state: Option<Arc<str>>,
+    /// Captured command output/result summary (STRM-542).
+    pub run_output: Option<Arc<str>>,
+    /// Exit code when execution finished (STRM-542).
+    pub run_exit_code: Option<i32>,
+    /// When execution finished (STRM-542).
+    pub run_finished_at: Option<Millis>,
 }
 
 /// How a request ended, as the permission log shows it.
@@ -179,37 +203,56 @@ pub struct PermissionRequest {
 pub enum LogOutcome {
     /// Allowed without a human: a read, or anything from an agent in its own VM.
     AutoAllowed,
-    /// The agent was told "not now" (pending, never answered) or a human denied it.
+    /// Waiting for a human decision (live queue, STRM-542).
+    Pending,
+    /// A human denied it.
     Declined,
     /// A human approved it (a one-shot grant).
     Approved,
+    /// Approved command currently running (STRM-542).
+    Running,
+    /// Queued command completed (STRM-542).
+    Done,
+    /// Queued command failed or could not be executed (STRM-542).
+    Failed,
 }
 
 impl LogOutcome {
     pub fn label(self) -> &'static str {
         match self {
             LogOutcome::AutoAllowed => "Auto-allowed",
+            LogOutcome::Pending => "Pending",
             LogOutcome::Declined => "Declined",
             LogOutcome::Approved => "Approved",
+            LogOutcome::Running => "Running",
+            LogOutcome::Done => "Done",
+            LogOutcome::Failed => "Failed",
         }
     }
 }
 
 impl PermissionRequest {
-    /// The outcome the permission log shows. A pending request counts as
-    /// declined: the agent's tool call was declined at once, whatever a human
-    /// may say later.
+    /// The outcome the permission log/queue shows.
     pub fn outcome(&self) -> LogOutcome {
+        match self.run_state.as_deref() {
+            Some("running") => return LogOutcome::Running,
+            Some("done") => return LogOutcome::Done,
+            Some("failed") | Some("unrunnable") => return LogOutcome::Failed,
+            Some("denied") => return LogOutcome::Declined,
+            Some("queued") => return LogOutcome::Pending,
+            _ => {}
+        }
         match self.state {
             PermissionState::AutoApproved => LogOutcome::AutoAllowed,
             PermissionState::Approved => LogOutcome::Approved,
-            PermissionState::Pending | PermissionState::Denied => LogOutcome::Declined,
+            PermissionState::Denied => LogOutcome::Declined,
+            PermissionState::Pending => LogOutcome::Pending,
         }
     }
 }
 
 /// A native permission request, as the adapter hands it to core.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PermissionAsk {
     pub turn: Option<BatchId>,
     pub title: Arc<str>,
@@ -219,6 +262,8 @@ pub struct PermissionAsk {
     /// The tool call only reads (ACP tool kind `read` or `search`). Reads are
     /// always allowed; a missing kind is not a read.
     pub read_only: bool,
+    /// What kind of operation this is (STRM-542). Used for mode decisions.
+    pub kind: RequestKind,
     /// The request's key ([`request_key`]), which a grant must match. None
     /// falls back to a key on the title alone.
     pub key: Option<Arc<str>>,
@@ -237,6 +282,33 @@ pub enum PermissionVerdict {
     Sent { request: PermissionId },
     /// No core to ask (replay tests): decline, nothing recorded.
     Decline,
+}
+
+/// What kind of operation a permission request is for (STRM-542).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestKind {
+    /// A read-only operation (file read, search).
+    Read,
+    /// An edit operation (file write, delete, move).
+    Edit,
+    /// A command execution.
+    Execute,
+    /// A fetch operation (HTTP, etc.).
+    Fetch,
+    /// Some other kind of operation.
+    Other,
+}
+
+/// What a mode does with one incoming request (STRM-542).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModeOutcome {
+    /// Allow immediately.
+    Allow,
+    /// Ask a human.
+    AskHuman,
+    /// Queue for later execution.
+    Queue,
 }
 
 /// How an adapter asks core about a native permission request. Cheap to clone.
@@ -268,6 +340,62 @@ impl fmt::Debug for PermissionGate {
     }
 }
 
+/// What the agent says it wants to change, when the protocol gives us
+/// enough to show a human (STRM-542). `None` means "show the title/detail only" —
+/// we never fabricate a diff from the command line.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub enum ProposedChange {
+    /// Old/new text for one file (ACP diff content).
+    Text {
+        path: Arc<str>,
+        old: Arc<str>,
+        new: Arc<str>,
+    },
+    /// A unified diff blob, when that's all the agent sent.
+    Unified { path: Arc<str>, patch: Arc<str> },
+}
+
+/// One thing an agent wants to do that a human (or a mode) hasn't settled.
+/// This is the row the sidebar renders and the app's Approve/Deny acts on.
+/// Wraps/extends `permission_requests`; the store table is the same,
+/// the queue is the *view* plus the delivery bookkeeping (STRM-542).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct QueuedRequest {
+    pub id: PermissionId,
+    pub agent: MemberId,
+    pub channel: ChannelId,
+    /// What it wants, for display: title, detail, proposed diff if the
+    /// agent sent one (see `ProposedChange`).
+    pub ask: PermissionAsk,
+    /// Where it sits in the queue: position is display order, stable
+    /// across re-renders. Approving out of order is allowed — each
+    /// request is independent.
+    pub state: QueueState,
+    /// For `accept-edits` commands: the captured command line and the
+    /// working directory it would run in. Empty for plain asks.
+    pub command: Option<Arc<str>>,
+    /// What the agent says it wants to change (when available).
+    pub proposed_change: Option<ProposedChange>,
+}
+
+/// Where a queued request sits in its lifecycle (STRM-542).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueState {
+    /// Waiting for a human (or for its mode rule to apply).
+    Pending,
+    /// Approved; the command is running (accept-edits) or the grant is
+    /// armed for the agent's retry (ask-all).
+    Approved,
+    /// Denied by a human, with the reason that will be steered back.
+    Denied,
+    /// Ran to completion; `result` is what gets delivered to the agent.
+    Done,
+    /// Approved but execution failed (command exited non-zero, agent
+    /// unreachable). The agent hears the failure, not silence.
+    Failed,
+}
+
 /// The `_meta` an adapter attaches to a native decline after a request was
 /// sent, so the agent (or a person reading the transcript) knows it was "not
 /// now", not "no".
@@ -286,11 +414,9 @@ pub fn sent_meta(request: PermissionId) -> serde_json::Map<String, Value> {
 
 fn sent_message(request: PermissionId) -> String {
     format!(
-        "Declined for now: in Chaos Control you can read files freely, but running commands \
-and editing, moving or deleting files need a human's approval. This one was sent to the humans \
-as permission request #{request}. Don't wait for it: carry on with what you can do by reading, \
-or say in the chat what you would change. If a human approves, the answer arrives as a message \
-in a later turn (chat_permission_status shows it); then retry the same call and it goes through once."
+        "Request #{request} sent to Chaos Control's approval queue. You can continue other work. \
+Check status with chat_permission_status (request_id: {request}); you'll be notified when a decision is made. \
+If approved, follow the decision message (you may need to retry the same call once; queued commands may be run and reported back by Chaos Control as support is added)."
     )
 }
 
@@ -300,11 +426,181 @@ pub fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "read" | "search")
 }
 
+/// Maps an ACP wire tool kind to a [`RequestKind`] (STRM-542).
+pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
+    match kind {
+        Some("read" | "search") => RequestKind::Read,
+        Some("edit" | "delete" | "move") => RequestKind::Edit,
+        Some("execute") => RequestKind::Execute,
+        Some("fetch") => RequestKind::Fetch,
+        _ => RequestKind::Other,
+    }
+}
+
+/// What a mode does with one incoming request, before any human sees it.
+/// Pure function of (mode, request kind) — no I/O, fully testable (STRM-542).
+pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
+    match mode {
+        // Reads never reach this function: is_read_only_kind short-circuits
+        // upstream, as today.
+        ApprovalMode::AskAll => ModeOutcome::AskHuman,
+        ApprovalMode::AcceptEdits => match kind {
+            RequestKind::Edit | RequestKind::Read => ModeOutcome::Allow,
+            RequestKind::Execute | RequestKind::Fetch | RequestKind::Other => ModeOutcome::Queue,
+        },
+        ApprovalMode::Yolo => ModeOutcome::Allow,
+    }
+}
+
 // ---------- request keys ----------
 
 /// The fields of an ACP tool call that differ between two calls of the same
 /// thing: its ids, its progress and what it produced. Left out of the key.
 pub const ACP_VOLATILE: &[&str] = &["toolCallId", "terminalId", "status", "rawOutput", "_meta"];
+
+fn detail_json(detail: Option<&str>) -> Option<Value> {
+    detail.and_then(|d| serde_json::from_str(d).ok())
+}
+
+/// Best-effort extraction of an executable shell command from stored request
+/// detail (STRM-542). Returns None when no safe command string can be inferred.
+pub fn extract_command(detail: Option<&str>) -> Option<String> {
+    let v = detail_json(detail)?;
+    fn find(v: &Value) -> Option<String> {
+        if let Some(obj) = v.as_object() {
+            for key in ["command", "cmd", "script", "shell"] {
+                if let Some(c) = obj.get(key) {
+                    match c {
+                        Value::String(s) if !s.trim().is_empty() => return Some(s.clone()),
+                        Value::Array(a) => {
+                            let mut parts = Vec::with_capacity(a.len());
+                            for x in a {
+                                let s = x.as_str()?;
+                                parts.push(s.to_string());
+                            }
+                            if !parts.is_empty() {
+                                return Some(shell_join(&parts));
+                            }
+                        }
+                        Value::Object(o) => {
+                            // Some shapes nest the actual command, e.g. {command:{command:"..."}}
+                            if let Some(found) = find(&Value::Object(o.clone())) {
+                                return Some(found);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            // ACP v2/tool-call-like nested locations
+            for key in [
+                "rawInput",
+                "input",
+                "arguments",
+                "params",
+                "toolCall",
+                "subject",
+                "tool_call",
+                "fields",
+                "content",
+            ] {
+                if let Some(inner) = obj.get(key)
+                    && let Some(found) = find(inner)
+                {
+                    return Some(found);
+                }
+            }
+            // Some ACP tool calls put command in title/description-like fields? no, avoid guessing.
+        } else if let Some(arr) = v.as_array() {
+            for item in arr {
+                if let Some(found) = find(item) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    find(&v)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Best-effort extraction of a working directory from request detail.
+pub fn extract_cwd(detail: Option<&str>) -> Option<String> {
+    let v = detail_json(detail)?;
+    fn find(v: &Value) -> Option<String> {
+        if let Some(obj) = v.as_object() {
+            for key in [
+                "cwd",
+                "workdir",
+                "working_directory",
+                "workingDirectory",
+                "directory",
+                "dir",
+            ] {
+                if let Some(Value::String(s)) = obj.get(key) {
+                    let s = s.trim();
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+            for key in [
+                "rawInput",
+                "input",
+                "arguments",
+                "params",
+                "toolCall",
+                "subject",
+                "tool_call",
+                "fields",
+            ] {
+                if let Some(inner) = obj.get(key)
+                    && let Some(found) = find(inner)
+                {
+                    return Some(found);
+                }
+            }
+        } else if let Some(arr) = v.as_array() {
+            for item in arr {
+                if let Some(found) = find(item) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    find(&v)
+}
+
+fn shell_join(parts: &[String]) -> String {
+    // If this looks like ["bash","-lc","<script>"] or ["sh","-c","<script>"], prefer the script.
+    if parts.len() >= 3 {
+        let shell = parts[0].as_str();
+        let flag = parts[1].as_str();
+        if matches!(
+            shell,
+            "bash" | "sh" | "zsh" | "/bin/bash" | "/bin/sh" | "/bin/zsh"
+        ) && matches!(flag, "-lc" | "-c")
+        {
+            return parts[2].clone();
+        }
+    }
+    // Otherwise join as a simple command line (best-effort).
+    parts
+        .iter()
+        .map(|p| {
+            if p.chars()
+                .any(|c| c.is_whitespace() || "\"'\\$`".contains(c))
+            {
+                format!("'{}'", p.replace('\'', "'\\''"))
+            } else {
+                p.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// What a request asks for, as a key a grant must match (STRM-572): the tool
 /// kind, a `:`, then the SHA-256 (hex) of `payload` as canonical JSON (object
@@ -434,7 +730,8 @@ pub fn pick_decline(options: &[(OptionKind, &str)]) -> Option<usize> {
 // ---------- store ----------
 
 const COLS: &str = "id, agent_id, channel_id, batch_id, source, title, detail, reason, state, \
-asked_of, created_at, answered_by, answered_at, answer_note, used_at, read_only, request_key";
+asked_of, created_at, answered_by, answered_at, answer_note, used_at, read_only, request_key, decided_by, \
+command, cwd, run_state, run_output, run_exit_code, run_finished_at";
 
 fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
     let asked: String = r.get(9)?;
@@ -460,6 +757,15 @@ fn row(r: &Row<'_>) -> rusqlite::Result<PermissionRequest> {
         used_at: r.get::<_, Option<i64>>(14)?.map(|t| t as Millis),
         read_only: r.get::<_, i64>(15)? != 0,
         request_key: r.get::<_, Option<String>>(16)?.map(Arc::from),
+        decided_by: r
+            .get::<_, Option<String>>(17)?
+            .and_then(|s| DecidedBy::parse(&s)),
+        command: r.get::<_, Option<String>>(18)?.map(Arc::from),
+        cwd: r.get::<_, Option<String>>(19)?.map(Arc::from),
+        run_state: r.get::<_, Option<String>>(20)?.map(Arc::from),
+        run_output: r.get::<_, Option<String>>(21)?.map(Arc::from),
+        run_exit_code: r.get::<_, Option<i64>>(22)?.map(|v| v as i32),
+        run_finished_at: r.get::<_, Option<i64>>(23)?.map(|t| t as Millis),
     })
 }
 
@@ -478,6 +784,12 @@ pub struct NewRequest<'a> {
     pub read_only: bool,
     /// See [`PermissionRequest::request_key`].
     pub request_key: Option<&'a str>,
+    /// See [`PermissionRequest::decided_by`].
+    pub decided_by: Option<DecidedBy>,
+    /// Captured command for queued execution (STRM-542).
+    pub command: Option<&'a str>,
+    /// Working directory for queued execution (STRM-542).
+    pub cwd: Option<&'a str>,
 }
 
 pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<PermissionRequest> {
@@ -490,8 +802,8 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
     c.execute(
         "INSERT INTO permission_requests
             (agent_id, channel_id, batch_id, source, title, detail, reason, state, asked_of,
-             created_at, read_only, request_key)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             created_at, read_only, request_key, decided_by, command, cwd)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             r.agent.0,
             r.channel.0,
@@ -504,7 +816,10 @@ pub fn insert(c: &Connection, r: &NewRequest<'_>) -> rusqlite::Result<Permission
             asked,
             r.now as i64,
             r.read_only as i64,
-            r.request_key
+            r.request_key,
+            r.decided_by.as_ref().map(|d| d.as_str()),
+            r.command,
+            r.cwd,
         ],
     )?;
     let id = PermissionId(c.last_insert_rowid());
@@ -585,6 +900,55 @@ pub fn pending_in(c: &Connection, channel: ChannelId) -> rusqlite::Result<Vec<Pe
     stmt.query_map([channel.0], row)?.collect()
 }
 
+/// Requests relevant to the approval/command queue for a channel (STRM-542):
+/// pending, answered with run lifecycle, or otherwise actionable/recent.
+pub fn queue_in(
+    c: &Connection,
+    channel: ChannelId,
+    limit: usize,
+) -> rusqlite::Result<Vec<PermissionRequest>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {COLS} FROM permission_requests
+         WHERE channel_id = ?1 AND read_only = 0
+           AND (state = 'pending' OR run_state IS NOT NULL OR state = 'denied' OR state = 'approved')
+         ORDER BY
+           CASE
+             WHEN run_state = 'running' THEN 0
+             WHEN state = 'pending' THEN 1
+             WHEN run_state = 'queued' THEN 2
+             WHEN run_state IN ('done','failed','denied','unrunnable') THEN 3
+             ELSE 4
+           END,
+           id DESC
+         LIMIT ?2"
+    ))?;
+    stmt.query_map(params![channel.0, limit as i64], row)?
+        .collect()
+}
+
+fn queue_state_of(req: &PermissionRequest) -> QueueState {
+    match req.run_state.as_deref() {
+        Some("running") => QueueState::Approved,
+        Some("done") => QueueState::Done,
+        Some("failed") | Some("unrunnable") => QueueState::Failed,
+        Some("denied") => QueueState::Denied,
+        Some("queued") => QueueState::Pending,
+        _ => match req.state {
+            PermissionState::Pending => QueueState::Pending,
+            PermissionState::Approved | PermissionState::AutoApproved => QueueState::Approved,
+            PermissionState::Denied => QueueState::Denied,
+        },
+    }
+}
+
+/// Queued commands left running by a previous process (startup recovery).
+pub fn interrupted_runs(c: &Connection) -> rusqlite::Result<Vec<PermissionRequest>> {
+    let mut stmt = c.prepare_cached(&format!(
+        "SELECT {COLS} FROM permission_requests WHERE run_state = 'running' ORDER BY id"
+    ))?;
+    stmt.query_map([], row)?.collect()
+}
+
 /// How many logged reads a channel keeps. Reads are frequent and only
 /// matter for the log, so older ones are pruned as new ones arrive; every
 /// other request is kept.
@@ -644,6 +1008,9 @@ pub fn insert_read(
             now,
             read_only: true,
             request_key: None,
+            decided_by: Some(DecidedBy::AutoVm),
+            command: None,
+            cwd: None,
         },
     )?;
     prune_reads(c, channel, READS_KEPT)?;
@@ -660,11 +1027,19 @@ pub fn answer(
     note: Option<&str>,
     now: Millis,
 ) -> rusqlite::Result<bool> {
+    let decided_by = DecidedBy::Human(by);
     let n = c.execute(
         "UPDATE permission_requests
-         SET state = ?2, answered_by = ?3, answered_at = ?4, answer_note = ?5
+         SET state = ?2, answered_by = ?3, answered_at = ?4, answer_note = ?5, decided_by = ?6
          WHERE id = ?1 AND state = 'pending'",
-        params![id.0, state.as_str(), by.0, now as i64, note],
+        params![
+            id.0,
+            state.as_str(),
+            by.0,
+            now as i64,
+            note,
+            decided_by.as_str()
+        ],
     )?;
     Ok(n == 1)
 }
@@ -673,6 +1048,29 @@ pub fn mark_used(c: &Connection, id: PermissionId, now: Millis) -> rusqlite::Res
     c.execute(
         "UPDATE permission_requests SET used_at = ?2 WHERE id = ?1 AND used_at IS NULL",
         params![id.0, now as i64],
+    )?;
+    Ok(())
+}
+
+pub fn set_run_state(c: &Connection, id: PermissionId, state: &str) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE permission_requests SET run_state = ?2 WHERE id = ?1",
+        params![id.0, state],
+    )?;
+    Ok(())
+}
+
+pub fn set_run_result(
+    c: &Connection,
+    id: PermissionId,
+    state: &str,
+    output: Option<&str>,
+    exit_code: Option<i32>,
+    finished_at: Millis,
+) -> rusqlite::Result<()> {
+    c.execute(
+        "UPDATE permission_requests SET run_state = ?2, run_output = ?3, run_exit_code = ?4, run_finished_at = ?5 WHERE id = ?1",
+        params![id.0, state, output, exit_code, exit_code.map(|_| finished_at as i64).or(Some(finished_at as i64))],
     )?;
     Ok(())
 }
@@ -762,6 +1160,69 @@ impl Engine {
         self.runs_in.get(&agent).copied().unwrap_or_default()
     }
 
+    /// Sets the host-side approval mode for `agent` (STRM-542). Persisted.
+    pub fn set_approval_mode(
+        &mut self,
+        agent: MemberId,
+        mode: ApprovalMode,
+    ) -> rusqlite::Result<()> {
+        let key = format!("member_approval_mode:{}", agent.0);
+        self.store
+            .tx(|c| crate::store::set_app_setting(c, &key, Some(mode.as_str())))?;
+        self.approval_mode.insert(agent, mode);
+        Ok(())
+    }
+
+    pub fn approval_mode(&self, agent: MemberId) -> ApprovalMode {
+        let key = format!("member_approval_mode:{}", agent.0);
+        match crate::store::app_setting(self.conn(), &key) {
+            Ok(Some(m)) => ApprovalMode::parse(&m),
+            Ok(None) => self
+                .approval_mode
+                .get(&agent)
+                .copied()
+                .unwrap_or(ApprovalMode::AskAll),
+            Err(_) => ApprovalMode::AskAll,
+        }
+    }
+
+    /// Records the agent's working directory for command execution.
+    pub fn set_agent_cwd(&mut self, agent: MemberId, cwd: std::path::PathBuf) {
+        self.agent_cwd.insert(agent, cwd);
+    }
+
+    pub fn agent_cwd(&self, agent: MemberId) -> Option<std::path::PathBuf> {
+        self.agent_cwd.get(&agent).cloned()
+    }
+
+    /// Effective approval mode for a new request in `channel` (STRM-542):
+    /// channel override > project override > workspace override > member default.
+    /// Fails closed to `ask-all` if a higher-priority override cannot be read.
+    pub fn effective_approval_mode(&self, agent: MemberId, channel: ChannelId) -> ApprovalMode {
+        match crate::store::channel_approval_mode(self.conn(), channel) {
+            Ok(Some(m)) => return ApprovalMode::parse(&m),
+            Err(_) => return ApprovalMode::AskAll,
+            Ok(None) => {}
+        }
+        let project = match crate::store::channel(self.conn(), channel) {
+            Ok(Some(ch)) => Some(ch.project),
+            Ok(None) => None,
+            Err(_) => return ApprovalMode::AskAll,
+        };
+        if let Some(project) = project {
+            match crate::store::project_setting(self.conn(), &project, "approval_mode") {
+                Ok(Some(m)) => return ApprovalMode::parse(&m),
+                Err(_) => return ApprovalMode::AskAll,
+                Ok(None) => {}
+            }
+        }
+        match crate::store::app_setting(self.conn(), "approval_mode") {
+            Ok(Some(m)) => ApprovalMode::parse(&m),
+            Ok(None) => self.approval_mode(agent),
+            Err(_) => ApprovalMode::AskAll,
+        }
+    }
+
     /// The humans a request from `agent` goes to: whoever woke the turn it was
     /// asked in, else every human in the channel.
     fn route(&self, channel: ChannelId, batch: Option<BatchId>) -> Vec<MemberId> {
@@ -802,7 +1263,7 @@ impl Engine {
         if let Some(name) = ask
             .tool_name
             .as_deref()
-            .filter(|name| crate::mcp::TOOL_NAMES.contains(name))
+            .filter(|name| AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(name))
         {
             return match self.auto_approve_chat_tool(
                 now,
@@ -834,6 +1295,7 @@ impl Engine {
             ask.detail.as_deref(),
             None,
             ask.key.as_deref(),
+            ask.kind,
         ) {
             Ok(r) => match r.state {
                 PermissionState::Approved | PermissionState::AutoApproved => {
@@ -879,6 +1341,9 @@ impl Engine {
                     now,
                     read_only: false,
                     request_key: None,
+                    decided_by: Some(DecidedBy::AutoVm),
+                    command: None,
+                    cwd: None,
                 },
             )
         })?;
@@ -888,7 +1353,7 @@ impl Engine {
             format!("using {} (chat tool, auto-allowed)", short(name)),
         );
         self.effects
-            .push(Effect::Event(CoreEvent::Permission(r.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
         Ok(r)
     }
 
@@ -908,6 +1373,7 @@ impl Engine {
         detail: Option<&str>,
         reason: Option<&str>,
         key: Option<&str>,
+        kind: RequestKind,
     ) -> Result<PermissionRequest, PostError> {
         let title = title.trim();
         let title = if title.is_empty() { "a tool" } else { title };
@@ -937,6 +1403,9 @@ impl Engine {
                         now,
                         read_only: false,
                         request_key: Some(&*key),
+                        decided_by: Some(DecidedBy::AutoVm),
+                        command: None,
+                        cwd: None,
                     },
                 )
             })?;
@@ -946,7 +1415,43 @@ impl Engine {
                 format!("ran {} (own VM, auto-approved)", short(title)),
             );
             self.effects
-                .push(Effect::Event(CoreEvent::Permission(r.clone())));
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
+            return Ok(r);
+        }
+        // STRM-542: apply host-side approval mode. Reads are handled upstream.
+        let mode = self.effective_approval_mode(agent, channel);
+        let outcome = mode_verdict(mode, kind);
+        if outcome == ModeOutcome::Allow {
+            let r = self.store.tx(|c| {
+                insert(
+                    c,
+                    &NewRequest {
+                        agent,
+                        channel,
+                        batch: turn,
+                        source,
+                        title,
+                        detail,
+                        reason,
+                        state: PermissionState::AutoApproved,
+                        asked_of: &[],
+                        now,
+                        read_only: false,
+                        request_key: Some(&*key),
+                        decided_by: Some(DecidedBy::AutoMode),
+                        command: None,
+                        cwd: None,
+                    },
+                )
+            })?;
+            let mode_label = mode.as_str();
+            self.rt_note(
+                agent,
+                channel,
+                format!("ran {} (auto-approved, {mode_label})", short(title)),
+            );
+            self.effects
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
             return Ok(r);
         }
         if let Some(grant) = unused_grant(self.conn(), agent, channel, &key)? {
@@ -963,15 +1468,38 @@ impl Engine {
                 format!("running {} (approved, #{grant})", short(title)),
             );
             self.effects
-                .push(Effect::Event(CoreEvent::Permission(r.clone())));
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
             return Ok(r);
         }
         if let Some(r) = pending_for(self.conn(), agent, channel, &key)? {
             return Ok(r);
         }
         let asked_of = self.route(channel, turn);
+        let queued = outcome == ModeOutcome::Queue;
+        let command = if queued && kind == RequestKind::Execute {
+            extract_command(detail)
+        } else {
+            None
+        };
+        let (req_cwd, run_state_seed) = if queued && kind == RequestKind::Execute {
+            match command.as_deref() {
+                Some(_) => {
+                    let resolved = extract_cwd(detail).or_else(|| {
+                        self.agent_cwd(agent)
+                            .map(|p| p.to_string_lossy().into_owned())
+                    });
+                    match resolved {
+                        Some(cwd) => (Some(cwd), Some("queued")),
+                        None => (None, Some("unrunnable")),
+                    }
+                }
+                None => (None, Some("unrunnable")),
+            }
+        } else {
+            (None, None)
+        };
         let r = self.store.tx(|c| {
-            insert(
+            let r = insert(
                 c,
                 &NewRequest {
                     agent,
@@ -986,9 +1514,20 @@ impl Engine {
                     now,
                     read_only: false,
                     request_key: Some(&*key),
+                    decided_by: None,
+                    command: command.as_deref(),
+                    cwd: req_cwd.as_deref(),
                 },
-            )
+            )?;
+            if let Some(state) = run_state_seed {
+                c.execute(
+                    "UPDATE permission_requests SET run_state = ?2 WHERE id = ?1",
+                    params![r.id.0, state],
+                )?;
+            }
+            Ok::<_, rusqlite::Error>(r)
         })?;
+        let r = get(self.conn(), r.id)?.expect("inserted");
         if self.policy().note_permission_requests {
             let who: Vec<String> = asked_of
                 .iter()
@@ -1002,18 +1541,28 @@ impl Engine {
             } else {
                 format!(", sent to {}", who.join(", "))
             };
+            let verb = if queued { "queued" } else { "asked to run" };
+            let tail = if queued {
+                if r.run_state.as_deref() == Some("unrunnable") {
+                    " Command details could not be safely captured for execution by Chaos Control; if approved, you may need to retry/run it yourself when supported. Check chat_permission_status for status.".to_string()
+                } else {
+                    " You can continue working; check status with chat_permission_status and you'll be told when a decision is made.".to_string()
+                }
+            } else {
+                format!(" Any human here can approve or deny it; @{handle} carries on meanwhile.")
+            };
             self.system_note(
                 now,
                 channel,
                 &format!(
-                    "@{handle} asked to run {}{why}: permission request #{}{to}. Any human here can approve or deny it; @{handle} carries on meanwhile.",
+                    "@{handle} {verb} {}{why}: permission request #{}{to}.{tail}",
                     short(title),
                     r.id
                 ),
             )?;
         }
         self.effects
-            .push(Effect::Event(CoreEvent::Permission(r.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
         self.publish_status(agent, channel);
         Ok(r)
     }
@@ -1045,16 +1594,48 @@ impl Engine {
             let now_state = get(self.conn(), id)?.map(|r| r.state).unwrap_or(req.state);
             return Err(AnswerError::AlreadyAnswered(now_state));
         }
-        let req = get(self.conn(), id)?.expect("answered");
+        let mut req = get(self.conn(), id)?.expect("answered");
+        let was_queued_cmd = req.run_state.as_deref() == Some("queued")
+            && req.command.is_some()
+            && req.cwd.is_some();
+        let unrunnable_queued = req.run_state.as_deref() == Some("unrunnable")
+            || (req.run_state.as_deref() == Some("queued")
+                && (req.command.is_none() || req.cwd.is_none()));
+        let runnable = approve && was_queued_cmd;
+        if approve && req.run_state.as_deref() == Some("queued") && !was_queued_cmd {
+            self.store.tx(|c| set_run_state(c, id, "unrunnable"))?;
+            req = get(self.conn(), id)?.expect("answered");
+        }
+        if runnable {
+            self.store.tx(|c| set_run_state(c, id, "running"))?;
+            req = get(self.conn(), id)?.expect("answered");
+        } else if !approve && (req.run_state.as_deref() == Some("queued") || unrunnable_queued) {
+            self.store.tx(|c| set_run_state(c, id, "denied"))?;
+            req = get(self.conn(), id)?.expect("answered");
+        }
         let (agent, channel) = (req.agent, req.channel);
         let handle = handle_of(self.conn(), agent);
         let said = note.map(|n| format!(" \"{n}\"")).unwrap_or_default();
         let body = if approve {
-            format!(
-                "@{} approved @{handle}'s permission request #{id} to run {}{said}. @{handle}: retry it when you're ready; it goes through once.",
-                who.handle,
-                short(&req.title)
-            )
+            if runnable {
+                format!(
+                    "@{} approved @{handle}'s queued command #{id} ({}).{said} Running it now; @{handle}: you'll be notified with the result when it finishes. Check chat_permission_status(request_id: {id}) for status/output.",
+                    who.handle,
+                    short(&req.title)
+                )
+            } else if unrunnable_queued {
+                format!(
+                    "@{} approved @{handle}'s queued request #{id} to run {}{said}, but Chaos Control could not safely capture a runnable command. @{handle}: retry the same action when you're ready if supported; it may go through once.",
+                    who.handle,
+                    short(&req.title)
+                )
+            } else {
+                format!(
+                    "@{} approved @{handle}'s permission request #{id} to run {}{said}. @{handle}: retry it when you're ready; it goes through once.",
+                    who.handle,
+                    short(&req.title)
+                )
+            }
         } else {
             format!(
                 "@{} denied @{handle}'s permission request #{id} to run {}{said}. That's an answer, not a failure: carry on without it, or talk it through here.",
@@ -1077,7 +1658,7 @@ impl Engine {
         // A human's answer is a fresh start, like a human ping.
         self.human_fresh_start(agent, channel);
         self.effects
-            .push(Effect::Event(CoreEvent::Permission(req.clone())));
+            .push(Effect::Event(Box::new(CoreEvent::Permission(req.clone()))));
         self.pump(now, agent, channel);
         Ok(req)
     }
@@ -1099,7 +1680,9 @@ impl Engine {
             .store
             .tx(|c| insert_read(c, agent, channel, turn, title, detail, now))
         {
-            Ok(r) => self.effects.push(Effect::Event(CoreEvent::Permission(r))),
+            Ok(r) => self
+                .effects
+                .push(Effect::Event(Box::new(CoreEvent::Permission(r)))),
             Err(e) => self.rt_note(agent, channel, format!("permission log: {e}")),
         }
     }
@@ -1121,11 +1704,200 @@ impl Engine {
     ) -> rusqlite::Result<Vec<PermissionRequest>> {
         pending_in(self.conn(), channel)
     }
+
+    /// The approval queue for a channel: pending, running, and recent outcomes.
+    /// This is what the sidebar's Permissions pane binds to (STRM-542).
+    pub fn approval_queue(&self, channel: ChannelId) -> rusqlite::Result<Vec<QueuedRequest>> {
+        Ok(queue_in(self.conn(), channel, 100)?
+            .into_iter()
+            .map(|req| QueuedRequest {
+                id: req.id,
+                agent: req.agent,
+                channel: req.channel,
+                ask: PermissionAsk {
+                    turn: req.batch,
+                    title: req.title.clone(),
+                    tool_name: None,
+                    detail: req.detail.clone(),
+                    read_only: req.read_only,
+                    kind: if req.read_only {
+                        RequestKind::Read
+                    } else {
+                        RequestKind::Other
+                    },
+                    key: req.request_key.clone(),
+                },
+                state: queue_state_of(&req),
+                command: req.command.clone(),
+                proposed_change: None,
+            })
+            .collect())
+    }
+
+    /// Records completion of a Chaos-Control-executed queued command and steers
+    /// the result to the agent (STRM-542). Persists result and notification together.
+    pub fn complete_command_run(
+        &mut self,
+        now: Millis,
+        id: PermissionId,
+        ok: bool,
+        exit_code: Option<i32>,
+        output: &str,
+    ) -> Result<PermissionRequest, AnswerError> {
+        let req = get(self.conn(), id)?.ok_or(AnswerError::UnknownRequest)?;
+        if req.run_state.as_deref() != Some("running") {
+            return Err(AnswerError::Store("command is not running".into()));
+        }
+        let state = if ok { "done" } else { "failed" };
+        let output = output.trim();
+        let out_store = if output.is_empty() {
+            None
+        } else {
+            Some(output)
+        };
+        let (agent, channel) = (req.agent, req.channel);
+        let handle = handle_of(self.conn(), agent);
+        let status = match (ok, exit_code) {
+            (true, Some(code)) => format!("completed (exit {code})"),
+            (true, None) => "completed".to_string(),
+            (false, Some(code)) => format!("failed (exit {code})"),
+            (false, None) => "failed".to_string(),
+        };
+        let shown = if output.is_empty() {
+            "(no output)".to_string()
+        } else {
+            const MAX: usize = 4000;
+            if output.chars().count() > MAX {
+                let mut s: String = output.chars().take(MAX).collect();
+                s.push_str("\n…(truncated)");
+                s
+            } else {
+                output.to_string()
+            }
+        };
+        let body = format!(
+            "@{handle} queued command #{id} ({}) {status}.\nOutput:\n{shown}",
+            short(&req.title)
+        );
+        let (req, msg) = self.store.tx::<_, rusqlite::Error>(|c| {
+            set_run_result(c, id, state, out_store, exit_code, now)?;
+            let msg = store::insert_message(
+                c,
+                &crate::store::NewMessage {
+                    channel,
+                    author: None,
+                    origin: Origin::System,
+                    body: &body,
+                    reply_to: None,
+                    mentions: &[],
+                    hop: 0,
+                    cause_batch: None,
+                    client_request_id: None,
+                    sent_at: now,
+                },
+            )?;
+            let batch = store::pending_batch_or_create(c, agent, channel, now)?;
+            let t = TriggerId {
+                agent,
+                channel,
+                message: msg.id,
+            };
+            store::insert_trigger(c, t, WakeReason::Permission, 0, batch.id, now)?;
+            let req = get(c, id)?.expect("updated");
+            Ok((req, msg))
+        })?;
+        self.effects
+            .push(Effect::Event(Box::new(CoreEvent::Message(msg))));
+        self.human_fresh_start(agent, channel);
+        self.effects
+            .push(Effect::Event(Box::new(CoreEvent::Permission(req.clone()))));
+        self.pump(now, agent, channel);
+        Ok(req)
+    }
+
+    /// Marks queued commands left `running` by a previous process as failed
+    /// and notifies the agent (startup recovery).
+    pub fn recover_interrupted_command_runs(&mut self, now: Millis) {
+        let Ok(runs) = interrupted_runs(self.conn()) else {
+            return;
+        };
+        for req in runs {
+            let _ = self.complete_command_run(
+                now,
+                req.id,
+                false,
+                None,
+                "interrupted: Chaos Control restarted while the command was running",
+            );
+        }
+    }
+
+    /// A human approves or denies a queued request (STRM-542).
+    /// For `ask-all` this is today's `answer_permission` (one-shot grant + wake).
+    /// For `accept-edits` commands, approval also *runs the command* and the
+    /// result — not just the grant — is steered back to the agent.
+    pub fn resolve_queued(
+        &mut self,
+        now: Millis,
+        id: PermissionId,
+        by: MemberId,
+        approve: bool,
+        note: Option<&str>,
+    ) -> Result<QueuedRequest, AnswerError> {
+        let req = self
+            .answer_permission(now, id, by, approve, note)
+            .map_err(|e| match e {
+                AnswerError::Store(s) => AnswerError::Store(s),
+                _ => e,
+            })?;
+        Ok(QueuedRequest {
+            id: req.id,
+            agent: req.agent,
+            channel: req.channel,
+            ask: PermissionAsk {
+                turn: req.batch,
+                title: req.title.clone(),
+                tool_name: None,
+                detail: req.detail.clone(),
+                read_only: req.read_only,
+                kind: if req.read_only {
+                    RequestKind::Read
+                } else {
+                    RequestKind::Other
+                },
+                key: req.request_key.clone(),
+            },
+            state: queue_state_of(&req),
+            command: req.command.clone(),
+            proposed_change: None,
+        })
+    }
 }
 
 // ---------- chat tools ----------
 
-pub const TOOL_NAMES: [&str; 2] = ["chat_request_permission", "chat_permission_status"];
+pub const TOOL_NAMES: [&str; 4] = [
+    "chat_request_permission",
+    "chat_permission_status",
+    "chat_approval_mode_status",
+    "chat_set_approval_mode",
+];
+
+/// Named chat tools that are safe to auto-approve when requested natively.
+/// Policy changes are excluded: they must be human-authorized.
+pub const AUTO_ALLOWED_CHAT_TOOL_NAMES: [&str; 11] = [
+    "chat_context",
+    "chat_read",
+    "chat_search",
+    "chat_send",
+    "chat_react",
+    "chat_refuse",
+    "chat_dissent",
+    "chat_status",
+    "chat_request_permission",
+    "chat_permission_status",
+    "chat_approval_mode_status",
+];
 
 pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<Tool> {
     vec![
@@ -1141,10 +1913,25 @@ pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<To
         ),
         Tool::new(
             "chat_permission_status",
-            "Your permission requests in this channel and their answers (pending, approved, denied, auto_approved), newest first. Pass request_id for one.",
+            "Your permission/queue requests in this channel and their state (pending, approved, denied, auto_approved) plus queued command run info when available (run_state: queued/running/done/failed/unrunnable/denied, output, exit code). Newest first. Pass request_id to watch one.",
             schema(json!({"type": "object", "properties": {
                 "request_id": {"type": "integer"}
             }})),
+        ),
+        Tool::new(
+            "chat_approval_mode_status",
+            "Show the effective approval mode for new requests in this channel and configured overrides (member/workspace/project/channel).",
+            schema(json!({"type": "object", "properties": {}})),
+        ),
+        Tool::new(
+            "chat_set_approval_mode",
+            "Set or clear an approval mode override. Scope: 'channel', 'project', 'workspace', or 'member' (default member). Mode: 'ask-all', 'accept-edits', 'yolo', or null to clear an override (member cannot be cleared). Affects new requests only.",
+            schema(
+                json!({"type": "object", "required": ["mode"], "properties": {
+                    "scope": {"type": "string", "enum": ["channel", "project", "workspace", "member"]},
+                    "mode": {"type": ["string", "null"], "enum": ["ask-all", "accept-edits", "yolo", null]}
+                }}),
+            ),
         ),
     ]
 }
@@ -1159,6 +1946,11 @@ fn view(c: &Connection, r: &PermissionRequest) -> Value {
         "answered_by": r.answered_by.map(|m| format!("@{}", handle_of(c, m))),
         "note": r.answer_note.as_deref(),
         "used": r.used_at.is_some(),
+        "run_state": r.run_state.as_deref(),
+        "command": r.command.as_deref(),
+        "run_exit_code": r.run_exit_code,
+        "run_output": r.run_output.as_deref(),
+        "run_finished_at": r.run_finished_at,
     })
 }
 
@@ -1170,6 +1962,37 @@ pub fn call_tool(
     args: &Value,
 ) -> Result<Value, ToolError> {
     match name {
+        "chat_approval_mode_status" => {
+            let channel = scope.channel;
+            let member_mode = engine.approval_mode(scope.agent);
+            let channel_mode = crate::store::channel_approval_mode(engine.conn(), channel)?
+                .map(|m| ApprovalMode::parse(&m).as_str().to_string());
+            let project_mode = match crate::store::channel(engine.conn(), channel)? {
+                Some(ch) => {
+                    crate::store::project_setting(engine.conn(), &ch.project, "approval_mode")?
+                        .map(|m| ApprovalMode::parse(&m).as_str().to_string())
+                }
+                None => None,
+            };
+            let workspace_mode = crate::store::app_setting(engine.conn(), "approval_mode")?
+                .map(|m| ApprovalMode::parse(&m).as_str().to_string());
+            let effective = engine.effective_approval_mode(scope.agent, channel);
+            Ok(json!({
+                "effective": effective.as_str(),
+                "member_default": member_mode.as_str(),
+                "workspace_override": workspace_mode,
+                "project_override": project_mode,
+                "channel_override": channel_mode,
+                "note": "Effective mode applies to new requests only: channel > project > workspace > member."
+            }))
+        }
+        "chat_set_approval_mode" => {
+            // Policy changes are human-authorized. Agents must not be able to
+            // elevate their own effective permissions or change broader scopes.
+            Err(ToolError(
+                "only a human may change approval policy (use the app settings)".into(),
+            ))
+        }
         "chat_request_permission" => {
             let action = args
                 .get("action")
@@ -1191,6 +2014,7 @@ pub fn call_tool(
                 None,
                 reason,
                 Some(&*key),
+                RequestKind::Other,
             )?;
             let mut v = view(engine.conn(), &r);
             let status = match r.state {
@@ -1327,5 +2151,62 @@ mod tests {
             RunsIn::Host
         );
         assert_eq!(RunsIn::default(), RunsIn::Host);
+    }
+
+    #[test]
+    fn mode_verdict_covers_all_kinds() {
+        use super::{ModeOutcome, RequestKind, mode_verdict};
+        use crate::types::ApprovalMode;
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Read),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Edit),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Execute),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Fetch),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AskAll, RequestKind::Other),
+            ModeOutcome::AskHuman
+        );
+
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Read),
+            ModeOutcome::Allow
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Edit),
+            ModeOutcome::Allow
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Execute),
+            ModeOutcome::Queue
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Fetch),
+            ModeOutcome::Queue
+        );
+        assert_eq!(
+            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Other),
+            ModeOutcome::Queue
+        );
+
+        for k in [
+            RequestKind::Read,
+            RequestKind::Edit,
+            RequestKind::Execute,
+            RequestKind::Fetch,
+            RequestKind::Other,
+        ] {
+            assert_eq!(mode_verdict(ApprovalMode::Yolo, k), ModeOutcome::Allow);
+        }
     }
 }

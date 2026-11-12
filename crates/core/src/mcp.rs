@@ -105,7 +105,7 @@ fn random_token() -> String {
 
 // ---------- tools ----------
 
-pub const TOOL_NAMES: [&str; 10] = [
+pub const TOOL_NAMES: [&str; 12] = [
     "chat_context",
     "chat_read",
     "chat_search",
@@ -116,6 +116,8 @@ pub const TOOL_NAMES: [&str; 10] = [
     "chat_status",
     crate::permission::TOOL_NAMES[0],
     crate::permission::TOOL_NAMES[1],
+    crate::permission::TOOL_NAMES[2],
+    crate::permission::TOOL_NAMES[3],
 ];
 
 fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {

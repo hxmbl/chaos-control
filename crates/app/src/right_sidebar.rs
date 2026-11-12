@@ -77,7 +77,7 @@ impl RightSidebar {
     }
 
     /// One row of the permission log. Clicking it opens the pane read-only
-    /// with the request's details.
+    /// with the request's details. Pending requests can be approved/denied.
     fn permission_row(
         &self,
         entry: PermissionLogEntry,
@@ -99,7 +99,11 @@ impl RightSidebar {
             "{}: {} · {outcome} · #{}",
             entry.agent_name, entry.action, entry.request
         );
-        let declined = entry.outcome == PermissionOutcome::Declined;
+        let declined = matches!(
+            entry.outcome,
+            PermissionOutcome::Declined | PermissionOutcome::Failed
+        );
+        let pending = entry.outcome == PermissionOutcome::Pending;
         let initial: SharedString = entry
             .agent_name
             .chars()
@@ -121,7 +125,8 @@ impl RightSidebar {
                     .text_color(t.ink_soft)
                     .child(initial),
             });
-        pill(("permission", entry.request as usize), cx)
+        let req = entry.request;
+        pill(("permission", req as usize), cx)
             .h(size::ROW)
             .flex_none()
             .gap(space::X2)
@@ -145,7 +150,11 @@ impl RightSidebar {
                 div()
                     .flex_none()
                     .type_style(text::CAPTION)
-                    .text_color(if declined { t.ink_soft } else { t.muted })
+                    .text_color(if declined || pending {
+                        t.ink_soft
+                    } else {
+                        t.muted
+                    })
                     .child(outcome),
             )
             .child(

@@ -35,15 +35,12 @@ pub enum Transport {
     /// Agent Client Protocol over stdio (`crate::acp`), natively or through an
     /// adapter binary.
     Acp,
-    /// Codex's own app-server JSON-RPC over stdio (`crate::codex`).
-    CodexAppServer,
 }
 
 impl Transport {
     pub fn label(self) -> &'static str {
         match self {
             Transport::Acp => "acp",
-            Transport::CodexAppServer => "codex app-server",
         }
     }
 }
@@ -54,8 +51,6 @@ pub enum ModelSelect {
     /// ACP `session/set_config_option` on the session's model option
     /// (category `model`, or id `model`), after `session/new`.
     AcpConfigOption,
-    /// `model` on Codex's `thread/start`.
-    CodexThreadStart,
 }
 
 /// One way to start a harness: a binary and its arguments.
@@ -122,33 +117,17 @@ pub static PRESETS: &[HarnessPreset] = &[
         id: "codex",
         name: "Codex",
         icon: "openai",
-        transport: Transport::CodexAppServer,
-        detect: &["codex"],
+        transport: Transport::Acp,
+        // Native Codex integration removed (STRM-542): Codex is supported via ACP.
+        detect: &["codex-acp"],
         launch: Launch {
             command: BIN,
-            args: &["app-server"],
+            args: &[],
         },
         adapter: None,
-        model_select: ModelSelect::CodexThreadStart,
-        models: &[
-            ModelPreset {
-                id: None,
-                name: "Default model",
-            },
-            ModelPreset {
-                id: Some("gpt-6.1-sol"),
-                name: "GPT-6.1 Sol",
-            },
-            ModelPreset {
-                id: Some("gpt-6-astra"),
-                name: "GPT-6 Astra",
-            },
-            ModelPreset {
-                id: Some("gpt-6-luna"),
-                name: "GPT-6 Luna",
-            },
-        ],
-        install: "npm i -g @openai/codex",
+        model_select: ModelSelect::AcpConfigOption,
+        models: DEFAULT_ONLY,
+        install: "npm i -g @zed-industries/codex-acp",
     },
     HarnessPreset {
         id: "fx",
@@ -489,15 +468,6 @@ pub fn adapter_for(
                 record: opts.record,
             }))
             .prefer_v2(opts.acp_v2)
-            .chat_tools(opts.chat_tools)
-            .model(model),
-        ),
-        Transport::CodexAppServer => Arc::new(
-            crate::codex::CodexAdapter::new(Arc::new(crate::codex::CodexSpawn {
-                command,
-                args,
-                env: opts.env,
-            }))
             .chat_tools(opts.chat_tools)
             .model(model),
         ),
@@ -847,7 +817,7 @@ mod tests {
     #[test]
     fn detects_from_path_and_usual_dirs() {
         let files: HashSet<PathBuf> = [
-            "/usr/x/bin/codex",
+            "/usr/x/bin/codex-acp",
             "/home/hx/.fx/bin/fx",
             "/home/hx/.local/bin/vibe",
             "/home/hx/.local/bin/vibe-acp",
@@ -860,8 +830,8 @@ mod tests {
         let found = detect(&env);
         let ids: Vec<_> = found.iter().map(|d| d.preset.id).collect();
         assert_eq!(ids, ["codex", "fx", "vibe"]);
-        assert_eq!(found[0].command, PathBuf::from("/usr/x/bin/codex"));
-        assert_eq!(found[0].args, ["app-server"]);
+        assert_eq!(found[0].command, PathBuf::from("/usr/x/bin/codex-acp"));
+        assert!(found[0].args.is_empty());
         assert_eq!(found[1].args, ["acp"]);
         // Vibe runs its sibling ACP binary, not the TUI.
         assert_eq!(

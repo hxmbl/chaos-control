@@ -19,18 +19,30 @@ pub const LOG_LEN: usize = 200;
 pub enum PermissionOutcome {
     /// Allowed without asking anyone: a read, or an agent in its own VM.
     AutoAllowed,
-    /// Declined at once (never answered), or denied by a human.
+    /// Waiting for a human decision (STRM-542).
+    Pending,
+    /// Declined/denied by a human.
     Declined,
-    /// A human approved it (only possible through core for now).
+    /// A human approved it.
     Approved,
+    /// Approved command currently running (STRM-542).
+    Running,
+    /// Queued command completed (STRM-542).
+    Done,
+    /// Queued command failed or could not be executed (STRM-542).
+    Failed,
 }
 
 impl PermissionOutcome {
     pub fn label(self) -> &'static str {
         match self {
             PermissionOutcome::AutoAllowed => "Auto-allowed",
+            PermissionOutcome::Pending => "Pending",
             PermissionOutcome::Declined => "Declined",
             PermissionOutcome::Approved => "Approved",
+            PermissionOutcome::Running => "Running",
+            PermissionOutcome::Done => "Done",
+            PermissionOutcome::Failed => "Failed",
         }
     }
 }
@@ -59,11 +71,27 @@ pub struct PermissionLogEntry {
     pub detail: Option<Arc<str>>,
     /// Who it was routed to ("Hx"); empty for reads and VM agents.
     pub asked: Arc<str>,
+    /// Captured command for queued execution, if any.
+    pub command: Option<Arc<str>>,
+    /// Working directory the command would run in (resolved/persisted), if known.
+    pub cwd: Option<Arc<str>>,
+    /// Execution lifecycle state.
+    pub run_state: Option<Arc<str>>,
+    /// Command output/result when available.
+    pub run_output: Option<Arc<str>>,
+    /// Exit code when execution finished.
+    pub run_exit_code: Option<i32>,
 }
 
 impl PermissionLogEntry {
-    /// The read-only pane view of this row (no Approve / Deny).
+    /// The pane view of this row. Pending requests stay actionable;
+    /// completed/logged outcomes are read-only.
     pub fn prompt(&self) -> PermissionPrompt {
+        let logged = if self.outcome == PermissionOutcome::Pending {
+            None
+        } else {
+            Some(self.outcome)
+        };
         PermissionPrompt {
             request: self.request,
             agent: self.agent_name.clone(),
@@ -71,7 +99,12 @@ impl PermissionLogEntry {
             reason: self.reason.clone(),
             detail: self.detail.clone(),
             asked: self.asked.clone(),
-            logged: Some(self.outcome),
+            logged,
+            command: self.command.clone(),
+            cwd: self.cwd.clone(),
+            run_state: self.run_state.clone(),
+            run_output: self.run_output.clone(),
+            run_exit_code: self.run_exit_code,
         }
     }
 }
@@ -153,6 +186,11 @@ mod tests {
             reason: None,
             detail: None,
             asked: Arc::from(""),
+            command: None,
+            cwd: None,
+            run_state: None,
+            run_output: None,
+            run_exit_code: None,
         }
     }
 
@@ -204,6 +242,17 @@ mod tests {
         assert_eq!(relative_time(500, 100), "now");
     }
 
+    #[test]
+    fn a_pending_entry_opens_actionable() {
+        let p = entry(8, PermissionOutcome::Pending).prompt();
+        assert_eq!(p.logged, None);
+        let pane = crate::PaneContent::Permission(p);
+        let kinds: Vec<_> = pane.actions().into_iter().map(|a| a.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![crate::PaneActionKind::Approve, crate::PaneActionKind::Deny]
+        );
+    }
     #[test]
     fn a_logged_entry_opens_read_only() {
         let p = entry(7, PermissionOutcome::Declined).prompt();

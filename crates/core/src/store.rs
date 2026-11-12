@@ -455,6 +455,33 @@ ALTER TABLE permission_requests ADD COLUMN request_key TEXT;
 CREATE INDEX permission_requests_by_key
     ON permission_requests (agent_id, channel_id, request_key, state);
 "#,
+    // 16: decided_by column for tracking who/what decided a permission request (STRM-542).
+    r#"
+ALTER TABLE permission_requests ADD COLUMN decided_by TEXT;
+"#,
+    // 17: per-channel approval mode override (STRM-542). Most-specific scope.
+    r#"
+CREATE TABLE channel_approval_mode (
+    channel_id  INTEGER PRIMARY KEY REFERENCES channels(id) ON DELETE CASCADE,
+    mode        TEXT NOT NULL
+);
+"#,
+    // 18: workspace/global app settings (STRM-542), e.g. approval_mode override.
+    r#"
+CREATE TABLE app_settings (
+    key         TEXT PRIMARY KEY NOT NULL,
+    value       TEXT NOT NULL
+);
+"#,
+    // 19: queued command execution lifecycle (STRM-542).
+    r#"
+ALTER TABLE permission_requests ADD COLUMN command TEXT;
+ALTER TABLE permission_requests ADD COLUMN cwd TEXT;
+ALTER TABLE permission_requests ADD COLUMN run_state TEXT;
+ALTER TABLE permission_requests ADD COLUMN run_output TEXT;
+ALTER TABLE permission_requests ADD COLUMN run_exit_code INTEGER;
+ALTER TABLE permission_requests ADD COLUMN run_finished_at INTEGER;
+"#,
 ];
 
 pub struct Store {
@@ -923,6 +950,58 @@ pub fn rename_channel(c: &Connection, id: ChannelId, name: &str) -> Result<bool>
         "UPDATE channels SET name = ?2 WHERE id = ?1",
         params![id.0, name.trim_start_matches('#')],
     )? == 1)
+}
+
+/// Per-channel approval mode override (STRM-542). None means inherit.
+pub fn channel_approval_mode(c: &Connection, channel: ChannelId) -> Result<Option<String>> {
+    c.query_row(
+        "SELECT mode FROM channel_approval_mode WHERE channel_id = ?1",
+        [channel.0],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Sets (`Some`) or clears (`None`) a channel's approval mode override.
+pub fn set_channel_approval_mode(
+    c: &Connection,
+    channel: ChannelId,
+    mode: Option<&str>,
+) -> Result<()> {
+    match mode {
+        Some(m) => c.execute(
+            "INSERT INTO channel_approval_mode (channel_id, mode) VALUES (?1, ?2)
+             ON CONFLICT(channel_id) DO UPDATE SET mode = excluded.mode",
+            params![channel.0, m],
+        )?,
+        None => c.execute(
+            "DELETE FROM channel_approval_mode WHERE channel_id = ?1",
+            [channel.0],
+        )?,
+    };
+    Ok(())
+}
+
+/// A workspace/global app setting (STRM-542).
+pub fn app_setting(c: &Connection, key: &str) -> Result<Option<String>> {
+    c.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        [key],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+pub fn set_app_setting(c: &Connection, key: &str, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(v) => c.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, v],
+        )?,
+        None => c.execute("DELETE FROM app_settings WHERE key = ?1", [key])?,
+    };
+    Ok(())
 }
 
 pub(crate) fn member_from_row(r: &Row<'_>) -> Result<Member> {
@@ -2881,6 +2960,9 @@ mod tests {
                 now,
                 read_only: false,
                 request_key: None,
+                decided_by: None,
+                command: None,
+                cwd: None,
             },
         )
         .unwrap()
@@ -2916,7 +2998,7 @@ mod tests {
                 ("rm -rf build/", LogOutcome::Declined, false),
                 ("cargo test", LogOutcome::AutoAllowed, false),
                 ("Read src/main.rs", LogOutcome::AutoAllowed, true),
-                ("Edit src/main.rs", LogOutcome::Declined, false),
+                ("Edit src/main.rs", LogOutcome::Pending, false),
             ]
         );
         assert_eq!(log[2].state, S::AutoApproved);
@@ -3036,7 +3118,7 @@ mod tests {
         let log = crate::permission::log_in(s.conn(), ChannelId(3), 10).unwrap();
         assert_eq!(log.len(), 1);
         assert!(!log[0].read_only);
-        assert_eq!(log[0].outcome(), crate::permission::LogOutcome::Declined);
+        assert_eq!(log[0].outcome(), crate::permission::LogOutcome::Pending);
         // The column only takes 0 or 1.
         assert!(
             s.conn()

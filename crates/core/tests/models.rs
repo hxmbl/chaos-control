@@ -1,6 +1,5 @@
 //! Model members (a model running through a harness): model selection over
-//! ACP config options, model discovery, the native Codex app-server adapter
-//! (against the in-process fake app-server) and the per-project roster.
+//! ACP config options, model discovery and the per-project roster.
 
 mod common;
 
@@ -9,12 +8,10 @@ use std::{sync::Arc, time::Duration};
 use chaos_core::{
     acp::{AcpAdapter, FnTransport},
     adapter::AgentAdapter,
-    codex::CodexAdapter,
     engine::CoreEvent,
     fake::{self, FakeAgent},
-    fake_codex::{self, FakeCodex, Step},
     host::MemberSpec,
-    permission::{PermissionState, RunsIn},
+    permission::RunsIn,
     roster::ModelMember,
     types::*,
 };
@@ -49,6 +46,7 @@ async fn add(
                 adapter,
                 cwd: Some(std::env::temp_dir()),
                 runs_in,
+                approval: ApprovalMode::AskAll,
             },
             h.main,
         )
@@ -238,6 +236,7 @@ async fn devin_folders_are_trusted_before_discovery_and_sessions() {
                 adapter,
                 cwd: Some(work_dir.clone()),
                 runs_in: RunsIn::Host,
+                approval: ApprovalMode::AskAll,
             },
             h.main,
         )
@@ -262,274 +261,6 @@ async fn discovery_of_a_signed_out_harness_is_an_error_and_caches_nothing() {
         .unwrap_err();
     assert!(err.contains("Authentication required"), "{err}");
     assert!(h.core.harness_models("fx").await.unwrap().is_empty());
-}
-
-// ---------- Codex app-server ----------
-
-fn codex(script: fake_codex::Script, model: Option<&str>) -> (FakeCodex, Arc<CodexAdapter>) {
-    let fake = FakeCodex::new(script);
-    let adapter = Arc::new(CodexAdapter::new(Arc::new(fake.clone())).model(model.map(Arc::from)));
-    (fake, adapter)
-}
-
-fn sol_models() -> Vec<(String, String)> {
-    vec![
-        ("gpt-6.1-sol".into(), "GPT-6.1 Sol".into()),
-        ("gpt-6-luna".into(), "GPT-6 Luna".into()),
-    ]
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_member_takes_a_turn_and_its_last_message_is_the_fallback_reply() {
-    let mut h = Harness::new().await;
-    let (fake, adapter) = codex(
-        fake_codex::Script {
-            models: sol_models(),
-            turns: vec![fake_codex::Turn {
-                steps: vec![
-                    Step::Message("Let me check".into()),
-                    Step::Command("cargo test".into()),
-                    Step::Message("All green.".into()),
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        Some("gpt-6.1-sol"),
-    );
-    let m = add(
-        &h,
-        "codex",
-        Some("gpt-6.1-sol"),
-        "GPT-6.1 Sol",
-        adapter,
-        RunsIn::Host,
-    )
-    .await;
-    let ping = h.say("@gpt-6-1-sol run the tests").await;
-    let reply = h
-        .wait_message("the fallback reply", Some(m.member.id))
-        .await;
-    assert_eq!(&*reply.body, "All green.");
-    assert_eq!(reply.reply_to, Some(ping.id));
-
-    assert_eq!(
-        fake.methods()[..4],
-        ["initialize", "initialized", "model/list", "thread/start"]
-    );
-    let start = fake.request("thread/start").unwrap();
-    assert_eq!(start["model"], "gpt-6.1-sol");
-    // Reads never prompt; anything more asks (and the gate declines it).
-    assert_eq!(start["sandbox"], "read-only");
-    assert_eq!(start["approvalPolicy"], "on-request");
-    let mcp = &start["config"]["mcp_servers.chaos-control"];
-    assert!(
-        mcp["url"]
-            .as_str()
-            .unwrap()
-            .starts_with("http://127.0.0.1:")
-    );
-    assert!(
-        mcp["http_headers"]["Authorization"]
-            .as_str()
-            .unwrap()
-            .starts_with("Bearer ")
-    );
-    let turn = fake.request("turn/start").unwrap();
-    assert_eq!(turn["threadId"], "thr_1");
-    assert!(
-        turn["input"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("run the tests")
-    );
-    // model/list fed the picker cache.
-    assert_eq!(h.core.harness_models("codex").await.unwrap().len(), 2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_model_missing_from_model_list_starts_on_the_default() {
-    let mut h = Harness::new().await;
-    let (fake, adapter) = codex(
-        fake_codex::Script {
-            models: sol_models(),
-            turns: vec![fake_codex::Turn {
-                steps: vec![Step::Message("ok".into())],
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        Some("gpt-old"),
-    );
-    let m = add(
-        &h,
-        "codex",
-        Some("gpt-old"),
-        "GPT Old",
-        adapter,
-        RunsIn::Host,
-    )
-    .await;
-    h.say("@gpt-old hi").await;
-    h.wait_message("the reply", Some(m.member.id)).await;
-    assert!(fake.request("thread/start").unwrap().get("model").is_none());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_approvals_go_through_the_permission_gate() {
-    // On the host: declined natively (the turn carries on), sent to the humans.
-    let mut h = Harness::new().await;
-    let (fake, adapter) = codex(
-        fake_codex::Script {
-            turns: vec![fake_codex::Turn {
-                steps: vec![
-                    Step::Approval("rm -rf build/".into()),
-                    Step::Message("Asked; doing the docs meanwhile.".into()),
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        None,
-    );
-    let m = add(&h, "codex", None, "Codex default", adapter, RunsIn::Host).await;
-    h.say("@codex clean up").await;
-    let req = match h
-        .wait_for(
-            "a pending request",
-            |e| matches!(e, CoreEvent::Permission(r) if r.state == PermissionState::Pending),
-        )
-        .await
-    {
-        CoreEvent::Permission(r) => r,
-        _ => unreachable!(),
-    };
-    assert_eq!(&*req.title, "rm -rf build/");
-    assert_eq!(req.agent, m.member.id);
-    h.wait_message("the turn carried on", Some(m.member.id))
-        .await;
-    assert_eq!(*fake.decisions.lock().unwrap(), ["decline"]);
-
-    // In its own VM: accepted.
-    let mut h = Harness::new().await;
-    let (fake, adapter) = codex(
-        fake_codex::Script {
-            turns: vec![fake_codex::Turn {
-                steps: vec![
-                    Step::Approval("make".into()),
-                    Step::Message("Built.".into()),
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        None,
-    );
-    let m = add(&h, "codex", None, "Codex default", adapter, RunsIn::Vm).await;
-    h.say("@codex build it").await;
-    h.wait_message("the reply", Some(m.member.id)).await;
-    assert_eq!(*fake.decisions.lock().unwrap(), ["accept"]);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_signed_out_goes_red_without_retrying() {
-    let h = Harness::new().await;
-    let (fake, adapter) = codex(
-        fake_codex::Script {
-            thread_error: Some("Not logged in. Run `codex login`.".into()),
-            ..Default::default()
-        },
-        None,
-    );
-    let m = add(&h, "codex", None, "Codex default", adapter, RunsIn::Host).await;
-    h.say("@codex hi").await;
-    let status = eventually("red", async || {
-        let s = h.core.status(m.member.id, h.main).await.ok()?;
-        (s.glow == Glow::Unresponsive).then_some(s)
-    })
-    .await;
-    assert!(status.presence.unwrap_or_default().contains("logged in"));
-    h.advance(60_000).await;
-    h.quiesce().await;
-    let starts = fake
-        .methods()
-        .iter()
-        .filter(|m| *m == "thread/start")
-        .count();
-    assert_eq!(starts, 1, "an auth failure is never retried");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_interrupt_ends_the_turn_cancelled_with_no_fallback() {
-    let mut h = Harness::new().await;
-    let (fake, adapter) = codex(
-        fake_codex::Script {
-            turns: vec![fake_codex::Turn {
-                steps: vec![
-                    Step::Message("Starting".into()),
-                    Step::Sleep(10_000),
-                    Step::Message("never".into()),
-                ],
-                ..Default::default()
-            }],
-            ..Default::default()
-        },
-        None,
-    );
-    let m = add(&h, "codex", None, "Codex default", adapter, RunsIn::Host).await;
-    let ping = h.say("@codex long job").await;
-    eventually("turn started", async || {
-        fake.methods()
-            .iter()
-            .any(|m| m == "turn/start")
-            .then_some(())
-    })
-    .await;
-    // Let the turn be accepted before cancelling.
-    eventually("accepted", async || {
-        let s = h.core.status(m.member.id, h.main).await.ok()?;
-        (s.glow == Glow::Active).then_some(())
-    })
-    .await;
-    h.core.interrupt(m.member.id, h.main);
-    eventually("interrupt sent", async || {
-        fake.methods()
-            .iter()
-            .any(|m| m == "turn/interrupt")
-            .then_some(())
-    })
-    .await;
-    let state = eventually("obligation unmet", async || {
-        let s = h.obligation(m.member.id, ping.id).await?;
-        (s != ObligationState::Open).then_some(s)
-    })
-    .await;
-    assert_eq!(state, ObligationState::Unmet);
-    h.quiesce().await;
-    assert!(
-        h.by(m.member.id).await.is_empty(),
-        "no fallback after a cancel"
-    );
-    let _ = &mut h;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn codex_lists_models_without_starting_a_thread() {
-    let (fake, adapter) = codex(
-        fake_codex::Script {
-            models: sol_models(),
-            ..Default::default()
-        },
-        None,
-    );
-    let found = adapter
-        .list_models(std::env::temp_dir())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(found.len(), 2);
-    assert_eq!(&*found[0].name, "GPT-6.1 Sol");
-    assert!(!fake.methods().iter().any(|m| m == "thread/start"));
 }
 
 // ---------- roster ----------
@@ -624,29 +355,23 @@ fn discovery_can_be_awaited_from_outside_the_tokio_runtime() {
         .build()
         .unwrap();
     let h = rt.block_on(Harness::new());
-    let (_fake, codex_adapter) = codex(
-        fake_codex::Script {
-            models: sol_models(),
-            ..Default::default()
-        },
-        None,
-    );
-    let fake = FakeAgent::new(script(models_script()));
+    let fake_a = FakeAgent::new(script(models_script()));
+    let fake_b = FakeAgent::new(script(models_script()));
     // Not inside `rt`: like GPUI's foreground executor.
-    let codex_found = futures::executor::block_on(h.core.discover_models(
-        "codex",
-        codex_adapter,
-        std::env::temp_dir(),
-    ))
-    .unwrap();
-    assert_eq!(codex_found.len(), 2);
-    let acp_found = futures::executor::block_on(h.core.discover_models(
+    let found_a = futures::executor::block_on(h.core.discover_models(
         "fx",
-        acp_adapter(&fake, None),
+        acp_adapter(&fake_a, None),
         std::env::temp_dir(),
     ))
     .unwrap();
-    assert_eq!(acp_found.len(), 2);
+    assert_eq!(found_a.len(), 2);
+    let found_b = futures::executor::block_on(h.core.discover_models(
+        "vibe",
+        acp_adapter(&fake_b, None),
+        std::env::temp_dir(),
+    ))
+    .unwrap();
+    assert_eq!(found_b.len(), 2);
     drop(h);
     drop(rt);
 }

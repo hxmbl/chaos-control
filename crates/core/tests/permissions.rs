@@ -371,7 +371,7 @@ async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
             let message = o[ix]["_meta"]["chaosControl"]["message"]
                 .as_str()
                 .unwrap_or_default();
-            assert!(message.contains("read files freely"), "{message}");
+            assert!(message.contains("approval queue"), "{message}");
         }
         // The turn carried on and ended with a reply.
         h.wait_message("the agent carried on", Some(bot.id)).await;
@@ -389,9 +389,9 @@ async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
         assert_eq!(
             rows,
             [
-                ("no kind given", LogOutcome::Declined),
-                ("cargo test", LogOutcome::Declined),
-                ("Edit src/main.rs", LogOutcome::Declined),
+                ("no kind given", LogOutcome::Pending),
+                ("cargo test", LogOutcome::Pending),
+                ("Edit src/main.rs", LogOutcome::Pending),
                 ("Search for TODO", LogOutcome::AutoAllowed),
                 ("Read src/main.rs", LogOutcome::AutoAllowed),
             ],

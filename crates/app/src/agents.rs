@@ -36,7 +36,7 @@
 //!   "human": { "handle": "hx", "name": "Hx" },
 //!   "detect": true,
 //!   "harnesses": {
-//!     "codex": { "command": "/opt/codex/bin/codex", "args": ["app-server"] },
+//!     "codex": { "command": "/opt/codex-acp/bin/codex-acp" },
 //!     "fx": { "env": { "FX_LOG": "warn" } }
 //!   },
 //!   "members": [
@@ -90,7 +90,7 @@ use chaos_core::{
     policy::Policy,
     reaction::PingAnswers,
     roster::ModelMember,
-    types::{Channel, ChannelId, MemberId, Project, ProjectId},
+    types::{ApprovalMode, Channel, ChannelId, MemberId, Project, ProjectId},
 };
 use model::Brand;
 use serde::Deserialize;
@@ -155,6 +155,9 @@ pub struct MemberConfig {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub runs_in: RunsIn,
+    /// Host-side approval mode (STRM-542). Defaults to ask-all.
+    #[serde(default)]
+    pub approval: ApprovalMode,
 }
 
 /// The original shape: one ACP command per agent.
@@ -486,6 +489,7 @@ fn seed_entry(h: &Harness) -> MemberConfig {
         name: Some(first.name.to_string()),
         cwd: None,
         runs_in: RunsIn::Host,
+        approval: ApprovalMode::AskAll,
     }
 }
 
@@ -513,6 +517,7 @@ pub fn spec_for(harnesses: &[Harness], m: &MemberConfig) -> Option<MemberSpec> {
         adapter: h.adapter(m.model.as_deref()),
         cwd: m.cwd.clone(),
         runs_in: m.runs_in,
+        approval: m.approval,
     })
 }
 
@@ -628,6 +633,7 @@ pub fn start_with(
                         adapter: Arc::new(adapter),
                         cwd: a.cwd,
                         runs_in: a.runs_in,
+                        approval: ApprovalMode::AskAll,
                         ping_answers,
                     },
                     main,
@@ -662,6 +668,7 @@ pub fn start_with(
                             name: Some(m.model_name.to_string()),
                             cwd: None,
                             runs_in: RunsIn::Host,
+                            approval: ApprovalMode::AskAll,
                         })
                         .collect()
                 };
@@ -745,6 +752,7 @@ pub async fn add_member(
                 adapter: harness.adapter(model.as_deref()),
                 cwd: None,
                 runs_in: RunsIn::Host,
+                approval: ApprovalMode::AskAll,
             },
             main,
         )
@@ -984,7 +992,7 @@ mod tests {
         // Codex is not on PATH but its command override counts.
         assert_eq!(ids, ["codex", "fx"]);
         assert_eq!(found[0].command, PathBuf::from("/opt/codex"));
-        assert_eq!(found[0].args, ["app-server"]);
+        assert!(found[0].args.is_empty());
         assert_eq!(found[1].args, ["acp"]);
 
         let off: AgentsConfig = serde_json::from_str(r#"{"detect": false}"#).unwrap();

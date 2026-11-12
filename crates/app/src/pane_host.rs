@@ -753,7 +753,22 @@ fn permission_text(p: &model::PermissionPrompt) -> String {
     if let Some(reason) = &p.reason {
         out.push_str(&format!("Why: {reason}\n"));
     }
-    if let Some(detail) = &p.detail {
+    if let Some(cmd) = &p.command {
+        out.push_str(&format!("Command: {cmd}\n"));
+    }
+    if let Some(cwd) = &p.cwd {
+        out.push_str(&format!("Working directory: {cwd}\n"));
+    }
+    if let Some(state) = &p.run_state {
+        out.push_str(&format!("Run state: {state}\n"));
+    }
+    if let Some(code) = p.run_exit_code {
+        out.push_str(&format!("Exit code: {code}\n"));
+    }
+    if let Some(output) = &p.run_output {
+        let shown: String = output.chars().take(1200).collect();
+        out.push_str(&format!("Output:\n{shown}\n"));
+    } else if let Some(detail) = &p.detail {
         let detail: String = detail.chars().take(600).collect();
         out.push_str(&format!("Details: {detail}\n"));
     }
@@ -765,12 +780,25 @@ fn permission_text(p: &model::PermissionPrompt) -> String {
                 p.request
             ),
             model::PermissionOutcome::Declined => format!(
-                "Request #{}: declined at once. {} was told \"not now\" and carried on; nothing ran.",
+                "Request #{}: declined/denied. {} was told it could not proceed as requested.",
                 p.request, p.agent
             ),
             model::PermissionOutcome::Approved => {
-                format!("Request #{}: approved by a human, once.", p.request)
+                format!("Request #{}: approved.", p.request)
             }
+            model::PermissionOutcome::Pending => format!(
+                "Request #{}: waiting for a human to approve or deny.",
+                p.request
+            ),
+            model::PermissionOutcome::Running => format!(
+                "Request #{}: approved and running in Chaos Control.",
+                p.request
+            ),
+            model::PermissionOutcome::Done => format!("Request #{}: completed.", p.request),
+            model::PermissionOutcome::Failed => format!(
+                "Request #{}: failed or could not be executed by Chaos Control.",
+                p.request
+            ),
         });
         return out;
     }
