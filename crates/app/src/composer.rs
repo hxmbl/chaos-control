@@ -814,10 +814,7 @@ mod tests {
             mention_query("hello @cod", 10),
             Some((6..10, "cod".to_string()))
         );
-        assert_eq!(
-            mention_query("@al", 3),
-            Some((0..3, "al".to_string()))
-        );
+        assert_eq!(mention_query("@al", 3), Some((0..3, "al".to_string())));
         assert_eq!(mention_query("email test@example.com", 20), None);
         assert_eq!(mention_query("hi @foo bar", 9), None);
         assert_eq!(mention_query("hello", 5), None);
