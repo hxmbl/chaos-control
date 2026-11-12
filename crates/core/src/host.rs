@@ -1116,6 +1116,22 @@ struct RunningCommand {
     pgid: Option<u32>,
 }
 
+struct ProcessGroupGuard(Option<u32>);
+
+impl ProcessGroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            Actor::kill_pgid(pgid);
+        }
+    }
+}
+
 impl Actor {
     fn run_queued(&mut self, id: PermissionId) {
         let Some(req) = crate::permission::get(self.engine.conn(), id)
@@ -1239,6 +1255,7 @@ impl Actor {
             .map_err(|e| format!("failed to execute command: {e}"))?;
 
         let pgid = child.id();
+        let mut process_group = ProcessGroupGuard(pgid);
         let _ = tx.send(Cmd::RunStarted { id, pgid });
 
         let stdout = child
@@ -1301,6 +1318,17 @@ impl Actor {
             }
         };
 
+        let mut background_processes = false;
+        if Self::process_group_exists(pgid).await? {
+            background_processes = !timed_out && !io_timed_out;
+            Self::kill_process_tree(pgid, &mut child).await;
+        }
+        if !Self::process_group_exists(pgid).await? {
+            process_group.disarm();
+        } else {
+            background_processes = true;
+        }
+
         let total_len = out.len().saturating_add(err.len());
         let mut text = Self::format_output(out, err, max_total);
         if timed_out {
@@ -1320,6 +1348,12 @@ impl Actor {
                 "output pipes did not close in time; background processes were terminated",
             );
         }
+        if background_processes {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str("background processes remained after command exit; they were terminated");
+        }
         if total_len > max_total {
             if !text.is_empty() {
                 text.push_str("\n\n");
@@ -1327,10 +1361,30 @@ impl Actor {
             text.push_str("[output truncated]");
         }
         Ok((
-            status.success() && !timed_out && !io_timed_out,
+            status.success() && !timed_out && !io_timed_out && !background_processes,
             status.code(),
             text,
         ))
+    }
+
+    async fn process_group_exists(pgid: Option<u32>) -> Result<bool, String> {
+        #[cfg(unix)]
+        if let Some(pgid) = pgid {
+            let result = tokio::process::Command::new("kill")
+                .args(["-0", &format!("-{pgid}")])
+                .output()
+                .await
+                .map_err(|e| format!("failed to inspect command process group: {e}"))?;
+            if result.status.success() {
+                return Ok(true);
+            }
+            if String::from_utf8_lossy(&result.stderr).contains("Operation not permitted") {
+                return Err(format!(
+                    "permission denied inspecting command process group {pgid}"
+                ));
+            }
+        }
+        Ok(false)
     }
 
     async fn kill_process_tree(pgid: Option<u32>, child: &mut tokio::process::Child) {
@@ -1338,11 +1392,13 @@ impl Actor {
         if let Some(pgid) = pgid {
             let _ = tokio::process::Command::new("kill")
                 .args(["-TERM", &format!("-{pgid}")])
+                .stderr(std::process::Stdio::null())
                 .status()
                 .await;
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = tokio::process::Command::new("kill")
                 .args(["-KILL", &format!("-{pgid}")])
+                .stderr(std::process::Stdio::null())
                 .status()
                 .await;
         }
@@ -1354,6 +1410,7 @@ impl Actor {
         {
             let _ = std::process::Command::new("kill")
                 .args(["-KILL", &format!("-{pgid}")])
+                .stderr(std::process::Stdio::null())
                 .status();
         }
         #[cfg(not(unix))]

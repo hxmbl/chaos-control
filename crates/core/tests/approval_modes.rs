@@ -530,3 +530,68 @@ async fn background_process_inheriting_pipes_does_not_hang_runner() {
         "{done:#?}"
     );
 }
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_process_with_redirected_pipes_is_terminated() {
+    let mut h = Harness::new().await;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let pid_file = std::env::temp_dir().join(format!(
+        "cc-bg-redirected-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let escaped_path = pid_file.to_string_lossy().replace('\'', "'\\''");
+    let command = format!("sleep 30 >/dev/null 2>&1 & echo $! > '{escaped_path}'");
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                exec_perm(&command, &cwd),
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot run").await;
+    let req = wait_permission_state(&mut h, PermissionState::Pending).await;
+    h.core
+        .answer_permission(req.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+
+    let done = wait_run_state(&h, req.id, "failed").await;
+    assert!(
+        done.run_output
+            .as_deref()
+            .unwrap_or("")
+            .contains("background processes remained"),
+        "{done:#?}"
+    );
+    let pid: u32 = std::fs::read_to_string(&pid_file)
+        .expect("background child writes its pid")
+        .trim()
+        .parse()
+        .expect("background child pid is numeric");
+    let _ = std::fs::remove_file(&pid_file);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive || tokio::time::Instant::now() >= deadline {
+            assert!(!alive, "background child {pid} survived command completion");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
