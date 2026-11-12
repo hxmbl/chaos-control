@@ -59,7 +59,25 @@ fn sendable(text: &str) -> bool {
     !text.trim().is_empty()
 }
 
-#[derive(Clone)]
+/// Core echoes the posted text trimmed; compare against that.
+fn sent_body(text: &str) -> &str {
+    text.trim()
+}
+
+fn echo_matches_in(
+    log: Option<&model::ChannelLog>,
+    range: std::ops::Range<usize>,
+    sent: &str,
+) -> bool {
+    let Some(log) = log else {
+        return false;
+    };
+    range
+        .filter_map(|ix| log.get(ix))
+        .any(|m| matches!(m.author, model::Author::Human) && m.body.as_ref() == sent_body(sent))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Draft {
     text: SharedString,
     selection: Range<usize>,
@@ -75,6 +93,10 @@ impl Draft {
             reversed: false,
             reply: None,
         }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.as_ref().trim().is_empty() && self.reply.is_none()
     }
 }
 
@@ -110,12 +132,11 @@ impl Composer {
             cx.subscribe(&input, |this, _, event, cx| match event {
                 TextInputEvent::Submit => this.send(cx),
                 TextInputEvent::Changed => {
-                    if let Some((ch, draft)) = &this.pending {
-                        if *ch == this.channel
-                            && this.input.read(cx).text().as_ref() != draft.text.as_ref()
-                        {
-                            this.pending = None;
-                        }
+                    if let Some((ch, draft)) = &this.pending
+                        && *ch == this.channel
+                        && this.input.read(cx).text().as_ref() != draft.text.as_ref()
+                    {
+                        this.pending = None;
                     }
                     cx.notify()
                 }
@@ -130,7 +151,7 @@ impl Composer {
                         let (_, draft) = this.pending.take().unwrap();
                         // Keep the text if the send failed.
                         this.drafts.insert(*channel, draft.clone());
-                        if this.channel == *channel {
+                        if this.channel == *channel && this.input.read(cx).text().is_empty() {
                             this.reply = draft.reply.clone();
                             this.input.update(cx, |input, cx| {
                                 input.restore_draft_state(
@@ -140,33 +161,30 @@ impl Composer {
                                     cx,
                                 );
                             });
-                            cx.notify();
                         }
+                        cx.notify();
                     }
                 }
-                StoreEvent::Appended { channel, .. } => {
+                StoreEvent::Appended { channel, range } => {
                     // A successful core send shows up as an appended message.
-                    if let Some((ch, draft)) = this.pending.as_ref() {
-                        if ch == channel {
-                            let sent = store
-                                .read(cx)
-                                .log(*channel)
-                                .and_then(|log| log.get(log.len().saturating_sub(1)))
-                                .is_some_and(|m| {
-                                    matches!(m.author, model::Author::Human)
-                                        && m.body.as_ref() == draft.text.as_ref()
-                                });
-                            if sent {
-                                this.pending = None;
-                                if this.channel == *channel {
-                                    this.input.update(cx, |input, cx| input.clear(cx));
-                                    this.reply = None;
-                                    this.drafts.remove(channel);
-                                    cx.notify();
-                                } else {
-                                    this.drafts.remove(channel);
-                                }
+                    let matched = this.pending.as_ref().and_then(|(ch, draft)| {
+                        (*ch == *channel
+                            && echo_matches_in(
+                                store.read(cx).log(*channel),
+                                range.clone(),
+                                draft.text.as_ref(),
+                            ))
+                        .then(|| draft.text.as_ref().to_string())
+                    });
+                    if let Some(sent_text) = matched {
+                        this.pending = None;
+                        this.drafts.remove(channel);
+                        if this.channel == *channel {
+                            if this.input.read(cx).text().as_ref() == sent_text.as_str() {
+                                this.input.update(cx, |input, cx| input.clear(cx));
+                                this.reply = None;
                             }
+                            cx.notify();
                         }
                     }
                 }
@@ -198,13 +216,9 @@ impl Composer {
         }
     }
 
-    fn is_empty_draft(draft: &Draft) -> bool {
-        draft.text.as_ref().trim().is_empty() && draft.reply.is_none()
-    }
-
     fn save_current(&mut self, cx: &Context<Self>) {
         let draft = self.snapshot(cx);
-        if Self::is_empty_draft(&draft) {
+        if draft.is_empty() {
             self.drafts.remove(&self.channel);
         } else {
             self.drafts.insert(self.channel, draft);
@@ -282,17 +296,13 @@ impl Composer {
         };
         self.store
             .update(cx, |store, cx| store.post_from_human(&text, reply, cx));
-        match route {
-            SendRoute::Core => {
-                // Keep the draft until the send is known to have failed; core
-                // reports success by echoing the message back.
-                self.pending = Some((self.channel, recovery));
-            }
-            _ => {
-                self.input.update(cx, |input, cx| input.clear(cx));
-                self.reply = None;
-                self.drafts.remove(&self.channel);
-            }
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.reply = None;
+        self.drafts.remove(&self.channel);
+        if route == SendRoute::Core {
+            // Keep the draft until the send is known to have failed; core
+            // reports success by echoing the message back.
+            self.pending = Some((self.channel, recovery));
         }
         cx.notify();
     }
@@ -494,5 +504,93 @@ mod tests {
         assert!(!sendable(" \t\n \r\n"));
         assert!(sendable("hi"));
         assert!(sendable("  hi\n"));
+    }
+
+    #[test]
+    fn drafts_switch_and_restore_per_channel() {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut drafts = HashMap::new();
+        let a = Id(1);
+        let b = Id(2);
+        let draft_a = Draft {
+            text: SharedString::from("hello"),
+            selection: 2..5,
+            reversed: false,
+            reply: None,
+        };
+
+        // Save channel A, switch away, restore it.
+        if draft_a.is_empty() {
+            drafts.remove(&a);
+        } else {
+            drafts.insert(a, draft_a.clone());
+        }
+        let restored_a = drafts.get(&a).cloned().unwrap_or_else(Draft::empty);
+        assert_eq!(restored_a, draft_a);
+
+        // Empty draft is not kept.
+        let empty = Draft::empty();
+        if empty.is_empty() {
+            drafts.remove(&b);
+        } else {
+            drafts.insert(b, empty.clone());
+        }
+        assert!(drafts.get(&b).is_none());
+        assert_eq!(drafts.get(&b).cloned().unwrap_or_else(Draft::empty), empty);
+
+        // Reply makes an otherwise empty text draft worth keeping.
+        let reply = ReplyRef {
+            message: Id(99),
+            author: model::Author::Human,
+            quote: Arc::from("quoted"),
+        };
+        let draft_reply = Draft {
+            text: SharedString::default(),
+            selection: 0..0,
+            reversed: false,
+            reply: Some(reply),
+        };
+        assert!(!draft_reply.is_empty());
+        drafts.insert(b, draft_reply.clone());
+        assert_eq!(
+            drafts.get(&b).cloned().unwrap_or_else(Draft::empty),
+            draft_reply
+        );
+    }
+
+    #[test]
+    fn core_echo_match_trims_and_scans_appended_range() {
+        use std::sync::Arc;
+
+        let mut log = model::ChannelLog::default();
+        let human = |id: u32, body: &str| model::Message {
+            id: Id(id),
+            author: model::Author::Human,
+            sent_at: 0,
+            body: Arc::from(body),
+            reply_to: None,
+            stance: None,
+        };
+        let agent = |id: u32, body: &str| model::Message {
+            id: Id(id),
+            author: model::Author::Agent(Id(7)),
+            sent_at: 0,
+            body: Arc::from(body),
+            reply_to: None,
+            stance: None,
+        };
+
+        // Core stores trimmed body; draft may have trailing whitespace.
+        let r1 = log.extend([human(1, "hello")]);
+        assert!(echo_matches_in(Some(&log), r1.clone(), "hello  \n"));
+
+        // If other messages land in the same appended range, still find the echo.
+        let r2 = log.extend([agent(2, "reply"), human(3, "second")]);
+        assert!(echo_matches_in(Some(&log), r2, "second\n"));
+
+        // Different body does not match.
+        assert!(!echo_matches_in(Some(&log), 0..log.len(), "other"));
     }
 }

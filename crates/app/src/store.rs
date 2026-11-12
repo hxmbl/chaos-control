@@ -95,7 +95,11 @@ pub enum StoreEvent {
     /// pane if it is still showing.
     PermissionAnswered { request: i64 },
     /// Sending a human message failed; the composer keeps its draft.
-    SendFailed { channel: Id, error: Arc<str> },
+    SendFailed {
+        channel: Id,
+        #[allow(dead_code)]
+        error: Arc<str>,
+    },
 }
 
 /// Someone who has read up to a message (Slack/iMessage-style read marks).
