@@ -615,3 +615,102 @@ fn process_alive(pid: u32) -> bool {
             .is_ok_and(|status| status.success())
     }
 }
+
+async fn start_running_command(h: &mut Harness, command: &str) -> PermissionId {
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                exec_perm(command, &cwd),
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot run").await;
+    let req = wait_permission_state(h, PermissionState::Pending).await;
+    h.core
+        .answer_permission(req.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+    wait_run_state(h, req.id, "running").await;
+    req.id
+}
+
+fn temp_pid_file(tag: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "cc-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ))
+}
+
+/// STRM-588: shutdown right after a command starts still kills its process group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_kills_a_running_command() {
+    let mut h = Harness::new().await;
+    let pid_file = temp_pid_file("shutdown");
+    let escaped = pid_file.to_string_lossy().replace('\'', "'\\''");
+    start_running_command(&mut h, &format!("echo $$ > '{escaped}'; exec sleep 30")).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let pid: u32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "command never wrote its pid"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let _ = std::fs::remove_file(&pid_file);
+    assert!(
+        process_alive(pid),
+        "command should be running before shutdown"
+    );
+
+    h.core.shutdown().await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while process_alive(pid) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "command {pid} survived shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// STRM-587: a run still marked `running` when Chaos Control starts (it crashed
+/// or was killed) is failed with an explanation instead of staying running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_recovery_fails_runs_left_running() {
+    let mut h = Harness::new().await;
+    let id = start_running_command(&mut h, "sleep 30").await;
+
+    h.core
+        .with_engine(|e, now| e.recover_interrupted_command_runs(now))
+        .await
+        .unwrap();
+
+    let done = wait_run_state(&h, id, "failed").await;
+    assert!(
+        done.run_output
+            .as_deref()
+            .unwrap_or("")
+            .contains("restarted while the command was running"),
+        "{done:#?}"
+    );
+    h.core.shutdown().await;
+}

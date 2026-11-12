@@ -5,7 +5,16 @@
 //! call is a message to the actor, every answer comes back on a channel, and UI
 //! updates arrive as [`CoreEvent`]s.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -161,10 +170,6 @@ enum Cmd {
     },
     RunQueued {
         id: PermissionId,
-    },
-    RunStarted {
-        id: PermissionId,
-        pgid: Option<u32>,
     },
     RunFinished {
         id: PermissionId,
@@ -1113,7 +1118,10 @@ struct Actor {
 
 struct RunningCommand {
     abort: tokio::task::AbortHandle,
-    pgid: Option<u32>,
+    /// The command's process group, written by the runner task straight after
+    /// spawn (0 until then), so shutdown sees it without waiting on a message
+    /// the actor may not have processed yet (STRM-588).
+    pgid: Arc<AtomicU32>,
 }
 
 struct ProcessGroupGuard(Option<u32>);
@@ -1161,6 +1169,8 @@ impl Actor {
         }
         let tx = self.tx.clone();
         let limit = self.run_limit.clone();
+        let pgid = Arc::new(AtomicU32::new(0));
+        let pgid_slot = pgid.clone();
         let handle = tokio::spawn(async move {
             let permit = match limit.acquire_owned().await {
                 Ok(p) => p,
@@ -1169,7 +1179,7 @@ impl Actor {
                     return;
                 }
             };
-            let result = Self::execute_command(command, cwd, tx.clone(), id).await;
+            let result = Self::execute_command(command, cwd, pgid_slot).await;
             drop(permit);
             match result {
                 Ok((ok, code, text)) => Self::send_run_result(&tx, id, ok, code, &text),
@@ -1180,7 +1190,7 @@ impl Actor {
             id,
             RunningCommand {
                 abort: handle.abort_handle(),
-                pgid: None,
+                pgid,
             },
         );
     }
@@ -1223,8 +1233,7 @@ impl Actor {
     async fn execute_command(
         command: String,
         cwd: PathBuf,
-        tx: mpsc::UnboundedSender<Cmd>,
-        id: PermissionId,
+        pgid_slot: Arc<AtomicU32>,
     ) -> Result<(bool, Option<i32>, String), String> {
         use std::process::Stdio;
         let timeout_secs: u64 = std::env::var("CHAOS_COMMAND_TIMEOUT_SECS")
@@ -1256,7 +1265,8 @@ impl Actor {
 
         let pgid = child.id();
         let mut process_group = ProcessGroupGuard(pgid);
-        let _ = tx.send(Cmd::RunStarted { id, pgid });
+        // No await between spawn and here, so an abort cannot land in between.
+        pgid_slot.store(pgid.unwrap_or(0), Ordering::SeqCst);
 
         let stdout = child
             .stdout
@@ -1519,25 +1529,24 @@ impl Actor {
                 }
             }
             Cmd::RunQueued { id } => self.run_queued(id),
-            Cmd::RunStarted { id, pgid } => {
-                if let Some(r) = self.running.get_mut(&id) {
-                    r.pgid = pgid;
-                }
-            }
             Cmd::RunFinished { id } => {
                 self.running.remove(&id);
             }
             Cmd::Shutdown(reply) => {
-                let running: Vec<(PermissionId, Option<u32>, tokio::task::AbortHandle)> = self
+                let running: Vec<(PermissionId, Arc<AtomicU32>, tokio::task::AbortHandle)> = self
                     .running
                     .drain()
                     .map(|(id, run)| (id, run.pgid, run.abort))
                     .collect();
                 for (id, pgid, abort) in running {
-                    if let Some(pgid) = pgid {
-                        Self::kill_pgid(pgid);
-                    }
+                    // Abort first: a task still inside spawn stores its pgid and
+                    // then, at its next await, is dropped, and its guard kills
+                    // the group. A task already past spawn is killed here too.
                     abort.abort();
+                    match pgid.load(Ordering::SeqCst) {
+                        0 => {}
+                        pgid => Self::kill_pgid(pgid),
+                    }
                     let _ = self.fail_run(
                         id,
                         "interrupted: Chaos Control shut down while the command was running",
