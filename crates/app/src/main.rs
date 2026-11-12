@@ -15,6 +15,8 @@ mod settings;
 mod sidebar;
 mod store;
 mod titlebar;
+#[cfg(target_os = "macos")]
+mod tray;
 mod workspace;
 
 use gpui::{
@@ -79,6 +81,8 @@ fn main() {
                 ),
             ]);
             cx.bind_keys(composer::bindings());
+            #[cfg(target_os = "macos")]
+            tray::init(cx);
             cx.on_window_closed(|cx| {
                 if cx.windows().is_empty() {
                     cx.quit();
