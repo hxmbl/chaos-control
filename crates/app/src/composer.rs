@@ -131,15 +131,7 @@ impl Composer {
         let subscriptions = [
             cx.subscribe(&input, |this, _, event, cx| match event {
                 TextInputEvent::Submit => this.send(cx),
-                TextInputEvent::Changed => {
-                    if let Some((ch, draft)) = &this.pending
-                        && *ch == this.channel
-                        && this.input.read(cx).text().as_ref() != draft.text.as_ref()
-                    {
-                        this.pending = None;
-                    }
-                    cx.notify()
-                }
+                TextInputEvent::Changed => cx.notify(),
             }),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
