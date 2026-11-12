@@ -53,8 +53,12 @@ actions!(
         SelectAll,
         Home,
         End,
+        DocumentHome,
+        DocumentEnd,
         SelectToStart,
         SelectToEnd,
+        SelectToDocumentStart,
+        SelectToDocumentEnd,
         ShowCharacterPalette,
         Paste,
         Cut,
@@ -124,12 +128,12 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("alt-shift-right", SelectWordRight, ctx),
             KeyBinding::new("cmd-left", Home, ctx),
             KeyBinding::new("cmd-right", End, ctx),
-            KeyBinding::new("cmd-up", Home, ctx),
-            KeyBinding::new("cmd-down", End, ctx),
+            KeyBinding::new("cmd-up", DocumentHome, ctx),
+            KeyBinding::new("cmd-down", DocumentEnd, ctx),
             KeyBinding::new("cmd-shift-left", SelectToStart, ctx),
             KeyBinding::new("cmd-shift-right", SelectToEnd, ctx),
-            KeyBinding::new("cmd-shift-up", SelectToStart, ctx),
-            KeyBinding::new("cmd-shift-down", SelectToEnd, ctx),
+            KeyBinding::new("cmd-shift-up", SelectToDocumentStart, ctx),
+            KeyBinding::new("cmd-shift-down", SelectToDocumentEnd, ctx),
             KeyBinding::new("alt-backspace", DeleteWordLeft, ctx),
             KeyBinding::new("alt-delete", DeleteWordRight, ctx),
             KeyBinding::new("cmd-backspace", DeleteToStart, ctx),
@@ -150,10 +154,10 @@ pub fn bindings() -> Vec<KeyBinding> {
             KeyBinding::new("ctrl-right", WordRight, ctx),
             KeyBinding::new("ctrl-shift-left", SelectWordLeft, ctx),
             KeyBinding::new("ctrl-shift-right", SelectWordRight, ctx),
-            KeyBinding::new("ctrl-home", Home, ctx),
-            KeyBinding::new("ctrl-end", End, ctx),
-            KeyBinding::new("ctrl-shift-home", SelectToStart, ctx),
-            KeyBinding::new("ctrl-shift-end", SelectToEnd, ctx),
+            KeyBinding::new("ctrl-home", DocumentHome, ctx),
+            KeyBinding::new("ctrl-end", DocumentEnd, ctx),
+            KeyBinding::new("ctrl-shift-home", SelectToDocumentStart, ctx),
+            KeyBinding::new("ctrl-shift-end", SelectToDocumentEnd, ctx),
             KeyBinding::new("ctrl-backspace", DeleteWordLeft, ctx),
             KeyBinding::new("ctrl-delete", DeleteWordRight, ctx),
             KeyBinding::new("ctrl-y", Redo, ctx),
@@ -289,6 +293,43 @@ impl TextInput {
         cx.notify();
     }
 
+    /// The text and cursor/selection, so a view can keep it per context (e.g.
+    /// a per-channel composer draft) and restore it later.
+    pub fn draft_state(&self) -> (SharedString, Range<usize>, bool) {
+        (
+            self.content.clone(),
+            self.selected_range.clone(),
+            self.selection_reversed,
+        )
+    }
+
+    /// Restores a draft saved with [`Self::draft_state`]. The selection is
+    /// clamped to the text and the undo history starts fresh.
+    pub fn restore_draft_state(
+        &mut self,
+        text: SharedString,
+        selection: Range<usize>,
+        reversed: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let len = text.len();
+        let start = selection.start.min(len);
+        let mut end = selection.end.min(len);
+        if end < start {
+            end = start;
+        }
+        self.content = text;
+        self.selected_range = start..end;
+        self.selection_reversed = reversed && start != end;
+        self.marked_range = None;
+        self.history.clear();
+        self.scroll_y = px(0.);
+        self.autoscroll = true;
+        self.goal_x = None;
+        cx.emit(TextInputEvent::Changed);
+        cx.notify();
+    }
+
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.move_to(
@@ -358,19 +399,78 @@ impl TextInput {
         self.select_to(self.content.len(), cx)
     }
 
+    fn current_visual_line_range(&self) -> Option<(usize, usize)> {
+        if !self.multiline {
+            return None;
+        }
+        let multi = self.last_multi.as_ref()?;
+        let offset = self.cursor_offset();
+        let ix = multi.line_at(offset);
+        let line = multi.lines.get(ix)?;
+        let base = *multi.starts.get(ix)?;
+        let rows = MultiLayout::row_starts(line);
+        let local = offset.saturating_sub(base).min(line.len());
+        let row = rows.partition_point(|&s| s <= local).saturating_sub(1);
+        let start = base + rows.get(row).copied().unwrap_or(0);
+        let end = base + rows.get(row + 1).copied().unwrap_or(line.len());
+        Some((start, end))
+    }
+
     fn home(&mut self, _: &Home, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_to(0, cx);
+        if let Some((start, _)) = self.current_visual_line_range() {
+            self.move_to(start, cx);
+        } else {
+            self.move_to(0, cx);
+        }
     }
 
     fn end(&mut self, _: &End, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, end)) = self.current_visual_line_range() {
+            self.move_to(end, cx);
+        } else {
+            self.move_to(self.content.len(), cx);
+        }
+    }
+
+    fn document_home(&mut self, _: &DocumentHome, _: &mut Window, cx: &mut Context<Self>) {
+        self.move_to(0, cx);
+    }
+
+    fn document_end(&mut self, _: &DocumentEnd, _: &mut Window, cx: &mut Context<Self>) {
         self.move_to(self.content.len(), cx);
     }
 
     fn select_to_start(&mut self, _: &SelectToStart, _: &mut Window, cx: &mut Context<Self>) {
-        self.select_to(0, cx);
+        if let Some((start, _)) = self.current_visual_line_range() {
+            self.select_to(start, cx);
+        } else {
+            self.select_to(0, cx);
+        }
     }
 
     fn select_to_end(&mut self, _: &SelectToEnd, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some((_, end)) = self.current_visual_line_range() {
+            self.select_to(end, cx);
+        } else {
+            self.select_to(self.content.len(), cx);
+        }
+    }
+
+    fn select_to_document_start(
+        &mut self,
+        _: &SelectToDocumentStart,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_to(0, cx);
+    }
+
+    fn select_to_document_end(
+        &mut self,
+        _: &SelectToDocumentEnd,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.select_to(self.content.len(), cx);
     }
 
@@ -1628,6 +1728,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_word_right))
             .on_action(cx.listener(Self::select_to_start))
             .on_action(cx.listener(Self::select_to_end))
+            .on_action(cx.listener(Self::select_to_document_start))
+            .on_action(cx.listener(Self::select_to_document_end))
             .on_action(cx.listener(Self::undo))
             .on_action(cx.listener(Self::redo))
             .on_action(cx.listener(Self::left))
@@ -1637,6 +1739,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_all))
             .on_action(cx.listener(Self::home))
             .on_action(cx.listener(Self::end))
+            .on_action(cx.listener(Self::document_home))
+            .on_action(cx.listener(Self::document_end))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::up))
