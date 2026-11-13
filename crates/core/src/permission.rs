@@ -445,15 +445,19 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
 /// Generic edit requests are not auto-approved in `accept-edits` on this path
 /// until structured-edit/editable-root and sufficient execution-time scope
 /// enforcement evidence are available in production; absent those prerequisites,
-/// fail closed to human approval. Execute/fetch/other remain queued for
-/// approval in `accept-edits` in this slice (preserved existing behavior where
-/// not yet reclassified). `yolo` allows everything.
+/// fail closed to human approval. Fetch and unknown/other operations require
+/// human approval in both modes on this mediated path. Execute remains queued in
+/// `accept-edits` in this slice to preserve existing approval-gated command
+/// execution behavior pending explicit shell/command contract reconciliation.
+/// `yolo` allows everything.
 pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
     match mode {
         ApprovalMode::AskAll => ModeOutcome::AskHuman,
         ApprovalMode::AcceptEdits => match kind {
-            RequestKind::Read | RequestKind::Edit => ModeOutcome::AskHuman,
-            RequestKind::Execute | RequestKind::Fetch | RequestKind::Other => ModeOutcome::Queue,
+            RequestKind::Read | RequestKind::Edit | RequestKind::Fetch | RequestKind::Other => {
+                ModeOutcome::AskHuman
+            }
+            RequestKind::Execute => ModeOutcome::Queue,
         },
         ApprovalMode::Yolo => ModeOutcome::Allow,
     }
@@ -2176,11 +2180,11 @@ mod tests {
         );
         assert_eq!(
             mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Fetch),
-            ModeOutcome::Queue
+            ModeOutcome::AskHuman
         );
         assert_eq!(
             mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Other),
-            ModeOutcome::Queue
+            ModeOutcome::AskHuman
         );
 
         for k in [
