@@ -83,6 +83,27 @@ fn echo_matches_in(
         .any(|m| matches!(m.author, model::Author::Human) && m.body.as_ref() == sent_body(sent))
 }
 
+fn apply_finish_edit(
+    edits: &mut HashMap<Id, Editing>,
+    drafts: &mut HashMap<Id, Draft>,
+    channel: Id,
+    index: usize,
+) -> Option<Editing> {
+    let matches = edits
+        .get(&channel)
+        .is_some_and(|edit| edit.pending && edit.index == index);
+    if !matches {
+        return None;
+    }
+    let edit = edits.remove(&channel)?;
+    if edit.saved.is_empty() {
+        drafts.remove(&channel);
+    } else {
+        drafts.insert(channel, edit.saved.clone());
+    }
+    Some(edit)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Draft {
     text: SharedString,
@@ -442,6 +463,10 @@ impl Composer {
             });
             self.mention = None;
             self.save_current(cx);
+        } else if edit.saved.is_empty() {
+            self.drafts.remove(&channel);
+        } else {
+            self.drafts.insert(channel, edit.saved);
         }
         cx.notify();
     }
@@ -1168,5 +1193,62 @@ mod tests {
         assert_eq!(filter_mentions(&candidates, "CX").len(), 1);
         assert_eq!(filter_mentions(&candidates, "").len(), 2);
         assert!(filter_mentions(&candidates, "zzz").is_empty());
+    }
+
+    #[test]
+    fn finishing_pending_edit_in_inactive_channel_preserves_saved_draft() {
+        let channel = Id(1);
+        let saved = Draft {
+            text: "draft I was writing".into(),
+            selection: 5..5,
+            reversed: false,
+            reply: None,
+        };
+        let buffer = Draft {
+            text: "edited message".into(),
+            selection: 14..14,
+            reversed: false,
+            reply: None,
+        };
+        let mut edits = HashMap::new();
+        edits.insert(
+            channel,
+            Editing {
+                index: 7,
+                core_id: chaos_core::types::MessageId(42),
+                saved: saved.clone(),
+                buffer,
+                pending: true,
+                attempted: Some("edited message".into()),
+            },
+        );
+        let mut drafts = HashMap::new();
+
+        let finished = apply_finish_edit(&mut edits, &mut drafts, channel, 7).unwrap();
+        assert_eq!(finished.saved, saved);
+        assert!(!edits.contains_key(&channel));
+        assert_eq!(drafts.get(&channel), Some(&saved));
+
+        // If the saved draft was empty, it should not linger in drafts.
+        let mut edits = HashMap::new();
+        edits.insert(
+            channel,
+            Editing {
+                index: 1,
+                core_id: chaos_core::types::MessageId(9),
+                saved: Draft::empty(),
+                buffer: Draft {
+                    text: "x".into(),
+                    selection: 1..1,
+                    reversed: false,
+                    reply: None,
+                },
+                pending: true,
+                attempted: Some("x".into()),
+            },
+        );
+        let mut drafts = HashMap::from([(channel, saved.clone())]);
+        apply_finish_edit(&mut edits, &mut drafts, channel, 1);
+        assert!(!drafts.contains_key(&channel));
     }
 }
