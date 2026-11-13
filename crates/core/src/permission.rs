@@ -438,17 +438,27 @@ pub fn is_read_only_kind(kind: &str) -> bool {
 
 /// Maps an ACP wire tool kind to a [`RequestKind`] (STRM-542/STRM-606).
 /// Delete/move are classified explicitly (never as auto-allow-eligible edits);
-/// unknown/missing kinds are treated as other/unclassifiable and fail closed.
+/// unknown/missing/unsupported kinds (including `switch_mode`, `think`, and any
+/// future/unrecognized kind) are treated as other/unclassifiable and fail closed.
 pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
-    match kind {
+    match kind.map(str::trim) {
         Some("read" | "search") => RequestKind::Read,
         Some("edit") => RequestKind::Edit,
         Some("delete") => RequestKind::Delete,
         Some("move") => RequestKind::Move,
         Some("execute") => RequestKind::Execute,
         Some("fetch") => RequestKind::Fetch,
-        _ => RequestKind::Other,
+        Some("") | None => RequestKind::Other,
+        Some(_) => RequestKind::Other,
     }
+}
+
+/// True when `name` is an exact CC control-plane chat tool name eligible for
+/// scoped native auto-approval on the mediated path (separate from "selected
+/// MCP" allowances). Read/status and policy/answer tools are excluded and must
+/// require human approval.
+pub fn is_auto_allowed_cc_control_plane_tool(name: &str) -> bool {
+    AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name.trim())
 }
 
 /// Verified prerequisites required before a mediated structured edit could be
@@ -484,11 +494,16 @@ pub fn effective_request_kind(kind: RequestKind, detail: Option<&str>) -> Reques
 fn has_conflicting_edit_kind_signal(v: &Value) -> bool {
     match v {
         Value::Object(m) => {
-            // A structured "kind":"delete"/"move"/"execute"/"fetch" marker inside an
-            // edit-classified payload indicates a conflicting/mixed/unclassifiable
-            // operation shape.
+            // A structured operation-kind marker inside an edit-classified payload
+            // that indicates a conflicting, mixed, or unclassifiable operation
+            // shape must fail closed. `edit`/`read`/`search` markers are not
+            // treated as conflicting here; absence of evidence is not proof of a
+            // pure structured edit.
             if let Some(Value::String(k)) = m.get("kind")
-                && matches!(k.as_str(), "delete" | "move" | "execute" | "fetch")
+                && matches!(
+                    k.as_str(),
+                    "delete" | "move" | "execute" | "fetch" | "switch_mode" | "other" | "unknown"
+                )
             {
                 return true;
             }
@@ -1350,14 +1365,14 @@ impl Engine {
         if let Some(name) = ask
             .tool_name
             .as_deref()
-            .filter(|name| AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(name))
+            .filter(|name| is_auto_allowed_cc_control_plane_tool(name))
         {
             return match self.auto_approve_chat_tool(
                 now,
                 agent,
                 channel,
                 ask.turn,
-                name,
+                name.trim(),
                 ask.detail.as_deref(),
             ) {
                 Ok(r) => PermissionVerdict::Allow { request: r.id },
@@ -1411,6 +1426,23 @@ impl Engine {
         name: &str,
         detail: Option<&str>,
     ) -> Result<PermissionRequest, PostError> {
+        let name = name.trim();
+        if !is_auto_allowed_cc_control_plane_tool(name) {
+            // Defense-in-depth: only exact scoped CC control-plane actions may be
+            // auto-approved on this path; everything else must fail closed.
+            return self.ask_permission(
+                now,
+                agent,
+                channel,
+                turn,
+                PermissionSource::Native,
+                name,
+                detail,
+                None,
+                None,
+                RequestKind::Other,
+            );
+        }
         let turn = match turn {
             Some(t) => Some(t),
             None => store::in_flight_batch(self.conn(), agent, channel)?.map(|b| b.id),
@@ -1473,7 +1505,7 @@ impl Engine {
     ) -> Result<PermissionRequest, PostError> {
         let title = title.trim();
         let title = if title.is_empty() { "a tool" } else { title };
-        let (key, bindable): (Arc<str>, bool) = match key {
+        let (key, bindable): (Arc<str>, bool) = match key.map(str::trim).filter(|k| !k.is_empty()) {
             Some(k) => (Arc::from(k), true),
             // Unbindable identity: derive a per-ask key so this request cannot
             // match/consume an unrelated prior grant or be collapsed with a
@@ -2316,8 +2348,50 @@ mod tests {
         assert_eq!(request_kind_from_wire(Some("edit")), RequestKind::Edit);
         assert_eq!(request_kind_from_wire(Some("delete")), RequestKind::Delete);
         assert_eq!(request_kind_from_wire(Some("move")), RequestKind::Move);
+        assert_eq!(
+            request_kind_from_wire(Some("switch_mode")),
+            RequestKind::Other
+        );
+        assert_eq!(request_kind_from_wire(Some("think")), RequestKind::Other);
         assert_eq!(request_kind_from_wire(Some("unknown")), RequestKind::Other);
+        assert_eq!(request_kind_from_wire(Some("  edit  ")), RequestKind::Edit);
+        assert_eq!(request_kind_from_wire(Some("")), RequestKind::Other);
+        assert_eq!(request_kind_from_wire(Some("   ")), RequestKind::Other);
         assert_eq!(request_kind_from_wire(None), RequestKind::Other);
+    }
+
+    #[test]
+    fn cc_control_plane_auto_allow_is_exact_and_scoped() {
+        for allowed in [
+            "chat_send",
+            "chat_react",
+            "chat_status",
+            "chat_refuse",
+            "chat_dissent",
+            "chat_request_permission",
+        ] {
+            assert!(is_auto_allowed_cc_control_plane_tool(allowed), "{allowed}");
+            assert!(
+                is_auto_allowed_cc_control_plane_tool(&format!("  {allowed}  ")),
+                "{allowed} trimmed"
+            );
+        }
+        for denied in [
+            "chat_context",
+            "chat_read",
+            "chat_search",
+            "chat_permission_status",
+            "chat_approval_mode_status",
+            "chat_answer_permission",
+            "chat_set_approval_mode",
+            "chat_unknown_control_plane_tool",
+            "CHAT_SEND",
+        ] {
+            assert!(
+                !is_auto_allowed_cc_control_plane_tool(denied),
+                "{denied} must not be auto-allowed"
+            );
+        }
     }
 
     #[test]
@@ -2373,16 +2447,25 @@ mod tests {
         assert_eq!(
             effective_request_kind(
                 RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"kind":"switch_mode"}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
                 Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"path":"a.rs"}}}}"#)
             ),
             RequestKind::Edit
         );
+        // Any conflicting/unclassifiable operation-kind marker in structured
+        // payload detail is treated as mixed/unclassifiable (fail closed).
         assert_eq!(
             effective_request_kind(
                 RequestKind::Edit,
                 Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"kind":"other"}}}}"#)
             ),
-            RequestKind::Edit
+            RequestKind::Other
         );
     }
 }
