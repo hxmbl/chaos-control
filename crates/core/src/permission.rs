@@ -486,6 +486,12 @@ impl StructuredEditEvidence {
     }
 }
 
+/// Shell/execute operations are never auto-allow-eligible on the mediated path
+/// outside `yolo`; `accept-edits` uses approval-gated queuing (not auto-allow).
+pub fn execute_auto_allow_eligible_without_yolo() -> bool {
+    false
+}
+
 /// Verified prerequisites required before a mediated structured edit could be
 /// auto-allow-eligible in `accept-edits` on the production path (STRM-596/606):
 /// explicit editable-root authorization and sufficient execution-time scope
@@ -1614,6 +1620,11 @@ impl Engine {
             {
                 ModeOutcome::AskHuman
             }
+            // Execute must never be silently auto-allowed outside yolo on the
+            // mediated path (ask-all asks; accept-edits queues with human approval).
+            (ModeOutcome::Allow, RequestKind::Execute) if mode != ApprovalMode::Yolo => {
+                ModeOutcome::AskHuman
+            }
             (other, _) => other,
         };
         if outcome == ModeOutcome::Allow {
@@ -2437,6 +2448,7 @@ mod tests {
             !structured_edit_prerequisites_verified(),
             "core must not claim verified editable-root/execution-time evidence"
         );
+        assert!(!execute_auto_allow_eligible_without_yolo());
         assert!(!StructuredEditEvidence::Unverified.allows_auto_edit());
         // Evidence-gated verdict: only a verified pure structured edit may be
         // auto-allow-eligible in accept-edits; delete/move/others never.
