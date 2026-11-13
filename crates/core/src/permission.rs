@@ -1373,7 +1373,7 @@ impl Engine {
                     now,
                     read_only: false,
                     request_key: None,
-                    decided_by: Some(DecidedBy::AutoVm),
+                    decided_by: Some(DecidedBy::AutoMode),
                     command: None,
                     cwd: None,
                 },

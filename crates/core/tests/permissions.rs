@@ -708,18 +708,9 @@ async fn delete_move_and_unclassifiable_require_human_approval_with_one_shot_lif
 
             h.wait_message("first turn", Some(bot.id)).await;
 
-            // Deny move/unclassifiable (no grant), approve delete once. Deny/approve
-            // answers wake the agent; trigger turn 2 explicitly after all answers so
-            // the one-shot grant is visible regardless of wake/answer-notification
-            // ordering (script has exactly 2 turns).
-            h.core
-                .answer_permission(req_move.id, h.hx.id, false, None)
-                .await
-                .unwrap();
-            h.core
-                .answer_permission(req_unclass.id, h.hx.id, false, None)
-                .await
-                .unwrap();
+            // Approve delete once and trigger its retry turn explicitly so the
+            // one-shot grant is exercised without competing answer wakes. Deny
+            // move/unclassifiable afterwards (no grant, never retried).
             h.core
                 .answer_permission(req_delete.id, h.hx.id, true, None)
                 .await
@@ -761,6 +752,24 @@ async fn delete_move_and_unclassifiable_require_human_approval_with_one_shot_lif
                 c.query_row(
                     "SELECT used_at IS NOT NULL FROM permission_requests WHERE id = ?1",
                     [req_delete.id.0],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            })
+            .await;
+
+            h.core
+                .answer_permission(req_move.id, h.hx.id, false, None)
+                .await
+                .unwrap();
+            h.core
+                .answer_permission(req_unclass.id, h.hx.id, false, None)
+                .await
+                .unwrap();
+            h.until("move/unclass denied", move |c| {
+                c.query_row(
+                    "SELECT COUNT(*) = 2 FROM permission_requests WHERE id IN (?1, ?2) AND state = 'denied'",
+                    [req_move.id.0, req_unclass.id.0],
                     |r| r.get::<_, bool>(0),
                 )
                 .unwrap()
