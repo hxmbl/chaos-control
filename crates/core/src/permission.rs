@@ -1880,20 +1880,21 @@ pub const TOOL_NAMES: [&str; 4] = [
     "chat_set_approval_mode",
 ];
 
-/// Named chat tools that are safe to auto-approve when requested natively.
-/// Policy changes are excluded: they must be human-authorized.
-pub const AUTO_ALLOWED_CHAT_TOOL_NAMES: [&str; 11] = [
-    "chat_context",
-    "chat_read",
-    "chat_search",
+/// CC-internal control-plane chat tools that may be auto-approved without
+/// per-call human approval when requested natively, but only as exact
+/// CC-owned tool identities on the mediated path (separate from "explicitly
+/// selected MCP" allowances; STRM-596/606 v3). Read/status control-plane tools
+/// (`chat_context`, `chat_read`, `chat_search`, `chat_permission_status`,
+/// `chat_approval_mode_status`) require human approval in both modes and are
+/// therefore excluded. Policy/authorization actions remain separately
+/// controlled and must not be agent-self-approved.
+pub const AUTO_ALLOWED_CHAT_TOOL_NAMES: [&str; 6] = [
     "chat_send",
     "chat_react",
     "chat_refuse",
     "chat_dissent",
     "chat_status",
     "chat_request_permission",
-    "chat_permission_status",
-    "chat_approval_mode_status",
 ];
 
 pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<Tool> {
