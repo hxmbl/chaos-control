@@ -1175,3 +1175,240 @@ async fn a_grant_is_for_the_exact_request_not_its_title() {
         assert_eq!(pending[1].request_key, Some(key), "a.rs again, v{protocol}");
     }
 }
+
+/// CC control-plane tools that are not in the exact scoped native auto-allow set
+/// (including policy/answer tools and unknown `chat_*` names) must require human
+/// approval in both `ask-all` and `accept-edits` (STRM-596/606). Exact-name
+/// identity is required; no prefix/namespace-based auto-allow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_allowlisted_and_policy_cc_tools_require_human_approval() {
+    let tools = [
+        "chat_answer_permission",
+        "chat_set_approval_mode",
+        "chat_unknown_control_plane_tool",
+    ];
+    for protocol in [1, 2] {
+        for mode in [ApprovalMode::AskAll, ApprovalMode::AcceptEdits] {
+            let mut h = Harness::new().await;
+            let steps: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|name| {
+                    json!({"permission_kind": {"title": "a tool", "name": name, "kind": "execute"}})
+                })
+                .chain(std::iter::once(json!({"text": "Asked."})))
+                .collect();
+            let bot = h
+                .agent(
+                    "bot",
+                    script(json!({"protocol": protocol, "turns": [{"steps": steps}]})),
+                )
+                .await;
+            h.core.set_approval_mode(bot.id, mode).await.unwrap();
+            h.say("@bot try restricted cc tools").await;
+
+            let outcomes = wait_outcomes(&h, "bot", tools.len()).await;
+            for (ix, name) in tools.iter().enumerate() {
+                assert_eq!(
+                    picked(&outcomes[ix]),
+                    &json!("deny"),
+                    "{name} must not be auto-allowed, v{protocol}, {mode:?}: {}",
+                    outcomes[ix]
+                );
+                assert_eq!(
+                    outcomes[ix]["_meta"]["chaosControl"]["status"],
+                    json!("request_sent"),
+                    "{name}, v{protocol}, {mode:?}: {}",
+                    outcomes[ix]
+                );
+            }
+            h.wait_message("turn completed", Some(bot.id)).await;
+
+            let pending = h.core.pending_permissions(h.main).await.unwrap();
+            assert_eq!(
+                pending.len(),
+                tools.len(),
+                "v{protocol}, {mode:?}: {pending:#?}"
+            );
+            assert!(pending.iter().all(|r| r.state == PermissionState::Pending));
+            let mut titles: Vec<&str> = pending.iter().map(|r| r.title.as_ref()).collect();
+            titles.sort_unstable();
+            let mut expected = tools.to_vec();
+            expected.sort_unstable();
+            assert_eq!(titles, expected, "v{protocol}, {mode:?}");
+
+            let log = h.core.permission_log(h.main, 50).await.unwrap();
+            assert!(
+                !log.iter().any(|r| tools.contains(&r.title.as_ref())
+                    && r.state == PermissionState::AutoApproved),
+                "restricted cc tools must not be auto-approved, v{protocol}, {mode:?}: {log:#?}"
+            );
+        }
+    }
+}
+
+/// Edit-classified mediated requests that carry verifiable conflicting/mixed
+/// operation-kind signals in structured payload detail are treated as
+/// unclassifiable (fail closed) and require human approval in both modes. They
+/// must never be auto-approved as structured edits. `yolo` still allows
+/// everything explicitly. Over ACP v1/v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_edit_payload_kind_signal_requires_human_approval() {
+    let conflicting_inputs = [
+        json!({"kind": "delete", "path": "build/"}),
+        json!({"kind": "move", "from": "a.rs", "to": "b.rs"}),
+        json!({"nested": {"kind": "execute", "command": "rm -rf build/"}}),
+        json!({"ops": [{"kind": "fetch", "url": "https://example.com"}]}),
+    ];
+    for protocol in [1, 2] {
+        for raw_input in &conflicting_inputs {
+            for mode in [
+                ApprovalMode::AskAll,
+                ApprovalMode::AcceptEdits,
+                ApprovalMode::Yolo,
+            ] {
+                let mut h = Harness::new().await;
+                let step = json!({"permission_kind": {
+                    "title": "Edit files",
+                    "kind": "edit",
+                    "raw_input": raw_input.clone()
+                }});
+                let bot = h
+                    .agent(
+                        "bot",
+                        script(json!({"protocol": protocol, "turns": [{
+                            "steps": [step, {"text": "Asked."}]
+                        }]})),
+                    )
+                    .await;
+                h.core.set_approval_mode(bot.id, mode).await.unwrap();
+                h.say("@bot edit build").await;
+
+                if mode == ApprovalMode::Yolo {
+                    let outcomes = wait_outcomes(&h, "bot", 1).await;
+                    assert_eq!(
+                        picked(&outcomes[0]),
+                        &json!("allow"),
+                        "yolo allows all, v{protocol}, raw={raw_input}: {}",
+                        outcomes[0]
+                    );
+                    assert!(
+                        outcomes[0].get("_meta").is_none()
+                            || outcomes[0]["_meta"].get("chaosControl").is_none(),
+                        "yolo should not create pending human request, v{protocol}: {}",
+                        outcomes[0]
+                    );
+                    h.wait_message("turn completed", Some(bot.id)).await;
+                    let pending = h.core.pending_permissions(h.main).await.unwrap();
+                    assert!(
+                        pending.is_empty(),
+                        "v{protocol}, raw={raw_input}: {pending:#?}"
+                    );
+                    continue;
+                }
+
+                let pending = wait_request(&mut h, PermissionState::Pending).await;
+                assert_eq!(
+                    &*pending.title, "Edit files",
+                    "v{protocol}, {mode:?}, {raw_input}"
+                );
+                assert!(
+                    pending.run_state.is_none() && pending.command.is_none(),
+                    "must not be auto-approved/queued as command, v{protocol}, {mode:?}: {pending:#?}"
+                );
+
+                let outcomes = wait_outcomes(&h, "bot", 1).await;
+                assert_eq!(
+                    picked(&outcomes[0]),
+                    &json!("deny"),
+                    "v{protocol}, {mode:?}, {raw_input}: {}",
+                    outcomes[0]
+                );
+                assert_eq!(
+                    outcomes[0]["_meta"]["chaosControl"]["status"],
+                    json!("request_sent"),
+                    "v{protocol}, {mode:?}, {raw_input}: {}",
+                    outcomes[0]
+                );
+                h.wait_message("turn completed", Some(bot.id)).await;
+
+                let all_pending = h.core.pending_permissions(h.main).await.unwrap();
+                assert_eq!(
+                    all_pending.len(),
+                    1,
+                    "v{protocol}, {mode:?}, {raw_input}: {all_pending:#?}"
+                );
+                assert_eq!(all_pending[0].state, PermissionState::Pending);
+            }
+        }
+    }
+}
+
+/// Generic structured edit requests remain fail-closed in `accept-edits` on the
+/// mediated path without verified editable-root + execution-time scope
+/// enforcement prerequisites/evidence (STRM-596/606). They require human
+/// approval in both `ask-all` and `accept-edits`; `yolo` allows. Over ACP v1/v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn generic_structured_edits_require_human_approval_without_verified_prerequisites() {
+    for protocol in [1, 2] {
+        for mode in [
+            ApprovalMode::AskAll,
+            ApprovalMode::AcceptEdits,
+            ApprovalMode::Yolo,
+        ] {
+            let mut h = Harness::new().await;
+            let edit = json!({"permission_kind": {
+                "title": "Edit src/lib.rs",
+                "kind": "edit",
+                "raw_input": {"path": "src/lib.rs", "old": "a", "new": "b"}
+            }});
+            let bot = h
+                .agent(
+                    "bot",
+                    script(json!({"protocol": protocol, "turns": [{
+                        "steps": [edit, {"text": "Asked."}]
+                    }]})),
+                )
+                .await;
+            h.core.set_approval_mode(bot.id, mode).await.unwrap();
+            h.say("@bot edit lib").await;
+
+            if mode == ApprovalMode::Yolo {
+                let outcomes = wait_outcomes(&h, "bot", 1).await;
+                assert_eq!(
+                    picked(&outcomes[0]),
+                    &json!("allow"),
+                    "v{protocol}: {}",
+                    outcomes[0]
+                );
+                h.wait_message("turn completed", Some(bot.id)).await;
+                assert!(h.core.pending_permissions(h.main).await.unwrap().is_empty());
+                continue;
+            }
+
+            let pending = wait_request(&mut h, PermissionState::Pending).await;
+            assert_eq!(&*pending.title, "Edit src/lib.rs", "v{protocol}, {mode:?}");
+            let outcomes = wait_outcomes(&h, "bot", 1).await;
+            assert_eq!(
+                picked(&outcomes[0]),
+                &json!("deny"),
+                "v{protocol}, {mode:?}: {}",
+                outcomes[0]
+            );
+            assert_eq!(
+                outcomes[0]["_meta"]["chaosControl"]["status"],
+                json!("request_sent"),
+                "v{protocol}, {mode:?}: {}",
+                outcomes[0]
+            );
+            h.wait_message("turn completed", Some(bot.id)).await;
+            let all_pending = h.core.pending_permissions(h.main).await.unwrap();
+            assert_eq!(
+                all_pending.len(),
+                1,
+                "v{protocol}, {mode:?}: {all_pending:#?}"
+            );
+            assert_eq!(all_pending[0].state, PermissionState::Pending);
+            assert!(all_pending[0].run_state.is_none() && all_pending[0].command.is_none());
+        }
+    }
+}

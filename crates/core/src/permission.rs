@@ -451,6 +451,54 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
     }
 }
 
+/// Verified prerequisites required before a mediated structured edit could be
+/// auto-allow-eligible in `accept-edits` on the production path (STRM-596/606):
+/// explicit editable-root authorization and sufficient execution-time scope
+/// enforcement evidence for the exact operation. Core does not have verified
+/// evidence on this path today; callers must fail closed.
+pub fn structured_edit_prerequisites_verified() -> bool {
+    false
+}
+
+/// Conservative fail-closed refinement for mediated classification: if an
+/// `Edit`-classified request shows verifiable protocol/detail evidence of a
+/// conflicting delete/move operation kind (or other unclassifiable mixed
+/// signal) in its structured payload, treat it as `Other`/unclassifiable so it
+/// can never be considered an auto-allow-eligible structured edit. This uses
+/// only structural kind markers present in serialized request details; absence
+/// of evidence is not treated as proof of safety.
+pub fn effective_request_kind(kind: RequestKind, detail: Option<&str>) -> RequestKind {
+    if kind != RequestKind::Edit {
+        return kind;
+    }
+    let Some(v) = detail.and_then(|d| serde_json::from_str::<Value>(d).ok()) else {
+        return kind;
+    };
+    if has_conflicting_edit_kind_signal(&v) {
+        RequestKind::Other
+    } else {
+        kind
+    }
+}
+
+fn has_conflicting_edit_kind_signal(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => {
+            // A structured "kind":"delete"/"move"/"execute"/"fetch" marker inside an
+            // edit-classified payload indicates a conflicting/mixed/unclassifiable
+            // operation shape.
+            if let Some(Value::String(k)) = m.get("kind")
+                && matches!(k.as_str(), "delete" | "move" | "execute" | "fetch")
+            {
+                return true;
+            }
+            m.values().any(has_conflicting_edit_kind_signal)
+        }
+        Value::Array(a) => a.iter().any(has_conflicting_edit_kind_signal),
+        _ => false,
+    }
+}
+
 /// What a mode does with one incoming request, before any human sees it.
 /// Pure function of (mode, request kind) — no I/O, fully testable (STRM-542/STRM-606).
 ///
@@ -476,7 +524,15 @@ pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
             | RequestKind::Delete
             | RequestKind::Move
             | RequestKind::Fetch
-            | RequestKind::Other => ModeOutcome::AskHuman,
+            | RequestKind::Other => {
+                // Structured edits are only potentially auto-allow-eligible with
+                // verified prerequisites; no evidence exists on this path.
+                if kind == RequestKind::Edit && structured_edit_prerequisites_verified() {
+                    ModeOutcome::Allow
+                } else {
+                    ModeOutcome::AskHuman
+                }
+            }
             RequestKind::Execute => ModeOutcome::Queue,
         },
         ApprovalMode::Yolo => ModeOutcome::Allow,
@@ -1316,7 +1372,9 @@ impl Engine {
         // and explicitly selected MCP allowances require verifiable proof on the
         // production path; without that proof, no automatic exception is granted.
         // Generic ACP kinds, tool basenames, titles, and self-declared metadata
-        // are never sufficient (fail closed).
+        // are never sufficient (fail closed). Conflicting/mixed edit-payload
+        // signals are treated as unclassifiable (Ask in both modes).
+        let kind = effective_request_kind(ask.kind, ask.detail.as_deref());
         match self.ask_permission(
             now,
             agent,
@@ -1327,7 +1385,7 @@ impl Engine {
             ask.detail.as_deref(),
             None,
             ask.key.as_deref(),
-            ask.kind,
+            kind,
         ) {
             Ok(r) => match r.state {
                 PermissionState::Approved | PermissionState::AutoApproved => {
@@ -2260,5 +2318,71 @@ mod tests {
         assert_eq!(request_kind_from_wire(Some("move")), RequestKind::Move);
         assert_eq!(request_kind_from_wire(Some("unknown")), RequestKind::Other);
         assert_eq!(request_kind_from_wire(None), RequestKind::Other);
+    }
+
+    #[test]
+    fn structured_edit_prerequisites_are_unavailable_fail_closed() {
+        assert!(
+            !structured_edit_prerequisites_verified(),
+            "core must not claim verified editable-root/execution-time evidence"
+        );
+    }
+
+    #[test]
+    fn effective_request_kind_downgrades_conflicting_edit_payloads() {
+        assert_eq!(
+            effective_request_kind(RequestKind::Read, Some(r#"{"kind":"delete"}"#)),
+            RequestKind::Read
+        );
+        assert_eq!(
+            effective_request_kind(RequestKind::Edit, None),
+            RequestKind::Edit
+        );
+        assert_eq!(
+            effective_request_kind(RequestKind::Edit, Some("not json")),
+            RequestKind::Edit
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"kind":"delete"}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"nested":{"kind":"move"}}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"ops":[{"kind":"execute"}]}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"ops":[{"kind":"fetch"}]}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"path":"a.rs"}}}}"#)
+            ),
+            RequestKind::Edit
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"kind":"other"}}}}"#)
+            ),
+            RequestKind::Edit
+        );
     }
 }
