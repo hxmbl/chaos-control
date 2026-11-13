@@ -1392,7 +1392,10 @@ impl Engine {
     /// Records a request and works out its state: auto-approved in a VM, the
     /// grant a human already gave (used up here), the same request already
     /// pending, or a new pending request for the humans. "The same" means the
-    /// same `key` ([`request_key`]); without one, a key on the title alone.
+    /// same `key` ([`request_key`]). If the request identity cannot be stably
+    /// bound (no key), fail closed on the mediated path: do not reuse/consume a
+    /// prior grant and do not dedupe as "the same request" via a weak fallback;
+    /// always require an explicit decision/approval for this ask.
     /// Policy/mode classification is applied on the mediated production path
     /// (STRM-606); reads/local search and other protected classes are not
     /// auto-allowed by bypassing this decision.
@@ -1412,9 +1415,25 @@ impl Engine {
     ) -> Result<PermissionRequest, PostError> {
         let title = title.trim();
         let title = if title.is_empty() { "a tool" } else { title };
-        let key: Arc<str> = match key {
-            Some(k) => Arc::from(k),
-            None => request_key("title", &json!(title)),
+        let (key, bindable): (Arc<str>, bool) = match key {
+            Some(k) => (Arc::from(k), true),
+            // Unbindable identity: derive a per-ask key so this request cannot
+            // match/consume an unrelated prior grant or be collapsed with a
+            // different unverified request (fail closed).
+            None => (
+                request_key(
+                    "unbindable",
+                    &json!({
+                        "title": title,
+                        "detail": detail,
+                        "reason": reason,
+                        "source": source.as_str(),
+                        "kind": format!("{kind:?}"),
+                        "now": now,
+                    }),
+                ),
+                false,
+            ),
         };
         let turn = match turn {
             Some(t) => Some(t),
@@ -1489,25 +1508,27 @@ impl Engine {
                 .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
             return Ok(r);
         }
-        if let Some(grant) = unused_grant(self.conn(), agent, channel, &key)? {
-            if source == PermissionSource::ChatTool {
-                // Asking ahead for something already approved: still approved,
-                // and still unused until the tool call itself runs.
-                return Ok(get(self.conn(), grant)?.expect("grant exists"));
+        if bindable {
+            if let Some(grant) = unused_grant(self.conn(), agent, channel, &key)? {
+                if source == PermissionSource::ChatTool {
+                    // Asking ahead for something already approved: still approved,
+                    // and still unused until the tool call itself runs.
+                    return Ok(get(self.conn(), grant)?.expect("grant exists"));
+                }
+                self.store.tx(|c| mark_used(c, grant, now))?;
+                let r = get(self.conn(), grant)?.expect("grant exists");
+                self.rt_note(
+                    agent,
+                    channel,
+                    format!("running {} (approved, #{grant})", short(title)),
+                );
+                self.effects
+                    .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
+                return Ok(r);
             }
-            self.store.tx(|c| mark_used(c, grant, now))?;
-            let r = get(self.conn(), grant)?.expect("grant exists");
-            self.rt_note(
-                agent,
-                channel,
-                format!("running {} (approved, #{grant})", short(title)),
-            );
-            self.effects
-                .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
-            return Ok(r);
-        }
-        if let Some(r) = pending_for(self.conn(), agent, channel, &key)? {
-            return Ok(r);
+            if let Some(r) = pending_for(self.conn(), agent, channel, &key)? {
+                return Ok(r);
+            }
         }
         let asked_of = self.route(channel, turn);
         let queued = outcome == ModeOutcome::Queue;
