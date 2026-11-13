@@ -1472,9 +1472,22 @@ impl Engine {
                 .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
             return Ok(r);
         }
-        // STRM-542: apply host-side approval mode. Reads are handled upstream.
+        // STRM-542/596/606: apply host-side approval mode. Defense-in-depth on
+        // the mediated path: delete/move must never be auto-allowed as edits, and
+        // structured edits may only become auto-allow-eligible in accept-edits
+        // with verified editable-root + execution-time enforcement prerequisites/
+        // evidence on the production path (none here). `yolo` explicitly allows
+        // everything. Fail closed outside `yolo`.
         let mode = self.effective_approval_mode(agent, channel);
         let outcome = mode_verdict(mode, kind);
+        let outcome = match (outcome, kind) {
+            (ModeOutcome::Allow, RequestKind::Edit | RequestKind::Delete | RequestKind::Move)
+                if mode != ApprovalMode::Yolo =>
+            {
+                ModeOutcome::AskHuman
+            }
+            (other, _) => other,
+        };
         if outcome == ModeOutcome::Allow {
             let r = self.store.tx(|c| {
                 insert(
