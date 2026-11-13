@@ -26,18 +26,33 @@
 //! never turns an agent red or fails its turn.
 //!
 //! **Mediated ACP requests (STRM-596/606, partial):** on the production
-//! `native_permission` path, requests are not auto-allowed merely because they
-//! look like reads/searches. Reads/local search and generic edit requests
-//! require human approval in both `ask-all` and `accept-edits` in this slice
-//! (generic edits fail closed in `accept-edits` until verified
-//! structured-edit/editable-root and execution-time enforcement prerequisites
-//! exist). Fetch and unknown/other requests require human approval in both
-//! modes. Execute requests require human approval in `ask-all` and remain queued
-//! for approval-gated command execution in `accept-edits` (preserved behavior,
-//! pending shell/command contract reconciliation). A native request for one of
-//! this app's named chat MCP tools is auto-approved and logged by its exact
-//! tool name. `yolo` allows mediated requests (recorded as auto-approved-by-
-//! mode). ACP mediation is not proof of complete class/profile protection.
+//! `native_permission` path, requests are classified and decided fail-closed
+//! (ACP mediation is not proof of complete mediation/enforcement). Generic ACP
+//! kinds, tool basenames, titles, and self-declared metadata are never treated
+//! as sufficient proof of safety or scope.
+//!
+//! - Reads/local search, generic structured edits, delete/move,
+//!   fetch/URL-open, execute/shell, unselected/unverified MCP, and
+//!   unknown/changed/mixed/unclassifiable operations require human approval in
+//!   both `ask-all` and `accept-edits` on this mediated path (except `yolo`,
+//!   which allows everything, recorded as auto-approved-by-mode). Execute in
+//!   `accept-edits` is queued for approval-gated command execution (not
+//!   auto-allowed); missing/uncapturable command/cwd fail closed for safe
+//!   execution capture.
+//! - Structured edits are never auto-allowed without verified editable-root
+//!   authorization and sufficient execution-time scope enforcement evidence for
+//!   the exact operation (unavailable in core today). Delete/move/mixed/
+//!   unclassifiable operations are never auto-allow-eligible as structured edits.
+//! - Request identity is bound by stable request keys where available; if
+//!   identity cannot be stably bound, the request fails closed (no prior-grant
+//!   reuse and no weak pending-key dedupe).
+//! - CC control-plane: scoped native actions may be auto-approved only by exact
+//!   tool identity (`chat_send`, `chat_react`, `chat_status`, `chat_refuse`,
+//!   `chat_dissent`, `chat_request_permission`); CC read/status tools and
+//!   policy/answer/unknown `chat_*` tools require human approval. This is
+//!   separate from "selected MCP" allowances (which require verifiable proof not
+//!   assumed here). No verified web-search/search-only or selected-MCP exceptions
+//!   are granted without verifiable production-path evidence.
 //!
 //! **Approval modes (STRM-542, evolving under STRM-596/606).** On the host,
 //! `ApprovalMode` and [`mode_verdict`] decide how a mediated request is handled.
@@ -526,14 +541,16 @@ fn has_conflicting_edit_kind_signal(v: &Value) -> bool {
     match v {
         Value::Object(m) => {
             // A structured operation-kind marker inside an edit-classified payload
-            // that indicates a conflicting, mixed, or unclassifiable operation
-            // shape must fail closed. `edit`/`read`/`search` markers are not
-            // treated as conflicting here; absence of evidence is not proof of a
-            // pure structured edit.
+            // that indicates a concrete conflicting/mixed operation shape must fail
+            // closed. `edit`/`read`/`search` markers are not treated as
+            // conflicting here; absence of evidence is not proof of a pure
+            // structured edit. Ambiguous generic markers like `other`/`unknown`
+            // are intentionally not used as signals to avoid false positives on
+            // arbitrary payload data.
             if let Some(Value::String(k)) = m.get("kind")
                 && matches!(
                     k.as_str(),
-                    "delete" | "move" | "execute" | "fetch" | "switch_mode" | "other" | "unknown"
+                    "delete" | "move" | "execute" | "fetch" | "switch_mode"
                 )
             {
                 return true;
@@ -2548,14 +2565,21 @@ mod tests {
             ),
             RequestKind::Edit
         );
-        // Any conflicting/unclassifiable operation-kind marker in structured
-        // payload detail is treated as mixed/unclassifiable (fail closed).
+        // Generic/ambiguous kind markers in arbitrary payload data are not, by
+        // themselves, treated as verifiable conflicting operation-kind signals.
         assert_eq!(
             effective_request_kind(
                 RequestKind::Edit,
                 Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"kind":"other"}}}}"#)
             ),
-            RequestKind::Other
+            RequestKind::Edit
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"kind":"unknown"}}}}"#)
+            ),
+            RequestKind::Edit
         );
     }
 }
