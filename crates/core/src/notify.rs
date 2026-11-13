@@ -79,22 +79,16 @@ fn line(c: &Connection, m: &Message, max: usize) -> String {
     } else {
         String::new()
     };
-    let edited = if m.edited_at.is_some() {
-        " [edited]"
-    } else {
-        ""
-    };
     let stance = match m.origin {
         Origin::Refusal => " [refused]",
         Origin::Dissent => " [dissent]",
         _ => "",
     };
     format!(
-        "#{} id:{}{}{}{} {}: {}{}{}",
+        "#{} id:{}{}{} {}: {}{}{}",
         m.seq,
         m.id,
         reply,
-        edited,
         stance,
         author_label(c, m),
         body,

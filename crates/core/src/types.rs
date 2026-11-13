@@ -216,14 +216,11 @@ pub struct Message {
     pub origin: Origin,
     pub body: Arc<str>,
     pub reply_to: Option<MessageId>,
-    /// Parsed once, at append time (and re-derived on edit), against the
-    /// channel's members.
+    /// Parsed once, at append time, against the channel's members.
     pub mentions: Vec<MemberId>,
     /// Agent-to-agent hop count (0 for humans; see `policy`).
     pub hop: u8,
     pub sent_at: Millis,
-    /// When the message body was last edited in place, if ever.
-    pub edited_at: Option<Millis>,
 }
 
 /// Why an agent was woken by a message.

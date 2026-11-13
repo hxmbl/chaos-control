@@ -80,16 +80,6 @@ pub enum StoreEvent {
         channel: Id,
         range: std::ops::Range<usize>,
     },
-    /// A message was edited in place.
-    Updated { channel: Id, index: usize },
-    /// Submitting an edit failed; the composer can restore the attempt.
-    EditFailed {
-        channel: Id,
-        core_id: ct::MessageId,
-        attempted: Arc<str>,
-        #[allow(dead_code)]
-        error: Arc<str>,
-    },
     /// Scroll to and highlight a message (from search). Follows `Selected` when
     /// the message is in another channel.
     Reveal { channel: Id, index: usize },
@@ -667,7 +657,6 @@ impl ChatStore {
             body: Arc::from(body),
             reply_to,
             stance: None,
-            edited_at: None,
         };
         self.append(self.selected, vec![message], cx);
     }
@@ -1702,93 +1691,6 @@ impl ChatStore {
         self.permissions = PermissionLog::default();
     }
 
-    fn core_to_model_message(&self, m: &ct::Message, attached: &Attached, channel: Id) -> Message {
-        let author = match m.author {
-            _ if m.origin == ct::Origin::System => Author::System,
-            None => Author::System,
-            Some(id)
-                if attached.link.agents.iter().any(|a| a.member == id)
-                    || attached.agent_ids.contains(&id) =>
-            {
-                Author::Agent(agent_id(id))
-            }
-            Some(_) => Author::Human,
-        };
-        let reply_to = m.reply_to.and_then(|r| {
-            let ix = *attached.seen.get(&r)?;
-            self.logs.get(&channel)?.get(ix).map(ReplyRef::to)
-        });
-        Message {
-            id: Id(CORE_MESSAGE_BASE.saturating_add(m.id.0 as u32)),
-            author,
-            sent_at: m.sent_at / 1000,
-            body: m.body.clone(),
-            reply_to,
-            stance: match m.origin {
-                ct::Origin::Refusal => Some(Stance::Refusal),
-                ct::Origin::Dissent => Some(Stance::Dissent),
-                _ => None,
-            },
-            edited_at: m.edited_at.map(|t| t / 1000),
-        }
-    }
-
-    /// The latest own human-authored composer message in the selected core
-    /// channel, if it can be edited from the composer.
-    pub fn editable_last_own_message(&self) -> Option<(usize, ct::MessageId, Arc<str>)> {
-        let attached = self.core.as_ref()?;
-        if attached.channel != self.selected {
-            return None;
-        }
-        let log = self.logs.get(&self.selected)?;
-        for ix in (0..log.len()).rev() {
-            let Some(message) = log.get(ix) else {
-                continue;
-            };
-            if !matches!(message.author, Author::Human) {
-                continue;
-            }
-            let id = core_message_id(message.id)?;
-            return Some((ix, id, message.body.clone()));
-        }
-        None
-    }
-
-    /// Edits a human-authored message in place through core.
-    pub fn edit_message(&mut self, core_id: ct::MessageId, body: &str, cx: &mut Context<Self>) {
-        let trimmed = body.trim();
-        if trimmed.is_empty() {
-            return;
-        }
-        let Some(attached) = &self.core else {
-            return;
-        };
-        if attached.channel != self.selected {
-            return;
-        }
-        let core = attached.link.core.clone();
-        let (author, channel) = (attached.link.human, attached.link.main());
-        let app_channel = self.selected;
-        let attempted: Arc<str> = Arc::from(body.to_string());
-        let body = trimmed.to_string();
-        cx.spawn(async move |this, cx| {
-            if let Err(e) = core.edit_message(author, channel, core_id, &body).await {
-                let error: Arc<str> = Arc::from(e.to_string());
-                this.update(cx, |store, cx| {
-                    store.system_note(&format!("Not edited: {error}"), cx);
-                    cx.emit(StoreEvent::EditFailed {
-                        channel: app_channel,
-                        core_id,
-                        attempted,
-                        error,
-                    });
-                })
-                .ok();
-            }
-        })
-        .detach();
-    }
-
     /// Folds one core event into the app's state.
     pub fn apply_core_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
         let Some(attached) = &self.core else {
@@ -1799,8 +1701,34 @@ impl ChatStore {
                 if m.channel != attached.link.main() || attached.seen.contains_key(&m.id) {
                     return;
                 }
+                let author = match m.author {
+                    _ if m.origin == ct::Origin::System => Author::System,
+                    None => Author::System,
+                    Some(id)
+                        if attached.link.agents.iter().any(|a| a.member == id)
+                            || attached.agent_ids.contains(&id) =>
+                    {
+                        Author::Agent(agent_id(id))
+                    }
+                    Some(_) => Author::Human,
+                };
                 let channel = attached.channel;
-                let message = self.core_to_model_message(&m, attached, channel);
+                let reply_to = m.reply_to.and_then(|r| {
+                    let ix = *attached.seen.get(&r)?;
+                    self.logs.get(&channel)?.get(ix).map(ReplyRef::to)
+                });
+                let message = Message {
+                    id: Id(CORE_MESSAGE_BASE.saturating_add(m.id.0 as u32)),
+                    author,
+                    sent_at: m.sent_at / 1000,
+                    body: m.body.clone(),
+                    reply_to,
+                    stance: match m.origin {
+                        ct::Origin::Refusal => Some(Stance::Refusal),
+                        ct::Origin::Dissent => Some(Stance::Dissent),
+                        _ => None,
+                    },
+                };
                 let ix = self.logs.get(&channel).map_or(0, |l| l.len());
                 // A receipt already past this message moves down onto it.
                 let moved: Vec<usize> = attached
@@ -1818,24 +1746,6 @@ impl ChatStore {
                     let rows = moved.into_iter().chain([ix]).collect();
                     cx.emit(StoreEvent::Receipts { channel, rows });
                 }
-            }
-            CoreEvent::MessageEdited(m) => {
-                if m.channel != attached.link.main() {
-                    return;
-                }
-                let Some(&ix) = attached.seen.get(&m.id) else {
-                    return;
-                };
-                let channel = attached.channel;
-                let message = self.core_to_model_message(&m, attached, channel);
-                if let Some(slot) = self.logs.get_mut(&channel).and_then(|l| l.get_mut(ix)) {
-                    *slot = message;
-                }
-                if let Some(attached) = &mut self.core {
-                    attached.by_seq.insert(m.seq, ix);
-                }
-                cx.emit(StoreEvent::Updated { channel, index: ix });
-                cx.notify();
             }
             CoreEvent::Read(r) => {
                 if r.channel != attached.link.main() || r.member == attached.link.human {
@@ -2106,7 +2016,6 @@ impl ChatStore {
             body: Arc::from(body),
             reply_to: None,
             stance: None,
-            edited_at: None,
         };
         self.append(self.selected, vec![message], cx);
     }

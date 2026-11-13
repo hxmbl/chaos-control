@@ -178,8 +178,6 @@ pub struct Message {
     /// Set when the message states a refusal or a dissent (a peer's "no" or
     /// "I disagree"). Drawn distinctly but quietly; never as an error.
     pub stance: Option<Stance>,
-    /// When the message was last edited, seconds since the Unix epoch.
-    pub edited_at: Option<u64>,
 }
 
 /// A peer's position on the message it replies to.
@@ -252,11 +250,6 @@ impl ChannelLog {
         let start = messages.len();
         messages.extend(batch);
         start..messages.len()
-    }
-
-    /// Mutable access to one message, copying the backing store if shared.
-    pub fn get_mut(&mut self, ix: usize) -> Option<&mut Message> {
-        Arc::make_mut(&mut self.messages).get_mut(ix)
     }
 
     /// The whole history as it is now, for reading off the UI thread.
