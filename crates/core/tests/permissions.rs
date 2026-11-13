@@ -737,6 +737,99 @@ async fn shell_execute_requires_human_approval_in_ask_all_and_accept_edits() {
     }
 }
 
+/// CC-internal control-plane read/status tools require human approval in both
+/// `ask-all` and `accept-edits` when requested natively (separate from selected
+/// MCP exceptions; STRM-596/606). Scoped control-plane action tools remain
+/// auto-approved by exact CC identity on this path. Over ACP v1/v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn control_plane_read_tools_require_approval_while_scoped_actions_are_auto_allowed() {
+    let read_tools = [
+        "chat_context",
+        "chat_read",
+        "chat_search",
+        "chat_permission_status",
+        "chat_approval_mode_status",
+    ];
+    for protocol in [1, 2] {
+        for mode in [ApprovalMode::AskAll, ApprovalMode::AcceptEdits] {
+            let mut h = Harness::new().await;
+            let mut steps: Vec<serde_json::Value> = read_tools
+                .iter()
+                .map(|name| {
+                    json!({"permission_kind": {"title": "a tool", "name": name, "kind": "execute"}})
+                })
+                .collect();
+            steps.push(json!({"permission_kind": {"title": "a tool", "name": "chat_react", "kind": "execute"}}));
+            steps.push(json!({"text": "Done."}));
+            let bot = h
+                .agent(
+                    "bot",
+                    script(json!({"protocol": protocol, "turns": [{"steps": steps}]})),
+                )
+                .await;
+            h.core.set_approval_mode(bot.id, mode).await.unwrap();
+            h.say("@bot run control-plane tools").await;
+
+            let outcomes = wait_outcomes(&h, "bot", read_tools.len() + 1).await;
+            for (ix, name) in read_tools.iter().enumerate() {
+                assert_eq!(
+                    picked(&outcomes[ix]),
+                    &json!("deny"),
+                    "{name} should require approval, v{protocol}, {mode:?}: {}",
+                    outcomes[ix]
+                );
+                assert_eq!(
+                    outcomes[ix]["_meta"]["chaosControl"]["status"],
+                    json!("request_sent"),
+                    "{name}, v{protocol}, {mode:?}: {}",
+                    outcomes[ix]
+                );
+            }
+            assert_eq!(
+                picked(&outcomes[read_tools.len()]),
+                &json!("allow"),
+                "chat_react scoped action should be auto-allowed, v{protocol}, {mode:?}: {}",
+                outcomes[read_tools.len()]
+            );
+            assert!(
+                outcomes[read_tools.len()].get("_meta").is_none()
+                    || outcomes[read_tools.len()]["_meta"]
+                        .get("chaosControl")
+                        .is_none(),
+                "chat_react should not be sent for human approval, v{protocol}, {mode:?}: {}",
+                outcomes[read_tools.len()]
+            );
+
+            h.wait_message("turn completed", Some(bot.id)).await;
+
+            let pending = h.core.pending_permissions(h.main).await.unwrap();
+            assert_eq!(
+                pending.len(),
+                read_tools.len(),
+                "v{protocol}, {mode:?}: {pending:#?}"
+            );
+            assert!(pending.iter().all(|r| r.state == PermissionState::Pending));
+            assert_eq!(
+                pending.iter().map(|r| r.title.as_ref()).collect::<Vec<_>>(),
+                read_tools.to_vec(),
+                "v{protocol}, {mode:?}"
+            );
+
+            let log = h.core.permission_log(h.main, 50).await.unwrap();
+            let react = log
+                .iter()
+                .find(|r| r.title.as_ref() == "chat_react")
+                .expect("chat_react logged");
+            assert_eq!(react.state, PermissionState::AutoApproved);
+            assert!(
+                log.iter()
+                    .filter(|r| read_tools.contains(&r.title.as_ref()))
+                    .all(|r| r.state == PermissionState::Pending)
+            );
+        }
+    }
+}
+
 /// In `accept-edits`, mediated `fetch` and unknown/`other` requests (ACP v1/v2)
 /// must reach the human approval flow: pending requests with request_sent
 /// responses, not auto-approved, not silently allowed, and not queued for
