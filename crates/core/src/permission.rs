@@ -461,13 +461,38 @@ pub fn is_auto_allowed_cc_control_plane_tool(name: &str) -> bool {
     AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name.trim())
 }
 
+/// Execution-time evidence for a mediated structured edit on the production
+/// path (STRM-596/606). Auto-allow eligibility in `accept-edits` requires
+/// explicit editable-root authorization and sufficient execution-time scope
+/// enforcement evidence for the exact operation. Core has no verified evidence
+/// on this path today and must fail closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StructuredEditEvidence {
+    /// No verified editable-root/scope-enforcement evidence available.
+    #[default]
+    Unverified,
+    /// Verified prerequisites are satisfied for this exact operation.
+    /// (Not constructible on the current core production path.)
+    #[doc(hidden)]
+    _Verified,
+}
+
+impl StructuredEditEvidence {
+    /// Whether verified prerequisites allow a structured edit to be considered
+    /// for auto-allow in `accept-edits` (subject to mode and kind rules).
+    pub fn allows_auto_edit(self) -> bool {
+        matches!(self, Self::_Verified)
+    }
+}
+
 /// Verified prerequisites required before a mediated structured edit could be
 /// auto-allow-eligible in `accept-edits` on the production path (STRM-596/606):
 /// explicit editable-root authorization and sufficient execution-time scope
 /// enforcement evidence for the exact operation. Core does not have verified
 /// evidence on this path today; callers must fail closed.
 pub fn structured_edit_prerequisites_verified() -> bool {
-    false
+    StructuredEditEvidence::Unverified.allows_auto_edit()
 }
 
 /// Conservative fail-closed refinement for mediated classification: if an
@@ -531,6 +556,18 @@ fn has_conflicting_edit_kind_signal(v: &Value) -> bool {
 /// command execution (preserved behavior) rather than auto-allowed. `yolo`
 /// allows everything.
 pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
+    mode_verdict_with_edit_evidence(mode, kind, StructuredEditEvidence::Unverified)
+}
+
+/// Like [`mode_verdict`], but parameterized by verified structured-edit
+/// evidence. No verified evidence exists on the current core production path;
+/// callers must pass [`StructuredEditEvidence::Unverified`] unless they can
+/// prove prerequisites for the exact operation.
+pub fn mode_verdict_with_edit_evidence(
+    mode: ApprovalMode,
+    kind: RequestKind,
+    edit_evidence: StructuredEditEvidence,
+) -> ModeOutcome {
     match mode {
         ApprovalMode::AskAll => ModeOutcome::AskHuman,
         ApprovalMode::AcceptEdits => match kind {
@@ -540,9 +577,10 @@ pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
             | RequestKind::Move
             | RequestKind::Fetch
             | RequestKind::Other => {
-                // Structured edits are only potentially auto-allow-eligible with
-                // verified prerequisites; no evidence exists on this path.
-                if kind == RequestKind::Edit && structured_edit_prerequisites_verified() {
+                // Only a pure structured edit with verified prerequisites may
+                // become auto-allow-eligible; delete/move/mixed/unclassifiable
+                // never qualify.
+                if kind == RequestKind::Edit && edit_evidence.allows_auto_edit() {
                     ModeOutcome::Allow
                 } else {
                     ModeOutcome::AskHuman
@@ -1569,7 +1607,8 @@ impl Engine {
         // evidence on the production path (none here). `yolo` explicitly allows
         // everything. Fail closed outside `yolo`.
         let mode = self.effective_approval_mode(agent, channel);
-        let outcome = mode_verdict(mode, kind);
+        let outcome =
+            mode_verdict_with_edit_evidence(mode, kind, StructuredEditEvidence::Unverified);
         let outcome = match (outcome, kind) {
             (ModeOutcome::Allow, RequestKind::Edit | RequestKind::Delete | RequestKind::Move)
                 if mode != ApprovalMode::Yolo =>
@@ -2400,6 +2439,47 @@ mod tests {
             !structured_edit_prerequisites_verified(),
             "core must not claim verified editable-root/execution-time evidence"
         );
+        assert!(!StructuredEditEvidence::Unverified.allows_auto_edit());
+        // Evidence-gated verdict: only a verified pure structured edit may be
+        // auto-allow-eligible in accept-edits; delete/move/others never.
+        assert_eq!(
+            mode_verdict_with_edit_evidence(
+                ApprovalMode::AcceptEdits,
+                RequestKind::Edit,
+                StructuredEditEvidence::Unverified
+            ),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict_with_edit_evidence(
+                ApprovalMode::AcceptEdits,
+                RequestKind::Edit,
+                StructuredEditEvidence::_Verified
+            ),
+            ModeOutcome::Allow
+        );
+        for kind in [
+            RequestKind::Delete,
+            RequestKind::Move,
+            RequestKind::Other,
+            RequestKind::Read,
+            RequestKind::Fetch,
+            RequestKind::Execute,
+        ] {
+            assert_eq!(
+                mode_verdict_with_edit_evidence(
+                    ApprovalMode::AcceptEdits,
+                    kind,
+                    StructuredEditEvidence::_Verified
+                ),
+                if kind == RequestKind::Execute {
+                    ModeOutcome::Queue
+                } else {
+                    ModeOutcome::AskHuman
+                },
+                "non-edit kinds must never become auto-allow-eligible edits: {kind:?}"
+            );
+        }
     }
 
     #[test]
