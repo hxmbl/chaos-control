@@ -712,6 +712,20 @@ impl Core {
         .map_err(PostError::Store)?
     }
 
+    /// Edits a human-authored message in place (see [`Engine::edit_message`]).
+    pub async fn edit_message(
+        &self,
+        author: MemberId,
+        channel: ChannelId,
+        message: MessageId,
+        body: &str,
+    ) -> Result<Message, crate::engine::EditError> {
+        let body = body.to_string();
+        self.with_engine(move |e, now| e.edit_message(now, author, channel, message, &body))
+            .await
+            .map_err(crate::engine::EditError::Store)?
+    }
+
     /// Adds (`add`) or removes `member`'s reaction. Idempotent, and never a
     /// wake (see [`Engine::react`]).
     pub async fn react(

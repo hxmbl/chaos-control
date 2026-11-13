@@ -401,6 +401,7 @@ mod tests {
             body: Arc::from(body),
             reply_to: None,
             stance: None,
+            edited_at: None,
         }
     }
 
