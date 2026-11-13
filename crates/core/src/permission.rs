@@ -305,16 +305,6 @@ pub enum RequestKind {
     Other,
 }
 
-/// Whether a mediated request qualifies for a verified automatic exception
-/// (STRM-596/606). Currently always `false` (fail closed): "verified web-search
-/// (search-only)" and "explicitly selected MCP server/tool identity" allowances
-/// require verifiable identity/scope/search-only proof on the production path;
-/// absent that proof, no exception is granted. Generic ACP kinds, tool
-/// basenames, titles, and self-declared metadata are never sufficient.
-fn verified_exception_allowed(_ask: &PermissionAsk) -> bool {
-    false
-}
-
 /// What a mode does with one incoming request (STRM-542).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModeOutcome {
@@ -1310,10 +1300,9 @@ impl Engine {
         // STRM-596/606: URL fetch/open, unselected MCP, and unknown/changed
         // identities must be asked in both modes. Verified web-search (search-only)
         // and explicitly selected MCP allowances require verifiable proof on the
-        // production path; without it, no automatic exception is granted. Generic
-        // ACP kinds, tool basenames, titles, and self-declared metadata are never
-        // sufficient (fail closed).
-        let _verified_exception = verified_exception_allowed(&ask);
+        // production path; without that proof, no automatic exception is granted.
+        // Generic ACP kinds, tool basenames, titles, and self-declared metadata
+        // are never sufficient (fail closed).
         match self.ask_permission(
             now,
             agent,
