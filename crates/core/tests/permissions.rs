@@ -1186,6 +1186,8 @@ async fn non_allowlisted_and_policy_cc_tools_require_human_approval() {
         "chat_answer_permission",
         "chat_set_approval_mode",
         "chat_unknown_control_plane_tool",
+        " chat_send",
+        "chat_react ",
     ];
     for protocol in [1, 2] {
         for mode in [ApprovalMode::AskAll, ApprovalMode::AcceptEdits] {
@@ -1232,9 +1234,12 @@ async fn non_allowlisted_and_policy_cc_tools_require_human_approval() {
             assert!(pending.iter().all(|r| r.state == PermissionState::Pending));
             let mut titles: Vec<&str> = pending.iter().map(|r| r.title.as_ref()).collect();
             titles.sort_unstable();
-            let mut expected = tools.to_vec();
+            let mut expected: Vec<&str> = tools.iter().map(|t| t.trim()).collect();
             expected.sort_unstable();
-            assert_eq!(titles, expected, "v{protocol}, {mode:?}");
+            assert_eq!(
+                titles, expected,
+                "exact identity required (padded names must not auto-allow), v{protocol}, {mode:?}"
+            );
 
             let log = h.core.permission_log(h.main, 50).await.unwrap();
             assert!(
