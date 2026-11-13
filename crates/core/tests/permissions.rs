@@ -590,6 +590,94 @@ async fn named_chat_tools_are_auto_allowed_and_logged_by_name() {
     }
 }
 
+/// Shell/execute requests (including read-only-looking commands) require human
+/// approval in both `ask-all` and `accept-edits` (STRM-596). In `ask-all`
+/// approval yields a one-shot retry grant; in `accept-edits` execute is queued
+/// for approval-gated command execution (not auto-allowed). Over ACP v1/v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_execute_requires_human_approval_in_ask_all_and_accept_edits() {
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    for protocol in [1, 2] {
+        for mode in [ApprovalMode::AskAll, ApprovalMode::AcceptEdits] {
+            let mut h = Harness::new().await;
+            let cmd = json!({"permission_kind": {
+                "title": "ls -la",
+                "kind": "execute",
+                "raw_input": {"command": "ls -la", "cwd": cwd}
+            }});
+            let bot = h
+                .agent(
+                    "bot",
+                    script(json!({"protocol": protocol, "turns": [
+                        {"steps": [cmd.clone(), {"text": "Asked."}]},
+                        {"steps": [cmd.clone(), {"text": "Done."}]}
+                    ]})),
+                )
+                .await;
+            h.core.set_approval_mode(bot.id, mode).await.unwrap();
+
+            h.say("@bot list files").await;
+            let req = wait_request(&mut h, PermissionState::Pending).await;
+            assert_eq!(&*req.title, "ls -la", "v{protocol}, {mode:?}");
+            let first = wait_outcomes(&h, "bot", 1).await;
+            assert_eq!(
+                picked(&first[0]),
+                &json!("deny"),
+                "v{protocol}, {mode:?}: {}",
+                first[0]
+            );
+            assert_eq!(
+                first[0]["_meta"]["chaosControl"]["status"],
+                json!("request_sent"),
+                "v{protocol}, {mode:?}: {}",
+                first[0]
+            );
+            h.wait_message("first turn", Some(bot.id)).await;
+
+            let stored = h
+                .core
+                .with_engine(move |e, _| chaos_core::permission::get(e.conn(), req.id).unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            match mode {
+                ApprovalMode::AskAll => {
+                    assert_eq!(stored.run_state, None, "v{protocol}");
+                }
+                ApprovalMode::AcceptEdits => {
+                    // Queued for approval-gated execution, not auto-allowed.
+                    assert_eq!(
+                        stored.run_state.as_deref(),
+                        Some("queued"),
+                        "v{protocol}: {stored:#?}"
+                    );
+                }
+                ApprovalMode::Yolo => unreachable!(),
+            }
+
+            // Deny: no grant/execution; retry is a new pending request.
+            h.core
+                .answer_permission(req.id, h.hx.id, false, None)
+                .await
+                .unwrap();
+            let all = wait_outcomes(&h, "bot", 2).await;
+            assert_eq!(
+                picked(&all[1]),
+                &json!("deny"),
+                "v{protocol}, {mode:?}: {}",
+                all[1]
+            );
+            assert_ne!(
+                all[1]["_meta"]["chaosControl"]["requestId"],
+                json!(req.id.0),
+                "v{protocol}, {mode:?}"
+            );
+            let pending = h.core.pending_permissions(h.main).await.unwrap();
+            assert!(!pending.is_empty(), "v{protocol}, {mode:?}");
+        }
+    }
+}
+
 /// In `accept-edits`, mediated `fetch` and unknown/`other` requests (ACP v1/v2)
 /// must reach the human approval flow: pending requests with request_sent
 /// responses, not auto-approved, not silently allowed, and not queued for

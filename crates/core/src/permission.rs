@@ -452,10 +452,10 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
 /// until structured-edit/editable-root and sufficient execution-time scope
 /// enforcement evidence are available in production; absent those prerequisites,
 /// fail closed to human approval. Fetch and unknown/other operations require
-/// human approval in both modes on this mediated path. Execute remains queued in
-/// `accept-edits` in this slice to preserve existing approval-gated command
-/// execution behavior pending explicit shell/command contract reconciliation.
-/// `yolo` allows everything.
+/// human approval in both modes on this mediated path. Execute (shell/commands,
+/// including read-only-looking commands) requires human approval in both modes;
+/// in `accept-edits` it is queued for approval-gated command execution
+/// (preserved behavior) rather than auto-allowed. `yolo` allows everything.
 pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
     match mode {
         ApprovalMode::AskAll => ModeOutcome::AskHuman,
