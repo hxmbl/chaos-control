@@ -1246,6 +1246,85 @@ async fn non_allowlisted_and_policy_cc_tools_require_human_approval() {
     }
 }
 
+/// Unknown/unsupported ACP wire kinds (e.g. `switch_mode`, `think`) and missing
+/// kinds are treated as unclassifiable on the mediated path and require human
+/// approval in both `ask-all` and `accept-edits` (STRM-596/606). `yolo` allows.
+/// Over ACP v1/v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_and_unsupported_wire_kinds_require_human_approval() {
+    let kinds = ["switch_mode", "think", "mystery_kind"];
+    for protocol in [1, 2] {
+        for wire_kind in kinds {
+            for mode in [
+                ApprovalMode::AskAll,
+                ApprovalMode::AcceptEdits,
+                ApprovalMode::Yolo,
+            ] {
+                let mut h = Harness::new().await;
+                let step = json!({"permission_kind": {
+                    "title": format!("Tool ({wire_kind})"),
+                    "kind": wire_kind
+                }});
+                let bot = h
+                    .agent(
+                        "bot",
+                        script(json!({"protocol": protocol, "turns": [{
+                            "steps": [step, {"text": "Asked."}]
+                        }]})),
+                    )
+                    .await;
+                h.core.set_approval_mode(bot.id, mode).await.unwrap();
+                h.say("@bot do unknown-kind op").await;
+
+                if mode == ApprovalMode::Yolo {
+                    let outcomes = wait_outcomes(&h, "bot", 1).await;
+                    assert_eq!(
+                        picked(&outcomes[0]),
+                        &json!("allow"),
+                        "yolo, v{protocol}, kind={wire_kind}: {}",
+                        outcomes[0]
+                    );
+                    h.wait_message("turn completed", Some(bot.id)).await;
+                    assert!(h.core.pending_permissions(h.main).await.unwrap().is_empty());
+                    continue;
+                }
+
+                let pending = wait_request(&mut h, PermissionState::Pending).await;
+                assert_eq!(
+                    &*pending.title,
+                    format!("Tool ({wire_kind})"),
+                    "v{protocol}, {mode:?}, kind={wire_kind}"
+                );
+                assert!(
+                    pending.run_state.is_none() && pending.command.is_none(),
+                    "unclassifiable kind must not be queued as command execution, v{protocol}, {mode:?}, {wire_kind}: {pending:#?}"
+                );
+                let outcomes = wait_outcomes(&h, "bot", 1).await;
+                assert_eq!(
+                    picked(&outcomes[0]),
+                    &json!("deny"),
+                    "v{protocol}, {mode:?}, kind={wire_kind}: {}",
+                    outcomes[0]
+                );
+                assert_eq!(
+                    outcomes[0]["_meta"]["chaosControl"]["status"],
+                    json!("request_sent"),
+                    "v{protocol}, {mode:?}, kind={wire_kind}: {}",
+                    outcomes[0]
+                );
+                h.wait_message("turn completed", Some(bot.id)).await;
+                let all_pending = h.core.pending_permissions(h.main).await.unwrap();
+                assert_eq!(
+                    all_pending.len(),
+                    1,
+                    "v{protocol}, {mode:?}, kind={wire_kind}: {all_pending:#?}"
+                );
+                assert_eq!(all_pending[0].state, PermissionState::Pending);
+            }
+        }
+    }
+}
+
 /// Edit-classified mediated requests that carry verifiable conflicting/mixed
 /// operation-kind signals in structured payload detail are treated as
 /// unclassifiable (fail closed) and require human approval in both modes. They
