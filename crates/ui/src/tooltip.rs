@@ -5,7 +5,7 @@ use gpui::{
 
 use crate::{
     ActiveTheme, FONT_FAMILY, TypeStyleExt,
-    tokens::{radius, space, text},
+    tokens::{Elevation, radius, space, text},
 };
 
 /// Wrap long tooltips rather than letting them run across the window.
@@ -27,8 +27,11 @@ impl Tooltip {
 impl Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.theme();
-        // Inverted chip so it reads on either sidebar surface.
-        // No shadow: the inverted chip already separates itself.
+        // Same recipe as the composer's mention menu: a raised surface with a
+        // border and an overlay shadow, so it follows the theme. The border is
+        // `line_strong` because tooltips often sit over a `surface` panel. The
+        // old inverted chip (ink fill, surface text) became a bright white
+        // block in dark mode.
         div().pl(space::X2).pt(space::X1_5).child(
             div()
                 .font_family(FONT_FAMILY)
@@ -37,8 +40,11 @@ impl Render for Tooltip {
                 .py(space::X1)
                 .max_w(MAX_W)
                 .rounded(radius::SM)
-                .bg(t.ink)
-                .text_color(t.surface)
+                .bg(t.surface)
+                .border_1()
+                .border_color(t.line_strong)
+                .shadow(t.elevation(Elevation::Overlay))
+                .text_color(t.ink)
                 .child(self.text.clone()),
         )
     }
