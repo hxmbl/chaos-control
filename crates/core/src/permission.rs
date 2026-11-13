@@ -289,19 +289,23 @@ pub enum PermissionVerdict {
     Decline,
 }
 
-/// What kind of operation a permission request is for (STRM-542).
+/// What kind of operation a permission request is for (STRM-542/STRM-606).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestKind {
     /// A read-only operation (file read, search).
     Read,
-    /// An edit operation (file write, delete, move).
+    /// A structured edit operation (file write/change).
     Edit,
+    /// A delete operation.
+    Delete,
+    /// A move/rename operation.
+    Move,
     /// A command execution.
     Execute,
     /// A fetch operation (HTTP, etc.).
     Fetch,
-    /// Some other kind of operation.
+    /// Some other, mixed, or unclassifiable operation.
     Other,
 }
 
@@ -432,11 +436,15 @@ pub fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "read" | "search")
 }
 
-/// Maps an ACP wire tool kind to a [`RequestKind`] (STRM-542).
+/// Maps an ACP wire tool kind to a [`RequestKind`] (STRM-542/STRM-606).
+/// Delete/move are classified explicitly (never as auto-allow-eligible edits);
+/// unknown/missing kinds are treated as other/unclassifiable and fail closed.
 pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
     match kind {
         Some("read" | "search") => RequestKind::Read,
-        Some("edit" | "delete" | "move") => RequestKind::Edit,
+        Some("edit") => RequestKind::Edit,
+        Some("delete") => RequestKind::Delete,
+        Some("move") => RequestKind::Move,
         Some("execute") => RequestKind::Execute,
         Some("fetch") => RequestKind::Fetch,
         _ => RequestKind::Other,
@@ -448,21 +456,27 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
 ///
 /// Contract (STRM-596, mediated): ordinary/private/out-of-workspace reads and
 /// local search require human approval in both `ask-all` and `accept-edits`.
-/// Generic edit requests are not auto-approved in `accept-edits` on this path
-/// until structured-edit/editable-root and sufficient execution-time scope
-/// enforcement evidence are available in production; absent those prerequisites,
-/// fail closed to human approval. Fetch and unknown/other operations require
-/// human approval in both modes on this mediated path. Execute (shell/commands,
-/// including read-only-looking commands) requires human approval in both modes;
-/// in `accept-edits` it is queued for approval-gated command execution
-/// (preserved behavior) rather than auto-allowed. `yolo` allows everything.
+/// Generic structured edit requests are not auto-approved in `accept-edits` on
+/// this path until structured-edit/editable-root and sufficient execution-time
+/// scope enforcement evidence are available in production; absent those
+/// prerequisites, fail closed to human approval. Delete, move, and
+/// other/mixed/unclassifiable operations require human approval in both modes
+/// and are never treated as auto-allow-eligible edits. Fetch and
+/// unknown/other operations require human approval in both modes. Execute
+/// (shell/commands, including read-only-looking commands) requires human
+/// approval in both modes; in `accept-edits` it is queued for approval-gated
+/// command execution (preserved behavior) rather than auto-allowed. `yolo`
+/// allows everything.
 pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
     match mode {
         ApprovalMode::AskAll => ModeOutcome::AskHuman,
         ApprovalMode::AcceptEdits => match kind {
-            RequestKind::Read | RequestKind::Edit | RequestKind::Fetch | RequestKind::Other => {
-                ModeOutcome::AskHuman
-            }
+            RequestKind::Read
+            | RequestKind::Edit
+            | RequestKind::Delete
+            | RequestKind::Move
+            | RequestKind::Fetch
+            | RequestKind::Other => ModeOutcome::AskHuman,
             RequestKind::Execute => ModeOutcome::Queue,
         },
         ApprovalMode::Yolo => ModeOutcome::Allow,
@@ -2155,59 +2169,62 @@ mod tests {
     fn mode_verdict_covers_all_kinds() {
         use super::{ModeOutcome, RequestKind, mode_verdict};
         use crate::types::ApprovalMode;
-        assert_eq!(
-            mode_verdict(ApprovalMode::AskAll, RequestKind::Read),
-            ModeOutcome::AskHuman
-        );
-        assert_eq!(
-            mode_verdict(ApprovalMode::AskAll, RequestKind::Edit),
-            ModeOutcome::AskHuman
-        );
-        assert_eq!(
-            mode_verdict(ApprovalMode::AskAll, RequestKind::Execute),
-            ModeOutcome::AskHuman
-        );
-        assert_eq!(
-            mode_verdict(ApprovalMode::AskAll, RequestKind::Fetch),
-            ModeOutcome::AskHuman
-        );
-        assert_eq!(
-            mode_verdict(ApprovalMode::AskAll, RequestKind::Other),
-            ModeOutcome::AskHuman
-        );
+        for kind in [
+            RequestKind::Read,
+            RequestKind::Edit,
+            RequestKind::Delete,
+            RequestKind::Move,
+            RequestKind::Execute,
+            RequestKind::Fetch,
+            RequestKind::Other,
+        ] {
+            assert_eq!(
+                mode_verdict(ApprovalMode::AskAll, kind),
+                ModeOutcome::AskHuman
+            );
+        }
 
-        // STRM-596/606: reads/local search and generic edits require human
-        // approval in both ask-all and accept-edits on the mediated path until
-        // contract prerequisites for automatic edit approval are available.
-        assert_eq!(
-            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Read),
-            ModeOutcome::AskHuman
-        );
-        assert_eq!(
-            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Edit),
-            ModeOutcome::AskHuman
-        );
+        // STRM-596/606: reads/local search, generic structured edits,
+        // delete/move, fetch, and other/mixed/unclassifiable operations require
+        // human approval in both ask-all and accept-edits on the mediated path
+        // (edits/delete/move fail closed until verified prerequisites exist).
+        for kind in [
+            RequestKind::Read,
+            RequestKind::Edit,
+            RequestKind::Delete,
+            RequestKind::Move,
+            RequestKind::Fetch,
+            RequestKind::Other,
+        ] {
+            assert_eq!(
+                mode_verdict(ApprovalMode::AcceptEdits, kind),
+                ModeOutcome::AskHuman
+            );
+        }
         assert_eq!(
             mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Execute),
             ModeOutcome::Queue
-        );
-        assert_eq!(
-            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Fetch),
-            ModeOutcome::AskHuman
-        );
-        assert_eq!(
-            mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Other),
-            ModeOutcome::AskHuman
         );
 
         for k in [
             RequestKind::Read,
             RequestKind::Edit,
+            RequestKind::Delete,
+            RequestKind::Move,
             RequestKind::Execute,
             RequestKind::Fetch,
             RequestKind::Other,
         ] {
             assert_eq!(mode_verdict(ApprovalMode::Yolo, k), ModeOutcome::Allow);
         }
+    }
+
+    #[test]
+    fn request_kind_from_wire_distinguishes_delete_and_move() {
+        assert_eq!(request_kind_from_wire(Some("edit")), RequestKind::Edit);
+        assert_eq!(request_kind_from_wire(Some("delete")), RequestKind::Delete);
+        assert_eq!(request_kind_from_wire(Some("move")), RequestKind::Move);
+        assert_eq!(request_kind_from_wire(Some("unknown")), RequestKind::Other);
+        assert_eq!(request_kind_from_wire(None), RequestKind::Other);
     }
 }

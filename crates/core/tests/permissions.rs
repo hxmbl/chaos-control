@@ -649,6 +649,118 @@ async fn unverified_fetch_search_like_requests_require_human_approval() {
     }
 }
 
+/// Delete, move, and unclassifiable operations require human approval in both
+/// `ask-all` and `accept-edits` (STRM-596/606). They must not be auto-approved
+/// or treated as auto-allow-eligible edits, and are not queued for command
+/// execution. Denial grants nothing; approval is one-shot. Over ACP v1/v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_move_and_unclassifiable_require_human_approval_with_one_shot_lifecycle() {
+    for protocol in [1, 2] {
+        for mode in [ApprovalMode::AskAll, ApprovalMode::AcceptEdits] {
+            let mut h = Harness::new().await;
+            let delete = json!({"permission_kind": {"title": "Delete build/", "kind": "delete"}});
+            let mv = json!({"permission_kind": {"title": "Move a.rs to b.rs", "kind": "move"}});
+            let unclass = json!({"permission_kind": {"title": "Mystery op", "kind": "mystery"}});
+            let bot = h
+                .agent(
+                    "bot",
+                    script(json!({"protocol": protocol, "turns": [
+                        {"steps": [delete.clone(), mv.clone(), unclass.clone(), {"text": "Asked."}]},
+                        {"steps": [delete.clone(), delete.clone(), {"text": "Done."}]}
+                    ]})),
+                )
+                .await;
+            h.core.set_approval_mode(bot.id, mode).await.unwrap();
+
+            h.say("@bot do risky ops").await;
+            let req_delete = wait_request(&mut h, PermissionState::Pending).await;
+            let req_move = wait_request(&mut h, PermissionState::Pending).await;
+            let req_unclass = wait_request(&mut h, PermissionState::Pending).await;
+            assert_eq!(&*req_delete.title, "Delete build/", "v{protocol}, {mode:?}");
+            assert_eq!(
+                &*req_move.title, "Move a.rs to b.rs",
+                "v{protocol}, {mode:?}"
+            );
+            assert_eq!(&*req_unclass.title, "Mystery op", "v{protocol}, {mode:?}");
+            for req in [&req_delete, &req_move, &req_unclass] {
+                assert_eq!(req.state, PermissionState::Pending);
+                assert!(
+                    req.run_state.is_none() && req.command.is_none(),
+                    "not auto-allowed/queued-as-allowed, v{protocol}, {mode:?}: {req:#?}"
+                );
+            }
+
+            let first = wait_outcomes(&h, "bot", 3).await;
+            for (ix, what) in [(0, "delete"), (1, "move"), (2, "unclassifiable")] {
+                assert_eq!(
+                    picked(&first[ix]),
+                    &json!("deny"),
+                    "{what}, v{protocol}, {mode:?}: {}",
+                    first[ix]
+                );
+                assert_eq!(
+                    first[ix]["_meta"]["chaosControl"]["status"],
+                    json!("request_sent"),
+                    "{what}, v{protocol}, {mode:?}: {}",
+                    first[ix]
+                );
+            }
+
+            h.wait_message("first turn", Some(bot.id)).await;
+
+            // Deny move/unclassifiable (no grant), approve delete once.
+            h.core
+                .answer_permission(req_move.id, h.hx.id, false, None)
+                .await
+                .unwrap();
+            h.core
+                .answer_permission(req_unclass.id, h.hx.id, false, None)
+                .await
+                .unwrap();
+            h.core
+                .answer_permission(req_delete.id, h.hx.id, true, None)
+                .await
+                .unwrap();
+
+            let all = wait_outcomes(&h, "bot", 5).await;
+            // Exact retry of approved delete: allowed once.
+            assert_eq!(
+                picked(&all[3]),
+                &json!("allow"),
+                "delete retry, v{protocol}, {mode:?}: {}",
+                all[3]
+            );
+            // Second identical delete retry after grant consumed: new pending request.
+            assert_eq!(
+                picked(&all[4]),
+                &json!("deny"),
+                "delete again, v{protocol}, {mode:?}: {}",
+                all[4]
+            );
+            assert_ne!(
+                all[4]["_meta"]["chaosControl"]["requestId"],
+                json!(req_delete.id.0),
+                "v{protocol}, {mode:?}"
+            );
+
+            h.until("approved delete grant used", move |c| {
+                c.query_row(
+                    "SELECT used_at IS NOT NULL FROM permission_requests WHERE id = ?1",
+                    [req_delete.id.0],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            })
+            .await;
+
+            let pending = h.core.pending_permissions(h.main).await.unwrap();
+            assert_eq!(pending.len(), 1, "v{protocol}, {mode:?}: {pending:#?}");
+            assert_eq!(&*pending[0].title, "Delete build/");
+            assert!(pending[0].run_state.is_none() && pending[0].command.is_none());
+        }
+    }
+}
+
 /// Shell/execute requests (including read-only-looking commands) require human
 /// approval in both `ask-all` and `accept-edits` (STRM-596). In `ask-all`
 /// approval yields a one-shot retry grant; in `accept-edits` execute is queued
