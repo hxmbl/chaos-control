@@ -456,9 +456,9 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
 /// True when `name` is an exact CC control-plane chat tool name eligible for
 /// scoped native auto-approval on the mediated path (separate from "selected
 /// MCP" allowances). Read/status and policy/answer tools are excluded and must
-/// require human approval.
+/// require human approval. Identity matching is exact (no normalization).
 pub fn is_auto_allowed_cc_control_plane_tool(name: &str) -> bool {
-    AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name.trim())
+    AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name)
 }
 
 /// Execution-time evidence for a mediated structured edit on the production
@@ -1410,7 +1410,7 @@ impl Engine {
                 agent,
                 channel,
                 ask.turn,
-                name.trim(),
+                name,
                 ask.detail.as_deref(),
             ) {
                 Ok(r) => PermissionVerdict::Allow { request: r.id },
@@ -1464,7 +1464,6 @@ impl Engine {
         name: &str,
         detail: Option<&str>,
     ) -> Result<PermissionRequest, PostError> {
-        let name = name.trim();
         if !is_auto_allowed_cc_control_plane_tool(name) {
             // Defense-in-depth: only exact scoped CC control-plane actions may be
             // auto-approved on this path; everything else must fail closed.
@@ -2410,10 +2409,6 @@ mod tests {
             "chat_request_permission",
         ] {
             assert!(is_auto_allowed_cc_control_plane_tool(allowed), "{allowed}");
-            assert!(
-                is_auto_allowed_cc_control_plane_tool(&format!("  {allowed}  ")),
-                "{allowed} trimmed"
-            );
         }
         for denied in [
             "chat_context",
@@ -2425,6 +2420,9 @@ mod tests {
             "chat_set_approval_mode",
             "chat_unknown_control_plane_tool",
             "CHAT_SEND",
+            " chat_send",
+            "chat_send ",
+            " chat_send ",
         ] {
             assert!(
                 !is_auto_allowed_cc_control_plane_tool(denied),
