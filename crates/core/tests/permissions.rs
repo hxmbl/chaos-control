@@ -590,6 +590,65 @@ async fn named_chat_tools_are_auto_allowed_and_logged_by_name() {
     }
 }
 
+/// Fetch/URL-open-like requests are not granted a "verified web-search
+/// (search-only)" exception without verifiable identity/scope/search-only proof
+/// on the production path (STRM-596/606). Generic kind/name/title metadata is
+/// insufficient, so they remain approval-gated in both `ask-all` and
+/// `accept-edits`. Over ACP v1/v2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_fetch_search_like_requests_require_human_approval() {
+    for protocol in [1, 2] {
+        for mode in [ApprovalMode::AskAll, ApprovalMode::AcceptEdits] {
+            let mut h = Harness::new().await;
+            let req = json!({"permission_kind": {
+                "title": "Search the web for docs",
+                "name": "web_search",
+                "kind": "fetch",
+                "raw_input": {"url": "https://example.com/search?q=docs"}
+            }});
+            let bot = h
+                .agent(
+                    "bot",
+                    script(json!({"protocol": protocol, "turns": [{
+                        "steps": [req.clone(), {"text": "Asked."}]
+                    }]})),
+                )
+                .await;
+            h.core.set_approval_mode(bot.id, mode).await.unwrap();
+
+            h.say("@bot search docs").await;
+            let pending = wait_request(&mut h, PermissionState::Pending).await;
+            assert_eq!(
+                &*pending.title, "Search the web for docs",
+                "v{protocol}, {mode:?}"
+            );
+            assert!(
+                pending.run_state.is_none() && pending.command.is_none(),
+                "fetch must not be queued as command execution, v{protocol}, {mode:?}: {pending:#?}"
+            );
+
+            let outcomes = wait_outcomes(&h, "bot", 1).await;
+            assert_eq!(
+                picked(&outcomes[0]),
+                &json!("deny"),
+                "v{protocol}, {mode:?}: {}",
+                outcomes[0]
+            );
+            assert_eq!(
+                outcomes[0]["_meta"]["chaosControl"]["status"],
+                json!("request_sent"),
+                "v{protocol}, {mode:?}: {}",
+                outcomes[0]
+            );
+
+            h.wait_message("turn completed", Some(bot.id)).await;
+            let all = h.core.pending_permissions(h.main).await.unwrap();
+            assert_eq!(all.len(), 1, "v{protocol}, {mode:?}: {all:#?}");
+            assert_eq!(all[0].state, PermissionState::Pending);
+        }
+    }
+}
+
 /// Shell/execute requests (including read-only-looking commands) require human
 /// approval in both `ask-all` and `accept-edits` (STRM-596). In `ask-all`
 /// approval yields a one-shot retry grant; in `accept-edits` execute is queued
