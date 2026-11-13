@@ -393,9 +393,12 @@ pub struct QueuedRequest {
     /// across re-renders. Approving out of order is allowed — each
     /// request is independent.
     pub state: QueueState,
-    /// For `accept-edits` commands: the captured command line and the
-    /// working directory it would run in. Empty for plain asks.
+    /// For `accept-edits` commands: the captured command line, exactly as
+    /// stored/approved for execution. Empty for plain asks.
     pub command: Option<Arc<str>>,
+    /// Working directory captured for queued command execution (when
+    /// applicable), exactly as stored/approved. Execution must use this value.
+    pub cwd: Option<Arc<str>>,
     /// What the agent says it wants to change (when available).
     pub proposed_change: Option<ProposedChange>,
 }
@@ -1928,6 +1931,7 @@ impl Engine {
                 },
                 state: queue_state_of(&req),
                 command: req.command.clone(),
+                cwd: req.cwd.clone(),
                 proposed_change: None,
             })
             .collect())
@@ -2068,6 +2072,7 @@ impl Engine {
             },
             state: queue_state_of(&req),
             command: req.command.clone(),
+            cwd: req.cwd.clone(),
             proposed_change: None,
         })
     }
@@ -2113,7 +2118,7 @@ pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<To
         ),
         Tool::new(
             "chat_permission_status",
-            "Your permission/queue requests in this channel and their state (pending, approved, denied, auto_approved) plus queued command run info when available (run_state: queued/running/done/failed/unrunnable/denied, output, exit code). Newest first. Pass request_id to watch one.",
+            "Your permission/queue requests in this channel and their state (pending, approved, denied, auto_approved) plus queued command run info when available (run_state: queued/running/done/failed/unrunnable/denied, captured command/cwd for execution, output, exit code). Newest first. Pass request_id to watch one.",
             schema(json!({"type": "object", "properties": {
                 "request_id": {"type": "integer"}
             }})),
@@ -2148,6 +2153,7 @@ fn view(c: &Connection, r: &PermissionRequest) -> Value {
         "used": r.used_at.is_some(),
         "run_state": r.run_state.as_deref(),
         "command": r.command.as_deref(),
+        "cwd": r.cwd.as_deref(),
         "run_exit_code": r.run_exit_code,
         "run_output": r.run_output.as_deref(),
         "run_finished_at": r.run_finished_at,
