@@ -1297,6 +1297,12 @@ impl Engine {
                 }
             };
         }
+        // STRM-596/606: URL fetch/open, unselected MCP, and unknown/changed
+        // identities must be asked in both modes. Verified web-search (search-only)
+        // and explicitly selected MCP allowances require verifiable proof on the
+        // production path; without that proof, no automatic exception is granted.
+        // Generic ACP kinds, tool basenames, titles, and self-declared metadata
+        // are never sufficient (fail closed).
         match self.ask_permission(
             now,
             agent,
