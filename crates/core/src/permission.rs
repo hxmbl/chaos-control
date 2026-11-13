@@ -438,16 +438,110 @@ pub fn is_read_only_kind(kind: &str) -> bool {
 
 /// Maps an ACP wire tool kind to a [`RequestKind`] (STRM-542/STRM-606).
 /// Delete/move are classified explicitly (never as auto-allow-eligible edits);
-/// unknown/missing kinds are treated as other/unclassifiable and fail closed.
+/// unknown/missing/unsupported kinds (including `switch_mode`, `think`, and any
+/// future/unrecognized kind) are treated as other/unclassifiable and fail closed.
 pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
-    match kind {
+    match kind.map(str::trim) {
         Some("read" | "search") => RequestKind::Read,
         Some("edit") => RequestKind::Edit,
         Some("delete") => RequestKind::Delete,
         Some("move") => RequestKind::Move,
         Some("execute") => RequestKind::Execute,
         Some("fetch") => RequestKind::Fetch,
-        _ => RequestKind::Other,
+        Some("") | None => RequestKind::Other,
+        Some(_) => RequestKind::Other,
+    }
+}
+
+/// True when `name` is an exact CC control-plane chat tool name eligible for
+/// scoped native auto-approval on the mediated path (separate from "selected
+/// MCP" allowances). Read/status and policy/answer tools are excluded and must
+/// require human approval. Identity matching is exact (no normalization).
+pub fn is_auto_allowed_cc_control_plane_tool(name: &str) -> bool {
+    AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name)
+}
+
+/// Execution-time evidence for a mediated structured edit on the production
+/// path (STRM-596/606). Auto-allow eligibility in `accept-edits` requires
+/// explicit editable-root authorization and sufficient execution-time scope
+/// enforcement evidence for the exact operation. Core has no verified evidence
+/// on this path today and must fail closed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StructuredEditEvidence {
+    /// No verified editable-root/scope-enforcement evidence available.
+    #[default]
+    Unverified,
+    /// Verified prerequisites are satisfied for this exact operation.
+    /// (Not constructible on the current core production path.)
+    #[doc(hidden)]
+    _Verified,
+}
+
+impl StructuredEditEvidence {
+    /// Whether verified prerequisites allow a structured edit to be considered
+    /// for auto-allow in `accept-edits` (subject to mode and kind rules).
+    pub fn allows_auto_edit(self) -> bool {
+        matches!(self, Self::_Verified)
+    }
+}
+
+/// Shell/execute operations are never auto-allow-eligible on the mediated path
+/// outside `yolo`; `accept-edits` uses approval-gated queuing (not auto-allow).
+pub fn execute_auto_allow_eligible_without_yolo() -> bool {
+    false
+}
+
+/// Verified prerequisites required before a mediated structured edit could be
+/// auto-allow-eligible in `accept-edits` on the production path (STRM-596/606):
+/// explicit editable-root authorization and sufficient execution-time scope
+/// enforcement evidence for the exact operation. Core does not have verified
+/// evidence on this path today; callers must fail closed.
+pub fn structured_edit_prerequisites_verified() -> bool {
+    StructuredEditEvidence::Unverified.allows_auto_edit()
+}
+
+/// Conservative fail-closed refinement for mediated classification: if an
+/// `Edit`-classified request shows verifiable protocol/detail evidence of a
+/// conflicting delete/move operation kind (or other unclassifiable mixed
+/// signal) in its structured payload, treat it as `Other`/unclassifiable so it
+/// can never be considered an auto-allow-eligible structured edit. This uses
+/// only structural kind markers present in serialized request details; absence
+/// of evidence is not treated as proof of safety.
+pub fn effective_request_kind(kind: RequestKind, detail: Option<&str>) -> RequestKind {
+    if kind != RequestKind::Edit {
+        return kind;
+    }
+    let Some(v) = detail.and_then(|d| serde_json::from_str::<Value>(d).ok()) else {
+        return kind;
+    };
+    if has_conflicting_edit_kind_signal(&v) {
+        RequestKind::Other
+    } else {
+        kind
+    }
+}
+
+fn has_conflicting_edit_kind_signal(v: &Value) -> bool {
+    match v {
+        Value::Object(m) => {
+            // A structured operation-kind marker inside an edit-classified payload
+            // that indicates a conflicting, mixed, or unclassifiable operation
+            // shape must fail closed. `edit`/`read`/`search` markers are not
+            // treated as conflicting here; absence of evidence is not proof of a
+            // pure structured edit.
+            if let Some(Value::String(k)) = m.get("kind")
+                && matches!(
+                    k.as_str(),
+                    "delete" | "move" | "execute" | "fetch" | "switch_mode" | "other" | "unknown"
+                )
+            {
+                return true;
+            }
+            m.values().any(has_conflicting_edit_kind_signal)
+        }
+        Value::Array(a) => a.iter().any(has_conflicting_edit_kind_signal),
+        _ => false,
     }
 }
 
@@ -468,6 +562,18 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
 /// command execution (preserved behavior) rather than auto-allowed. `yolo`
 /// allows everything.
 pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
+    mode_verdict_with_edit_evidence(mode, kind, StructuredEditEvidence::Unverified)
+}
+
+/// Like [`mode_verdict`], but parameterized by verified structured-edit
+/// evidence. No verified evidence exists on the current core production path;
+/// callers must pass [`StructuredEditEvidence::Unverified`] unless they can
+/// prove prerequisites for the exact operation.
+pub fn mode_verdict_with_edit_evidence(
+    mode: ApprovalMode,
+    kind: RequestKind,
+    edit_evidence: StructuredEditEvidence,
+) -> ModeOutcome {
     match mode {
         ApprovalMode::AskAll => ModeOutcome::AskHuman,
         ApprovalMode::AcceptEdits => match kind {
@@ -476,7 +582,16 @@ pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
             | RequestKind::Delete
             | RequestKind::Move
             | RequestKind::Fetch
-            | RequestKind::Other => ModeOutcome::AskHuman,
+            | RequestKind::Other => {
+                // Only a pure structured edit with verified prerequisites may
+                // become auto-allow-eligible; delete/move/mixed/unclassifiable
+                // never qualify.
+                if kind == RequestKind::Edit && edit_evidence.allows_auto_edit() {
+                    ModeOutcome::Allow
+                } else {
+                    ModeOutcome::AskHuman
+                }
+            }
             RequestKind::Execute => ModeOutcome::Queue,
         },
         ApprovalMode::Yolo => ModeOutcome::Allow,
@@ -1294,7 +1409,7 @@ impl Engine {
         if let Some(name) = ask
             .tool_name
             .as_deref()
-            .filter(|name| AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(name))
+            .filter(|name| is_auto_allowed_cc_control_plane_tool(name))
         {
             return match self.auto_approve_chat_tool(
                 now,
@@ -1316,7 +1431,9 @@ impl Engine {
         // and explicitly selected MCP allowances require verifiable proof on the
         // production path; without that proof, no automatic exception is granted.
         // Generic ACP kinds, tool basenames, titles, and self-declared metadata
-        // are never sufficient (fail closed).
+        // are never sufficient (fail closed). Conflicting/mixed edit-payload
+        // signals are treated as unclassifiable (Ask in both modes).
+        let kind = effective_request_kind(ask.kind, ask.detail.as_deref());
         match self.ask_permission(
             now,
             agent,
@@ -1327,7 +1444,7 @@ impl Engine {
             ask.detail.as_deref(),
             None,
             ask.key.as_deref(),
-            ask.kind,
+            kind,
         ) {
             Ok(r) => match r.state {
                 PermissionState::Approved | PermissionState::AutoApproved => {
@@ -1353,6 +1470,22 @@ impl Engine {
         name: &str,
         detail: Option<&str>,
     ) -> Result<PermissionRequest, PostError> {
+        if !is_auto_allowed_cc_control_plane_tool(name) {
+            // Defense-in-depth: only exact scoped CC control-plane actions may be
+            // auto-approved on this path; everything else must fail closed.
+            return self.ask_permission(
+                now,
+                agent,
+                channel,
+                turn,
+                PermissionSource::Native,
+                name,
+                detail,
+                None,
+                None,
+                RequestKind::Other,
+            );
+        }
         let turn = match turn {
             Some(t) => Some(t),
             None => store::in_flight_batch(self.conn(), agent, channel)?.map(|b| b.id),
@@ -1415,7 +1548,7 @@ impl Engine {
     ) -> Result<PermissionRequest, PostError> {
         let title = title.trim();
         let title = if title.is_empty() { "a tool" } else { title };
-        let (key, bindable): (Arc<str>, bool) = match key {
+        let (key, bindable): (Arc<str>, bool) = match key.map(str::trim).filter(|k| !k.is_empty()) {
             Some(k) => (Arc::from(k), true),
             // Unbindable identity: derive a per-ask key so this request cannot
             // match/consume an unrelated prior grant or be collapsed with a
@@ -1479,11 +1612,17 @@ impl Engine {
         // evidence on the production path (none here). `yolo` explicitly allows
         // everything. Fail closed outside `yolo`.
         let mode = self.effective_approval_mode(agent, channel);
-        let outcome = mode_verdict(mode, kind);
+        let outcome =
+            mode_verdict_with_edit_evidence(mode, kind, StructuredEditEvidence::Unverified);
         let outcome = match (outcome, kind) {
             (ModeOutcome::Allow, RequestKind::Edit | RequestKind::Delete | RequestKind::Move)
                 if mode != ApprovalMode::Yolo =>
             {
+                ModeOutcome::AskHuman
+            }
+            // Execute must never be silently auto-allowed outside yolo on the
+            // mediated path (ask-all asks; accept-edits queues with human approval).
+            (ModeOutcome::Allow, RequestKind::Execute) if mode != ApprovalMode::Yolo => {
                 ModeOutcome::AskHuman
             }
             (other, _) => other,
@@ -2258,7 +2397,165 @@ mod tests {
         assert_eq!(request_kind_from_wire(Some("edit")), RequestKind::Edit);
         assert_eq!(request_kind_from_wire(Some("delete")), RequestKind::Delete);
         assert_eq!(request_kind_from_wire(Some("move")), RequestKind::Move);
+        assert_eq!(
+            request_kind_from_wire(Some("switch_mode")),
+            RequestKind::Other
+        );
+        assert_eq!(request_kind_from_wire(Some("think")), RequestKind::Other);
         assert_eq!(request_kind_from_wire(Some("unknown")), RequestKind::Other);
+        assert_eq!(request_kind_from_wire(Some("  edit  ")), RequestKind::Edit);
+        assert_eq!(request_kind_from_wire(Some("")), RequestKind::Other);
+        assert_eq!(request_kind_from_wire(Some("   ")), RequestKind::Other);
         assert_eq!(request_kind_from_wire(None), RequestKind::Other);
+    }
+
+    #[test]
+    fn cc_control_plane_auto_allow_is_exact_and_scoped() {
+        for allowed in [
+            "chat_send",
+            "chat_react",
+            "chat_status",
+            "chat_refuse",
+            "chat_dissent",
+            "chat_request_permission",
+        ] {
+            assert!(is_auto_allowed_cc_control_plane_tool(allowed), "{allowed}");
+        }
+        for denied in [
+            "chat_context",
+            "chat_read",
+            "chat_search",
+            "chat_permission_status",
+            "chat_approval_mode_status",
+            "chat_answer_permission",
+            "chat_set_approval_mode",
+            "chat_unknown_control_plane_tool",
+            "CHAT_SEND",
+            " chat_send",
+            "chat_send ",
+            " chat_send ",
+        ] {
+            assert!(
+                !is_auto_allowed_cc_control_plane_tool(denied),
+                "{denied} must not be auto-allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn structured_edit_prerequisites_are_unavailable_fail_closed() {
+        assert!(
+            !structured_edit_prerequisites_verified(),
+            "core must not claim verified editable-root/execution-time evidence"
+        );
+        assert!(!execute_auto_allow_eligible_without_yolo());
+        assert!(!StructuredEditEvidence::Unverified.allows_auto_edit());
+        // Evidence-gated verdict: only a verified pure structured edit may be
+        // auto-allow-eligible in accept-edits; delete/move/others never.
+        assert_eq!(
+            mode_verdict_with_edit_evidence(
+                ApprovalMode::AcceptEdits,
+                RequestKind::Edit,
+                StructuredEditEvidence::Unverified
+            ),
+            ModeOutcome::AskHuman
+        );
+        assert_eq!(
+            mode_verdict_with_edit_evidence(
+                ApprovalMode::AcceptEdits,
+                RequestKind::Edit,
+                StructuredEditEvidence::_Verified
+            ),
+            ModeOutcome::Allow
+        );
+        for kind in [
+            RequestKind::Delete,
+            RequestKind::Move,
+            RequestKind::Other,
+            RequestKind::Read,
+            RequestKind::Fetch,
+            RequestKind::Execute,
+        ] {
+            assert_eq!(
+                mode_verdict_with_edit_evidence(
+                    ApprovalMode::AcceptEdits,
+                    kind,
+                    StructuredEditEvidence::_Verified
+                ),
+                if kind == RequestKind::Execute {
+                    ModeOutcome::Queue
+                } else {
+                    ModeOutcome::AskHuman
+                },
+                "non-edit kinds must never become auto-allow-eligible edits: {kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn effective_request_kind_downgrades_conflicting_edit_payloads() {
+        assert_eq!(
+            effective_request_kind(RequestKind::Read, Some(r#"{"kind":"delete"}"#)),
+            RequestKind::Read
+        );
+        assert_eq!(
+            effective_request_kind(RequestKind::Edit, None),
+            RequestKind::Edit
+        );
+        assert_eq!(
+            effective_request_kind(RequestKind::Edit, Some("not json")),
+            RequestKind::Edit
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"kind":"delete"}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"nested":{"kind":"move"}}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"ops":[{"kind":"execute"}]}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"ops":[{"kind":"fetch"}]}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"rawInput":{"kind":"switch_mode"}}}}"#)
+            ),
+            RequestKind::Other
+        );
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"path":"a.rs"}}}}"#)
+            ),
+            RequestKind::Edit
+        );
+        // Any conflicting/unclassifiable operation-kind marker in structured
+        // payload detail is treated as mixed/unclassifiable (fail closed).
+        assert_eq!(
+            effective_request_kind(
+                RequestKind::Edit,
+                Some(r#"{"subject":{"toolCall":{"kind":"edit","rawInput":{"kind":"other"}}}}"#)
+            ),
+            RequestKind::Other
+        );
     }
 }

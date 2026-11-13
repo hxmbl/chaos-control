@@ -361,69 +361,77 @@ longer parses counts as unset. Agents see their list in `chat_context`
 ("✅ or 👍 answers it; 👀 means you're on it, and other emoji don't
 answer").
 
-## Permissions: by where the agent runs
+## Permissions: by where the agent runs (STRM-596/606, mediated core — evolving)
 
-**Reads and chat tools are always allowed.** The goal for now is talking to
-many agents, so agents get full access for reading files, and their calls to
-this app's own chat MCP tools do not need a human approval:
+**Mediated ACP permission requests are fail-closed by default on the host.** Chaos Control
+does not claim complete mediation or strict enforcement from ACP callbacks alone.
+On the production mediated path (`native_permission`/`ask_permission`), requests
+are classified, identity-bound where possible, and decided without trusting
+generic ACP kinds, tool basenames, titles, or self-declared metadata as proof of
+safety or scope. Unverified, unknown, changed, unbindable, or unclassifiable
+cases require human approval (or are otherwise held/fail closed) as applicable.
 
-- A native request for a read-only tool call (ACP tool kind `read` or
-  `search`, from the request's tool call on v1 or its `subject` on the v2
-  draft) is answered with the agent's own allow-once option straight away,
-  wherever the agent runs. Nobody is asked; presence shows "reading:
-  <title>". It is kept for the permission log only (below): a row with
-  `read_only = 1` and state `auto_approved`, left out of the agent's own
-  `chat_permission_status`, and only the newest 500 per channel are kept
-  (`permission::READS_KEPT`; older reads are pruned as new ones arrive).
-- A native request whose ACP tool name matches one of this app's `chat_*`
-  MCP tools is auto-approved regardless of kind and logged under that exact
-  tool name.
-- Anything else (kinds `edit`, `delete`, `move`, `execute`, `fetch`,
-  `switch_mode`, `other`, an unknown kind, or no kind at all) is never
-  auto-approved on the host *by default*. What it becomes depends on the
-  agent's approval mode (STRM-542, below): `ask-all` sends it to the
-  humans, `accept-edits` allows edits but queues commands, `yolo` allows
-  it. In every case the agent is answered **at once** (it is never left
-  waiting on the protocol call) with a message in
-  `_meta.chaosControl.message`: reads are free, this one was sent or
-  queued as request #N, don't wait for it.
-
-Otherwise Chaos Control doesn't change an agent's permission mode or
-simulate one. What happens to a request that isn't a read depends on where
-the agent runs, set per agent in `agents.json` (`"runs_in"`, default
-`"host"`):
+### Where the agent runs
 
 | Where | What happens |
 | --- | --- |
-| `host` (the user's computer) | Decided by the approval mode (below): `ask-all` sends the request to the humans, `accept-edits` allows edits and queues commands, `yolo` allows it (logged as auto-approved-by-mode). In all cases **non-blocking**: the agent hears the outcome with a request id at once and decides whether to wait or do something else. A human's Approve or Deny arrives later, as a message. Never times out into an approval. |
-| `vm` (the agent's own VM) | Everything is approved. A broken VM is replaced, not protected. No VM orchestration yet: the flag only marks the agent. |
+| `host` (the user's computer, default) | Decided by mediated classification + approval mode (below). Requests that require approval are **non-blocking**: the agent is answered at once with a "request sent" / pending outcome (and request id) so it can continue other work or wait; a human Approve/Deny arrives later as a wake/message. Approved one-shot grants apply only to the exact retried request identity. Nothing times out into an approval. |
+| `vm` (the agent's own VM) | Auto-approved (`DecidedBy::AutoVm`). A broken VM is replaced, not protected. No VM orchestration yet: the flag only marks the agent. |
 
-**Approval modes (STRM-542, `docs/command-approval.md`).** `ApprovalMode`
-is `ask-all` (default), `accept-edits` or `yolo`. `mode_verdict` is the pure
-decision per request kind (`RequestKind`: read/edit/execute/fetch/other,
-classified from the ACP tool kind by `request_kind_from_wire`):
+`yolo` mode explicitly allows mediated requests on the host (`DecidedBy::AutoMode`),
+logged distinctly from VM auto-approval.
 
-- `ask-all`: every non-read goes to the humans (a `pending` request).
-- `accept-edits`: `edit` (and `read`, though reads never reach the mode)
-  is auto-approved (`DecidedBy::AutoMode`); `execute`, `fetch` and `other`
-  become pending requests flagged as queued commands — execute requests
-  get `command` captured from the tool input and `run_state = "queued"`
-  (migration 19; core does not run them yet, the grant-on-retry path
-  applies on approval).
-- `yolo`: everything non-read is auto-approved (`DecidedBy::AutoMode`),
-  kept in the log so it reads differently from a VM's auto-approval.
+### Mediated classification and host behavior (current core)
+
+Classification is derived from verifiable ACP wire/tool-call evidence
+(`request_kind_from_wire`, with conservative refinement `effective_request_kind`
+for conflicting/mixed edit-payload signals). **Delete** and **move** are distinct
+from **edit**. Unknown/missing kinds and conflicting/unclassifiable signals are
+treated as `Other`/unclassifiable (fail closed).
+
+| Request class (mediated) | `ask-all` | `accept-edits` | Notes |
+| --- | --- | --- | --- |
+| Read / local search (`read`, `search`) | Ask human | Ask human | Ordinary/private/out-of-workspace reads and local search are not auto-allowed on this path. |
+| Structured edit (`edit`, no conflicting mixed/unclassifiable signal) | Ask human | Ask human (fail closed) | Never auto-allowed outside `yolo` without verified editable-root authorization **and** sufficient execution-time scope enforcement evidence on the production path (unavailable in core today). |
+| Delete (`delete`) | Ask human | Ask human | Never auto-allow-eligible as an edit. |
+| Move (`move`) | Ask human | Ask human | Never auto-allow-eligible as an edit. |
+| Shell/execute (`execute`, incl. read-only-looking commands) | Ask human | Queued for approval-gated command execution (pending/runnable as captured) | Human approval is required in both modes; `accept-edits` preserves approval-gated queued execution behavior (not auto-allowed). Missing/uncapturable command/cwd fail closed for safe execution capture. |
+| Fetch / URL open (`fetch`) | Ask human | Ask human | No automatic verified-web-search/selected-MCP exception without verifiable production-path proof. |
+| Other / unknown / mixed / unclassifiable | Ask human | Ask human | Includes unknown wire kinds and payloads treated as conflicting/unclassifiable. |
+
+Additional fail-closed rules on the mediated path:
+- **Identity binding:** request keys bind grants/dedup to the exact operation
+  (kind + canonicalized payload hash with volatile fields stripped). If identity
+  cannot be stably bound (no key), the request is treated as unbindable: no
+  prior-grant reuse and no weak title-key dedupe/auto-match (always requires an
+  explicit decision for that ask).
+- **CC control-plane (exact identity only, separate from “selected MCP”):**
+  scoped native actions `chat_send`, `chat_react`, `chat_status`, `chat_refuse`,
+  `chat_dissent`, `chat_request_permission` may be auto-approved by exact CC tool
+  identity on the mediated native path (recorded as auto-approved). CC read/status
+  tools `chat_context`, `chat_read`, `chat_search`, `chat_permission_status`,
+  `chat_approval_mode_status` require human approval in both modes. Policy/answer
+  and unknown `chat_*` tools are not auto-allowed by exact-name scope.
+- **No invented exceptions:** verified web-search (search-only) and explicitly
+  selected MCP allowances require verifiable proof/scope evidence not assumed by
+  core; otherwise fail closed. ACP mediation is not evidence of complete
+  mediation.
+
+**Approval modes (STRM-542, evolving under STRM-596/606).** `ApprovalMode`
+is `ask-all` (default), `accept-edits`, or `yolo`. `mode_verdict` is the pure
+decision per `RequestKind` (`Read`, `Edit`, `Delete`, `Move`, `Execute`, `Fetch`,
+`Other`), with defense-in-depth guards preventing `Edit`/`Delete`/`Move`
+auto-approval outside `yolo` without verified prerequisites.
 
 The effective mode resolves most-specific-first: channel override
 (`channel_approval_mode`, migration 17) > project `approval_mode` setting >
 workspace `approval_mode` (`app_settings`, migration 18) > the member's
 `agents.json` `"approval"` (default `ask-all`). Mode changes are not
-retroactive: they only decide *new* requests. `decided_by` (migration 16)
-records who or what decided each request (`AutoVm`, `AutoMode`,
+retroactive. `decided_by` records who/what decided (`AutoVm`, `AutoMode`,
 `Human(<member>)`).
 
 A declined or denied request is an answer, not a failure (the peer model): it
-never fails a turn, never turns an agent red and is never retried by the
-runtime.
+never fails a turn, never turns an agent red, and is never retried by the runtime.
 
 **Native requests (ACP `session/request_permission`).** The protocol call
 blocks the agent until it is answered, so the adapter asks core
