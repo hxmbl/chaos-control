@@ -624,36 +624,39 @@ fn detail_json(detail: Option<&str>) -> Option<Value> {
 }
 
 /// Best-effort extraction of an executable shell command from stored request
-/// detail (STRM-542). Returns None when no safe command string can be inferred.
+/// detail (STRM-542). Prefers authoritative command fields when unambiguous;
+/// heuristic extraction is fallback-only. Returns None when no safe command can
+/// be inferred or when candidates conflict/are ambiguous (fail closed).
 pub fn extract_command(detail: Option<&str>) -> Option<String> {
     let v = detail_json(detail)?;
-    fn find(v: &Value) -> Option<String> {
-        if let Some(obj) = v.as_object() {
+    let mut candidates: Vec<String> = Vec::new();
+    collect_command_candidates(&v, &mut candidates);
+    let mut unique: Vec<String> = Vec::new();
+    for c in candidates {
+        let c = c.trim().to_string();
+        if c.is_empty() {
+            continue;
+        }
+        if !unique.iter().any(|u| u == &c) {
+            unique.push(c);
+        }
+    }
+    match unique.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+fn collect_command_candidates(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(obj) => {
             for key in ["command", "cmd", "script", "shell"] {
                 if let Some(c) = obj.get(key) {
-                    match c {
-                        Value::String(s) if !s.trim().is_empty() => return Some(s.clone()),
-                        Value::Array(a) => {
-                            let mut parts = Vec::with_capacity(a.len());
-                            for x in a {
-                                let s = x.as_str()?;
-                                parts.push(s.to_string());
-                            }
-                            if !parts.is_empty() {
-                                return Some(shell_join(&parts));
-                            }
-                        }
-                        Value::Object(o) => {
-                            // Some shapes nest the actual command, e.g. {command:{command:"..."}}
-                            if let Some(found) = find(&Value::Object(o.clone())) {
-                                return Some(found);
-                            }
-                        }
-                        _ => {}
-                    }
+                    collect_command_value(c, out);
                 }
             }
-            // ACP v2/tool-call-like nested locations
+            // Recurse into common nested locations that may carry the actual
+            // execution descriptor (e.g. ACP rawInput/arguments/toolCall).
             for key in [
                 "rawInput",
                 "input",
@@ -665,32 +668,72 @@ pub fn extract_command(detail: Option<&str>) -> Option<String> {
                 "fields",
                 "content",
             ] {
-                if let Some(inner) = obj.get(key)
-                    && let Some(found) = find(inner)
-                {
-                    return Some(found);
-                }
-            }
-            // Some ACP tool calls put command in title/description-like fields? no, avoid guessing.
-        } else if let Some(arr) = v.as_array() {
-            for item in arr {
-                if let Some(found) = find(item) {
-                    return Some(found);
+                if let Some(inner) = obj.get(key) {
+                    collect_command_candidates(inner, out);
                 }
             }
         }
-        None
+        Value::Array(arr) => {
+            // Arrays of descriptor objects may appear in some payload shapes;
+            // collect from elements but do not treat a bare argv-like array as a
+            // command unless it is the value of a command key (handled above).
+            for item in arr {
+                collect_command_candidates(item, out);
+            }
+        }
+        _ => {}
     }
-    find(&v)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
-/// Best-effort extraction of a working directory from request detail.
+fn collect_command_value(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+        Value::Array(a) => {
+            let mut parts = Vec::with_capacity(a.len());
+            for x in a {
+                let Some(s) = x.as_str() else {
+                    // Ambiguous/non-string argv element: do not guess.
+                    return;
+                };
+                parts.push(s.to_string());
+            }
+            if !parts.is_empty() {
+                out.push(shell_join(&parts));
+            }
+        }
+        Value::Object(o) => {
+            // Some shapes nest the actual command, e.g. {command:{command:"..."}}
+            collect_command_candidates(&Value::Object(o.clone()), out);
+        }
+        _ => {}
+    }
+}
+
+/// Best-effort extraction of a working directory from stored request detail.
+/// Returns None when no safe cwd can be inferred or when candidates conflict.
 pub fn extract_cwd(detail: Option<&str>) -> Option<String> {
     let v = detail_json(detail)?;
-    fn find(v: &Value) -> Option<String> {
-        if let Some(obj) = v.as_object() {
+    let mut candidates: Vec<String> = Vec::new();
+    collect_cwd_candidates(&v, &mut candidates);
+    let mut unique: Vec<String> = Vec::new();
+    for c in candidates {
+        let c = c.trim().to_string();
+        if c.is_empty() {
+            continue;
+        }
+        if !unique.iter().any(|u| u == &c) {
+            unique.push(c);
+        }
+    }
+    match unique.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
+    }
+}
+
+fn collect_cwd_candidates(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(obj) => {
             for key in [
                 "cwd",
                 "workdir",
@@ -699,11 +742,10 @@ pub fn extract_cwd(detail: Option<&str>) -> Option<String> {
                 "directory",
                 "dir",
             ] {
-                if let Some(Value::String(s)) = obj.get(key) {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        return Some(s.to_string());
-                    }
+                if let Some(Value::String(s)) = obj.get(key)
+                    && !s.trim().is_empty()
+                {
+                    out.push(s.clone());
                 }
             }
             for key in [
@@ -716,22 +758,18 @@ pub fn extract_cwd(detail: Option<&str>) -> Option<String> {
                 "tool_call",
                 "fields",
             ] {
-                if let Some(inner) = obj.get(key)
-                    && let Some(found) = find(inner)
-                {
-                    return Some(found);
-                }
-            }
-        } else if let Some(arr) = v.as_array() {
-            for item in arr {
-                if let Some(found) = find(item) {
-                    return Some(found);
+                if let Some(inner) = obj.get(key) {
+                    collect_cwd_candidates(inner, out);
                 }
             }
         }
-        None
+        Value::Array(arr) => {
+            for item in arr {
+                collect_cwd_candidates(item, out);
+            }
+        }
+        _ => {}
     }
-    find(&v)
 }
 
 fn shell_join(parts: &[String]) -> String {
@@ -2579,5 +2617,85 @@ mod tests {
             ),
             RequestKind::Edit
         );
+    }
+
+    #[test]
+    fn extract_command_accepts_unambiguous_candidates_and_rejects_conflicts() {
+        assert_eq!(extract_command(None), None);
+        assert_eq!(extract_command(Some("not json")), None);
+        assert_eq!(
+            extract_command(Some(r#"{"command":"echo hi"}"#)),
+            Some("echo hi".into())
+        );
+        assert_eq!(
+            extract_command(Some(r#"{"rawInput":{"command":"echo nested"}}"#)),
+            Some("echo nested".into())
+        );
+        // argv array -> shell-quoted command string (bash -lc script form preserves script)
+        assert_eq!(
+            extract_command(Some(r#"{"command":["bash","-lc","echo hi && pwd"]}"#)),
+            Some("echo hi && pwd".into())
+        );
+        assert_eq!(
+            extract_command(Some(r#"{"command":["echo","hello world","$x","a'b"]}"#)),
+            Some("echo 'hello world' '$x' 'a'\\''b'".into())
+        );
+        // Consistent duplicates across locations are unambiguous.
+        assert_eq!(
+            extract_command(Some(
+                r#"{"command":"echo same","rawInput":{"command":"echo same"}}"#
+            )),
+            Some("echo same".into())
+        );
+        // Conflicting candidates fail closed.
+        assert_eq!(
+            extract_command(Some(
+                r#"{"command":"echo one","rawInput":{"command":"echo two"}}"#
+            )),
+            None
+        );
+        assert_eq!(
+            extract_command(Some(
+                r#"{"toolCall":{"rawInput":{"command":"echo a"}},"arguments":{"cmd":"echo b"}}"#
+            )),
+            None
+        );
+        // Ambiguous/non-string argv elements fail closed.
+        assert_eq!(extract_command(Some(r#"{"command":["echo",123]}"#)), None);
+        assert_eq!(extract_command(Some(r#"{"command":["echo",null]}"#)), None);
+        // Empty/missing/blank are not executable descriptors.
+        assert_eq!(extract_command(Some(r#"{"command":"   "}"#)), None);
+        assert_eq!(extract_command(Some(r#"{"command":[]}"#)), None);
+        assert_eq!(extract_command(Some(r#"{"cwd":"/tmp"}"#)), None);
+        // Embedded newlines are preserved in the captured descriptor.
+        assert_eq!(
+            extract_command(Some(r#"{"command":"echo a\necho b"}"#)),
+            Some("echo a\necho b".into())
+        );
+        assert_eq!(
+            extract_command(Some(r#"{"script":"printf 'x\\n'"}"#)),
+            Some("printf 'x\\n'".into())
+        );
+    }
+
+    #[test]
+    fn extract_cwd_accepts_unambiguous_candidates_and_rejects_conflicts() {
+        assert_eq!(extract_cwd(None), None);
+        assert_eq!(extract_cwd(Some("not json")), None);
+        assert_eq!(extract_cwd(Some(r#"{"cwd":"/tmp"}"#)), Some("/tmp".into()));
+        assert_eq!(
+            extract_cwd(Some(r#"{"rawInput":{"cwd":"/work"}}"#)),
+            Some("/work".into())
+        );
+        assert_eq!(
+            extract_cwd(Some(r#"{"cwd":"/a","arguments":{"cwd":"/a"}}"#)),
+            Some("/a".into())
+        );
+        assert_eq!(
+            extract_cwd(Some(r#"{"cwd":"/a","arguments":{"cwd":"/b"}}"#)),
+            None
+        );
+        assert_eq!(extract_cwd(Some(r#"{"cwd":"   "}"#)), None);
+        assert_eq!(extract_cwd(Some(r#"{"command":"echo hi"}"#)), None);
     }
 }
