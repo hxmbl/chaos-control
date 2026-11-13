@@ -1668,8 +1668,6 @@ impl Engine {
         Ok(req)
     }
 
-
-
     /// The permission log for `channel`: every request, reads included,
     /// newest first, at most `limit`.
     pub fn permission_log(
