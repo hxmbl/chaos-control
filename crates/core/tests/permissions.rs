@@ -708,7 +708,10 @@ async fn delete_move_and_unclassifiable_require_human_approval_with_one_shot_lif
 
             h.wait_message("first turn", Some(bot.id)).await;
 
-            // Deny move/unclassifiable (no grant), approve delete once.
+            // Deny move/unclassifiable (no grant), approve delete once. Deny/approve
+            // answers wake the agent; trigger turn 2 explicitly after all answers so
+            // the one-shot grant is visible regardless of wake/answer-notification
+            // ordering (script has exactly 2 turns).
             h.core
                 .answer_permission(req_move.id, h.hx.id, false, None)
                 .await
@@ -721,6 +724,17 @@ async fn delete_move_and_unclassifiable_require_human_approval_with_one_shot_lif
                 .answer_permission(req_delete.id, h.hx.id, true, None)
                 .await
                 .unwrap();
+            h.until("delete approved", move |c| {
+                c.query_row(
+                    "SELECT state = 'approved' FROM permission_requests WHERE id = ?1",
+                    [req_delete.id.0],
+                    |r| r.get::<_, bool>(0),
+                )
+                .unwrap()
+            })
+            .await;
+            h.quiesce().await;
+            h.say("@bot retry deletes").await;
 
             let all = wait_outcomes(&h, "bot", 5).await;
             // Exact retry of approved delete: allowed once.
