@@ -714,3 +714,92 @@ async fn startup_recovery_fails_runs_left_running() {
     );
     h.core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_execution_context_is_captured_bound_and_exposed() {
+    let mut h = Harness::new().await;
+    let cwd = std::env::temp_dir();
+    let cwd_s = cwd.to_string_lossy().to_string();
+    let command = "pwd".to_string();
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                exec_perm(&command, &cwd_s),
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot run pwd").await;
+
+    let pending = wait_permission_state(&mut h, PermissionState::Pending).await;
+    let req = h
+        .core
+        .with_engine(move |e, _| chaos_core::permission::get(e.conn(), pending.id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(req.command.as_deref(), Some(command.as_str()), "{req:#?}");
+    assert_eq!(req.cwd.as_deref(), Some(cwd_s.as_str()), "{req:#?}");
+    assert_eq!(req.run_state.as_deref(), Some("queued"), "{req:#?}");
+
+    let q = h.core.approval_queue(h.main).await.unwrap();
+    let qreq = q
+        .iter()
+        .find(|r| r.id == pending.id)
+        .expect("queued request present");
+    assert_eq!(qreq.command.as_deref(), Some(command.as_str()), "{qreq:#?}");
+    assert_eq!(qreq.cwd.as_deref(), Some(cwd_s.as_str()), "{qreq:#?}");
+
+    let scope = mcp::Scope {
+        agent: bot.id,
+        channel: h.main,
+        epoch: 0,
+    };
+    let st = h
+        .core
+        .tool(
+            scope,
+            "chat_permission_status",
+            json!({"request_id": pending.id.0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(st["command"], json!(command), "{st}");
+    assert_eq!(st["cwd"], json!(cwd_s), "{st}");
+
+    h.core
+        .answer_permission(pending.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+    let done = wait_run_state(&h, pending.id, "done").await;
+    assert_eq!(done.run_exit_code, Some(0), "{done:#?}");
+    assert_eq!(done.command.as_deref(), Some(command.as_str()), "{done:#?}");
+    assert_eq!(done.cwd.as_deref(), Some(cwd_s.as_str()), "{done:#?}");
+    let out = done.run_output.as_deref().unwrap_or_default();
+    let expected = std::fs::canonicalize(&cwd)
+        .unwrap_or(cwd)
+        .to_string_lossy()
+        .to_string();
+    assert!(
+        out.contains(expected.trim()) || out.contains(cwd_s.trim()),
+        "execution must use stored cwd; output={out:?} expected~={expected:?} stored={cwd_s:?}"
+    );
+
+    let st2 = h
+        .core
+        .tool(
+            scope,
+            "chat_permission_status",
+            json!({"request_id": pending.id.0}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(st2["command"], json!(command), "{st2}");
+    assert_eq!(st2["cwd"], json!(cwd_s), "{st2}");
+    assert_eq!(st2["run_state"], json!("done"), "{st2}");
+}
