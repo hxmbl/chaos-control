@@ -205,6 +205,51 @@ async fn a_denial_is_an_answer_not_a_grant_or_a_failure() {
     assert_ne!(status.glow, Glow::Unresponsive);
 }
 
+/// In `yolo` mode, mediated host requests are allowed by policy (recorded as
+/// auto-approved-by-mode), preserving existing yolo semantics.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn yolo_mode_allows_mediated_requests_without_human_approval() {
+    for protocol in [1, 2] {
+        let mut h = Harness::new().await;
+        let bot = h
+            .agent(
+                "bot",
+                script(json!({"protocol": protocol, "turns": [{"steps": [
+                    {"permission_kind": {"title": "Read src/main.rs", "kind": "read"}},
+                    {"permission_kind": {"title": "Edit src/main.rs", "kind": "edit"}},
+                    {"permission": "run something"},
+                    {"text": "Done."}
+                ]}]})),
+            )
+            .await;
+        h.core
+            .set_approval_mode(bot.id, ApprovalMode::Yolo)
+            .await
+            .unwrap();
+        h.say("@bot go").await;
+        let all = wait_outcomes(&h, "bot", 3).await;
+        for (ix, what) in [(0, "read"), (1, "edit"), (2, "other")] {
+            assert_eq!(
+                picked(&all[ix]),
+                &json!("allow"),
+                "{what}, v{protocol}: {}",
+                all[ix]
+            );
+        }
+        h.wait_message("reply", Some(bot.id)).await;
+        let pending = h.core.pending_permissions(h.main).await.unwrap();
+        assert!(pending.is_empty(), "v{protocol}: {pending:#?}");
+        let log = h.core.permission_log(h.main, 50).await.unwrap();
+        assert_eq!(log.len(), 3, "v{protocol}: {log:#?}");
+        assert!(log.iter().all(|r| {
+            r.state == PermissionState::AutoApproved
+                && r.decided_by == Some(DecidedBy::AutoMode)
+                && r.outcome() == LogOutcome::AutoAllowed
+        }));
+    }
+}
+
+/// A VM agent's permission requests are approved without asking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_agent_in_its_own_vm_is_approved_without_asking() {
     let mut h = Harness::new().await;
@@ -327,78 +372,177 @@ async fn a_vm_agent_asking_ahead_is_told_to_go_ahead() {
     assert_eq!(r["state"], json!("auto_approved"));
 }
 
-/// Reads are always allowed (ACP tool kinds `read` and `search`), on the host
-/// too, and only kept for the permission log; an edit or a command is declined at once with
-/// the request sent to the humans. Over ACP v1 and the v2 draft.
+/// Reads and local search (ACP kinds `read` and `search`) require human
+/// approval on the mediated host path in both `ask-all` and `accept-edits`
+/// (STRM-596/606). The adapter answers "not now" at once with a request sent
+/// to humans; the agent can continue, and a human decision arrives later.
+/// Over ACP v1 and the v2 draft.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reads_are_allowed_and_everything_else_is_declined_without_waiting() {
+async fn reads_and_local_search_require_human_approval_without_blocking() {
     for protocol in [1, 2] {
-        let mut h = Harness::new().await;
-        let bot = h
-            .agent(
-                "bot",
-                script(json!({"protocol": protocol, "turns": [{"steps": [
-                    {"permission_kind": {"title": "Read src/main.rs", "kind": "read"}},
-                    {"permission_kind": {"title": "Search for TODO", "kind": "search"}},
-                    {"permission_kind": {"title": "Edit src/main.rs", "kind": "edit"}},
-                    {"permission_kind": {"title": "cargo test", "kind": "execute"}},
-                    {"permission": "no kind given"},
-                    {"text": "Read what I could."}
-                ]}]})),
-            )
-            .await;
-        h.say("@bot look around").await;
-        let o = wait_outcomes(&h, "bot", 5).await;
-        assert_eq!(
-            picked(&o[0]),
-            &json!("allow"),
-            "read, v{protocol}: {}",
-            o[0]
-        );
-        assert_eq!(
-            picked(&o[1]),
-            &json!("allow"),
-            "search, v{protocol}: {}",
-            o[1]
-        );
-        for (ix, what) in [(2, "edit"), (3, "execute"), (4, "no kind")] {
+        for mode in [ApprovalMode::AskAll, ApprovalMode::AcceptEdits] {
+            let mut h = Harness::new().await;
+            let bot = h
+                .agent(
+                    "bot",
+                    script(json!({"protocol": protocol, "turns": [{"steps": [
+                        {"permission_kind": {"title": "Read src/main.rs", "kind": "read"}},
+                        {"permission_kind": {"title": "Search for TODO", "kind": "search"}},
+                        {"permission_kind": {"title": "Edit src/main.rs", "kind": "edit"}},
+                        {"permission_kind": {"title": "cargo test", "kind": "execute"}},
+                        {"permission": "no kind given"},
+                        {"text": "Read what I could."}
+                    ]}]})),
+                )
+                .await;
+            h.core.set_approval_mode(bot.id, mode).await.unwrap();
+            h.say("@bot look around").await;
+            let o = wait_outcomes(&h, "bot", 5).await;
+            for (ix, what) in [
+                (0, "read"),
+                (1, "search"),
+                (2, "edit"),
+                (3, "execute"),
+                (4, "no kind"),
+            ] {
+                assert_eq!(
+                    picked(&o[ix]),
+                    &json!("deny"),
+                    "{what}, v{protocol}, {mode:?}: {}",
+                    o[ix]
+                );
+                assert_eq!(
+                    o[ix]["_meta"]["chaosControl"]["status"],
+                    json!("request_sent"),
+                    "{what}, v{protocol}, {mode:?}: {}",
+                    o[ix]
+                );
+                assert!(
+                    o[ix]["_meta"]["chaosControl"]["requestId"]
+                        .as_i64()
+                        .is_some(),
+                    "{what}, v{protocol}, {mode:?}: {}",
+                    o[ix]
+                );
+            }
+            // The turn carried on and ended with a reply.
+            h.wait_message("the agent carried on", Some(bot.id)).await;
+            // Mediated requests in this slice went to the humans. pending_permissions()
+            // returns records whose human-answer state is still pending; that is
+            // intentionally separate from execution/run lifecycle surfaced via run_state
+            // and outcome() in the log/queue views.
+            let all = h.core.pending_permissions(h.main).await.unwrap();
+            let titles: Vec<&str> = all.iter().map(|r| &*r.title).collect();
             assert_eq!(
-                picked(&o[ix]),
-                &json!("deny"),
-                "{what}, v{protocol}: {}",
-                o[ix]
+                titles,
+                [
+                    "Read src/main.rs",
+                    "Search for TODO",
+                    "Edit src/main.rs",
+                    "cargo test",
+                    "no kind given",
+                ],
+                "v{protocol}, {mode:?}"
             );
-            let message = o[ix]["_meta"]["chaosControl"]["message"]
-                .as_str()
-                .unwrap_or_default();
-            assert!(message.contains("approval queue"), "{message}");
+            assert!(all.iter().all(|r| r.state == PermissionState::Pending));
+            // The permission log records the same mediated requests (not auto-allowed).
+            // In accept-edits, execute remains Queue-preserved: without a safely
+            // capturable command/cwd it is stored pending for human decision but
+            // marked run_state=unrunnable, so outcome() reports Failed while DB state
+            // remains Pending. Read/search and generic edit are AskHuman (fail closed).
+            let log = h.core.permission_log(h.main, 50).await.unwrap();
+            let rows: Vec<(&str, LogOutcome, bool, PermissionState, Option<&str>)> = log
+                .iter()
+                .map(|r| {
+                    (
+                        &*r.title,
+                        r.outcome(),
+                        r.read_only,
+                        r.state,
+                        r.run_state.as_deref(),
+                    )
+                })
+                .collect();
+            let expected = match mode {
+                ApprovalMode::AskAll => vec![
+                    (
+                        "no kind given",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                    (
+                        "cargo test",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                    (
+                        "Edit src/main.rs",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                    (
+                        "Search for TODO",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                    (
+                        "Read src/main.rs",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                ],
+                ApprovalMode::AcceptEdits => vec![
+                    (
+                        "no kind given",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                    (
+                        "cargo test",
+                        LogOutcome::Failed,
+                        false,
+                        PermissionState::Pending,
+                        Some("unrunnable"),
+                    ),
+                    (
+                        "Edit src/main.rs",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                    (
+                        "Search for TODO",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                    (
+                        "Read src/main.rs",
+                        LogOutcome::Pending,
+                        false,
+                        PermissionState::Pending,
+                        None,
+                    ),
+                ],
+                ApprovalMode::Yolo => unreachable!("yolo not exercised here"),
+            };
+            assert_eq!(rows, expected, "v{protocol}, {mode:?}");
+            assert!(log.iter().all(|r| r.agent == bot.id));
         }
-        // The turn carried on and ended with a reply.
-        h.wait_message("the agent carried on", Some(bot.id)).await;
-        // Only the three non-reads went to the humans.
-        let all = h.core.pending_permissions(h.main).await.unwrap();
-        let titles: Vec<&str> = all.iter().map(|r| &*r.title).collect();
-        assert_eq!(
-            titles,
-            ["Edit src/main.rs", "cargo test", "no kind given"],
-            "v{protocol}"
-        );
-        // The permission log has all five, reads included, newest first.
-        let log = h.core.permission_log(h.main, 50).await.unwrap();
-        let rows: Vec<(&str, LogOutcome)> = log.iter().map(|r| (&*r.title, r.outcome())).collect();
-        assert_eq!(
-            rows,
-            [
-                ("no kind given", LogOutcome::Pending),
-                ("cargo test", LogOutcome::Pending),
-                ("Edit src/main.rs", LogOutcome::Pending),
-                ("Search for TODO", LogOutcome::AutoAllowed),
-                ("Read src/main.rs", LogOutcome::AutoAllowed),
-            ],
-            "v{protocol}"
-        );
-        assert!(log[3].read_only && log[4].read_only && !log[0].read_only);
-        assert!(log.iter().all(|r| r.agent == bot.id));
     }
 }
 

@@ -438,14 +438,21 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
 }
 
 /// What a mode does with one incoming request, before any human sees it.
-/// Pure function of (mode, request kind) — no I/O, fully testable (STRM-542).
+/// Pure function of (mode, request kind) — no I/O, fully testable (STRM-542/STRM-606).
+///
+/// Contract (STRM-596, mediated): ordinary/private/out-of-workspace reads and
+/// local search require human approval in both `ask-all` and `accept-edits`.
+/// Generic edit requests are not auto-approved in `accept-edits` on this path
+/// until structured-edit/editable-root and sufficient execution-time scope
+/// enforcement evidence are available in production; absent those prerequisites,
+/// fail closed to human approval. Execute/fetch/other remain queued for
+/// approval in `accept-edits` in this slice (preserved existing behavior where
+/// not yet reclassified). `yolo` allows everything.
 pub fn mode_verdict(mode: ApprovalMode, kind: RequestKind) -> ModeOutcome {
     match mode {
-        // Reads never reach this function: is_read_only_kind short-circuits
-        // upstream, as today.
         ApprovalMode::AskAll => ModeOutcome::AskHuman,
         ApprovalMode::AcceptEdits => match kind {
-            RequestKind::Edit | RequestKind::Read => ModeOutcome::Allow,
+            RequestKind::Read | RequestKind::Edit => ModeOutcome::AskHuman,
             RequestKind::Execute | RequestKind::Fetch | RequestKind::Other => ModeOutcome::Queue,
         },
         ApprovalMode::Yolo => ModeOutcome::Allow,
@@ -1280,11 +1287,6 @@ impl Engine {
                 }
             };
         }
-        if ask.read_only {
-            self.rt_note(agent, channel, format!("reading: {}", short(&ask.title)));
-            self.log_read(now, agent, channel, &ask);
-            return PermissionVerdict::AllowRead;
-        }
         match self.ask_permission(
             now,
             agent,
@@ -1361,6 +1363,9 @@ impl Engine {
     /// grant a human already gave (used up here), the same request already
     /// pending, or a new pending request for the humans. "The same" means the
     /// same `key` ([`request_key`]); without one, a key on the title alone.
+    /// Policy/mode classification is applied on the mediated production path
+    /// (STRM-606); reads/local search and shell-class operations are not
+    /// auto-allowed by bypassing this decision.
     #[allow(clippy::too_many_arguments)]
     pub fn ask_permission(
         &mut self,
@@ -1661,30 +1666,6 @@ impl Engine {
             .push(Effect::Event(Box::new(CoreEvent::Permission(req.clone()))));
         self.pump(now, agent, channel);
         Ok(req)
-    }
-
-    /// Keeps an allowed read for the permission log. A store error only costs
-    /// the log line: the read is allowed either way.
-    fn log_read(&mut self, now: Millis, agent: MemberId, channel: ChannelId, ask: &PermissionAsk) {
-        let title = ask.title.trim();
-        let title = if title.is_empty() { "a read" } else { title };
-        let turn = match ask.turn {
-            Some(t) => Some(t),
-            None => store::in_flight_batch(self.conn(), agent, channel)
-                .ok()
-                .flatten()
-                .map(|b| b.id),
-        };
-        let detail = ask.detail.as_deref();
-        match self
-            .store
-            .tx(|c| insert_read(c, agent, channel, turn, title, detail, now))
-        {
-            Ok(r) => self
-                .effects
-                .push(Effect::Event(Box::new(CoreEvent::Permission(r)))),
-            Err(e) => self.rt_note(agent, channel, format!("permission log: {e}")),
-        }
     }
 
     /// The permission log for `channel`: every request, reads included,
@@ -2178,13 +2159,16 @@ mod tests {
             ModeOutcome::AskHuman
         );
 
+        // STRM-596/606: reads/local search and generic edits require human
+        // approval in both ask-all and accept-edits on the mediated path until
+        // contract prerequisites for automatic edit approval are available.
         assert_eq!(
             mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Read),
-            ModeOutcome::Allow
+            ModeOutcome::AskHuman
         );
         assert_eq!(
             mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Edit),
-            ModeOutcome::Allow
+            ModeOutcome::AskHuman
         );
         assert_eq!(
             mode_verdict(ApprovalMode::AcceptEdits, RequestKind::Execute),
