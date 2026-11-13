@@ -31,11 +31,12 @@
 //! kinds, tool basenames, titles, and self-declared metadata are never treated
 //! as sufficient proof of safety or scope.
 //!
-//! - Reads/local search, generic structured edits, delete/move,
-//!   fetch/URL-open, execute/shell, unselected/unverified MCP, and
+//! - On the mediated host path, reads/local search, generic structured edits,
+//!   delete/move, fetch/URL-open, execute/shell, unselected/unverified MCP, and
 //!   unknown/changed/mixed/unclassifiable operations require human approval in
-//!   both `ask-all` and `accept-edits` on this mediated path (except `yolo`,
-//!   which allows everything, recorded as auto-approved-by-mode). Execute in
+//!   both `ask-all` and `accept-edits` unless `yolo` allows everything
+//!   (recorded as auto-approved-by-mode). Agents running in their own VM are
+//!   auto-approved (`RunsIn::Vm`, recorded as auto-approved-by-VM). Execute in
 //!   `accept-edits` is queued for approval-gated command execution (not
 //!   auto-allowed); missing/uncapturable command/cwd fail closed for safe
 //!   execution capture.
@@ -54,19 +55,16 @@
 //!   assumed here). No verified web-search/search-only or selected-MCP exceptions
 //!   are granted without verifiable production-path evidence.
 //!
-//! **Approval modes (STRM-542, evolving under STRM-596/606).** On the host,
-//! `ApprovalMode` and [`mode_verdict`] decide how a mediated request is handled.
-//! `ask-all` asks for mediated non-auto-allowed requests; `accept-edits`
-//! currently asks for reads/local search, generic edits, fetch and
-//! unknown/other, and queues execute requests for approval-gated execution
-//! (edits are not auto-allowed in this slice without verified prerequisites);
-//! `yolo` allows everything, recorded as auto-approved-by-mode
-//! (`DecidedBy::AutoMode`). The effective mode is the channel override, then
-//! the project override, then the workspace override, then the member's
-//! `agents.json` `"approval"` (default `ask-all`). Mode changes are not
-//! retroactive. `mode_verdict` is the pure decision; `decide`/`ApprovalCaps`
-//! are the capability-contract groundwork for adapters that can hold or defer a
-//! request (see `docs/command-approval.md`).
+//! **Approval modes (STRM-542, evolving under STRM-596/606).** On the mediated
+//! host path, [`mode_verdict`] (with evidence/defense-in-depth guards) decides
+//! handling: `ask-all` asks for mediated requests requiring approval;
+//! `accept-edits` asks for reads/local search, structured edits, delete/move,
+//! fetch, and other/mixed/unclassifiable requests and queues execute requests
+//! for approval-gated execution (edits/delete/move are not auto-allowed without
+//! verified prerequisites/evidence); `yolo` allows everything (recorded as
+//! auto-approved-by-mode, `DecidedBy::AutoMode`). The effective mode resolves
+//! channel > project > workspace > member `agents.json` `"approval"` (default
+//! `ask-all`). Mode changes are not retroactive.
 
 use std::{
     fmt::{self, Write as _},
