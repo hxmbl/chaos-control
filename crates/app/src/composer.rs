@@ -442,13 +442,8 @@ impl Composer {
     }
 
     fn finish_edit(&mut self, channel: Id, index: usize, cx: &mut Context<Self>) {
-        let Some(edit) = self.edits.get(&channel) else {
-            return;
-        };
-        if !edit.pending || edit.index != index {
-            return;
-        }
-        let Some(edit) = self.edits.remove(&channel) else {
+        let Some(edit) = apply_finish_edit(&mut self.edits, &mut self.drafts, channel, index)
+        else {
             return;
         };
         if self.channel == channel {
@@ -463,10 +458,6 @@ impl Composer {
             });
             self.mention = None;
             self.save_current(cx);
-        } else if edit.saved.is_empty() {
-            self.drafts.remove(&channel);
-        } else {
-            self.drafts.insert(channel, edit.saved);
         }
         cx.notify();
     }
