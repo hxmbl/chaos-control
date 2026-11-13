@@ -640,7 +640,8 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
         Glow::Active,
         "retrying"
     );
-    h.advance(1_000).await; // backoff 1s
+    h.advance(1_100).await; // backoff 1s (+margin for CI scheduling)
+    h.quiesce().await;
     h.until("second failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
             .unwrap()
@@ -650,7 +651,8 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
                 == "pending"
     })
     .await;
-    h.advance(5_000).await; // backoff 5s
+    h.advance(5_100).await; // backoff 5s (+margin for CI scheduling)
+    h.quiesce().await;
     h.until("third failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
             .unwrap()
