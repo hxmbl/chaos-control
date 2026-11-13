@@ -1,53 +1,57 @@
 //! Permissions by where the agent runs (STRM-401). The rules are written up in
 //! `docs/agents.md` ("Permissions").
 //!
-//! - **On the host** (the user's computer) a permission request goes to the
-//!   humans and never blocks the agent. The agent hears "request sent" with a
-//!   request id at once and decides whether to wait or do something else. A
-//!   human's Approve or Deny arrives later, as a message that wakes the agent
-//!   (its next turn). Nothing is ever approved automatically and nothing times
-//!   out into an approval.
+//! - **On the host** (the user's computer) a mediated permission request goes
+//!   to the humans and never blocks the agent. The agent hears "request sent"
+//!   with a request id at once and decides whether to wait or do something
+//!   else. A human's Approve or Deny arrives later, as a message that wakes the
+//!   agent (its next turn). Nothing times out into an approval.
 //! - **In the agent's own VM** ([`RunsIn::Vm`]) everything is approved: a broken
 //!   VM is replaced, not protected.
 //!
 //! A protocol whose permission call blocks (ACP `session/request_permission`)
 //! is answered at once: with the agent's own allow-once option when the
-//! request is approved (VM, or a one-shot grant a human already gave for that
-//! exact request), else with its own decline ("not now") option and a `_meta`
-//! note that a request was sent. An approval becomes a one-shot grant: when the
-//! agent retries the exact same tool call in that channel, it goes through
-//! once. "The same" is the request's key ([`request_key`]): the tool kind plus
-//! a SHA-256 of what the call would do, without its ids (STRM-572), so an
-//! approved `Edit files` on `a.rs` never lets an `Edit files` on `b.rs`
-//! through, and a retry with a new tool call id still matches. Agents can
-//! also ask ahead, and poll, through the chat tools `chat_request_permission`
-//! and `chat_permission_status`.
+//! request is approved (VM, yolo/mode-allowed, or a one-shot grant a human
+//! already gave for that exact request), else with its own decline ("not now")
+//! option and a `_meta` note that a request was sent. An approval becomes a
+//! one-shot grant: when the agent retries the exact same tool call in that
+//! channel, it goes through once. "The same" is the request's key
+//! ([`request_key`]): the tool kind plus a SHA-256 of what the call would do,
+//! without its ids (STRM-572), so an approved `Edit files` on `a.rs` never
+//! lets an `Edit files` on `b.rs` through, and a retry with a new tool call id
+//! still matches. Agents can also ask ahead, and poll, through the chat tools
+//! `chat_request_permission` and `chat_permission_status`.
 //!
 //! Peer model: a declined or denied request is an answer, not a failure. It
 //! never turns an agent red or fails its turn.
 //!
-//! **Reads and chat tools are always allowed.** A native request for a
-//! read-only tool call (ACP tool kind `read` or `search`) is answered with the
-//! agent's allow-once option straight away, wherever the agent runs: agents
-//! get full access for reading files. It is recorded for the permission log
-//! only (`read_only`, state `auto_approved`, the newest [`READS_KEPT`] per
-//! channel), never as a request anyone answers, and the agent's own
-//! `chat_permission_status` leaves it out. A native request for one of this
-//! app's named chat MCP tools is also auto-approved and logged by its tool
-//! name. Everything else (running commands, editing, deleting, moving,
-//! fetching, an unknown or missing kind) goes the way above: approved in a
-//! VM, else decided by the agent's approval mode (STRM-542, below).
+//! **Mediated ACP requests (STRM-596/606, partial):** on the production
+//! `native_permission` path, requests are not auto-allowed merely because they
+//! look like reads/searches. Reads/local search and generic edit requests
+//! require human approval in both `ask-all` and `accept-edits` in this slice
+//! (generic edits fail closed in `accept-edits` until verified
+//! structured-edit/editable-root and execution-time enforcement prerequisites
+//! exist). Fetch and unknown/other requests require human approval in both
+//! modes. Execute requests require human approval in `ask-all` and remain queued
+//! for approval-gated command execution in `accept-edits` (preserved behavior,
+//! pending shell/command contract reconciliation). A native request for one of
+//! this app's named chat MCP tools is auto-approved and logged by its exact
+//! tool name. `yolo` allows mediated requests (recorded as auto-approved-by-
+//! mode). ACP mediation is not proof of complete class/profile protection.
 //!
-//! **Approval modes (STRM-542).** On the host, `ApprovalMode` decides what a
-//! non-read request becomes: `ask-all` sends it to the humans (pending,
-//! answerable live); `accept-edits` allows edits and reads but queues
-//! commands for later execution; `yolo` allows everything, recorded as
-//! auto-approved-by-mode (`DecidedBy::AutoMode`). The effective mode is the
-//! channel override, then the project override, then the workspace override,
-//! then the member's `agents.json` `"approval"` (default `ask-all`). Mode
-//! changes are not retroactive. `mode_verdict` is the pure decision;
-//! `decide`/`ApprovalCaps` are the capability-contract groundwork for
-//! adapters that can hold or defer a request (see `docs/command-approval.md`).
+//! **Approval modes (STRM-542, evolving under STRM-596/606).** On the host,
+//! `ApprovalMode` and [`mode_verdict`] decide how a mediated request is handled.
+//! `ask-all` asks for mediated non-auto-allowed requests; `accept-edits`
+//! currently asks for reads/local search, generic edits, fetch and
+//! unknown/other, and queues execute requests for approval-gated execution
+//! (edits are not auto-allowed in this slice without verified prerequisites);
+//! `yolo` allows everything, recorded as auto-approved-by-mode
+//! (`DecidedBy::AutoMode`). The effective mode is the channel override, then
+//! the project override, then the workspace override, then the member's
+//! `agents.json` `"approval"` (default `ask-all`). Mode changes are not
+//! retroactive. `mode_verdict` is the pure decision; `decide`/`ApprovalCaps`
+//! are the capability-contract groundwork for adapters that can hold or defer a
+//! request (see `docs/command-approval.md`).
 
 use std::{
     fmt::{self, Write as _},
@@ -274,8 +278,9 @@ pub struct PermissionAsk {
 pub enum PermissionVerdict {
     /// Pick the agent's own allow-once option (VM agent, or a human's grant).
     Allow { request: PermissionId },
-    /// Pick the agent's own allow-once option for a read-only tool call.
-    /// Reads are always allowed and not recorded.
+    /// Pick the agent's own allow-once option for a read-only tool call when
+    /// policy allows it. (Not used for ACP reads/local search on the mediated
+    /// STRM-606 path, which require approval in ask-all/accept-edits.)
     AllowRead,
     /// Pick the agent's own decline ("not now") option; the request went to
     /// the humans and the answer arrives later.
@@ -420,8 +425,9 @@ If approved, follow the decision message (you may need to retry the same call on
     )
 }
 
-/// Whether an ACP tool kind (as its wire string: `read`, `search`, ...) only
-/// reads. Reads are always allowed; everything else needs approval.
+/// Whether an ACP tool kind (as its wire string: `read`, `search`, ...) is a
+/// read/local-search-shaped kind. Classification alone does not imply the
+/// operation is auto-allowed under current mediated policy.
 pub fn is_read_only_kind(kind: &str) -> bool {
     matches!(kind, "read" | "search")
 }
@@ -1368,7 +1374,7 @@ impl Engine {
     /// pending, or a new pending request for the humans. "The same" means the
     /// same `key` ([`request_key`]); without one, a key on the title alone.
     /// Policy/mode classification is applied on the mediated production path
-    /// (STRM-606); reads/local search and shell-class operations are not
+    /// (STRM-606); reads/local search and other protected classes are not
     /// auto-allowed by bypassing this decision.
     #[allow(clippy::too_many_arguments)]
     pub fn ask_permission(
