@@ -82,6 +82,14 @@ pub enum StoreEvent {
     },
     /// A message was edited in place.
     Updated { channel: Id, index: usize },
+    /// Submitting an edit failed; the composer can restore the attempt.
+    EditFailed {
+        channel: Id,
+        core_id: ct::MessageId,
+        attempted: Arc<str>,
+        #[allow(dead_code)]
+        error: Arc<str>,
+    },
     /// Scroll to and highlight a message (from search). Follows `Selected` when
     /// the message is in another channel.
     Reveal { channel: Id, index: usize },
@@ -1747,9 +1755,9 @@ impl ChatStore {
     }
 
     /// Edits a human-authored message in place through core.
-    pub fn edit_message(&mut self, index: usize, body: &str, cx: &mut Context<Self>) {
-        let body = body.trim();
-        if body.is_empty() {
+    pub fn edit_message(&mut self, core_id: ct::MessageId, body: &str, cx: &mut Context<Self>) {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
             return;
         }
         let Some(attached) = &self.core else {
@@ -1758,20 +1766,22 @@ impl ChatStore {
         if attached.channel != self.selected {
             return;
         }
-        let Some(message) = self.logs.get(&self.selected).and_then(|l| l.get(index)) else {
-            return;
-        };
-        let Some(id) = core_message_id(message.id) else {
-            return;
-        };
         let core = attached.link.core.clone();
         let (author, channel) = (attached.link.human, attached.link.main());
-        let body = body.to_string();
+        let app_channel = self.selected;
+        let attempted: Arc<str> = Arc::from(body.to_string());
+        let body = trimmed.to_string();
         cx.spawn(async move |this, cx| {
-            if let Err(e) = core.edit_message(author, channel, id, &body).await {
-                let error = e.to_string();
+            if let Err(e) = core.edit_message(author, channel, core_id, &body).await {
+                let error: Arc<str> = Arc::from(e.to_string());
                 this.update(cx, |store, cx| {
                     store.system_note(&format!("Not edited: {error}"), cx);
+                    cx.emit(StoreEvent::EditFailed {
+                        channel: app_channel,
+                        core_id,
+                        attempted,
+                        error,
+                    });
                 })
                 .ok();
             }

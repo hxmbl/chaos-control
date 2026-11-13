@@ -103,7 +103,8 @@ impl Conversation {
             StoreEvent::Receipts { .. } | StoreEvent::Reactions { .. } => {}
             StoreEvent::PermissionAsked(_)
             | StoreEvent::PermissionAnswered { .. }
-            | StoreEvent::SendFailed { .. } => {}
+            | StoreEvent::SendFailed { .. }
+            | StoreEvent::EditFailed { .. } => {}
         });
         Self {
             store,

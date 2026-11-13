@@ -1,7 +1,7 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, sync::Arc};
 
 use gpui::{
     Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
@@ -109,8 +109,11 @@ impl Draft {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Editing {
     index: usize,
+    core_id: chaos_core::types::MessageId,
     saved: Draft,
     buffer: Draft,
+    pending: bool,
+    attempted: Option<SharedString>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -254,6 +257,17 @@ impl Composer {
                         }
                     }
                 }
+                StoreEvent::Updated { channel, index } => {
+                    this.finish_edit(*channel, *index, cx);
+                }
+                StoreEvent::EditFailed {
+                    channel,
+                    core_id,
+                    attempted,
+                    ..
+                } => {
+                    this.restore_failed_edit(*channel, *core_id, attempted.clone(), cx);
+                }
                 _ => {}
             }),
         ];
@@ -350,7 +364,7 @@ impl Composer {
         if sendable(self.input.read(cx).text()) {
             return false;
         }
-        let Some((index, _id, body)) = self.store.read(cx).editable_last_own_message() else {
+        let Some((index, core_id, body)) = self.store.read(cx).editable_last_own_message() else {
             return false;
         };
         let saved = self.snapshot(cx);
@@ -367,8 +381,11 @@ impl Composer {
             self.channel,
             Editing {
                 index,
+                core_id,
                 saved,
                 buffer,
+                pending: false,
+                attempted: None,
             },
         );
         self.input.update(cx, |input, cx| {
@@ -380,6 +397,13 @@ impl Composer {
     }
 
     fn cancel_edit(&mut self, cx: &mut Context<Self>) {
+        if self
+            .edits
+            .get(&self.channel)
+            .is_some_and(|edit| edit.pending)
+        {
+            return;
+        }
         let Some(edit) = self.edits.remove(&self.channel) else {
             return;
         };
@@ -393,6 +417,65 @@ impl Composer {
             );
         });
         self.mention = None;
+        cx.notify();
+    }
+
+    fn finish_edit(&mut self, channel: Id, index: usize, cx: &mut Context<Self>) {
+        let Some(edit) = self.edits.get(&channel) else {
+            return;
+        };
+        if !edit.pending || edit.index != index {
+            return;
+        }
+        let Some(edit) = self.edits.remove(&channel) else {
+            return;
+        };
+        if self.channel == channel {
+            self.reply = edit.saved.reply.clone();
+            self.input.update(cx, |input, cx| {
+                input.restore_draft_state(
+                    edit.saved.text,
+                    edit.saved.selection,
+                    edit.saved.reversed,
+                    cx,
+                );
+            });
+            self.mention = None;
+            self.save_current(cx);
+        }
+        cx.notify();
+    }
+
+    fn restore_failed_edit(
+        &mut self,
+        channel: Id,
+        core_id: chaos_core::types::MessageId,
+        attempted: Arc<str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit) = self.edits.get_mut(&channel) else {
+            return;
+        };
+        if !edit.pending || edit.core_id != core_id {
+            return;
+        }
+        edit.pending = false;
+        let text = SharedString::from(attempted.as_ref().to_string());
+        let end = text.len();
+        edit.attempted = Some(text.clone());
+        edit.buffer = Draft {
+            text: text.clone(),
+            selection: end..end,
+            reversed: false,
+            reply: None,
+        };
+        if self.channel == channel {
+            self.reply = None;
+            self.input.update(cx, |input, cx| {
+                input.restore_draft_state(text, end..end, false, cx);
+            });
+            self.mention = None;
+        }
         cx.notify();
     }
 
@@ -548,23 +631,26 @@ impl Composer {
         if !sendable(&text) || self.unwired(cx) {
             return;
         }
-        if let Some(edit) = self.edits.remove(&self.channel) {
-            let index = edit.index;
-            self.store
-                .update(cx, |store, cx| store.edit_message(index, &text, cx));
-            self.reply = edit.saved.reply.clone();
-            self.input.update(cx, |input, cx| {
-                input.restore_draft_state(
-                    edit.saved.text,
-                    edit.saved.selection,
-                    edit.saved.reversed,
-                    cx,
-                );
-            });
-            self.drafts.remove(&self.channel);
-            if !self.snapshot(cx).is_empty() {
-                self.save_current(cx);
+        if self.is_editing() {
+            let Some(core_id) = self
+                .edits
+                .get(&self.channel)
+                .map(|e| (e.pending, e.core_id))
+            else {
+                return;
+            };
+            if core_id.0 {
+                return;
             }
+            let buffer = self.snapshot(cx);
+            if let Some(edit) = self.edits.get_mut(&self.channel) {
+                edit.pending = true;
+                edit.attempted = Some(text.clone());
+                edit.buffer = buffer;
+            }
+            self.store.update(cx, |store, cx| {
+                store.edit_message(core_id.1, text.as_ref(), cx)
+            });
             self.mention = None;
             cx.notify();
             return;
@@ -817,10 +903,21 @@ impl Render for Composer {
                                 .id("cancel-edit-banner")
                                 .type_style(text::SMALL)
                                 .text_color(t.muted)
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(t.ink))
-                                .on_click(cx.listener(|this, _, _, cx| this.cancel_edit(cx)))
-                                .child("Cancel"),
+                                .when(
+                                    !self.edits.get(&self.channel).is_some_and(|e| e.pending),
+                                    |d| {
+                                        d.cursor_pointer().hover(|s| s.text_color(t.ink)).on_click(
+                                            cx.listener(|this, _, _, cx| this.cancel_edit(cx)),
+                                        )
+                                    },
+                                )
+                                .child(
+                                    if self.edits.get(&self.channel).is_some_and(|e| e.pending) {
+                                        "Saving…"
+                                    } else {
+                                        "Cancel"
+                                    },
+                                ),
                         ),
                 )
             })
