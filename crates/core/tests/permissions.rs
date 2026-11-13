@@ -590,6 +590,136 @@ async fn named_chat_tools_are_auto_allowed_and_logged_by_name() {
     }
 }
 
+/// In `accept-edits`, mediated `fetch` and unknown/`other` requests (ACP v1/v2)
+/// must reach the human approval flow: pending requests with request_sent
+/// responses, not auto-approved, not silently allowed, and not queued for
+/// command execution. Denial grants nothing; approval is one-shot for the exact
+/// request key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accept_edits_fetch_and_other_require_human_approval_with_one_shot_lifecycle() {
+    for protocol in [1, 2] {
+        let mut h = Harness::new().await;
+        let fetch = json!({"permission_kind": {"title": "Fetch https://example.com/data", "kind": "fetch"}});
+        let other = json!({"permission_kind": {"title": "Unknown tool action", "kind": "other"}});
+        let bot = h
+            .agent(
+                "bot",
+                script(json!({"protocol": protocol, "turns": [
+                    {"steps": [fetch.clone(), other.clone(), {"text": "Asked."}]},
+                    {"steps": [fetch.clone(), other.clone(), other.clone(), {"text": "Done."}]}
+                ]})),
+            )
+            .await;
+        h.core
+            .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+            .await
+            .unwrap();
+
+        h.say("@bot run fetch and other").await;
+        let req_fetch = wait_request(&mut h, PermissionState::Pending).await;
+        let req_other = wait_request(&mut h, PermissionState::Pending).await;
+        assert_eq!(
+            &*req_fetch.title, "Fetch https://example.com/data",
+            "v{protocol}"
+        );
+        assert_eq!(&*req_other.title, "Unknown tool action", "v{protocol}");
+        for req in [&req_fetch, &req_other] {
+            assert_eq!(req.state, PermissionState::Pending, "v{protocol}: {req:#?}");
+            assert!(
+                req.run_state.is_none(),
+                "not queued/command execution, v{protocol}: {req:#?}"
+            );
+            assert!(req.command.is_none(), "v{protocol}: {req:#?}");
+            assert!(req.cwd.is_none(), "v{protocol}: {req:#?}");
+        }
+
+        let first = wait_outcomes(&h, "bot", 2).await;
+        for (ix, what) in [(0, "fetch"), (1, "other")] {
+            assert_eq!(
+                picked(&first[ix]),
+                &json!("deny"),
+                "{what}, v{protocol}: {}",
+                first[ix]
+            );
+            assert_eq!(
+                first[ix]["_meta"]["chaosControl"]["status"],
+                json!("request_sent"),
+                "{what}, v{protocol}: {}",
+                first[ix]
+            );
+            assert!(
+                first[ix]["_meta"]["chaosControl"]["requestId"]
+                    .as_i64()
+                    .is_some(),
+                "{what}, v{protocol}: {}",
+                first[ix]
+            );
+        }
+
+        h.wait_message("first turn", Some(bot.id)).await;
+
+        h.core
+            .answer_permission(req_fetch.id, h.hx.id, false, None)
+            .await
+            .unwrap();
+        h.core
+            .answer_permission(req_other.id, h.hx.id, true, None)
+            .await
+            .unwrap();
+
+        let all = wait_outcomes(&h, "bot", 5).await;
+        let id = |o: &serde_json::Value| o["_meta"]["chaosControl"]["requestId"].clone();
+        // Denied fetch: retry grants nothing and creates a new pending request.
+        assert_eq!(
+            picked(&all[2]),
+            &json!("deny"),
+            "fetch retry, v{protocol}: {}",
+            all[2]
+        );
+        assert_ne!(id(&all[2]), json!(req_fetch.id.0), "v{protocol}");
+        // Approved other: exact retry allowed once.
+        assert_eq!(
+            picked(&all[3]),
+            &json!("allow"),
+            "other retry, v{protocol}: {}",
+            all[3]
+        );
+        // Second identical other retry after grant consumed: new pending request.
+        assert_eq!(
+            picked(&all[4]),
+            &json!("deny"),
+            "other again, v{protocol}: {}",
+            all[4]
+        );
+        assert_ne!(id(&all[4]), json!(req_other.id.0), "v{protocol}");
+        assert_ne!(id(&all[4]), id(&all[2]), "v{protocol}");
+
+        h.until("approved other grant used", move |c| {
+            c.query_row(
+                "SELECT used_at IS NOT NULL FROM permission_requests WHERE id = ?1",
+                [req_other.id.0],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap()
+        })
+        .await;
+
+        let pending = h.core.pending_permissions(h.main).await.unwrap();
+        assert_eq!(pending.len(), 2, "v{protocol}: {pending:#?}");
+        let titles: Vec<&str> = pending.iter().map(|r| &*r.title).collect();
+        assert_eq!(
+            titles,
+            ["Fetch https://example.com/data", "Unknown tool action"],
+            "v{protocol}"
+        );
+        assert!(
+            pending
+                .iter()
+                .all(|r| r.run_state.is_none() && r.command.is_none())
+        );
+    }
+}
+
 /// A grant is for the exact request, not its title (STRM-572): after a human
 /// approves "Edit files" on a.rs, "Edit files" on b.rs is still declined,
 /// the identical a.rs call goes through once (with a new tool call id), and
