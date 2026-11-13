@@ -210,7 +210,6 @@ pub fn demo_history(count: usize) -> impl Iterator<Item = Message> {
             body: Arc::from(body),
             reply_to: None,
             stance: None,
-            edited_at: None,
         }
     })
 }
@@ -274,7 +273,6 @@ pub fn sample_history() -> (Id, Vec<Message>) {
             body: Arc::from(body),
             reply_to: None,
             stance: None,
-            edited_at: None,
         })
         .collect();
     (MAIN, messages)

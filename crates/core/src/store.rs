@@ -482,8 +482,9 @@ ALTER TABLE permission_requests ADD COLUMN run_output TEXT;
 ALTER TABLE permission_requests ADD COLUMN run_exit_code INTEGER;
 ALTER TABLE permission_requests ADD COLUMN run_finished_at INTEGER;
 "#,
-    // 20: message edits (STRM-575). Messages keep their id and seq; the body
-    // changes in place and previous bodies are kept in `message_revisions`.
+    // 20: message edits (STRM-575). Editing was removed in STRM-604: sent
+    // messages are final. The column and table are kept, unused, for schema
+    // compatibility with databases that already ran this migration.
     r#"
 ALTER TABLE messages ADD COLUMN edited_at INTEGER;
 CREATE TABLE message_revisions (
@@ -1240,8 +1241,7 @@ pub fn is_not_a_project_member(e: &rusqlite::Error) -> bool {
 
 // ---------- messages ----------
 
-const MESSAGE_COLS: &str =
-    "id, channel_id, seq, author_id, origin, body, reply_to, hop, sent_at, edited_at";
+const MESSAGE_COLS: &str = "id, channel_id, seq, author_id, origin, body, reply_to, hop, sent_at";
 
 fn message_from_row(r: &Row<'_>) -> Result<Message> {
     Ok(Message {
@@ -1255,7 +1255,6 @@ fn message_from_row(r: &Row<'_>) -> Result<Message> {
         mentions: Vec::new(),
         hop: r.get::<_, i64>(7)?.clamp(0, u8::MAX as i64) as u8,
         sent_at: r.get::<_, i64>(8)? as Millis,
-        edited_at: r.get::<_, Option<i64>>(9)?.map(|t| t as Millis),
     })
 }
 
@@ -1441,54 +1440,6 @@ pub fn last_agent_message_after(
         params![channel.0, after_seq as i64],
     )?
     .pop())
-}
-
-/// The latest message sent by `author` in `channel` (by seq), if any.
-pub fn last_message_by_author(
-    c: &Connection,
-    channel: ChannelId,
-    author: MemberId,
-) -> Result<Option<Message>> {
-    Ok(query_messages(
-        c,
-        &format!(
-            "SELECT {MESSAGE_COLS} FROM messages
-             WHERE channel_id = ?1 AND author_id = ?2
-             ORDER BY seq DESC LIMIT 1"
-        ),
-        params![channel.0, author.0],
-    )?
-    .pop())
-}
-
-/// Records a previous body and replaces a message's body/edited time and
-/// mention rows in place. The message's id and seq stay the same.
-pub fn edit_message_body(
-    c: &Connection,
-    id: MessageId,
-    body: &str,
-    mentions: &[MemberId],
-    now: Millis,
-) -> Result<Message> {
-    let prev: String = c.query_row("SELECT body FROM messages WHERE id = ?1", [id.0], |r| {
-        r.get(0)
-    })?;
-    c.execute(
-        "INSERT INTO message_revisions (message_id, body, edited_at) VALUES (?1, ?2, ?3)",
-        params![id.0, prev, now as i64],
-    )?;
-    c.execute(
-        "UPDATE messages SET body = ?2, edited_at = ?3 WHERE id = ?1",
-        params![id.0, body, now as i64],
-    )?;
-    c.execute("DELETE FROM mentions WHERE message_id = ?1", [id.0])?;
-    for who in mentions {
-        c.execute(
-            "INSERT OR IGNORE INTO mentions (message_id, member_id) VALUES (?1, ?2)",
-            params![id.0, who.0],
-        )?;
-    }
-    message(c, id).map(|m| m.expect("edited"))
 }
 
 /// Adds `member`'s `emoji` (already normalised) to `message`. Returns whether

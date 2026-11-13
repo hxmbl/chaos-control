@@ -1,7 +1,7 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
-use std::{collections::HashMap, ops::Range, sync::Arc};
+use std::{collections::HashMap, ops::Range};
 
 use gpui::{
     Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
@@ -37,21 +37,18 @@ pub fn bindings() -> Vec<KeyBinding> {
 enum Escape {
     /// Close an open suggestion popup (@-mentions) and keep the reply.
     DismissSuggestions,
-    /// Cancel editing your last message and restore the saved draft.
-    CancelEdit,
     /// Drop the reply reference. The typed text stays.
     CancelReply,
     /// Nothing to back out of: let Esc go on to whatever is behind.
     Propagate,
 }
 
-/// Esc precedence (STRM-576): a suggestion popup first, then edit mode, then
-/// the reply. Text is never cleared.
-fn escape(suggestions_open: bool, editing: bool, replying: bool) -> Escape {
+/// Esc precedence (STRM-576): a suggestion popup first, then the reply.
+/// Edit mode (Up to edit your last message) slots in after the popup when it
+/// exists. Text is never cleared.
+fn escape(suggestions_open: bool, replying: bool) -> Escape {
     if suggestions_open {
         Escape::DismissSuggestions
-    } else if editing {
-        Escape::CancelEdit
     } else if replying {
         Escape::CancelReply
     } else {
@@ -83,27 +80,6 @@ fn echo_matches_in(
         .any(|m| matches!(m.author, model::Author::Human) && m.body.as_ref() == sent_body(sent))
 }
 
-fn apply_finish_edit(
-    edits: &mut HashMap<Id, Editing>,
-    drafts: &mut HashMap<Id, Draft>,
-    channel: Id,
-    index: usize,
-) -> Option<Editing> {
-    let matches = edits
-        .get(&channel)
-        .is_some_and(|edit| edit.pending && edit.index == index);
-    if !matches {
-        return None;
-    }
-    let edit = edits.remove(&channel)?;
-    if edit.saved.is_empty() {
-        drafts.remove(&channel);
-    } else {
-        drafts.insert(channel, edit.saved.clone());
-    }
-    Some(edit)
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Draft {
     text: SharedString,
@@ -125,16 +101,6 @@ impl Draft {
     fn is_empty(&self) -> bool {
         self.text.as_ref().trim().is_empty() && self.reply.is_none()
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Editing {
-    index: usize,
-    core_id: chaos_core::types::MessageId,
-    saved: Draft,
-    buffer: Draft,
-    pending: bool,
-    attempted: Option<SharedString>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -200,7 +166,6 @@ pub struct Composer {
     /// A core send in flight: restored if the send fails.
     pending: Option<(Id, Draft)>,
     mention: Option<MentionState>,
-    edits: HashMap<Id, Editing>,
     _subscriptions: [Subscription; 3],
 }
 
@@ -278,17 +243,6 @@ impl Composer {
                         }
                     }
                 }
-                StoreEvent::Updated { channel, index } => {
-                    this.finish_edit(*channel, *index, cx);
-                }
-                StoreEvent::EditFailed {
-                    channel,
-                    core_id,
-                    attempted,
-                    ..
-                } => {
-                    this.restore_failed_edit(*channel, *core_id, attempted.clone(), cx);
-                }
                 _ => {}
             }),
         ];
@@ -300,7 +254,6 @@ impl Composer {
             drafts: HashMap::new(),
             pending: None,
             mention: None,
-            edits: HashMap::new(),
             _subscriptions: subscriptions,
         }
     }
@@ -319,18 +272,7 @@ impl Composer {
         }
     }
 
-    fn is_editing(&self) -> bool {
-        self.edits.contains_key(&self.channel)
-    }
-
     fn save_current(&mut self, cx: &Context<Self>) {
-        if self.edits.contains_key(&self.channel) {
-            let draft = self.snapshot(cx);
-            if let Some(edit) = self.edits.get_mut(&self.channel) {
-                edit.buffer = draft;
-            }
-            return;
-        }
         let draft = self.snapshot(cx);
         if draft.is_empty() {
             self.drafts.remove(&self.channel);
@@ -340,18 +282,6 @@ impl Composer {
     }
 
     fn restore_for(&mut self, channel: Id, cx: &mut Context<Self>) {
-        if let Some(edit) = self.edits.get(&channel).cloned() {
-            self.reply = edit.buffer.reply.clone();
-            self.input.update(cx, |input, cx| {
-                input.restore_draft_state(
-                    edit.buffer.text,
-                    edit.buffer.selection,
-                    edit.buffer.reversed,
-                    cx,
-                );
-            });
-            return;
-        }
         let draft = self
             .drafts
             .get(&channel)
@@ -378,129 +308,9 @@ impl Composer {
         cx.notify();
     }
 
-    fn begin_edit(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.is_editing() || self.suggestions_open() || self.reply.is_some() {
-            return false;
-        }
-        if sendable(self.input.read(cx).text()) {
-            return false;
-        }
-        let Some((index, core_id, body)) = self.store.read(cx).editable_last_own_message() else {
-            return false;
-        };
-        let saved = self.snapshot(cx);
-        let body: SharedString = body.as_ref().to_string().into();
-        let end = body.len();
-        let buffer = Draft {
-            text: body.clone(),
-            selection: end..end,
-            reversed: false,
-            reply: None,
-        };
-        self.reply = None;
-        self.edits.insert(
-            self.channel,
-            Editing {
-                index,
-                core_id,
-                saved,
-                buffer,
-                pending: false,
-                attempted: None,
-            },
-        );
-        self.input.update(cx, |input, cx| {
-            input.restore_draft_state(body, end..end, false, cx);
-        });
-        self.mention = None;
-        cx.notify();
-        true
-    }
-
-    fn cancel_edit(&mut self, cx: &mut Context<Self>) {
-        if self
-            .edits
-            .get(&self.channel)
-            .is_some_and(|edit| edit.pending)
-        {
-            return;
-        }
-        let Some(edit) = self.edits.remove(&self.channel) else {
-            return;
-        };
-        self.reply = edit.saved.reply.clone();
-        self.input.update(cx, |input, cx| {
-            input.restore_draft_state(
-                edit.saved.text,
-                edit.saved.selection,
-                edit.saved.reversed,
-                cx,
-            );
-        });
-        self.mention = None;
-        cx.notify();
-    }
-
-    fn finish_edit(&mut self, channel: Id, index: usize, cx: &mut Context<Self>) {
-        let Some(edit) = apply_finish_edit(&mut self.edits, &mut self.drafts, channel, index)
-        else {
-            return;
-        };
-        if self.channel == channel {
-            self.reply = edit.saved.reply.clone();
-            self.input.update(cx, |input, cx| {
-                input.restore_draft_state(
-                    edit.saved.text,
-                    edit.saved.selection,
-                    edit.saved.reversed,
-                    cx,
-                );
-            });
-            self.mention = None;
-            self.save_current(cx);
-        }
-        cx.notify();
-    }
-
-    fn restore_failed_edit(
-        &mut self,
-        channel: Id,
-        core_id: chaos_core::types::MessageId,
-        attempted: Arc<str>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(edit) = self.edits.get_mut(&channel) else {
-            return;
-        };
-        if !edit.pending || edit.core_id != core_id {
-            return;
-        }
-        edit.pending = false;
-        let text = SharedString::from(attempted.as_ref().to_string());
-        let end = text.len();
-        edit.attempted = Some(text.clone());
-        edit.buffer = Draft {
-            text: text.clone(),
-            selection: end..end,
-            reversed: false,
-            reply: None,
-        };
-        if self.channel == channel {
-            self.reply = None;
-            self.input.update(cx, |input, cx| {
-                input.restore_draft_state(text, end..end, false, cx);
-            });
-            self.mention = None;
-        }
-        cx.notify();
-    }
-
     /// Starts a reply to a message (the pane's "Reply"): shows the reference
     /// above the field and hands the keyboard to the composer.
     pub fn set_reply(&mut self, reply: ReplyRef, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_editing() {
-            return;
-        }
         self.reply = Some(reply);
         self.focus(window, cx);
         cx.notify();
@@ -620,13 +430,8 @@ impl Composer {
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        match escape(
-            self.suggestions_open(),
-            self.is_editing(),
-            self.reply.is_some(),
-        ) {
+        match escape(self.suggestions_open(), self.reply.is_some()) {
             Escape::DismissSuggestions => self.dismiss_suggestions(cx),
-            Escape::CancelEdit => self.cancel_edit(cx),
             Escape::CancelReply => {
                 self.reply = None;
                 self.save_current(cx);
@@ -645,30 +450,6 @@ impl Composer {
     fn send(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text().clone();
         if !sendable(&text) || self.unwired(cx) {
-            return;
-        }
-        if self.is_editing() {
-            let Some(core_id) = self
-                .edits
-                .get(&self.channel)
-                .map(|e| (e.pending, e.core_id))
-            else {
-                return;
-            };
-            if core_id.0 {
-                return;
-            }
-            let buffer = self.snapshot(cx);
-            if let Some(edit) = self.edits.get_mut(&self.channel) {
-                edit.pending = true;
-                edit.attempted = Some(text.clone());
-                edit.buffer = buffer;
-            }
-            self.store.update(cx, |store, cx| {
-                store.edit_message(core_id.1, text.as_ref(), cx)
-            });
-            self.mention = None;
-            cx.notify();
             return;
         }
         let route = self.store.read(cx).send_route();
@@ -851,27 +632,14 @@ impl Render for Composer {
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::accept_mention_action))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                let key = event.keystroke.key.as_str();
-                if this.suggestions_open() {
-                    match key {
-                        "up" if this.move_mention_selection(-1, cx) => {
-                            cx.stop_propagation();
-                        }
-                        "down" if this.move_mention_selection(1, cx) => {
-                            cx.stop_propagation();
-                        }
-                        _ => {}
-                    }
+                if !this.suggestions_open() {
                     return;
                 }
-                if key == "up"
-                    && !this.is_editing()
-                    && !this.unwired(cx)
-                    && this.reply.is_none()
-                    && !sendable(this.input.read(cx).text())
-                    && this.begin_edit(cx)
-                {
-                    cx.stop_propagation();
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
+                    "down" if this.move_mention_selection(1, cx) => cx.stop_propagation(),
+                    _ => {}
                 }
             }))
             .w_full()
@@ -896,47 +664,6 @@ impl Render for Composer {
                 )
             })
             .children(self.render_mentions(cx))
-            .when(self.is_editing(), |d| {
-                d.child(
-                    div()
-                        .mx(space::X1)
-                        .mb(space::X1)
-                        .px(space::X2)
-                        .py(space::X1)
-                        .rounded(radius::MD)
-                        .bg(t.sunken)
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .type_style(text::SMALL)
-                                .text_color(t.muted)
-                                .child("Editing message"),
-                        )
-                        .child(
-                            div()
-                                .id("cancel-edit-banner")
-                                .type_style(text::SMALL)
-                                .text_color(t.muted)
-                                .when(
-                                    !self.edits.get(&self.channel).is_some_and(|e| e.pending),
-                                    |d| {
-                                        d.cursor_pointer().hover(|s| s.text_color(t.ink)).on_click(
-                                            cx.listener(|this, _, _, cx| this.cancel_edit(cx)),
-                                        )
-                                    },
-                                )
-                                .child(
-                                    if self.edits.get(&self.channel).is_some_and(|e| e.pending) {
-                                        "Saving…"
-                                    } else {
-                                        "Cancel"
-                                    },
-                                ),
-                        ),
-                )
-            })
             .when_some(self.reply.clone(), |d, reply| {
                 d.child(self.render_reply(&reply, cx))
             })
@@ -1020,27 +747,19 @@ mod tests {
     }
 
     #[test]
-    fn esc_closes_suggestions_before_edit_or_reply() {
-        assert_eq!(escape(true, true, true), Escape::DismissSuggestions);
-        assert_eq!(escape(true, true, false), Escape::DismissSuggestions);
-        assert_eq!(escape(true, false, true), Escape::DismissSuggestions);
-        assert_eq!(escape(true, false, false), Escape::DismissSuggestions);
+    fn esc_closes_suggestions_before_the_reply() {
+        assert_eq!(escape(true, true), Escape::DismissSuggestions);
+        assert_eq!(escape(true, false), Escape::DismissSuggestions);
     }
 
     #[test]
-    fn esc_cancels_edit_before_reply() {
-        assert_eq!(escape(false, true, true), Escape::CancelEdit);
-        assert_eq!(escape(false, true, false), Escape::CancelEdit);
-    }
-
-    #[test]
-    fn esc_cancels_a_reply_when_nothing_else_is_open() {
-        assert_eq!(escape(false, false, true), Escape::CancelReply);
+    fn esc_cancels_a_reply_when_nothing_is_open() {
+        assert_eq!(escape(false, true), Escape::CancelReply);
     }
 
     #[test]
     fn esc_with_nothing_to_cancel_passes_through() {
-        assert_eq!(escape(false, false, false), Escape::Propagate);
+        assert_eq!(escape(false, false), Escape::Propagate);
     }
 
     #[test]
@@ -1119,7 +838,6 @@ mod tests {
             body: Arc::from(body),
             reply_to: None,
             stance: None,
-            edited_at: None,
         };
         let agent = |id: u32, body: &str| model::Message {
             id: Id(id),
@@ -1128,7 +846,6 @@ mod tests {
             body: Arc::from(body),
             reply_to: None,
             stance: None,
-            edited_at: None,
         };
 
         // Core stores trimmed body; draft may have trailing whitespace.
@@ -1184,62 +901,5 @@ mod tests {
         assert_eq!(filter_mentions(&candidates, "CX").len(), 1);
         assert_eq!(filter_mentions(&candidates, "").len(), 2);
         assert!(filter_mentions(&candidates, "zzz").is_empty());
-    }
-
-    #[test]
-    fn finishing_pending_edit_in_inactive_channel_preserves_saved_draft() {
-        let channel = Id(1);
-        let saved = Draft {
-            text: "draft I was writing".into(),
-            selection: 5..5,
-            reversed: false,
-            reply: None,
-        };
-        let buffer = Draft {
-            text: "edited message".into(),
-            selection: 14..14,
-            reversed: false,
-            reply: None,
-        };
-        let mut edits = HashMap::new();
-        edits.insert(
-            channel,
-            Editing {
-                index: 7,
-                core_id: chaos_core::types::MessageId(42),
-                saved: saved.clone(),
-                buffer,
-                pending: true,
-                attempted: Some("edited message".into()),
-            },
-        );
-        let mut drafts = HashMap::new();
-
-        let finished = apply_finish_edit(&mut edits, &mut drafts, channel, 7).unwrap();
-        assert_eq!(finished.saved, saved);
-        assert!(!edits.contains_key(&channel));
-        assert_eq!(drafts.get(&channel), Some(&saved));
-
-        // If the saved draft was empty, it should not linger in drafts.
-        let mut edits = HashMap::new();
-        edits.insert(
-            channel,
-            Editing {
-                index: 1,
-                core_id: chaos_core::types::MessageId(9),
-                saved: Draft::empty(),
-                buffer: Draft {
-                    text: "x".into(),
-                    selection: 1..1,
-                    reversed: false,
-                    reply: None,
-                },
-                pending: true,
-                attempted: Some("x".into()),
-            },
-        );
-        let mut drafts = HashMap::from([(channel, saved.clone())]);
-        apply_finish_edit(&mut edits, &mut drafts, channel, 1);
-        assert!(!drafts.contains_key(&channel));
     }
 }

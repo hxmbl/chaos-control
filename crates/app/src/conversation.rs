@@ -79,14 +79,6 @@ impl Conversation {
                 cx.notify();
             }
             StoreEvent::Appended { .. } => {}
-            StoreEvent::Updated { channel, index } if *channel == this.channel => {
-                let count = this.list.item_count();
-                if *index < count {
-                    this.list.splice(*index..*index + 1, 1);
-                }
-                cx.notify();
-            }
-            StoreEvent::Updated { .. } => {}
             StoreEvent::Receipts { channel, rows } | StoreEvent::Reactions { channel, rows }
                 if *channel == this.channel =>
             {
@@ -103,8 +95,7 @@ impl Conversation {
             StoreEvent::Receipts { .. } | StoreEvent::Reactions { .. } => {}
             StoreEvent::PermissionAsked(_)
             | StoreEvent::PermissionAnswered { .. }
-            | StoreEvent::SendFailed { .. }
-            | StoreEvent::EditFailed { .. } => {}
+            | StoreEvent::SendFailed { .. } => {}
         });
         Self {
             store,
@@ -224,15 +215,6 @@ impl Conversation {
                                             .text_color(t.muted)
                                             .child(clock(message.sent_at)),
                                     )
-                                    .when(message.edited_at.is_some(), |d| {
-                                        d.child(
-                                            div()
-                                                .flex_none()
-                                                .type_style(text::CAPTION)
-                                                .text_color(t.muted)
-                                                .child("(edited)"),
-                                        )
-                                    })
                                     // A refusal or dissent is a normal peer
                                     // reply: one muted word, no colour (colour
                                     // means status), never an error style.
