@@ -1,3 +1,4 @@
+
 name: CI
 
 on:
@@ -24,8 +25,9 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
-  linux:
-    name: Linux (clippy, test, build)
+  test-clippy:
+    name: Test + Clippy
+    needs: fmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,10 +45,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
+
+  linux-build:
+    name: Linux Build
+    needs: test-clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: GPUI system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libasound2-dev libfontconfig-dev libfreetype-dev libssl-dev \
+            libvulkan-dev libwayland-dev libx11-xcb-dev libxcb1-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libzstd-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo build --workspace --locked
 
-  macos:
-    name: macOS (build)
+  macos-build:
+    name: macOS Build
+    needs: test-clippy
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
