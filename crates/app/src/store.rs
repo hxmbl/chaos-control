@@ -2173,6 +2173,7 @@ mod apply_core_event_tests {
         store
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn core_msg(
         id: i64,
         seq: u64,
@@ -2197,6 +2198,7 @@ mod apply_core_event_tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         store: &mut ChatStore,
         sink: &mut Sink,
