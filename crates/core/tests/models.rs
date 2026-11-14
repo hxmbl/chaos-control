@@ -12,7 +12,6 @@ use chaos_core::{
     fake::{self, FakeAgent},
     host::MemberSpec,
     roster::ModelMember,
-    types::*,
 };
 use common::*;
 use serde_json::json;
