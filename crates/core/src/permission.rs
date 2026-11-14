@@ -1435,38 +1435,21 @@ pub fn pending_presence(c: &Connection, agent: MemberId, channel: ChannelId) -> 
 
 impl Engine {
     /// Marks where an agent is configured/requested to run. Agents default to
-    /// the host. VM auto-approval requires separately verified isolation evidence;
-    /// config alone must never be treated as proof of isolation.
+    /// the host. VM auto-approval is disabled until a trustworthy isolation
+    /// mechanism can verify isolation with evidence bound to the agent/runtime
+    /// session; configuration alone is never proof of isolation.
     pub fn set_runs_in(&mut self, agent: MemberId, runs_in: RunsIn) {
         self.runs_in.insert(agent, runs_in);
-        if runs_in != RunsIn::Vm {
-            self.vm_isolation_verified.remove(&agent);
-        }
     }
 
     pub fn runs_in(&self, agent: MemberId) -> RunsIn {
         self.runs_in.get(&agent).copied().unwrap_or_default()
     }
 
-    /// Records whether VM isolation has been verified by a trustworthy capability.
-    /// This must not be derived from user configuration alone.
-    pub fn set_vm_isolation_verified(&mut self, agent: MemberId, verified: bool) {
-        if verified {
-            self.vm_isolation_verified.insert(agent, true);
-        } else {
-            self.vm_isolation_verified.remove(&agent);
-        }
-    }
-
-    pub fn vm_isolation_verified(&self, agent: MemberId) -> bool {
-        self.vm_isolation_verified
-            .get(&agent)
-            .copied()
-            .unwrap_or(false)
-    }
-
-    fn verified_vm_auto_approval(&self, agent: MemberId) -> bool {
-        self.runs_in(agent) == RunsIn::Vm && self.vm_isolation_verified(agent)
+    fn verified_vm_auto_approval(&self, _agent: MemberId) -> bool {
+        // No trusted, bound isolation verifier is implemented. A public/caller-
+        // controlled boolean is not acceptable as verification evidence.
+        false
     }
 
     /// Sets the host-side approval mode for `agent` (STRM-542). Persisted.
@@ -2263,11 +2246,12 @@ pub const TOOL_NAMES: [&str; 4] = [
     "chat_set_approval_mode",
 ];
 
-/// CC-internal control-plane chat tools that may be auto-approved without
-/// per-call human approval when requested natively, but only as verified
-/// CC-injected tool identities/origin on the mediated path. Read/status
-/// control-plane tools and policy/authorization actions remain human-approved.
-/// If trustworthy provenance cannot be established, no exception is granted.
+/// CC-internal control-plane chat tools. Auto-approval exceptions require a
+/// CC-established, non-forgeable tool identity/origin bound to the request; names
+/// and metadata supplied in incoming permission requests (including server-
+/// qualified names) are untrusted. Until such identity can be established, these
+/// requests fail closed and require human approval. Read/status control-plane
+/// tools and policy/authorization actions also remain human-approved.
 pub const AUTO_ALLOWED_CHAT_TOOL_NAMES: [&str; 6] = [
     "chat_send",
     "chat_react",
@@ -2311,94 +2295,14 @@ fn cc_control_plane_base_name(name: &str) -> Option<&str> {
     None
 }
 
-/// True only when the request identifies an exact CC control-plane tool with
-/// trustworthy CC MCP provenance. Bare/unqualified names without verifiable CC
-/// origin fail closed. Conflicting/malformed provenance fails closed.
-pub fn is_verified_cc_control_plane_tool(name: &str, detail: Option<&str>) -> bool {
-    let Some(base) = cc_control_plane_base_name(name) else {
-        return false;
-    };
-    if name.trim() != base {
-        // Explicit server-qualified identity binds to CC origin.
-        return true;
-    }
-    let Some(detail) = detail else {
-        return false;
-    };
-    if let Ok(v) = serde_json::from_str::<Value>(detail) {
-        let mut ids = Vec::new();
-        collect_server_identities(&v, &mut ids);
-        if ids.is_empty() {
-            return false;
-        }
-        let mut uniq: Vec<&str> = Vec::new();
-        for id in &ids {
-            if !uniq.iter().any(|u| u == id) {
-                uniq.push(id.as_str());
-            }
-        }
-        return uniq.as_slice() == [CC_MCP_SERVER_NAME];
-    }
+/// True only when Chaos Control itself has established that the permission
+/// request is for a CC-injected control-plane tool identity/origin. Names and
+/// metadata supplied in the incoming permission request (including server-
+/// qualified tool names) are untrusted and MUST NOT be treated as proof.
+/// Until CC can bind a trustworthy, non-forgeable identity to the request,
+/// control-plane auto-allow exceptions remain disabled (fail closed).
+pub fn is_verified_cc_control_plane_tool(_name: &str, _detail: Option<&str>) -> bool {
     false
-}
-
-fn collect_server_identities(v: &Value, out: &mut Vec<String>) {
-    match v {
-        Value::Object(map) => {
-            for k in [
-                "serverName",
-                "server_name",
-                "mcpServer",
-                "mcp_server",
-                "mcpServerName",
-                "mcp_server_name",
-                "sourceServer",
-                "source_server",
-            ] {
-                if let Some(Value::String(s)) = map.get(k) {
-                    out.push(s.clone());
-                }
-            }
-            // Generic "server" can be string identity or object; only treat
-            // explicit string/object-name forms as server identity markers.
-            if let Some(sv) = map.get("server") {
-                match sv {
-                    Value::String(s) => out.push(s.clone()),
-                    Value::Object(m) => {
-                        if let Some(Value::String(s)) = m
-                            .get("name")
-                            .or_else(|| m.get("id"))
-                            .or_else(|| m.get("serverName"))
-                        {
-                            out.push(s.clone());
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            for k in ["mcpServer", "mcp_server", "source", "origin", "toolCall"] {
-                if let Some(inner) = map.get(k) {
-                    collect_server_identities(inner, out);
-                }
-            }
-            for (k, v) in map {
-                // Avoid double-walking keys we specially handled in ways that
-                // already recurse; but recursion is cheap and safe.
-                if !matches!(
-                    k.as_str(),
-                    "server" | "mcpServer" | "mcp_server" | "source" | "origin" | "toolCall"
-                ) {
-                    collect_server_identities(v, out);
-                }
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                collect_server_identities(item, out);
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Exact allowlisted control-plane base name (no provenance, exact match).
@@ -3020,60 +2924,34 @@ mod tests {
     }
 
     #[test]
-    fn cc_control_plane_provenance_requires_verified_identity() {
-        // Correct injected tool identity (server-qualified) is verified.
-        assert!(is_verified_cc_control_plane_tool(
-            "chaos-control/chat_send",
-            None
-        ));
-        assert!(is_verified_cc_control_plane_tool(
-            "mcp__chaos-control__chat_status",
-            None
-        ));
-        assert!(is_verified_cc_control_plane_tool(
-            "chat_send",
-            Some(r#"{"subject":{"toolCall":{"serverName":"chaos-control","name":"chat_send"}}}"#)
-        ));
-
-        // Missing provenance for bare names fails closed.
-        assert!(!is_verified_cc_control_plane_tool("chat_send", None));
-        assert!(!is_verified_cc_control_plane_tool(
-            "chat_react",
-            Some(r#"{"command":"echo hi"}"#)
-        ));
-
-        // Same-name tool from unrelated provider fails closed.
-        assert!(!is_verified_cc_control_plane_tool(
-            "evil-mcp/chat_send",
-            None
-        ));
-        assert!(!is_verified_cc_control_plane_tool(
-            "chat_send",
-            Some(r#"{"serverName":"evil-mcp"}"#)
-        ));
-
-        // Malformed/conflicting provenance fails closed.
-        assert!(!is_verified_cc_control_plane_tool(
-            "chat_send",
-            Some("not json")
-        ));
-        assert!(!is_verified_cc_control_plane_tool(
-            "chat_send",
-            Some(r#"{"serverName":"chaos-control","source":{"serverName":"evil-mcp"}}"#)
-        ));
-        assert!(!is_verified_cc_control_plane_tool(
-            "chat_send",
-            Some(r#"{"server":"evil-mcp","toolCall":{"serverName":"chaos-control"}}"#)
-        ));
-
-        // Non-control-plane names are never verified as CC control-plane tools.
-        assert!(!is_verified_cc_control_plane_tool(
-            "chaos-control/external_tool",
-            None
-        ));
-        assert!(!is_verified_cc_control_plane_tool(
-            "external_tool",
-            Some(r#"{"serverName":"chaos-control"}"#)
-        ));
+    fn cc_control_plane_auto_allow_requires_cc_established_identity_not_request_names() {
+        // Request-supplied names/metadata (including server-qualified names and
+        // metadata claiming chaos-control origin) are untrusted and must not be
+        // accepted as proof of CC-established identity.
+        for (name, detail) in [
+            ("chat_send", None),
+            ("chaos-control/chat_send", None),
+            ("mcp__chaos-control__chat_status", None),
+            (
+                "chat_send",
+                Some(
+                    r#"{"subject":{"toolCall":{"serverName":"chaos-control","name":"chat_send"}}}"#,
+                ),
+            ),
+            ("evil-mcp/chat_send", None),
+            ("chat_send", Some(r#"{"serverName":"evil-mcp"}"#)),
+            ("chat_send", Some("not json")),
+            (
+                "chat_send",
+                Some(r#"{"serverName":"chaos-control","source":{"serverName":"evil-mcp"}}"#),
+            ),
+            ("chaos-control/external_tool", None),
+            ("external_tool", Some(r#"{"serverName":"chaos-control"}"#)),
+        ] {
+            assert!(
+                !is_verified_cc_control_plane_tool(name, detail),
+                "request-supplied identity must not be trusted: {name} {detail:?}"
+            );
+        }
     }
 }

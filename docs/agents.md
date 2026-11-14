@@ -376,7 +376,7 @@ cases require human approval (or are otherwise held/fail closed) as applicable.
 | Where | What happens |
 | --- | --- |
 | `host` (the user's computer, default) | Decided by mediated classification + approval mode (below). Requests that require approval are **non-blocking**: the agent is answered at once with a "request sent" / pending outcome (and request id) so it can continue other work or wait; a human Approve/Deny arrives later as a wake/message. Approved one-shot grants apply only to the exact retried request identity. Nothing times out into an approval. |
-| `vm` (agent configured/requested to run in its own VM) | Auto-approved (`DecidedBy::AutoVm`) **only** when Chaos Control has trustworthy, verified isolation evidence for that agent/session. A configuration flag alone is never proof of isolation; without verified isolation evidence, requests fall back to normal host-side permission enforcement (fail closed). No VM orchestration/verification is implemented by default today. |
+| `vm` (agent configured/requested to run in its own VM) | **VM auto-approval is disabled** until a trusted isolation mechanism verifies isolation with evidence bound to the agent/runtime/session. A configuration flag alone is never proof of isolation, and there is no public/caller-controlled verification setter; until a real trusted mechanism exists, requests fall back to normal host-side permission enforcement (fail closed). |
 
 `yolo` mode explicitly allows mediated requests on the host (`DecidedBy::AutoMode`),
 logged distinctly from verified VM auto-approval. Unverified `runs_in: "vm"` configuration must not grant auto-approval.
@@ -437,7 +437,7 @@ never fails a turn, never turns an agent red, and is never retried by the runtim
 blocks the agent until it is answered, so the adapter asks core
 (`OpenSession::permissions`, decided in the engine) and answers at once:
 
-- allowed (verified VM isolation, a grant, or the approval mode allowed it — below): the
+- allowed (a trusted, bound verified-isolation grant if/when supported, a prior one-shot grant, or the approval mode allowed it — below): the
   agent's own **allow-once** option, else allow-always only if nothing
   narrower is offered (claude-agent-acp's allow-always writes a lasting
   rule into the agent's local settings);
@@ -510,7 +510,7 @@ implemented yet).
 
 **Chat tools.** `chat_request_permission {action, reason?}` asks ahead: on
 the host it answers `{status: "request_sent", request_id, asked}` (or
-`approved` if that action is already approved and unused); in a verified isolated VM,
+`approved` if that action is already approved and unused); auto-approval requires a trusted isolation mechanism with evidence bound to the agent/runtime/session (not available/config-only today),
 `approved`. It is keyed on the `action` text, so it no longer pre-clears a
 tool call with that title (STRM-572): the tool call is approved through its
 own native request. `chat_permission_status {request_id?}` lists the agent's requests in
@@ -663,7 +663,7 @@ keys. Each entry is one ACP command; `brand` only picks the icon:
 
 `record` appends every ACP frame as NDJSON `{dir, frame}`, the replay-fixture
 format. Optional keys: `env` (object), `acp_v2` (default `true`),
-`chat_tools` (`"auto"` or `"stdio"`), `runs_in` (`"host"`, the default, or `"vm"` to request/mark a VM-isolated runtime; **config alone does not prove isolation or grant auto-approval** — verified isolation evidence is required, otherwise host-side enforcement applies),
+`chat_tools` (`"auto"` or `"stdio"`), `runs_in` (`"host"`, the default, or `"vm"` to request/mark a VM-isolated runtime; **config alone does not prove isolation and does not grant auto-approval** — VM auto-approval remains disabled until a trusted isolation mechanism verifies isolation with evidence bound to the agent/runtime/session, otherwise host-side enforcement applies),
 `"vm"`; see Permissions), `ping_answer_reactions` (a list of emoji, or
 `["*"]`; see "Which reactions answer a ping").
 
@@ -696,7 +696,7 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   approval mode, against the fake agent: a host request is routed to the
   waker, declined natively with the request id and the turn carries on;
   an approval wakes the agent and lets the retried call through once; a
-  denial grants nothing and is not a failure; a verified-VM agent may be approved
+  denial grants nothing and is not a failure; VM-configured agents are not auto-approved without a trusted, bound isolation mechanism
   without a note; reads are allowed and logged; the chat tools ask ahead,
   dedup and poll; only humans answer, once.
 - `tests/models.rs`: model members against the fake ACP agent: the ACP

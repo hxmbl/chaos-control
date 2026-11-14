@@ -985,17 +985,6 @@ impl Core {
             .await?
     }
 
-    /// Records whether an agent's VM isolation has been verified by a trustworthy
-    /// capability. This must not be derived from user configuration alone.
-    pub async fn set_vm_isolation_verified(
-        &self,
-        agent: MemberId,
-        verified: bool,
-    ) -> Result<(), String> {
-        self.with_engine(move |e, _| e.set_vm_isolation_verified(agent, verified))
-            .await
-    }
-
     /// Sets an agent/member's default approval mode (STRM-542). Affects new requests.
     pub async fn set_approval_mode(
         &self,
