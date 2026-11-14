@@ -24,7 +24,7 @@ const MAC_TRAFFIC_LIGHTS_END: f32 = 84.;
 /// Width of the Linux window controls (three 28px buttons, 4px gaps) plus a gap.
 const WINDOW_CONTROLS_WIDTH: f32 = 3. * 28. + 2. * 4. + 8.; // 3 × size::BUTTON_SM, 2 × space::X1, space::X2
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
-const HOVER_TEXT_FADE: Duration = Duration::from_millis(140);
+const HOVER_TEXT_FADE: Duration = Duration::from_millis(200);
 /// Update-check animation: spin the refresh arrow, break it into a dashed
 /// ring, then land on the tick — where it stops (it never cycles past it).
 const UPDATE_SPIN: Duration = Duration::from_millis(400);
