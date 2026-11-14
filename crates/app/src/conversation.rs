@@ -9,8 +9,9 @@
 use std::{borrow::Cow, sync::Arc};
 
 use gpui::{
-    AnyElement, Context, ElementId, Entity, ListAlignment, ListOffset, ListState, SharedString,
-    Subscription, WeakEntity, Window, div, list, prelude::*, px,
+    AnyElement, App, Context, ElementId, Entity, HighlightStyle, ListAlignment, ListOffset,
+    ListState, SharedString, StyledText, Subscription, TextRun, WeakEntity, Window, div, list,
+    prelude::*, px,
 };
 use model::{Author, Id, PaneContent, mentions, pane};
 use ui::{
@@ -20,6 +21,7 @@ use ui::{
 };
 
 use crate::{
+    mention_highlight::{self, KnownMentions},
     pane_host::PaneHost,
     store::{ChatStore, ReactionChip, Reader, StoreEvent},
 };
@@ -107,41 +109,61 @@ impl Conversation {
         }
     }
 
-    fn render_message(&self, ix: usize, cx: &gpui::App) -> AnyElement {
+    fn render_message(&self, ix: usize, window: &mut Window, cx: &mut App) -> AnyElement {
         let t = *cx.theme();
-        let store = self.store.read(cx);
-        let Some(message) = store.log(self.channel).and_then(|l| l.get(ix)) else {
-            return div().into_any_element();
-        };
-        let (avatar, name): (AnyElement, SharedString) = match message.author {
-            Author::Agent(id) => match store.workspace().agent(id) {
-                Some(agent) => (
-                    icon(brand_icon(agent.brand), icons::MD, t.ink).into_any_element(),
-                    agent.name.clone().into(),
+        let (message, avatar, name, can_react, chips, readers, display, known, is_long) = {
+            let store = self.store.read(cx);
+            let Some(message) = store.log(self.channel).and_then(|l| l.get(ix)).cloned() else {
+                return div().into_any_element();
+            };
+            let (avatar, name): (AnyElement, SharedString) = match message.author {
+                Author::Agent(id) => match store.workspace().agent(id) {
+                    Some(agent) => (
+                        icon(brand_icon(agent.brand), icons::MD, t.ink).into_any_element(),
+                        agent.name.clone().into(),
+                    ),
+                    None => (div().into_any_element(), model::PREVIOUS_AGENT.into()),
+                },
+                Author::Human => (
+                    div()
+                        .type_style(text::CAPTION)
+                        .font_weight(text::SEMIBOLD)
+                        .child("Hx")
+                        .into_any_element(),
+                    "Hx".into(),
                 ),
-                None => (div().into_any_element(), model::PREVIOUS_AGENT.into()),
-            },
-            Author::Human => (
-                div()
-                    .type_style(text::CAPTION)
-                    .font_weight(text::SEMIBOLD)
-                    .child("Hx")
-                    .into_any_element(),
-                "Hx".into(),
-            ),
-            Author::System => (
-                div()
-                    .type_style(text::CAPTION)
-                    .text_color(t.ink_soft)
-                    .child("·")
-                    .into_any_element(),
-                "Chaos Control".into(),
-            ),
-        };
+                Author::System => (
+                    div()
+                        .type_style(text::CAPTION)
+                        .text_color(t.ink_soft)
+                        .child("·")
+                        .into_any_element(),
+                    "Chaos Control".into(),
+                ),
+            };
 
-        let can_react = store.can_react(self.channel, ix);
-        let chips = store.reactions(self.channel, ix);
+            let can_react = store.can_react(self.channel, ix);
+            let chips = store.reactions(self.channel, ix);
+            let readers = store.readers(self.channel, ix);
+            let is_long = pane::is_long(&message.body);
+            let display = shown_body(store, &message.body);
+            let known = known_mentions(store);
+            (
+                message, avatar, name, can_react, chips, readers, display, known, is_long,
+            )
+        };
         let this = self.this.clone();
+        let body: AnyElement = if is_long {
+            self.render_collapsed_with(ix, &message, &display, &known, &t, window)
+        } else {
+            div()
+                .w_full()
+                .min_w_0()
+                .whitespace_normal()
+                .text_color(t.ink_soft)
+                .child(highlighted_text(display, &known, t.ink_soft, &t, window))
+                .into_any_element()
+        };
 
         div()
             .w_full()
@@ -213,9 +235,6 @@ impl Conversation {
                                             .text_color(t.muted)
                                             .child(clock(message.sent_at)),
                                     )
-                                    // A refusal or dissent is a normal peer
-                                    // reply: one muted word, no colour (colour
-                                    // means status), never an error style.
                                     .when_some(message.stance, |d, stance| {
                                         d.child(
                                             div()
@@ -228,6 +247,7 @@ impl Conversation {
                                     }),
                             )
                             .when_some(message.reply_to.as_ref(), |d, reply| {
+                                let store = self.store.read(cx);
                                 d.child(
                                     div()
                                         .flex()
@@ -254,31 +274,17 @@ impl Conversation {
                                         ),
                                 )
                             })
-                            .map(|d| {
-                                if pane::is_long(&message.body) {
-                                    d.child(self.render_collapsed(ix, message, cx))
-                                } else {
-                                    // Messages wrap; they are never clipped.
-                                    d.child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .whitespace_normal()
-                                            .text_color(t.ink_soft)
-                                            .child(shown_body(store, &message.body)),
-                                    )
-                                }
-                            })
+                            .child(body)
                             .when(!chips.is_empty(), |d| {
                                 d.child(self.reaction_chips(ix, &chips, can_react, &t))
                             })
-                            .map(|d| {
-                                let readers = store.readers(self.channel, ix);
-                                if readers.is_empty() {
-                                    d
-                                } else {
-                                    d.child(read_marks(ix, &readers, store.workspace(), &t))
-                                }
+                            .when(!readers.is_empty(), |d| {
+                                d.child(read_marks(
+                                    ix,
+                                    &readers,
+                                    self.store.read(cx).workspace(),
+                                    &t,
+                                ))
                             }),
                     )
                     .when(can_react && self.hovered == Some(ix), |row| {
@@ -462,15 +468,23 @@ fn initial(name: &str, t: &ui::Theme) -> AnyElement {
 impl Conversation {
     /// A long message's first lines, ending in "…", with "Open" to read it in
     /// full in the pane (see `model::pane::is_long` for the threshold).
-    fn render_collapsed(&self, ix: usize, message: &model::Message, cx: &gpui::App) -> AnyElement {
-        let t = *cx.theme();
-        let preview = pane::preview(&shown_body(self.store.read(cx), &message.body));
+    fn render_collapsed_with(
+        &self,
+        ix: usize,
+        message: &model::Message,
+        display: &SharedString,
+        known: &KnownMentions,
+        t: &ui::Theme,
+        window: &mut Window,
+    ) -> AnyElement {
+        let preview = pane::preview(display.as_ref());
         let lines = preview.lines().map(|line| {
+            let line: SharedString = line.to_string().into();
             div()
                 .w_full()
                 .min_w_0()
                 .whitespace_normal()
-                .child(SharedString::from(line.to_string()))
+                .child(highlighted_text(line, known, t.ink_soft, t, window))
         });
         let content = PaneContent::LongMessage {
             channel: self.channel,
@@ -538,6 +552,87 @@ fn shown_body(store: &ChatStore, body: &Arc<str>) -> SharedString {
         Cow::Borrowed(_) => SharedString::from(body.clone()),
         Cow::Owned(shown) => SharedString::from(shown),
     }
+}
+
+/// Known mention targets for highlighting: current project members' handles
+/// and nicknames, plus supported broadcast targets.
+fn known_mentions(store: &ChatStore) -> KnownMentions {
+    let mut known = KnownMentions::new();
+    for member in store.mention_candidates() {
+        known.insert_member(
+            member.handle.as_ref(),
+            member.handle.as_ref(),
+            &member.nicknames,
+        );
+    }
+    known.insert_broadcasts();
+    known
+}
+
+/// Builds a `StyledText` element for `text`, highlighting known mentions
+/// while keeping the base text color and font style.
+fn highlighted_text(
+    text: SharedString,
+    known: &KnownMentions,
+    base_color: gpui::Hsla,
+    theme: &ui::Theme,
+    window: &mut Window,
+) -> StyledText {
+    let spans = mention_highlight::mention_highlights(&text, known, theme.appearance);
+    let base = window.text_style();
+    if spans.is_empty() {
+        let run = TextRun {
+            len: text.len(),
+            font: base.font(),
+            color: base_color,
+            background_color: base.background_color,
+            underline: base.underline,
+            strikethrough: base.strikethrough,
+        };
+        return StyledText::new(text).with_runs(vec![run]);
+    }
+    let runs = runs_for_highlights(&text, &base, base_color, &spans);
+    StyledText::new(text).with_runs(runs)
+}
+
+fn runs_for_highlights(
+    text: &str,
+    base: &gpui::TextStyle,
+    base_color: gpui::Hsla,
+    highlights: &[(std::ops::Range<usize>, HighlightStyle)],
+) -> Vec<TextRun> {
+    let mut runs = Vec::new();
+    let mut ix = 0;
+    for (range, highlight) in highlights {
+        if ix < range.start {
+            debug_assert!(text.is_char_boundary(range.start));
+            runs.push(TextRun {
+                len: range.start - ix,
+                font: base.font(),
+                color: base_color,
+                background_color: base.background_color,
+                underline: base.underline,
+                strikethrough: base.strikethrough,
+            });
+        }
+        debug_assert!(text.is_char_boundary(range.end));
+        let mut style = base.clone();
+        style.color = base_color;
+        let style = style.highlight(*highlight);
+        runs.push(style.to_run(range.len()));
+        ix = range.end;
+    }
+    if ix < text.len() {
+        runs.push(TextRun {
+            len: text.len() - ix,
+            font: base.font(),
+            color: base_color,
+            background_color: base.background_color,
+            underline: base.underline,
+            strikethrough: base.strikethrough,
+        });
+    }
+    runs
 }
 
 /// "HH:MM" (UTC) without pulling in a date library. Good enough for sample data.
@@ -623,9 +718,11 @@ impl Conversation {
 
         if self.list.item_count() > 0 {
             let this = cx.entity().downgrade();
-            return list(self.list.clone(), move |ix, _, cx| {
+            return list(self.list.clone(), move |ix, window, cx| {
                 this.upgrade()
-                    .map(|view| view.read(cx).render_message(ix, cx))
+                    .map(|view| {
+                        view.update(cx, |view, view_cx| view.render_message(ix, window, view_cx))
+                    })
                     .unwrap_or_else(|| div().into_any_element())
             })
             .size_full()
