@@ -1,7 +1,7 @@
 //! Phosphor UI icons (regular weight only) and brand marks, drawn as
 //! single-colour SVG masks. Sizes come from `tokens::icon`.
 
-use gpui::{Hsla, IntoElement, Pixels, Styled, Svg, svg};
+use gpui::{Hsla, Pixels, Styled, Svg, svg};
 use model::Brand;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,12 +10,15 @@ pub enum IconName {
     AppMark,
     Archive,
     ArrowUp,
+    ArrowClockwise,
     CaretDown,
     CaretRight,
     CaretUp,
     ChatCircle,
     Check,
+    CircleDashed,
     CopySimple,
+    DownloadSimple,
     GearSix,
     Hash,
     MagnifyingGlass,
@@ -41,16 +44,19 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [IconName; 31] = [
+    pub const ALL: [IconName; 34] = [
         IconName::AppMark,
         IconName::Archive,
         IconName::ArrowUp,
+        IconName::ArrowClockwise,
         IconName::CaretDown,
         IconName::CaretRight,
         IconName::CaretUp,
         IconName::ChatCircle,
         IconName::Check,
+        IconName::CircleDashed,
         IconName::CopySimple,
+        IconName::DownloadSimple,
         IconName::GearSix,
         IconName::Hash,
         IconName::MagnifyingGlass,
@@ -80,12 +86,15 @@ impl IconName {
             IconName::AppMark => "icons/chaos-control.svg",
             IconName::Archive => "icons/phosphor/archive.svg",
             IconName::ArrowUp => "icons/phosphor/arrow-up.svg",
+            IconName::ArrowClockwise => "icons/phosphor/arrow-clockwise.svg",
             IconName::CaretDown => "icons/phosphor/caret-down.svg",
             IconName::CaretRight => "icons/phosphor/caret-right.svg",
             IconName::CaretUp => "icons/phosphor/caret-up.svg",
             IconName::ChatCircle => "icons/phosphor/chat-circle.svg",
             IconName::Check => "icons/phosphor/check.svg",
+            IconName::CircleDashed => "icons/phosphor/circle-dashed.svg",
             IconName::CopySimple => "icons/phosphor/copy-simple.svg",
+            IconName::DownloadSimple => "icons/phosphor/download-simple.svg",
             IconName::GearSix => "icons/phosphor/gear-six.svg",
             IconName::Hash => "icons/phosphor/hash.svg",
             IconName::MagnifyingGlass => "icons/phosphor/magnifying-glass.svg",
@@ -132,12 +141,12 @@ pub fn brand_icon(brand: Brand) -> IconName {
 }
 
 /// A square icon of `size`, tinted `color`. GPUI caches the rasterised mask per size.
-pub fn icon(name: IconName, size: impl Into<Pixels>, color: Hsla) -> impl IntoElement + Styled {
+/// Returns [`Svg`] so callers can chain on `with_transformation` (rotation, scale).
+pub fn icon(name: IconName, size: impl Into<Pixels>, color: Hsla) -> Svg {
     let size = size.into();
-    let el: Svg = svg()
+    svg()
         .path(name.path())
         .size(size)
         .flex_none()
-        .text_color(color);
-    el
+        .text_color(color)
 }
