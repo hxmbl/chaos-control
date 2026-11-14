@@ -236,6 +236,10 @@ impl Conversation {
         };
 
         let message_id = message.id;
+        let menu_open = self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.message_id == message_id);
         let hovered = self.hovered == Some(message_id);
 
         div()
@@ -371,7 +375,7 @@ impl Conversation {
                                 ))
                             }),
                     )
-                    .when(hovered, |row| {
+                    .when(hovered && !menu_open, |row| {
                         row.child(self.action_bar(ix, &message, can_react, &t, window, cx))
                     }),
             )
@@ -395,20 +399,18 @@ impl Conversation {
         let message = message.clone();
         let hover = t.hover;
 
-        let btn = |id: ElementId, label: &'static str| {
+        let btn = |id: ElementId, icon_name: IconName| {
             div()
                 .id(id)
-                .h(size::BUTTON_SM)
-                .px(space::X2)
+                .size(size::BUTTON_SM)
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded(radius::MD)
-                .type_style(text::SMALL)
                 .text_color(t.ink_soft)
                 .cursor_pointer()
                 .hover(move |s| s.bg(hover))
-                .child(label)
+                .child(icon(icon_name, icons::SM, t.ink_soft))
         };
 
         div()
@@ -425,7 +427,7 @@ impl Conversation {
             .child(
                 btn(
                     ElementId::Name(format!("reply-action-{ix}").into()),
-                    "Reply",
+                    IconName::ArrowBendUpLeft,
                 )
                 .on_click(move |_, window, cx| {
                     cx.stop_propagation();
@@ -436,15 +438,21 @@ impl Conversation {
                 }),
             )
             .child(
-                btn(ElementId::Name(format!("copy-action-{ix}").into()), "Copy").on_click(
-                    move |_, _, cx| {
-                        cx.stop_propagation();
-                        this_copy.update(cx, |c, cx| c.copy_body(&body, cx)).ok();
-                    },
-                ),
+                btn(
+                    ElementId::Name(format!("copy-action-{ix}").into()),
+                    IconName::CopySimple,
+                )
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    this_copy.update(cx, |c, cx| c.copy_body(&body, cx)).ok();
+                }),
             )
             .child(
-                btn(ElementId::Name(format!("more-action-{ix}").into()), "…").on_mouse_down(
+                btn(
+                    ElementId::Name(format!("more-action-{ix}").into()),
+                    IconName::DotsThree,
+                )
+                .on_mouse_down(
                     MouseButton::Left,
                     move |event: &MouseDownEvent, _, cx| {
                         cx.stop_propagation();
