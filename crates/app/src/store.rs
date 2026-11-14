@@ -2168,62 +2168,68 @@ mod apply_core_event_tests {
 
     fn store_with_main(app_channel: Id) -> ChatStore {
         let mut store = ChatStore::new(workspace_with_main(app_channel));
-        // ensure log exists
         store.logs.entry(app_channel).or_default();
         store
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn core_msg(
-        id: i64,
-        seq: u64,
+    struct MsgSpec<'a> {
         channel: ct::ChannelId,
         author: Option<ct::MemberId>,
-        body: &str,
+        body: &'a str,
         origin: ct::Origin,
         reply_to: Option<ct::MessageId>,
         sent_at: ct::Millis,
-    ) -> ct::Message {
+    }
+
+    fn core_msg(id: i64, seq: u64, spec: MsgSpec<'_>) -> ct::Message {
         ct::Message {
             id: ct::MessageId(id),
-            channel,
+            channel: spec.channel,
             seq,
-            author,
-            origin,
-            body: Arc::from(body),
-            reply_to,
+            author: spec.author,
+            origin: spec.origin,
+            body: Arc::from(spec.body),
+            reply_to: spec.reply_to,
             mentions: Vec::new(),
             hop: 0,
-            sent_at,
+            sent_at: spec.sent_at,
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
+    struct ApplyCtx<'a> {
+        main: ct::ChannelId,
+        human: ct::MemberId,
+        app_channel: Id,
+        agents: &'a [ct::MemberId],
+        agent_ids: &'a HashSet<ct::MemberId>,
+    }
+
+    #[derive(Default)]
+    struct ApplyState {
+        seen: HashMap<ct::MessageId, usize>,
+        by_seq: BTreeMap<ct::Seq, usize>,
+        receipts: HashMap<ct::MemberId, ct::Receipt>,
+        reactions: HashMap<ct::MessageId, Vec<ct::Reaction>>,
+    }
+
     fn apply(
         store: &mut ChatStore,
         sink: &mut Sink,
         event: CoreEvent,
-        main: ct::ChannelId,
-        human: ct::MemberId,
-        app_channel: Id,
-        agents: &[ct::MemberId],
-        agent_ids: &HashSet<ct::MemberId>,
-        seen: &mut HashMap<ct::MessageId, usize>,
-        by_seq: &mut BTreeMap<ct::Seq, usize>,
-        receipts: &mut HashMap<ct::MemberId, ct::Receipt>,
-        reactions: &mut HashMap<ct::MessageId, Vec<ct::Reaction>>,
+        ctx: &ApplyCtx<'_>,
+        state: &mut ApplyState,
     ) {
         store.apply_core_event_state(
             event,
-            main,
-            human,
-            app_channel,
-            agents,
-            agent_ids,
-            seen,
-            by_seq,
-            receipts,
-            reactions,
+            ctx.main,
+            ctx.human,
+            ctx.app_channel,
+            ctx.agents,
+            ctx.agent_ids,
+            &mut state.seen,
+            &mut state.by_seq,
+            &mut state.receipts,
+            &mut state.reactions,
             sink,
         );
     }
@@ -2234,12 +2240,16 @@ mod apply_core_event_tests {
         let main = ct::ChannelId(1);
         let mut store = store_with_main(app_channel);
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
+        let mut state = ApplyState::default();
         let agent = ct::MemberId(42);
         let agent_ids: HashSet<_> = [agent].into_iter().collect();
+        let ctx = ApplyCtx {
+            main,
+            human: ct::MemberId(1),
+            app_channel,
+            agents: &[],
+            agent_ids: &agent_ids,
+        };
 
         apply(
             &mut store,
@@ -2247,22 +2257,17 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 7,
                 3,
-                main,
-                Some(agent),
-                "hello",
-                ct::Origin::ChatTool,
-                None,
-                12_345,
+                MsgSpec {
+                    channel: main,
+                    author: Some(agent),
+                    body: "hello",
+                    origin: ct::Origin::ChatTool,
+                    reply_to: None,
+                    sent_at: 12_345,
+                },
             )),
-            main,
-            ct::MemberId(1),
-            app_channel,
-            &[],
-            &agent_ids,
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
 
         let log = store.log(app_channel).unwrap();
@@ -2271,16 +2276,15 @@ mod apply_core_event_tests {
         assert_eq!(m.id, Id(CORE_MESSAGE_BASE + 7));
         assert_eq!(m.author, Author::Agent(agent_id(agent)));
         assert_eq!(&*m.body, "hello");
-        assert_eq!(m.sent_at, 12); // ms -> s
+        assert_eq!(m.sent_at, 12);
         assert_eq!(m.stance, None);
-        assert_eq!(seen.get(&ct::MessageId(7)), Some(&0));
-        assert_eq!(by_seq.get(&3), Some(&0));
+        assert_eq!(state.seen.get(&ct::MessageId(7)), Some(&0));
+        assert_eq!(state.by_seq.get(&3), Some(&0));
         assert!(matches!(
             sink.events.as_slice(),
             [StoreEvent::Appended { channel, range }] if *channel == app_channel && range.start == 0 && range.end == 1
         ));
 
-        // refusal stance
         sink.events.clear();
         apply(
             &mut store,
@@ -2288,22 +2292,17 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 8,
                 4,
-                main,
-                Some(agent),
-                "no",
-                ct::Origin::Refusal,
-                None,
-                20_000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(agent),
+                    body: "no",
+                    origin: ct::Origin::Refusal,
+                    reply_to: None,
+                    sent_at: 20_000,
+                },
             )),
-            main,
-            ct::MemberId(1),
-            app_channel,
-            &[],
-            &agent_ids,
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         assert_eq!(
             store.log(app_channel).unwrap().get(1).unwrap().stance,
@@ -2317,54 +2316,45 @@ mod apply_core_event_tests {
         let main = ct::ChannelId(1);
         let mut store = store_with_main(app_channel);
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
-        let human = ct::MemberId(1);
-        let author = ct::MemberId(2);
+        let mut state = ApplyState::default();
+        let no_agents = HashSet::new();
+        let ctx = ApplyCtx {
+            main,
+            human: ct::MemberId(1),
+            app_channel,
+            agents: &[],
+            agent_ids: &no_agents,
+        };
 
         let msg = core_msg(
             7,
             1,
-            main,
-            Some(author),
-            "same",
-            ct::Origin::Composer,
-            None,
-            1000,
+            MsgSpec {
+                channel: main,
+                author: Some(ct::MemberId(2)),
+                body: "same",
+                origin: ct::Origin::Composer,
+                reply_to: None,
+                sent_at: 1000,
+            },
         );
         apply(
             &mut store,
             &mut sink,
             CoreEvent::Message(msg.clone()),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         apply(
             &mut store,
             &mut sink,
             CoreEvent::Message(msg),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
 
         assert_eq!(store.log(app_channel).unwrap().len(), 1);
-        assert_eq!(sink.events.len(), 1); // only first append
+        assert_eq!(sink.events.len(), 1);
     }
 
     #[test]
@@ -2373,12 +2363,16 @@ mod apply_core_event_tests {
         let main = ct::ChannelId(1);
         let mut store = store_with_main(app_channel);
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
+        let mut state = ApplyState::default();
         let author = ct::MemberId(2);
         let agent_ids: HashSet<_> = [author].into_iter().collect();
+        let ctx = ApplyCtx {
+            main,
+            human: ct::MemberId(1),
+            app_channel,
+            agents: &[],
+            agent_ids: &agent_ids,
+        };
 
         apply(
             &mut store,
@@ -2386,22 +2380,17 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 1,
                 1,
-                main,
-                Some(author),
-                "parent",
-                ct::Origin::ChatTool,
-                None,
-                1000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(author),
+                    body: "parent",
+                    origin: ct::Origin::ChatTool,
+                    reply_to: None,
+                    sent_at: 1000,
+                },
             )),
-            main,
-            ct::MemberId(1),
-            app_channel,
-            &[],
-            &agent_ids,
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         apply(
             &mut store,
@@ -2409,22 +2398,17 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 2,
                 2,
-                main,
-                Some(author),
-                "child",
-                ct::Origin::ChatTool,
-                Some(ct::MessageId(1)),
-                2000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(author),
+                    body: "child",
+                    origin: ct::Origin::ChatTool,
+                    reply_to: Some(ct::MessageId(1)),
+                    sent_at: 2000,
+                },
             )),
-            main,
-            ct::MemberId(1),
-            app_channel,
-            &[],
-            &agent_ids,
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
 
         let child = store.log(app_channel).unwrap().get(1).unwrap();
@@ -2439,36 +2423,35 @@ mod apply_core_event_tests {
         let main = ct::ChannelId(1);
         let mut store = store_with_main(app_channel);
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
+        let mut state = ApplyState::default();
         let human = ct::MemberId(1);
         let reader = ct::MemberId(9);
+        let no_agents = HashSet::new();
+        let ctx = ApplyCtx {
+            main,
+            human,
+            app_channel,
+            agents: &[],
+            agent_ids: &no_agents,
+        };
 
-        // seed two messages
         apply(
             &mut store,
             &mut sink,
             CoreEvent::Message(core_msg(
                 1,
                 1,
-                main,
-                Some(human),
-                "a",
-                ct::Origin::Composer,
-                None,
-                1000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(human),
+                    body: "a",
+                    origin: ct::Origin::Composer,
+                    reply_to: None,
+                    sent_at: 1000,
+                },
             )),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         apply(
             &mut store,
@@ -2476,27 +2459,21 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 2,
                 2,
-                main,
-                Some(human),
-                "b",
-                ct::Origin::Composer,
-                None,
-                2000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(human),
+                    body: "b",
+                    origin: ct::Origin::Composer,
+                    reply_to: None,
+                    sent_at: 2000,
+                },
             )),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         sink.events.clear();
         sink.notifies = 0;
 
-        // reader moves to seq 1
         let r1 = ct::Receipt {
             member: reader,
             channel: main,
@@ -2507,23 +2484,15 @@ mod apply_core_event_tests {
             &mut store,
             &mut sink,
             CoreEvent::Read(r1.clone()),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
-        assert_eq!(receipts.get(&reader), Some(&r1));
+        assert_eq!(state.receipts.get(&reader), Some(&r1));
         assert!(
             matches!(sink.events.as_slice(), [StoreEvent::Receipts { channel, rows }] if *channel == app_channel && rows == &vec![0])
         );
         assert_eq!(sink.notifies, 1);
 
-        // moves forward -> old and new rows emitted
         sink.events.clear();
         let r2 = ct::Receipt {
             member: reader,
@@ -2531,25 +2500,11 @@ mod apply_core_event_tests {
             read_through: 2,
             read_at: 4000,
         };
-        apply(
-            &mut store,
-            &mut sink,
-            CoreEvent::Read(r2),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
-        );
+        apply(&mut store, &mut sink, CoreEvent::Read(r2), &ctx, &mut state);
         assert!(
             matches!(sink.events.as_slice(), [StoreEvent::Receipts { channel, rows }] if *channel == app_channel && rows == &vec![0, 1])
         );
 
-        // own receipt ignored
         sink.events.clear();
         sink.notifies = 0;
         apply(
@@ -2561,15 +2516,8 @@ mod apply_core_event_tests {
                 read_through: 2,
                 read_at: 5000,
             }),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         assert!(sink.events.is_empty());
         assert_eq!(sink.notifies, 0);
@@ -2581,12 +2529,17 @@ mod apply_core_event_tests {
         let main = ct::ChannelId(1);
         let mut store = store_with_main(app_channel);
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
+        let mut state = ApplyState::default();
         let human = ct::MemberId(1);
         let reader = ct::MemberId(9);
+        let no_agents = HashSet::new();
+        let ctx = ApplyCtx {
+            main,
+            human,
+            app_channel,
+            agents: &[],
+            agent_ids: &no_agents,
+        };
 
         apply(
             &mut store,
@@ -2594,24 +2547,19 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 1,
                 1,
-                main,
-                Some(human),
-                "a",
-                ct::Origin::Composer,
-                None,
-                1000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(human),
+                    body: "a",
+                    origin: ct::Origin::Composer,
+                    reply_to: None,
+                    sent_at: 1000,
+                },
             )),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
-        receipts.insert(
+        state.receipts.insert(
             reader,
             ct::Receipt {
                 member: reader,
@@ -2622,31 +2570,28 @@ mod apply_core_event_tests {
         );
         sink.events.clear();
 
-        // new message with seq 2 is still <= read_through 5, so receipt "moves down" onto it
         apply(
             &mut store,
             &mut sink,
             CoreEvent::Message(core_msg(
                 2,
                 2,
-                main,
-                Some(human),
-                "b",
-                ct::Origin::Composer,
-                None,
-                2000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(human),
+                    body: "b",
+                    origin: ct::Origin::Composer,
+                    reply_to: None,
+                    sent_at: 2000,
+                },
             )),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
-        assert!(sink.events.iter().any(|e| matches!(e, StoreEvent::Receipts { channel, rows } if *channel == app_channel && rows.contains(&1))));
+        assert!(sink.events.iter().any(|e| matches!(
+            e,
+            StoreEvent::Receipts { channel, rows } if *channel == app_channel && rows.contains(&1)
+        )));
     }
 
     #[test]
@@ -2655,12 +2600,17 @@ mod apply_core_event_tests {
         let main = ct::ChannelId(1);
         let mut store = store_with_main(app_channel);
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
+        let mut state = ApplyState::default();
         let human = ct::MemberId(1);
         let member = ct::MemberId(2);
+        let no_agents = HashSet::new();
+        let ctx = ApplyCtx {
+            main,
+            human,
+            app_channel,
+            agents: &[],
+            agent_ids: &no_agents,
+        };
 
         apply(
             &mut store,
@@ -2668,22 +2618,17 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 7,
                 1,
-                main,
-                Some(human),
-                "hi",
-                ct::Origin::Composer,
-                None,
-                1000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(human),
+                    body: "hi",
+                    origin: ct::Origin::Composer,
+                    reply_to: None,
+                    sent_at: 1000,
+                },
             )),
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         sink.events.clear();
         sink.notifies = 0;
@@ -2698,23 +2643,15 @@ mod apply_core_event_tests {
                 emoji: Arc::from("👍"),
                 added: true,
             },
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
-        assert_eq!(reactions.get(&ct::MessageId(7)).unwrap().len(), 1);
+        assert_eq!(state.reactions.get(&ct::MessageId(7)).unwrap().len(), 1);
         assert!(
             matches!(sink.events.as_slice(), [StoreEvent::Reactions { channel, rows }] if *channel == app_channel && rows == &vec![0])
         );
         assert_eq!(sink.notifies, 1);
 
-        // duplicate add ignored (no change)
         sink.events.clear();
         sink.notifies = 0;
         apply(
@@ -2727,20 +2664,12 @@ mod apply_core_event_tests {
                 emoji: Arc::from("👍"),
                 added: true,
             },
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         assert!(sink.events.is_empty());
         assert_eq!(sink.notifies, 0);
 
-        // remove
         sink.events.clear();
         sink.notifies = 0;
         apply(
@@ -2753,17 +2682,10 @@ mod apply_core_event_tests {
                 emoji: Arc::from("👍"),
                 added: false,
             },
-            main,
-            human,
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
-        assert!(reactions.get(&ct::MessageId(7)).unwrap().is_empty());
+        assert!(state.reactions.get(&ct::MessageId(7)).unwrap().is_empty());
         assert!(
             matches!(sink.events.as_slice(), [StoreEvent::Reactions { channel, rows }] if *channel == app_channel && rows == &vec![0])
         );
@@ -2787,10 +2709,15 @@ mod apply_core_event_tests {
             removable: false,
         });
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
+        let mut state = ApplyState::default();
+        let no_agents = HashSet::new();
+        let ctx = ApplyCtx {
+            main,
+            human: ct::MemberId(1),
+            app_channel,
+            agents: &[],
+            agent_ids: &no_agents,
+        };
 
         apply(
             &mut store,
@@ -2801,15 +2728,8 @@ mod apply_core_event_tests {
                 glow: ct::Glow::Active,
                 presence: Some(Arc::from("thinking")),
             }),
-            main,
-            ct::MemberId(1),
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
 
         let a = store
@@ -2829,10 +2749,15 @@ mod apply_core_event_tests {
         let main = ct::ChannelId(1);
         let mut store = store_with_main(app_channel);
         let mut sink = Sink::default();
-        let mut seen = HashMap::new();
-        let mut by_seq = BTreeMap::new();
-        let mut receipts = HashMap::new();
-        let mut reactions = HashMap::new();
+        let mut state = ApplyState::default();
+        let no_agents = HashSet::new();
+        let ctx = ApplyCtx {
+            main,
+            human: ct::MemberId(1),
+            app_channel,
+            agents: &[],
+            agent_ids: &no_agents,
+        };
 
         apply(
             &mut store,
@@ -2840,22 +2765,17 @@ mod apply_core_event_tests {
             CoreEvent::Message(core_msg(
                 1,
                 1,
-                main,
-                Some(ct::MemberId(99)),
-                "sys",
-                ct::Origin::System,
-                None,
-                1000,
+                MsgSpec {
+                    channel: main,
+                    author: Some(ct::MemberId(99)),
+                    body: "sys",
+                    origin: ct::Origin::System,
+                    reply_to: None,
+                    sent_at: 1000,
+                },
             )),
-            main,
-            ct::MemberId(1),
-            app_channel,
-            &[],
-            &HashSet::new(),
-            &mut seen,
-            &mut by_seq,
-            &mut receipts,
-            &mut reactions,
+            &ctx,
+            &mut state,
         );
         let m = store.log(app_channel).unwrap().get(0).unwrap();
         assert_eq!(m.author, Author::System);
