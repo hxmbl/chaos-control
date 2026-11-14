@@ -167,7 +167,7 @@ pub struct Composer {
     /// A core send in flight: restored if the send fails.
     pending: Option<(Id, Draft)>,
     mention: Option<MentionState>,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 4],
 }
 
 /// Rows the composer grows to before it scrolls.
@@ -218,6 +218,7 @@ impl Composer {
                 TextInputEvent::Changed => this.refresh_mention(cx),
             }),
             cx.observe(&input, |this, _, cx| this.refresh_mention(cx)),
+            cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
                     let next = store.read(cx).selected();
@@ -502,6 +503,31 @@ impl Composer {
         self.store.read(cx).send_route() == SendRoute::Unwired
     }
 
+    fn working_indicator(&self, cx: &Context<Self>) -> Option<SharedString> {
+        let store = self.store.read(cx);
+        let agents = store.working_agents(store.selected());
+        if agents.is_empty() {
+            return None;
+        }
+        let label = if agents.len() == 1 {
+            let (name, verb) = &agents[0];
+            format!("{} is {verb}…", name)
+        } else {
+            let names = agents
+                .iter()
+                .map(|(name, _)| name.as_ref())
+                .collect::<Vec<_>>();
+            let joined = match names.as_slice() {
+                [] => return None,
+                [a] => (*a).to_string(),
+                [a, b] => format!("{a} and {b}"),
+                [all @ .., last] => format!("{}, and {last}", all.join(", ")),
+            };
+            format!("{joined} are Working…")
+        };
+        Some(label.into())
+    }
+
     fn render_reply(&self, reply: &ReplyRef, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = *cx.theme();
         let who = SharedString::from(author_name(self.store.read(cx).workspace(), reply.author));
@@ -648,6 +674,7 @@ impl Render for Composer {
         let can_send = !unwired && sendable(self.input.read(cx).text());
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
+        let working = self.working_indicator(cx);
 
         div()
             .key_context(KEY_CONTEXT)
@@ -675,6 +702,16 @@ impl Render for Composer {
             .pt(space::X3)
             .pb(space::X2)
             .shadow(t.elevation(Elevation::Float))
+            .when_some(working, |d, label| {
+                d.child(
+                    div()
+                        .px(space::X2)
+                        .mb(space::X1_5)
+                        .type_style(text::SMALL)
+                        .text_color(t.muted)
+                        .child(label),
+                )
+            })
             .when(unwired, |d| {
                 d.child(
                     div()
