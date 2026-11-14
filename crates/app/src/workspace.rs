@@ -25,7 +25,7 @@ use crate::{
     right_sidebar::RightSidebar,
     search::{FocusSearch, PILL_HEIGHT, Search, SearchEvent},
     sidebar::Sidebar,
-    store::{ChatStore, StoreEvent},
+    store::ChatStore,
     titlebar::Titlebar,
 };
 
@@ -158,24 +158,6 @@ impl Workspace {
             });
         // The pane layer is drawn here, so redraw when it opens or closes.
         let pane_changed = cx.observe(&pane, |_, _, cx| cx.notify());
-        // Muted for now (`store::PERMISSION_PANE`): requests go to the right
-        // sidebar's permission log and these events never fire. When they
-        // do, an agent's permission request opens the pane with Approve /
-        // Deny unless the pane is busy with something else, and an answer
-        // from anywhere closes its pane.
-        let pane_for_store = pane.clone();
-        let permissions =
-            cx.subscribe_in(&store, window, move |_, _, event, window, cx| match event {
-                StoreEvent::PermissionAsked(content) => pane_for_store.update(cx, |p, cx| {
-                    if p.can_show_permission() {
-                        p.open(content.clone(), window, cx);
-                    }
-                }),
-                StoreEvent::PermissionAnswered { request } => {
-                    pane_for_store.update(cx, |p, cx| p.close_permission(*request, window, cx))
-                }
-                _ => {}
-            });
         // After a jump, hand the keyboard back to the composer.
         let jumped = cx.subscribe_in(&search, window, |this, _, event, window, cx| match event {
             SearchEvent::Jumped | SearchEvent::Dismissed => {
@@ -211,8 +193,7 @@ impl Workspace {
             panels,
             search,
             sidebar: cx.new(|cx| Sidebar::new(store.clone(), pane.clone(), cx)),
-            right_sidebar: cx
-                .new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), pane.clone(), cx)),
+            right_sidebar: cx.new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), cx)),
             model_picker,
             conversation: cx.new(|cx| Conversation::new(store.clone(), pane.clone(), cx)),
             pane,
@@ -226,7 +207,6 @@ impl Workspace {
                 jumped,
                 pane_events,
                 pane_changed,
-                permissions,
                 picker_changed,
                 picker_events,
             ]

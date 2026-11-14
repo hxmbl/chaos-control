@@ -41,7 +41,7 @@
 //!   },
 //!   "members": [
 //!     { "harness": "codex", "model": "gpt-6.1-sol", "name": "GPT-6.1 Sol" },
-//!     { "harness": "fx", "model": "anthropic/claude-opus-5.5", "runs_in": "vm" }
+//!     { "harness": "fx", "model": "anthropic/claude-opus-5.5" }
 //!   ],
 //!   "agents": [{
 //!     "handle": "claude", "name": "Claude Code", "brand": "claude",
@@ -63,9 +63,9 @@
 //!
 //! `record` appends every ACP frame as NDJSON `{dir, frame}` (the replay
 //! fixture format). `chat_tools` is `"auto"` (HTTP when the agent offers it,
-//! else the stdio bridge) or `"stdio"`. `runs_in` is `"host"` (the default:
-//! permission requests go to the humans, without blocking the agent) or
-//! `"vm"` (the agent's own VM: everything is approved).
+//! else the stdio bridge) or `"stdio"`. Agents run under their own native
+//! permission settings; Chaos Control does not mediate permissions (being
+//! redesigned), and an older file's `runs_in` / `approval` keys are ignored.
 //!
 //! An `agents` entry may also set `ping_answer_reactions`: that agent's own
 //! list of reactions that answer a ping, over the project's (Settings) and
@@ -86,11 +86,9 @@ use chaos_core::{
     harness::{self, AdapterOptions, DetectEnv, HarnessPreset},
     host::{AgentSpec, Core, HostConfig, MemberSpec, StartError, SystemClock},
     model_cache::{self, CachedModels},
-    permission::RunsIn,
-    policy::Policy,
     reaction::PingAnswers,
     roster::ModelMember,
-    types::{ApprovalMode, Channel, ChannelId, MemberId, Project, ProjectId},
+    types::{Channel, ChannelId, MemberId, Project, ProjectId},
 };
 use model::Brand;
 use serde::Deserialize;
@@ -153,11 +151,6 @@ pub struct MemberConfig {
     /// Display name; defaults to the model id (or "<harness> default").
     pub name: Option<String>,
     pub cwd: Option<PathBuf>,
-    #[serde(default)]
-    pub runs_in: RunsIn,
-    /// Host-side approval mode (STRM-542). Defaults to ask-all.
-    #[serde(default)]
-    pub approval: ApprovalMode,
 }
 
 /// The original shape: one ACP command per agent.
@@ -177,10 +170,6 @@ pub struct AgentConfig {
     pub acp_v2: bool,
     #[serde(default)]
     pub chat_tools: ChatTools,
-    /// `"host"` (default: permission requests go to the humans, never
-    /// blocking) or `"vm"` (the agent's own VM: everything is approved).
-    #[serde(default)]
-    pub runs_in: RunsIn,
     /// This agent's own reactions that answer a ping (see the module docs).
     #[serde(default)]
     pub ping_answer_reactions: Option<Vec<String>>,
@@ -488,8 +477,6 @@ fn seed_entry(h: &Harness) -> MemberConfig {
         model: first.id.as_deref().map(str::to_string),
         name: Some(first.name.to_string()),
         cwd: None,
-        runs_in: RunsIn::Host,
-        approval: ApprovalMode::AskAll,
     }
 }
 
@@ -516,8 +503,6 @@ pub fn spec_for(harnesses: &[Harness], m: &MemberConfig) -> Option<MemberSpec> {
         model_name: entry_name(m),
         adapter: h.adapter(m.model.as_deref()),
         cwd: m.cwd.clone(),
-        runs_in: m.runs_in,
-        approval: m.approval,
     })
 }
 
@@ -572,13 +557,6 @@ pub fn start_with(
         db: Some(data.join("core.sqlite")),
         bridge,
         default_cwd: std::env::current_dir().unwrap_or_else(|_| data.clone()),
-        // Requests are muted (no Approve / Deny pane), so the chat note
-        // ("any human here can approve or deny it") would ask for something
-        // the app can't do. The right sidebar's permission log shows them.
-        policy: Policy {
-            note_permission_requests: false,
-            ..Policy::default()
-        },
         ..HostConfig::default()
     };
     let folder = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
@@ -632,8 +610,6 @@ pub fn start_with(
                         name: name.clone(),
                         adapter: Arc::new(adapter),
                         cwd: a.cwd,
-                        runs_in: a.runs_in,
-                        approval: ApprovalMode::AskAll,
                         ping_answers,
                     },
                     main,
@@ -667,8 +643,6 @@ pub fn start_with(
                             model: m.model.as_deref().map(str::to_string),
                             name: Some(m.model_name.to_string()),
                             cwd: None,
-                            runs_in: RunsIn::Host,
-                            approval: ApprovalMode::AskAll,
                         })
                         .collect()
                 };
@@ -751,8 +725,6 @@ pub async fn add_member(
                 model_name: name.to_string(),
                 adapter: harness.adapter(model.as_deref()),
                 cwd: None,
-                runs_in: RunsIn::Host,
-                approval: ApprovalMode::AskAll,
             },
             main,
         )
@@ -963,14 +935,14 @@ mod tests {
         let c: AgentsConfig = serde_json::from_str(
             r#"{"detect": false,
                 "harnesses": {"codex": {"command": "/opt/codex", "env": {"A": "1"}}},
-                "members": [{"harness": "codex", "model": "gpt-6.1-sol", "runs_in": "vm"},
+                "members": [{"harness": "codex", "model": "gpt-6.1-sol", "runs_in": "vm", "approval": "yolo"},
                             {"harness": "fx"}]}"#,
         )
         .unwrap();
+        // Keys from the removed permission model still parse (ignored).
         assert!(!c.detect);
         let members = c.members.as_ref().unwrap();
         assert_eq!(members[0].model.as_deref(), Some("gpt-6.1-sol"));
-        assert_eq!(members[0].runs_in, RunsIn::Vm);
         assert!(members[1].model.is_none());
         assert_eq!(c.harnesses["codex"].env["A"], "1");
     }
@@ -1019,7 +991,6 @@ mod tests {
         let (specs, dormant) = split_installed(&[fx], &roster);
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].model.as_deref(), Some("a"));
-        assert_eq!(specs[0].runs_in, RunsIn::Vm, "the first entry wins");
         assert_eq!(dormant.len(), 2);
         assert_eq!(&*dormant[0].harness, "devin");
         assert_eq!(&*dormant[0].harness_name, "Devin");

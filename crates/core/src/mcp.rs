@@ -1,10 +1,10 @@
 //! The chat MCP server agents use to take part in the room, plus the stdio
 //! bridge for agents that drop HTTP MCP servers.
 //!
-//! Ten tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
-//! `chat_react`, `chat_status`, the peer actions `chat_refuse` and
-//! `chat_dissent` (STRM-343), and `chat_request_permission` and
-//! `chat_permission_status` (STRM-401, see `permission`). `chat_react` adds
+//! Eight tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
+//! `chat_react`, `chat_status`, and the peer actions `chat_refuse` and
+//! `chat_dissent` (STRM-343). They just run: there is no approval gate.
+//! `chat_react` adds
 //! or removes a reaction and never wakes anyone (STRM-467). Every call is scoped by a bearer token minted
 //! for one session (agent x channel) and revoked when that session closes. The
 //! author of a post is taken from the token, never from the arguments. Channel
@@ -105,7 +105,7 @@ fn random_token() -> String {
 
 // ---------- tools ----------
 
-pub const TOOL_NAMES: [&str; 12] = [
+pub const TOOL_NAMES: [&str; 8] = [
     "chat_context",
     "chat_read",
     "chat_search",
@@ -114,10 +114,6 @@ pub const TOOL_NAMES: [&str; 12] = [
     "chat_refuse",
     "chat_dissent",
     "chat_status",
-    crate::permission::TOOL_NAMES[0],
-    crate::permission::TOOL_NAMES[1],
-    crate::permission::TOOL_NAMES[2],
-    crate::permission::TOOL_NAMES[3],
 ];
 
 fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
@@ -128,7 +124,7 @@ fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
 }
 
 pub fn tools() -> Vec<Tool> {
-    let mut all = vec![
+    vec![
         Tool::new(
             "chat_context",
             "Who you are, which channel this is, who's in it (with presence), your read position and how far everyone else has read (read_receipts). Cheap; call it first.",
@@ -211,9 +207,7 @@ pub fn tools() -> Vec<Tool> {
                 }}),
             ),
         ),
-    ];
-    all.extend(crate::permission::tools(schema));
-    all
+    ]
 }
 
 /// A tool failure the agent should see (it is returned as an error result,
@@ -657,7 +651,7 @@ pub fn call_tool(
             engine.set_agent_status(scope.agent, scope.channel, text);
             Ok(json!({"ok": true}))
         }
-        other => crate::permission::call_tool(engine, now, scope, other, args),
+        other => Err(ToolError(format!("unknown tool {other}"))),
     }
 }
 

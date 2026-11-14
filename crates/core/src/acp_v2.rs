@@ -30,10 +30,6 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::acp::{ChatToolsPreference, Tracker, V2Open, choose_mcp, error_kind};
 use crate::adapter::*;
-use crate::permission::{
-    OptionKind, PermissionAsk, PermissionGate, PermissionVerdict, pick_allow, pick_decline,
-    sent_meta,
-};
 use crate::types::BatchId;
 
 enum Cmd {
@@ -118,39 +114,19 @@ fn kind(k: &v2::PermissionOptionKind) -> OptionKind {
     match k {
         v2::PermissionOptionKind::AllowOnce => OptionKind::AllowOnce,
         v2::PermissionOptionKind::AllowAlways => OptionKind::AllowAlways,
-        v2::PermissionOptionKind::RejectOnce => OptionKind::RejectOnce,
-        v2::PermissionOptionKind::RejectAlways => OptionKind::RejectAlways,
         _ => OptionKind::Other,
     }
 }
 
-/// Answers a permission request with the agent's own option for `verdict`
-/// (see `crate::permission`).
-fn answer(
-    req: &v2::RequestPermissionRequest,
-    verdict: &PermissionVerdict,
-) -> v2::RequestPermissionResponse {
-    let opts: Vec<(OptionKind, &str)> = req
-        .options
-        .iter()
-        .map(|o| (kind(&o.kind), o.name.as_str()))
-        .collect();
-    let select = |ix: usize| {
-        v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
+/// Answers a permission request with the agent's own allow option (see
+/// [`auto_allow`]).
+fn answer(req: &v2::RequestPermissionRequest) -> v2::RequestPermissionResponse {
+    let opts: Vec<OptionKind> = req.options.iter().map(|o| kind(&o.kind)).collect();
+    match auto_allow(&opts) {
+        Some(ix) => v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
             v2::SelectedPermissionOutcome::new(req.options[ix].option_id.clone()),
-        ))
-    };
-    let decline = || match pick_decline(&opts) {
-        Some(ix) => select(ix),
+        )),
         None => v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
-    };
-    match verdict {
-        PermissionVerdict::Allow { .. } | PermissionVerdict::AllowRead => match pick_allow(&opts) {
-            Some(ix) => select(ix),
-            None => decline(),
-        },
-        PermissionVerdict::Sent { request } => decline().meta(sent_meta(*request)),
-        PermissionVerdict::Decline => decline(),
     }
 }
 
@@ -207,9 +183,8 @@ pub(crate) async fn open(
     let events = req.events.clone();
     let cwd = req.cwd.clone();
     let endpoint = req.chat_tools.clone();
-    let gate = req.permissions.clone();
     tokio::spawn(run(
-        transport, cwd, endpoint, pref, model, tracker, cmd_rx, ready_tx, events, gate,
+        transport, cwd, endpoint, pref, model, tracker, cmd_rx, ready_tx, events,
     ));
     match ready_rx.await {
         Ok(Ready::Session(info)) => Ok(Arc::new(V2Session { info, cmd: cmd_tx })),
@@ -233,12 +208,11 @@ async fn run(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: oneshot::Sender<Ready>,
     events: EventSink,
-    gate: PermissionGate,
 ) {
     let ready = Arc::new(Mutex::new(Some(ready_tx)));
     let ready_main = ready.clone();
-    let (t_notif, t_perm, t_main) = (tracker.clone(), tracker.clone(), tracker.clone());
-    let (ev_notif, _ev_perm, ev_main) = (events.clone(), events.clone(), events.clone());
+    let (t_notif, t_main) = (tracker.clone(), tracker.clone());
+    let (ev_notif, ev_main) = (events.clone(), events.clone());
     // Set once the session is handed out; only then do exits become events.
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_main = started.clone();
@@ -347,59 +321,7 @@ async fn run(
         )
         .on_receive_request(
             async move |r: v2::RequestPermissionRequest, responder, _cx: V2ConnectionTo<Agent>| {
-                let turn = t_perm.lock().expect("lock").turn;
-                let (tool_name, kind) = match &r.subject {
-                    Some(v2::RequestPermissionSubject::ToolCall(s)) => {
-                        let name = match &s.tool_call.name {
-                            MaybeUndefined::Value(name) => Some(Arc::from(name.as_str())),
-                            _ => None,
-                        };
-                        let kind = match &s.tool_call.kind {
-                            MaybeUndefined::Value(k) => Some(crate::acp::kind_str(k)),
-                            _ => None,
-                        };
-                        (name, kind)
-                    }
-                    _ => (None, None),
-                };
-                let read_only = kind
-                    .as_deref()
-                    .is_some_and(crate::permission::is_read_only_kind);
-                // The key: the prompt's title, description and subject minus
-                // ids and progress, so a retry with a new id still matches.
-                let key = crate::permission::request_key(
-                    kind.as_deref().unwrap_or("none"),
-                    &crate::permission::without(
-                        &serde_json::json!({
-                            "title": &r.title,
-                            "description": &r.description,
-                            "subject": &r.subject,
-                        }),
-                        crate::permission::ACP_VOLATILE,
-                    ),
-                );
-                let title =
-                    crate::permission::permission_title(Some(&r.title), tool_name.as_deref());
-                let detail = serde_json::to_string(&serde_json::json!({
-                    "title": &r.title,
-                    "description": &r.description,
-                    "subject": &r.subject,
-                }))
-                .ok()
-                .map(Arc::from)
-                .or_else(|| r.description.as_deref().map(Arc::from));
-                let verdict = gate
-                    .ask(PermissionAsk {
-                        turn,
-                        title,
-                        tool_name,
-                        detail,
-                        read_only,
-                        kind: crate::permission::request_kind_from_wire(kind.as_deref()),
-                        key: Some(key),
-                    })
-                    .await;
-                responder.respond(answer(&r, &verdict))
+                responder.respond(answer(&r))
             },
             acp::on_receive_request!(),
         )

@@ -7,6 +7,8 @@ A group chat for AI and humans. Each project gets a chat where its AI agents and
 
 Early days: this is a native desktop shell built with [GPUI](https://www.gpui.rs) (Zed's GPU-accelerated Rust UI framework) and sample data, no backend yet.
 
+Agent permissions are currently not mediated (the model is being redesigned): agents run under their own native settings, and a permission request from an agent is answered with its allow option. See [docs/agents.md](docs/agents.md).
+
 ## Develop
 
 You need stable Rust. On Linux, also install GPUI's system libraries:

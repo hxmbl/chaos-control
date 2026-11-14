@@ -8,8 +8,8 @@
 //! - [`acp`]: the generic ACP adapter (v1, plus the v2 draft).
 //! - [`devin`]: Devin-only setup (per-folder workspace trust).
 //! - [`mcp`]: the chat MCP server and the stdio bridge.
-//! - [`permission`]: permissions by where the agent runs (host: ask the
-//!   humans, non-blocking; own VM: approve).
+//! - Permissions are not mediated: an agent's permission request is answered
+//!   with its own allow option (see [`adapter::auto_allow`]); being redesigned.
 //! - [`host`]: the in-process runtime behind the [`host::Core`] handle.
 //! - [`fake`]: a scripted ACP agent for tests.
 //!
@@ -26,7 +26,6 @@ pub mod host;
 pub mod mcp;
 pub mod model_cache;
 pub mod notify;
-pub mod permission;
 pub mod policy;
 pub mod reaction;
 pub mod roster;

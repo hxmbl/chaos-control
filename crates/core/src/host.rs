@@ -5,21 +5,11 @@
 //! call is a message to the actor, every answer comes back on a channel, and UI
 //! updates arrive as [`CoreEvent`]s.
 
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicU32, Ordering},
-    },
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
-use tokio::io::AsyncReadExt;
-use tokio::sync::{Semaphore, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     adapter::*,
@@ -28,10 +18,6 @@ use crate::{
         StanceRequest,
     },
     mcp::{self, Scope, Tokens},
-    permission::{
-        AnswerError, PermissionGate, PermissionId, PermissionRequest, PermissionVerdict,
-        QueuedRequest, RunsIn,
-    },
     policy::Policy,
     reaction::PingAnswers,
     store::{OpenError, Store},
@@ -123,11 +109,6 @@ pub struct AgentSpec {
     pub name: String,
     pub adapter: Arc<dyn AgentAdapter>,
     pub cwd: Option<PathBuf>,
-    /// Where the agent runs: on the host its permission requests go to the
-    /// humans; in its own VM they are approved (see `permission`).
-    pub runs_in: RunsIn,
-    /// How much host-side work a human signs off on (STRM-542).
-    pub approval: crate::types::ApprovalMode,
     /// The agent's own list of reactions that answer a ping
     /// (`ping_answer_reactions` in `agents.json`); `None` uses the project's
     /// setting, then the default (see `Engine::ping_answers`).
@@ -168,12 +149,6 @@ enum Cmd {
         agent: MemberId,
         channel: ChannelId,
     },
-    RunQueued {
-        id: PermissionId,
-    },
-    RunFinished {
-        id: PermissionId,
-    },
     RemoveMember {
         project: ProjectId,
         member: MemberId,
@@ -191,9 +166,6 @@ pub struct MemberSpec {
     pub model_name: String,
     pub adapter: Arc<dyn AgentAdapter>,
     pub cwd: Option<PathBuf>,
-    pub runs_in: RunsIn,
-    /// How much host-side work a human signs off on (STRM-542).
-    pub approval: crate::types::ApprovalMode,
 }
 
 /// Cheap, cloneable handle to the runtime.
@@ -292,8 +264,6 @@ impl Core {
             tx: tx.clone(),
             events: events_tx,
             alive: true,
-            run_limit: Arc::new(Semaphore::new(4)),
-            running: HashMap::new(),
         };
         tokio::spawn(actor.run(rx));
         Ok((
@@ -536,8 +506,6 @@ impl Core {
                 name: mm.model_name.to_string(),
                 adapter: spec.adapter,
                 cwd: spec.cwd,
-                runs_in: spec.runs_in,
-                approval: spec.approval,
                 ping_answers: None,
             },
             channel,
@@ -917,144 +885,6 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
-    /// A human approves (`approve`) or denies a pending permission request.
-    /// Any human member of the request's channel may answer; the answer is
-    /// posted and delivered to the agent as a wake. Approved runnable queued
-    /// commands are executed by Chaos Control (STRM-542).
-    pub async fn answer_permission(
-        &self,
-        request: PermissionId,
-        by: MemberId,
-        approve: bool,
-        note: Option<&str>,
-    ) -> Result<PermissionRequest, AnswerError> {
-        let note = note.map(str::to_string);
-        let req = self
-            .with_engine(move |e, now| {
-                e.answer_permission(now, request, by, approve, note.as_deref())
-            })
-            .await
-            .map_err(AnswerError::Store)??;
-        if req.run_state.as_deref() == Some("running") {
-            self.enqueue_run(req.id).await;
-        }
-        Ok(req)
-    }
-
-    async fn enqueue_run(&self, id: PermissionId) {
-        if self.tx.send(Cmd::RunQueued { id }).is_err() {
-            let _ = self
-                .with_engine(move |e, now| {
-                    e.complete_command_run(
-                        now,
-                        id,
-                        false,
-                        None,
-                        "failed to schedule command execution (runtime stopped)",
-                    )
-                })
-                .await;
-        }
-    }
-
-    /// Pending permission requests in `channel`, oldest first.
-    pub async fn pending_permissions(
-        &self,
-        channel: ChannelId,
-    ) -> Result<Vec<PermissionRequest>, String> {
-        self.with_engine(move |e, _| e.pending_permissions(channel))
-            .await?
-            .map_err(|e| e.to_string())
-    }
-
-    /// The permission log for `channel` (reads included), newest first, at
-    /// most `limit`.
-    pub async fn permission_log(
-        &self,
-        channel: ChannelId,
-        limit: usize,
-    ) -> Result<Vec<PermissionRequest>, String> {
-        self.with_engine(move |e, _| e.permission_log(channel, limit))
-            .await?
-            .map_err(|e| e.to_string())
-    }
-
-    /// The approval queue for a channel (STRM-542).
-    pub async fn approval_queue(&self, channel: ChannelId) -> Result<Vec<QueuedRequest>, String> {
-        self.with_engine(move |e, _| e.approval_queue(channel).map_err(|e| e.to_string()))
-            .await?
-    }
-
-    /// Sets an agent/member's default approval mode (STRM-542). Affects new requests.
-    pub async fn set_approval_mode(
-        &self,
-        agent: MemberId,
-        mode: crate::types::ApprovalMode,
-    ) -> Result<(), String> {
-        self.with_engine(move |e, _| e.set_approval_mode(agent, mode).map_err(|e| e.to_string()))
-            .await?
-    }
-
-    /// Sets or clears a channel approval-mode override (STRM-542). Affects new requests.
-    pub async fn set_channel_approval_mode(
-        &self,
-        channel: ChannelId,
-        mode: Option<crate::types::ApprovalMode>,
-    ) -> Result<(), String> {
-        self.with_engine(move |e, _| e.set_channel_approval_mode_override(channel, mode))
-            .await?
-            .map_err(|e| e.to_string())
-    }
-
-    /// Sets or clears a project approval-mode override (STRM-542). Affects new requests.
-    pub async fn set_project_approval_mode(
-        &self,
-        project: ProjectId,
-        mode: Option<crate::types::ApprovalMode>,
-    ) -> Result<(), String> {
-        self.with_engine(move |e, now| e.set_project_approval_mode_override(&project, mode, now))
-            .await?
-            .map_err(|e| e.to_string())
-    }
-
-    /// Sets or clears the workspace approval-mode override (STRM-542). Affects new requests.
-    pub async fn set_workspace_approval_mode(
-        &self,
-        mode: Option<crate::types::ApprovalMode>,
-    ) -> Result<(), String> {
-        self.with_engine(move |e, _| e.set_workspace_approval_mode_override(mode))
-            .await?
-            .map_err(|e| e.to_string())
-    }
-
-    /// A human approves or denies a queued request (STRM-542).
-    pub async fn resolve_queued(
-        &self,
-        request: PermissionId,
-        by: MemberId,
-        approve: bool,
-        note: Option<&str>,
-    ) -> Result<QueuedRequest, AnswerError> {
-        let note = note.map(str::to_string);
-        let queued = self
-            .with_engine(move |e, now| e.resolve_queued(now, request, by, approve, note.as_deref()))
-            .await
-            .map_err(|e| AnswerError::Store(e.to_string()))??;
-        let running = self
-            .with_engine(move |e, _| {
-                crate::permission::get(e.conn(), request)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|r| r.run_state.as_deref() == Some("running"))
-            })
-            .await
-            .map_err(AnswerError::Store)?;
-        if running {
-            self.enqueue_run(request).await;
-        }
-        Ok(queued)
-    }
-
     /// Calls a chat tool as the session `scope` would (tests, debugging).
     pub async fn tool(&self, scope: Scope, name: &str, args: Value) -> Result<Value, String> {
         let name = name.to_string();
@@ -1112,331 +942,9 @@ struct Actor {
     tx: mpsc::UnboundedSender<Cmd>,
     events: mpsc::UnboundedSender<CoreEvent>,
     alive: bool,
-    run_limit: Arc<Semaphore>,
-    running: HashMap<PermissionId, RunningCommand>,
-}
-
-struct RunningCommand {
-    abort: tokio::task::AbortHandle,
-    /// The command's process group, written by the runner task straight after
-    /// spawn (0 until then), so shutdown sees it without waiting on a message
-    /// the actor may not have processed yet (STRM-588).
-    pgid: Arc<AtomicU32>,
-}
-
-struct ProcessGroupGuard(Option<u32>);
-
-impl ProcessGroupGuard {
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        if let Some(pgid) = self.0 {
-            Actor::kill_pgid(pgid);
-        }
-    }
 }
 
 impl Actor {
-    fn run_queued(&mut self, id: PermissionId) {
-        let Some(req) = crate::permission::get(self.engine.conn(), id)
-            .ok()
-            .flatten()
-        else {
-            return;
-        };
-        let Some(command) = req.command.as_deref().map(str::to_string) else {
-            let _ = self.fail_run(id, "command is missing");
-            return;
-        };
-        if req.run_state.as_deref() != Some("running") {
-            return;
-        }
-        let Some(cwd_str) = req.cwd.as_deref() else {
-            let _ = self.fail_run(id, "working directory was not resolved; refusing to run");
-            return;
-        };
-        let cwd = PathBuf::from(cwd_str);
-        if !cwd.is_dir() {
-            let _ = self.fail_run(
-                id,
-                &format!("working directory is not available: {}", cwd.display()),
-            );
-            return;
-        }
-        let tx = self.tx.clone();
-        let limit = self.run_limit.clone();
-        let pgid = Arc::new(AtomicU32::new(0));
-        let pgid_slot = pgid.clone();
-        let handle = tokio::spawn(async move {
-            let permit = match limit.acquire_owned().await {
-                Ok(p) => p,
-                Err(_) => {
-                    Self::send_run_result(&tx, id, false, None, "command runner is shutting down");
-                    return;
-                }
-            };
-            let result = Self::execute_command(command, cwd, pgid_slot).await;
-            drop(permit);
-            match result {
-                Ok((ok, code, text)) => Self::send_run_result(&tx, id, ok, code, &text),
-                Err(e) => Self::send_run_result(&tx, id, false, None, &e),
-            }
-        });
-        self.running.insert(
-            id,
-            RunningCommand {
-                abort: handle.abort_handle(),
-                pgid,
-            },
-        );
-    }
-
-    fn fail_run(&mut self, id: PermissionId, msg: &str) -> bool {
-        let now = self.clock.now();
-        match self.engine.complete_command_run(now, id, false, None, msg) {
-            Ok(_) => {
-                self.apply_effects();
-                true
-            }
-            Err(_) => false,
-        }
-    }
-
-    fn send_run_result(
-        tx: &mpsc::UnboundedSender<Cmd>,
-        id: PermissionId,
-        ok: bool,
-        code: Option<i32>,
-        text: &str,
-    ) {
-        let output = text.to_string();
-        let f: EngineFn = Box::new(move |e, now| {
-            if let Err(err) = e.complete_command_run(now, id, ok, code, &output) {
-                // If the run is no longer in the expected state, surface as a note.
-                if let Ok(Some(req)) = crate::permission::get(e.conn(), id) {
-                    e.rt_note(
-                        req.agent,
-                        req.channel,
-                        format!("command #{id} finished but result delivery failed: {err}"),
-                    );
-                }
-            }
-        });
-        let _ = tx.send(Cmd::Engine(f));
-        let _ = tx.send(Cmd::RunFinished { id });
-    }
-
-    async fn execute_command(
-        command: String,
-        cwd: PathBuf,
-        pgid_slot: Arc<AtomicU32>,
-    ) -> Result<(bool, Option<i32>, String), String> {
-        use std::process::Stdio;
-        let timeout_secs: u64 = std::env::var("CHAOS_COMMAND_TIMEOUT_SECS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(10 * 60);
-        let max_total: usize = std::env::var("CHAOS_COMMAND_MAX_OUTPUT_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(128 * 1024);
-        let timeout = Duration::from_secs(timeout_secs.max(1));
-        let io_drain = Duration::from_secs(2);
-
-        let mut cmd = tokio::process::Command::new("sh");
-        cmd.arg("-lc")
-            .arg(&command)
-            .current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        {
-            cmd.process_group(0);
-        }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to execute command: {e}"))?;
-
-        let pgid = child.id();
-        let mut process_group = ProcessGroupGuard(pgid);
-        // No await between spawn and here, so an abort cannot land in between.
-        pgid_slot.store(pgid.unwrap_or(0), Ordering::SeqCst);
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "stdout unavailable".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "stderr unavailable".to_string())?;
-
-        async fn read_limited<R: tokio::io::AsyncRead + Unpin>(
-            mut r: R,
-            max_total: usize,
-        ) -> Vec<u8> {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                let n = match r.read(&mut chunk).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                if buf.len() < max_total {
-                    let take = (max_total - buf.len()).min(n);
-                    buf.extend_from_slice(&chunk[..take]);
-                }
-            }
-            buf
-        }
-
-        let out_task = tokio::spawn(read_limited(stdout, max_total));
-        let err_task = tokio::spawn(read_limited(stderr, max_total));
-        let out_abort = out_task.abort_handle();
-        let err_abort = err_task.abort_handle();
-
-        let (status, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-            Ok(r) => (
-                r.map_err(|e| format!("failed waiting for command: {e}"))?,
-                false,
-            ),
-            Err(_) => {
-                Self::kill_process_tree(pgid, &mut child).await;
-                let st = child.wait().await.ok();
-                (st.unwrap_or_else(std::process::ExitStatus::default), true)
-            }
-        };
-
-        let (out, err, io_timed_out) = match tokio::time::timeout(io_drain, async {
-            (out_task.await, err_task.await)
-        })
-        .await
-        {
-            Ok((o, e)) => (o.unwrap_or_default(), e.unwrap_or_default(), false),
-            Err(_) => {
-                out_abort.abort();
-                err_abort.abort();
-                // Descendants may still hold stdio pipes; terminate the group.
-                Self::kill_process_tree(pgid, &mut child).await;
-                (Vec::new(), Vec::new(), true)
-            }
-        };
-
-        let mut background_processes = false;
-        if Self::process_group_exists(pgid).await? {
-            background_processes = !timed_out && !io_timed_out;
-            Self::kill_process_tree(pgid, &mut child).await;
-        }
-        if !Self::process_group_exists(pgid).await? {
-            process_group.disarm();
-        } else {
-            background_processes = true;
-        }
-
-        let total_len = out.len().saturating_add(err.len());
-        let mut text = Self::format_output(out, err, max_total);
-        if timed_out {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(&format!(
-                "command timed out after {}s and was killed",
-                timeout.as_secs()
-            ));
-        }
-        if io_timed_out {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str(
-                "output pipes did not close in time; background processes were terminated",
-            );
-        }
-        if background_processes {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str("background processes remained after command exit; they were terminated");
-        }
-        if total_len > max_total {
-            if !text.is_empty() {
-                text.push_str("\n\n");
-            }
-            text.push_str("[output truncated]");
-        }
-        Ok((
-            status.success() && !timed_out && !io_timed_out && !background_processes,
-            status.code(),
-            text,
-        ))
-    }
-
-    /// Whether any live (non-zombie) process is still in the command's group.
-    /// Zombies are ignored: they have already exited and only wait to be reaped,
-    /// which on Linux CI may never happen when the orphan's new parent does not reap.
-    async fn process_group_exists(pgid: Option<u32>) -> Result<bool, String> {
-        #[cfg(unix)]
-        if let Some(pgid) = pgid {
-            return tokio::task::spawn_blocking(move || group_has_live_members(pgid))
-                .await
-                .map_err(|e| format!("failed to inspect command process group: {e}"))?;
-        }
-        #[cfg(not(unix))]
-        let _ = pgid;
-        Ok(false)
-    }
-
-    /// TERM the group, give it a moment, then KILL it and wait (briefly) until no
-    /// live member remains.
-    async fn kill_process_tree(pgid: Option<u32>, child: &mut tokio::process::Child) {
-        #[cfg(unix)]
-        if let Some(pgid) = pgid {
-            signal_group(pgid, libc::SIGTERM);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            signal_group(pgid, libc::SIGKILL);
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            while matches!(Self::process_group_exists(Some(pgid)).await, Ok(true))
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-        let _ = child.kill().await;
-    }
-
-    fn kill_pgid(pgid: u32) {
-        #[cfg(unix)]
-        signal_group(pgid, libc::SIGKILL);
-        #[cfg(not(unix))]
-        let _ = pgid;
-    }
-
-    fn format_output(stdout: Vec<u8>, stderr: Vec<u8>, max_total: usize) -> String {
-        let mut out = String::new();
-        let stdout_s = String::from_utf8_lossy(&stdout);
-        let stderr_s = String::from_utf8_lossy(&stderr);
-        if !stdout_s.trim().is_empty() || !stdout.is_empty() {
-            out.push_str(stdout_s.trim_end_matches('\n'));
-        }
-        if !stderr_s.trim().is_empty() || !stderr.is_empty() {
-            if !out.is_empty() {
-                out.push_str("\n\n");
-            }
-            out.push_str("[stderr]\n");
-            out.push_str(stderr_s.trim_end_matches('\n'));
-        }
-        if out.len() > max_total {
-            out.truncate(max_total);
-        }
-        out
-    }
-
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Cmd>) {
         while self.alive {
             let sleep = match self.engine.next_deadline() {
@@ -1528,30 +1036,7 @@ impl Actor {
                     });
                 }
             }
-            Cmd::RunQueued { id } => self.run_queued(id),
-            Cmd::RunFinished { id } => {
-                self.running.remove(&id);
-            }
             Cmd::Shutdown(reply) => {
-                let running: Vec<(PermissionId, Arc<AtomicU32>, tokio::task::AbortHandle)> = self
-                    .running
-                    .drain()
-                    .map(|(id, run)| (id, run.pgid, run.abort))
-                    .collect();
-                for (id, pgid, abort) in running {
-                    // Abort first: a task still inside spawn stores its pgid and
-                    // then, at its next await, is dropped, and its guard kills
-                    // the group. A task already past spawn is killed here too.
-                    abort.abort();
-                    match pgid.load(Ordering::SeqCst) {
-                        0 => {}
-                        pgid => Self::kill_pgid(pgid),
-                    }
-                    let _ = self.fail_run(
-                        id,
-                        "interrupted: Chaos Control shut down while the command was running",
-                    );
-                }
                 for (_, slot) in self.slots.drain() {
                     self.tokens.revoke(&slot.token);
                     if let SlotState::Ready { session, .. } = slot.state {
@@ -1584,14 +1069,9 @@ impl Actor {
         self.engine
             .join(channel, &member, now)
             .map_err(|e| e.to_string())?;
-        self.engine.set_runs_in(member.id, spec.runs_in);
-        self.engine
-            .set_approval_mode(member.id, spec.approval)
-            .map_err(|e| e.to_string())?;
         self.engine
             .set_agent_ping_answers(member.id, spec.ping_answers.clone());
         let agent_cwd = spec.cwd.unwrap_or_else(|| self.default_cwd.clone());
-        self.engine.set_agent_cwd(member.id, agent_cwd.clone());
         let adapter = spec.adapter.clone();
         self.agents.insert(
             member.id,
@@ -1737,24 +1217,7 @@ impl Actor {
                 event,
             });
         });
-        // Native permission requests are decided by the engine, in the actor,
-        // and answered by the adapter at once (they never block on a human).
-        let gate_tx = self.tx.clone();
-        let permissions = PermissionGate::new(move |ask| {
-            let tx = gate_tx.clone();
-            Box::pin(async move {
-                let (reply, wait) = oneshot::channel();
-                let f: EngineFn = Box::new(move |e, now| {
-                    let _ = reply.send(e.native_permission(now, agent, channel, ask));
-                });
-                if tx.send(Cmd::Engine(f)).is_err() {
-                    return PermissionVerdict::Decline;
-                }
-                wait.await.unwrap_or(PermissionVerdict::Decline)
-            })
-        });
         let req = OpenSession {
-            permissions,
             agent,
             channel,
             handle: entry.handle.clone(),
@@ -1837,87 +1300,5 @@ impl Actor {
                 self.engine.session_closed(agent, channel);
             }
         }
-    }
-}
-
-/// Sends `sig` to every process in group `pgid`. Uses killpg(2) directly: the
-/// `kill` binary's handling of negative pids differs between implementations.
-#[cfg(unix)]
-fn signal_group(pgid: u32, sig: libc::c_int) {
-    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
-        return;
-    };
-    if pgid <= 1 {
-        return;
-    }
-    // SAFETY: killpg only takes plain integers and has no memory effects.
-    unsafe {
-        libc::killpg(pgid, sig);
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn group_has_live_members(pgid: u32) -> Result<bool, String> {
-    let entries = std::fs::read_dir("/proc").map_err(|e| format!("failed to read /proc: {e}"))?;
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !name.bytes().all(|b| b.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        if let Some((state, pgrp)) = parse_proc_stat(&stat)
-            && pgrp == pgid
-            && state != 'Z'
-            && state != 'X'
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// `(state, pgrp)` from a /proc/<pid>/stat line. The command name may contain
-/// spaces and parentheses, so fields are read after the last `)`.
-#[cfg(target_os = "linux")]
-fn parse_proc_stat(stat: &str) -> Option<(char, u32)> {
-    let rest = &stat[stat.rfind(')')? + 1..];
-    let mut fields = rest.split_whitespace();
-    let state = fields.next()?.chars().next()?;
-    let _ppid = fields.next()?;
-    let pgrp = fields.next()?.parse().ok()?;
-    Some((state, pgrp))
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn group_has_live_members(pgid: u32) -> Result<bool, String> {
-    let Ok(pgid) = libc::pid_t::try_from(pgid) else {
-        return Ok(false);
-    };
-    // SAFETY: signal 0 only checks for existence and permission.
-    if unsafe { libc::killpg(pgid, 0) } == 0 {
-        return Ok(true);
-    }
-    match std::io::Error::last_os_error().raw_os_error() {
-        Some(libc::ESRCH) => Ok(false),
-        Some(libc::EPERM) => Err(format!(
-            "permission denied inspecting command process group {pgid}"
-        )),
-        _ => Ok(false),
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-mod proc_stat_tests {
-    use super::parse_proc_stat;
-
-    #[test]
-    fn parses_state_and_pgrp_past_odd_names() {
-        let line = "4242 (we(ird) name) Z 1 4200 4200 0 -1 4194560";
-        assert_eq!(parse_proc_stat(line), Some(('Z', 4200)));
-        assert_eq!(parse_proc_stat("7 (sh) S 3 7 7 0"), Some(('S', 7)));
-        assert_eq!(parse_proc_stat("garbage"), None);
     }
 }

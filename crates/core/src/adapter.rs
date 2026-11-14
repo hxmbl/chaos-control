@@ -24,7 +24,6 @@ use std::{fmt, path::PathBuf, sync::Arc};
 use futures::future::BoxFuture;
 
 use crate::harness::ModelInfo;
-use crate::permission::PermissionGate;
 use crate::types::{BatchId, ChannelId, MemberId};
 
 /// Capabilities negotiated for one live session.
@@ -179,9 +178,28 @@ pub struct OpenSession {
     pub cwd: PathBuf,
     pub chat_tools: ChatToolsEndpoint,
     pub events: EventSink,
-    /// Where native permission requests go; the adapter answers the agent with
-    /// whatever core decides (see `permission`).
-    pub permissions: PermissionGate,
+}
+
+/// The kinds of option an agent offers on a permission request, across
+/// protocol versions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OptionKind {
+    AllowOnce,
+    AllowAlways,
+    Other,
+}
+
+/// The option Chaos Control selects for every `session/request_permission`:
+/// permissions are not mediated (the model is being redesigned), so the agent
+/// is answered at once with its own allow option. Allow-once wins over
+/// allow-always, which can write a lasting rule into the agent's settings;
+/// with no allow option, the first option. `None` only when none is offered.
+pub fn auto_allow(options: &[OptionKind]) -> Option<usize> {
+    options
+        .iter()
+        .position(|k| *k == OptionKind::AllowOnce)
+        .or_else(|| options.iter().position(|k| *k == OptionKind::AllowAlways))
+        .or(if options.is_empty() { None } else { Some(0) })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -303,5 +321,18 @@ pub(crate) fn model_outcome(
         Err(e) => Some(Arc::from(format!(
             "couldn't switch to {wanted} ({e}); running the harness default"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OptionKind::*, auto_allow};
+
+    #[test]
+    fn auto_allow_prefers_allow_once_then_allow_always_then_the_first() {
+        assert_eq!(auto_allow(&[Other, AllowAlways, AllowOnce]), Some(2));
+        assert_eq!(auto_allow(&[Other, AllowAlways]), Some(1));
+        assert_eq!(auto_allow(&[Other, Other]), Some(0));
+        assert_eq!(auto_allow(&[]), None);
     }
 }

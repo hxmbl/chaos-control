@@ -163,40 +163,6 @@ pub enum PaneContent {
     /// The launch folder's `.chaos/project.toml` disagrees with what the app
     /// remembers about the folder. Nothing switches until the user answers.
     ProjectIdentity(ProjectQuestion),
-    /// An agent on this computer asked for permission. It is not waiting on
-    /// the answer; Approve or Deny reaches it as a message.
-    Permission(PermissionPrompt),
-}
-
-/// A pending permission request, as the pane shows it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PermissionPrompt {
-    /// Core's request id (`#N` in the chat).
-    pub request: i64,
-    /// The agent's display name.
-    pub agent: Arc<str>,
-    /// What it wants to do (the tool call's title).
-    pub action: Arc<str>,
-    /// Why, in its words, when it said.
-    pub reason: Option<Arc<str>>,
-    /// The tool's raw input, when there is one.
-    pub detail: Option<Arc<str>>,
-    /// Who it was sent to ("Hx"); any human here can answer.
-    pub asked: Arc<str>,
-    /// Opened from the permission log: shown read-only with how it ended, no
-    /// Approve / Deny. `None` is a live prompt (unused while requests are
-    /// muted; see `permissions`).
-    pub logged: Option<crate::PermissionOutcome>,
-    /// Captured command for queued execution, if any.
-    pub command: Option<Arc<str>>,
-    /// Working directory the command would run in (resolved/persisted), if known.
-    pub cwd: Option<Arc<str>>,
-    /// Execution lifecycle state (queued/running/done/failed/unrunnable/denied).
-    pub run_state: Option<Arc<str>>,
-    /// Command output/result when available.
-    pub run_output: Option<Arc<str>>,
-    /// Exit code when execution finished.
-    pub run_exit_code: Option<i32>,
 }
 
 /// What the project-identity pane asks.
@@ -249,8 +215,6 @@ pub enum PaneActionKind {
     NewProject,
     /// Project identity: adopt the unclaimed pre-project history here.
     AdoptImported,
-    /// Permission request: say no (Approve says yes).
-    Deny,
 }
 
 /// A full-width row along the bottom of the pane.
@@ -297,10 +261,6 @@ impl PaneContent {
                 ProjectQuestionKind::CopiedFrom(_) => "This folder looks like a copy",
                 ProjectQuestionKind::Imported => "Earlier history found",
             }),
-            PaneContent::Permission(p) => Arc::from(match p.logged {
-                Some(outcome) => format!("{} · {}", p.agent, outcome.label()),
-                None => format!("{} asks permission", p.agent),
-            }),
         }
     }
 
@@ -341,11 +301,6 @@ impl PaneContent {
                     PaneAction::new(KeepProject, "Start fresh"),
                 ],
             },
-            PaneContent::Permission(p) if p.logged.is_some() => Vec::new(),
-            PaneContent::Permission(_) => vec![
-                PaneAction::new(Approve, "Approve"),
-                PaneAction::new(Deny, "Deny"),
-            ],
             PaneContent::Search {
                 results,
                 highlighted,
@@ -402,27 +357,6 @@ mod tests {
             reply_to: None,
             stance: None,
         }
-    }
-
-    #[test]
-    fn permission_offers_approve_and_deny() {
-        let pane = PaneContent::Permission(PermissionPrompt {
-            request: 3,
-            agent: Arc::from("Claude Code"),
-            action: Arc::from("rm -rf build/"),
-            reason: None,
-            detail: None,
-            asked: Arc::from("Hx"),
-            logged: None,
-            command: None,
-            cwd: None,
-            run_state: None,
-            run_output: None,
-            run_exit_code: None,
-        });
-        assert_eq!(&*pane.title(&sample()), "Claude Code asks permission");
-        let kinds: Vec<_> = pane.actions().into_iter().map(|a| a.kind).collect();
-        assert_eq!(kinds, vec![PaneActionKind::Approve, PaneActionKind::Deny]);
     }
 
     #[test]

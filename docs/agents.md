@@ -44,10 +44,9 @@ position and a voice.
   roster" below).
 - **Explicit posting.** Agents speak through the `chat_send` tool. Their final
   turn text is private working-out, posted only as the reply-owed fallback.
-- **Ten chat tools, a social plane only:** `chat_context`, `chat_read`,
-  `chat_search`, `chat_send`, `chat_react`, `chat_status`, the peer actions
-  `chat_refuse` and `chat_dissent`, and `chat_request_permission` and
-  `chat_permission_status` (see Permissions). No delegate, spawn or wait:
+- **Eight chat tools, a social plane only:** `chat_context`, `chat_read`,
+  `chat_search`, `chat_send`, `chat_react`, `chat_status`, and the peer
+  actions `chat_refuse` and `chat_dissent`. No delegate, spawn or wait:
   agents involve each other by mentioning in the open.
 
 ## Members and the roster
@@ -361,193 +360,23 @@ longer parses counts as unset. Agents see their list in `chat_context`
 ("✅ or 👍 answers it; 👀 means you're on it, and other emoji don't
 answer").
 
-## Permissions: by where the agent runs (STRM-596/606, mediated core — evolving)
+## Permissions: not mediated (being redesigned)
 
-**Mediated ACP permission requests are fail-closed by default on the host.** Chaos Control
-does not claim complete mediation or strict enforcement from ACP callbacks alone.
-On the production mediated path (`native_permission`/`ask_permission`), requests
-are classified, identity-bound where possible, and decided without trusting
-generic ACP kinds, tool basenames, titles, or self-declared metadata as proof of
-safety or scope. Unverified, unknown, changed, unbindable, or unclassifiable
-cases require human approval (or are otherwise held/fail closed) as applicable.
+Chaos Control currently does **not** mediate agent permissions. The earlier
+model (where an agent runs, host/VM; request classification; approval modes;
+the approval queue, queued command execution and the permission log) was
+removed so it can be rebuilt from the ground up.
 
-### Where the agent runs
-
-| Where | What happens |
-| --- | --- |
-| `host` (the user's computer, default) | Decided by mediated classification + approval mode (below). Requests that require approval are **non-blocking**: the agent is answered at once with a "request sent" / pending outcome (and request id) so it can continue other work or wait; a human Approve/Deny arrives later as a wake/message. Approved one-shot grants apply only to the exact retried request identity. Nothing times out into an approval. |
-| `vm` (the agent's own VM) | Auto-approved (`DecidedBy::AutoVm`). A broken VM is replaced, not protected. No VM orchestration yet: the flag only marks the agent. |
-
-`yolo` mode explicitly allows mediated requests on the host (`DecidedBy::AutoMode`),
-logged distinctly from VM auto-approval.
-
-### Mediated classification and host behavior (current core)
-
-Classification is derived from verifiable ACP wire/tool-call evidence
-(`request_kind_from_wire`, with conservative refinement `effective_request_kind`
-for conflicting/mixed edit-payload signals). **Delete** and **move** are distinct
-from **edit**. Unknown/missing kinds and conflicting/unclassifiable signals are
-treated as `Other`/unclassifiable (fail closed).
-
-| Request class (mediated) | `ask-all` | `accept-edits` | Notes |
-| --- | --- | --- | --- |
-| Read / local search (`read`, `search`) | Ask human | Ask human | Ordinary/private/out-of-workspace reads and local search are not auto-allowed on this path. |
-| Structured edit (`edit`, no conflicting mixed/unclassifiable signal) | Ask human | Ask human (fail closed) | Never auto-allowed outside `yolo` without verified editable-root authorization **and** sufficient execution-time scope enforcement evidence on the production path (unavailable in core today). |
-| Delete (`delete`) | Ask human | Ask human | Never auto-allow-eligible as an edit. |
-| Move (`move`) | Ask human | Ask human | Never auto-allow-eligible as an edit. |
-| Shell/execute (`execute`, incl. read-only-looking commands) | Ask human | Queued for approval-gated command execution (pending/runnable as captured) | Human approval is required in both modes; `accept-edits` preserves approval-gated queued execution behavior (not auto-allowed). Missing/uncapturable command/cwd fail closed for safe execution capture. |
-| Fetch / URL open (`fetch`) | Ask human | Ask human | No automatic verified-web-search/selected-MCP exception without verifiable production-path proof. |
-| Other / unknown / mixed / unclassifiable | Ask human | Ask human | Includes unknown wire kinds and payloads treated as conflicting/unclassifiable. |
-
-Additional fail-closed rules on the mediated path:
-- **Identity binding:** request keys bind grants/dedup to the exact operation
-  (kind + canonicalized payload hash with volatile fields stripped). If identity
-  cannot be stably bound (no key), the request is treated as unbindable: no
-  prior-grant reuse and no weak title-key dedupe/auto-match (always requires an
-  explicit decision for that ask).
-- **CC control-plane (exact identity only, separate from “selected MCP”):**
-  scoped native actions `chat_send`, `chat_react`, `chat_status`, `chat_refuse`,
-  `chat_dissent`, `chat_request_permission` may be auto-approved by exact CC tool
-  identity on the mediated native path (recorded as auto-approved). CC read/status
-  tools `chat_context`, `chat_read`, `chat_search`, `chat_permission_status`,
-  `chat_approval_mode_status` require human approval in both modes. Policy/answer
-  and unknown `chat_*` tools are not auto-allowed by exact-name scope.
-- **No invented exceptions:** verified web-search (search-only) and explicitly
-  selected MCP allowances require verifiable proof/scope evidence not assumed by
-  core; otherwise fail closed. ACP mediation is not evidence of complete
-  mediation.
-
-**Approval modes (STRM-542, evolving under STRM-596/606).** `ApprovalMode`
-is `ask-all` (default), `accept-edits`, or `yolo`. `mode_verdict` is the pure
-decision per `RequestKind` (`Read`, `Edit`, `Delete`, `Move`, `Execute`, `Fetch`,
-`Other`), with defense-in-depth guards preventing `Edit`/`Delete`/`Move`
-auto-approval outside `yolo` without verified prerequisites.
-
-The effective mode resolves most-specific-first: channel override
-(`channel_approval_mode`, migration 17) > project `approval_mode` setting >
-workspace `approval_mode` (`app_settings`, migration 18) > the member's
-`agents.json` `"approval"` (default `ask-all`). Mode changes are not
-retroactive. `decided_by` records who/what decided (`AutoVm`, `AutoMode`,
-`Human(<member>)`).
-
-A declined or denied request is an answer, not a failure (the peer model): it
-never fails a turn, never turns an agent red, and is never retried by the runtime.
-
-**Native requests (ACP `session/request_permission`).** The protocol call
-blocks the agent until it is answered, so the adapter asks core
-(`OpenSession::permissions`, decided in the engine) and answers at once:
-
-- allowed (VM, a grant, or the approval mode allowed it — below): the
-  agent's own **allow-once** option, else allow-always only if nothing
-  narrower is offered (claude-agent-acp's allow-always writes a lasting
-  rule into the agent's local settings);
-- otherwise: the agent's own **"not now"** decline, a reject-once that lets
-  the turn continue (Codex offers two reject-once options; the one whose name
-  says "continue" wins over "tell Codex what to do differently", which aborts
-  the turn), else reject-always, else `cancelled`. The response carries
-  `_meta.chaosControl = {status: "request_sent", requestId, message}`.
-
-**Requests.** Each is a row in `permission_requests` (migration 6): agent,
-channel, the turn it was asked in, source (`native` or `chat_tool`), title
-(the tool call's title), detail (raw input), reason, state (`pending`,
-`approved`, `denied`, `auto_approved`), who it was routed to, who answered,
-when, an optional note, and `used_at`. Migration 8 adds `read_only` (allowed
-reads, logged) and the log's indexes. Migration 13 adds `request_key`
-(STRM-572, below). STRM-542 adds `decided_by` (migration 16), the approval
-mode scopes (17, 18) and the queued-command run fields (migration 19:
-`command`, `cwd`, `run_state`, `run_output`, `run_exit_code`,
-`run_finished_at`; core records them, running the command itself is not
-implemented yet).
-
-- **Request key:** what exactly was asked for, `permission::request_key(kind,
-  payload)`: the tool kind, a `:`, then the SHA-256 (hex) of the payload as
-  canonical JSON (object keys sorted, no whitespace), with the volatile
-  fields stripped first. The request id is never part of it, so an approved
-  call retried with a new tool call id still matches. Per protocol:
-  - **ACP v1:** the whole tool call (title, kind, content, locations,
-    `rawInput`, ...) without `toolCallId`, `terminalId`, `status`,
-    `rawOutput` and `_meta` (at any depth except inside `rawInput`, which is
-    hashed as given).
-  - **ACP v2 draft:** the prompt's `title`, `description` and `subject`,
-    without the same fields.
-  - **`chat_request_permission`:** its `action` text (kind `chat`).
-  - Logged reads and auto-allowed chat tools store no key; nor do rows
-    from before migration 13, so an old unused grant matches nothing.
-
-- **Routing:** to the humans whose messages woke the turn, else every human
-  in the channel. Any human member of the channel can answer; agents can't.
-- **Dedup:** asking again for the same request (same key) while one is
-  pending reuses it. The same title with another payload is a new request.
-- **Surfacing:** one system note ("@bot asked to run X: permission request #N,
-  sent to @hx. Any human here can approve or deny it; @bot carries on
-  meanwhile." — "queued to run" for accept-edits commands) when
-  `Policy::note_permission_requests` is on, a `CoreEvent::Permission`
-  (also for every logged read), and presence "request pending: X (#N)"
-  (never "blocked"; glow is unchanged).
-- **The app's permission surface (STRM-542).** Requests still never open
-  the pane: `store::PERMISSION_PANE` is `false`, and the app starts core
-  with `note_permission_requests` off. The right sidebar's **Permissions**
-  list is the live surface: it loads `Core::permission_log(channel, 200)`
-  when core starts or the project switches, then folds in each
-  `CoreEvent::Permission`. `pending` rows show **Pending** with inline
-  Approve / Deny pills wired to `ChatStore::answer_permission`; the pane
-  still opens read-only with the details. Outcomes are
-  `PermissionRequest::outcome()`: `auto_approved` shows **Auto-allowed**;
-  `pending` shows **Pending**; `denied` shows **Declined**; `approved`
-  shows **Approved**. `Core::approval_queue(channel)` exposes the same
-  pending set as `QueuedRequest`s for clients that want the queue shape.
-- **Answer:** `Core::answer_permission(id, human, approve, note)` records it
-  (only a pending request can be answered, once), posts it as a system
-  message and delivers it as a wake: one trigger with reason `permission` on
-  that message, no reply owed, merged into the pending batch if the agent is
-  busy. A human's answer clears a red state like a human ping.
-- **Grant:** an approval is a **one-shot grant** for that (agent, channel,
-  request key). The next native request with the same key is answered with
-  allow-once and the grant is spent (`used_at`); a second identical call is a
-  new request. The same title on another payload (an approved `Edit files`
-  on `a.rs`, then `Edit files` on `b.rs`) is declined and sent as its own
-  request. A denial grants nothing.
-
-**Chat tools.** `chat_request_permission {action, reason?}` asks ahead: on
-the host it answers `{status: "request_sent", request_id, asked}` (or
-`approved` if that action is already approved and unused); in a VM,
-`approved`. It is keyed on the `action` text, so it no longer pre-clears a
-tool call with that title (STRM-572): the tool call is approved through its
-own native request. `chat_permission_status {request_id?}` lists the agent's requests in
-the channel with their answers, plus the queued-command run fields
-(`run_state`, `command`, `run_output`, `run_exit_code`, `run_finished_at`)
-so an agent can watch a queued request by id.
-
-**Resuming a declined action (investigated against the published sources,
-not live yet).** Neither agent can be told "approved" inside the call it
-already made, so resuming means retrying on a later turn, which the grant
-lets through:
-
-- **claude-agent-acp 0.97.0:** a reject-once becomes
-  `{behavior: "deny", message: "User refused permission to run tool"}`
-  without `interrupt`, so Claude sees a refused tool result and keeps going
-  in the same turn. It ignores our `_meta`, so the "request sent" context
-  reaches it through the room norms in its orientation and the answer
-  message. On the answer's wake it retries the tool call; the same call
-  (the Bash command, `Edit <path>`, ...) hits the grant.
-- **codex-acp:** exec and patch approvals map options to Codex review
-  decisions; we pick "denied" (continue without running it), never "abort"
-  (ends the turn). Codex sees the command was rejected and continues. On the
-  answer's wake it re-issues the command, codex-acp asks again, and the grant
-  answers "approved". `cancelled` would map to abort, so it is only used when
-  an agent offers no decline at all.
-- **Codex ACP sandbox/permissions (migration):** the old native Codex path
-  configured a read-only sandbox and on-request approval policy; those native
-  settings are removed. Do **not** assume `codex-acp` preserves the same
-  effective filesystem or command restrictions. Before relying on it, verify a
-  real Codex ACP session's effective permissions (reads, writes, command
-  execution, and approval behavior) and update this document with the observed
-  behavior.
-- Limits: sessions close after 10 idle minutes, so an answer that comes
-  later wakes a fresh session that only knows what the answer message and
-  its unread context say (title and request id). A grant matches the
-  request key, so a retried call that changes anything but its ids (another
-  file, another command) asks again.
+- **Native requests (ACP `session/request_permission`, v1 and v2).** Answered
+  at once with the agent's own allow option (`adapter::auto_allow`):
+  allow-once, else allow-always, else the first option offered; `cancelled`
+  only when the agent offers none. No prompt, no queue, no log, no chat note.
+- Agents otherwise run under their own native permission settings. Chaos
+  Control never changes an agent's permission mode (`session/set_mode`).
+- The chat tools Chaos Control exposes just run; there is no approval gate.
+- The permission tables from earlier migrations (`permission_requests`,
+  `channel_approval_mode`, `app_settings`) are kept so local databases keep
+  their schema version, but nothing reads or writes them.
 
 ## Room policy
 
@@ -615,7 +444,7 @@ project answers `not_found`.
   },
   "members": [
     { "harness": "codex", "model": "gpt-6.1-sol", "name": "GPT-6.1 Sol" },
-    { "harness": "fx", "model": "anthropic/claude-opus-5.5", "runs_in": "vm" }
+    { "harness": "fx", "model": "anthropic/claude-opus-5.5" }
   ]
 }
 ```
@@ -628,15 +457,14 @@ project answers `not_found`.
   `chat_tools` (`"auto"` or `"stdio"`). A harness with a `command` here
   counts as installed even when detection didn't find it.
 - `members`: the roster (Hxmbl's decision, 2026-10-31). Each entry has
-  `harness`, optional `model` (absent: the harness default), `name`, `cwd`,
-  `runs_in` and `approval` (STRM-542: `"ask-all"`, `"accept-edits"` or
-  `"yolo"`, absent: `ask-all`). It is loaded at every start and the app writes it back as
+  `harness`, optional `model` (absent: the harness default), `name` and
+  `cwd` (older `runs_in` / `approval` keys are ignored). It is loaded at every start and the app writes it back as
   the roster changes:
   - "Add a model" appends `{harness, model, name}`; removing a member
     deletes its entry. A missing file is created in `<data>` (or at
     `$CHAOS_CONTROL_AGENTS`).
   - Only `members` changes. Other keys, and an entry's own extra fields
-    (`cwd`, `runs_in`, anything unknown), are kept in their order; the file
+    (`cwd`, anything unknown), are kept in their order; the file
     is re-indented with two spaces. Writes are atomic (a temporary file
     renamed over it) and one at a time, off the UI thread.
   - A file that isn't valid JSON is never overwritten: the app prints why
@@ -663,8 +491,7 @@ keys. Each entry is one ACP command; `brand` only picks the icon:
 
 `record` appends every ACP frame as NDJSON `{dir, frame}`, the replay-fixture
 format. Optional keys: `env` (object), `acp_v2` (default `true`),
-`chat_tools` (`"auto"` or `"stdio"`), `runs_in` (`"host"`, the default, or
-`"vm"`; see Permissions), `ping_answer_reactions` (a list of emoji, or
+`chat_tools` (`"auto"` or `"stdio"`), `ping_answer_reactions` (a list of emoji, or
 `["*"]`; see "Which reactions answer a ping").
 
 ## Testing
@@ -692,13 +519,8 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   handled), an invalid list is rejected whole and leaves the old one, and
   reactions show up in `chat_react`, `chat_read`, `chat_context` and the
   next prompt.
-- `tests/permissions.rs`: permissions by where the agent runs and by
-  approval mode, against the fake agent: a host request is routed to the
-  waker, declined natively with the request id and the turn carries on;
-  an approval wakes the agent and lets the retried call through once; a
-  denial grants nothing and is not a failure; a VM agent is approved
-  without a note; reads are allowed and logged; the chat tools ask ahead,
-  dedup and poll; only humans answer, once.
+- Permission auto-allow: `tests/scenarios.rs` (v1) and `tests/v2.rs` (v2)
+  check that a request is answered with the agent's allow option at once.
 - `tests/models.rs`: model members against the fake ACP agent: the ACP
   session model option (set, not offered, default), throwaway-session
   discovery and a signed-out harness caching nothing; one harness hosting
@@ -749,19 +571,17 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
 - **Recorded:** codex-acp 0.16.0 v1 (`session/new` needs sign-in) and
   claude-agent-acp 0.97.0 answering a v1-only client.
 - **Against the fake only:** agent output, keyed message and tool-call
-  upserts, permission requests and cancel over v2 (`tests/v2.rs`), and the
-  whole permission flow (`tests/permissions.rs`).
+  upserts, auto-allowed permission requests and cancel over v2
+  (`tests/v2.rs`).
 - **Harnesses (not live-verified):** none of the harness presets (Codex
   via `codex-acp`, fx, Mistral Vibe, Claude Code via claude-agent-acp
   0.99.1, Copilot CLI, opencode, Devin, Cursor, Gemini), model discovery
   or model selection has been run against a real harness. They are tested
   against the fakes only; manual checks are in `agent-adapters.md`.
-- **Roster follow-ups (2026-10-31, not live-verified):** reads allowed /
-  everything else to the approval queue (`tests/permissions.rs`), the
+- **Roster follow-ups (2026-10-31, not live-verified):** the
   model cache and background probe, discovery awaited off the tokio
   runtime (`tests/models.rs`), and `agents.json` write-back (unit tests in
-  the app's `agents_file`). Whether real harnesses label their reads
-  `read`/`search` is unchecked.
+  the app's `agents_file`).
 - **Not yet:** a signed-in agent actually calling `chat_context` and
   `chat_send`, agent output, tool calls and permission requests over v2 from a
   real agent, and the stdio bridge inside a real agent. That is validation step 2 on a Mac with

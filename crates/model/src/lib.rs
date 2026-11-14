@@ -5,17 +5,12 @@
 
 pub mod mentions;
 pub mod pane;
-pub mod permissions;
 mod sample;
 pub mod search;
 
 pub use pane::{
-    Attachment, PaneAction, PaneActionKind, PaneContent, PermissionPrompt, ProjectQuestion,
-    ProjectQuestionKind, ReplyRef, ReviewItem, Settings,
-};
-pub use permissions::{
-    LOG_LEN as PERMISSION_LOG_LEN, PermissionLog, PermissionLogEntry, PermissionOutcome,
-    relative_time,
+    Attachment, PaneAction, PaneActionKind, PaneContent, ProjectQuestion, ProjectQuestionKind,
+    ReplyRef, ReviewItem, Settings,
 };
 pub use sample::{demo_channels, demo_history, sample, sample_history};
 pub use search::{
@@ -159,7 +154,7 @@ pub struct Mention {
 pub enum Author {
     Agent(Id),
     Human,
-    /// A runtime notice (an agent asked for permission, a paused
+    /// A runtime notice (a paused
     /// agent-to-agent exchange). Shown quietly; never wakes anyone.
     System,
 }
