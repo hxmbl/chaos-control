@@ -263,6 +263,9 @@ pub struct Engine {
     pub(crate) effects: Vec<Effect>,
     /// Where each agent runs (see `permission`); absent means the host.
     pub(crate) runs_in: HashMap<MemberId, RunsIn>,
+    /// Whether VM isolation has been verified by a trustworthy capability/path.
+    /// Config alone must not set this; absent/false means unverified (fail closed).
+    pub(crate) vm_isolation_verified: HashMap<MemberId, bool>,
     /// Host-side approval mode per agent (STRM-542). Absent means AskAll.
     pub(crate) approval_mode: HashMap<MemberId, ApprovalMode>,
     /// The agent's working directory, when known (used for command execution).
@@ -291,6 +294,7 @@ impl Engine {
             rt: HashMap::new(),
             effects: Vec::new(),
             runs_in: HashMap::new(),
+            vm_isolation_verified: HashMap::new(),
             approval_mode: HashMap::new(),
             agent_cwd: HashMap::new(),
             ping_answers: HashMap::new(),

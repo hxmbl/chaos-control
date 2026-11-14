@@ -67,8 +67,20 @@ impl Harness {
         self.agent_in(handle, script, RunsIn::Host).await
     }
 
-    /// An agent that runs in its own VM (every permission is approved).
+    /// An agent configured to run in a VM with verified isolation evidence.
+    /// Used for tests that model a trustworthy, verified isolated runtime.
     pub async fn agent_in_vm(&mut self, handle: &str, script: Script) -> Member {
+        let member = self.agent_in(handle, script, RunsIn::Vm).await;
+        self.core
+            .set_vm_isolation_verified(member.id, true)
+            .await
+            .unwrap();
+        member
+    }
+
+    /// An agent configured as `runs_in: vm` but without verified isolation
+    /// evidence (config alone). Must fall back to host-side permission enforcement.
+    pub async fn agent_in_unverified_vm(&mut self, handle: &str, script: Script) -> Member {
         self.agent_in(handle, script, RunsIn::Vm).await
     }
 

@@ -350,6 +350,72 @@ async fn chat_tools_ask_ahead_without_blocking_and_poll_the_answer() {
     assert!(h.core.pending_permissions(h.main).await.unwrap().is_empty());
 }
 
+/// `runs_in: vm` without verified isolation evidence must not auto-approve;
+/// it must fall back to normal host-side permission enforcement (fail closed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_vm_config_cannot_auto_approve_and_falls_back_to_host_policy() {
+    let mut h = Harness::new().await;
+    let bot = h
+        .agent_in_unverified_vm(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                {"permission": "rm -rf /tmp/scratch"},
+                {"text": "waited"}
+            ]}]})),
+        )
+        .await;
+    h.say("@bot clean scratch").await;
+
+    let req = wait_request(&mut h, PermissionState::Pending).await;
+    assert_eq!(&*req.title, "rm -rf /tmp/scratch");
+    assert_eq!(req.asked_of, vec![h.hx.id], "host policy applies: {req:#?}");
+    assert_ne!(
+        req.state,
+        PermissionState::AutoApproved,
+        "config alone must not prove isolation: {req:#?}"
+    );
+
+    let outcomes = wait_outcomes(&h, "bot", 1).await;
+    assert_eq!(picked(&outcomes[0]), &json!("deny"), "{}", outcomes[0]);
+
+    // A normal host agent remains subject to configured approval policy.
+    let host_bot = h
+        .agent(
+            "host",
+            script(json!({"turns": [{"steps": [
+                {"permission": "echo hi"},
+                {"text": "ok"}
+            ]}]})),
+        )
+        .await;
+    h.say("@host hi").await;
+    let host_req = wait_request(&mut h, PermissionState::Pending).await;
+    assert_eq!(host_req.agent, host_bot.id);
+    assert_eq!(host_req.asked_of, vec![h.hx.id]);
+
+    // Missing/unavailable isolation evidence fails closed (explicitly unverified).
+    h.core
+        .set_vm_isolation_verified(bot.id, false)
+        .await
+        .unwrap();
+    let scope = mcp::Scope {
+        agent: bot.id,
+        channel: h.main,
+        epoch: 0,
+    };
+    let asked = h
+        .core
+        .tool(
+            scope,
+            "chat_request_permission",
+            json!({"action": "install deps"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(asked["status"], json!("request_sent"), "{asked}");
+    assert_eq!(asked["state"], json!("pending"), "{asked}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_vm_agent_asking_ahead_is_told_to_go_ahead() {
     let mut h = Harness::new().await;
@@ -547,46 +613,74 @@ async fn reads_and_local_search_require_human_approval_without_blocking() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn named_chat_tools_are_auto_allowed_and_logged_by_name() {
+async fn verified_cc_control_plane_tools_are_auto_allowed_but_unverified_names_fail_closed() {
     for protocol in [1, 2] {
         let mut h = Harness::new().await;
         let bot = h
             .agent(
                 "bot",
                 script(json!({"protocol": protocol, "turns": [{"steps": [
-                    {"permission_kind": {"title": "a tool", "name": "chat_send", "kind": "execute"}},
-                    {"permission_kind": {"title": "a tool", "name": "external_tool", "kind": "execute"}},
-                    {"text": "The chat tool ran; the other tool needs approval."}
+                    // Correct injected CC tool identity (server-qualified provenance).
+                    {"permission_kind": {"title": "chat_send", "name": "chaos-control/chat_send", "kind": "execute"}},
+                    // Same bare name without trustworthy provenance must fail closed.
+                    {"permission_kind": {"title": "chat_send", "name": "chat_send", "kind": "execute"}},
+                    // Same-name tool from an unrelated provider must not receive exception.
+                    {"permission_kind": {"title": "chat_send", "name": "evil-mcp/chat_send", "kind": "execute"}},
+                    // Non-control-plane tool remains approval-gated.
+                    {"permission_kind": {"title": "external_tool", "name": "external_tool", "kind": "execute"}},
+                    {"text": "done"}
                 ]}]})),
             )
             .await;
-        h.say("@bot use the chat tool").await;
+        h.say("@bot use tools").await;
 
-        let all = wait_outcomes(&h, "bot", 2).await;
+        let all = wait_outcomes(&h, "bot", 4).await;
         assert_eq!(
             picked(&all[0]),
             &json!("allow"),
-            "chat tool, v{protocol}: {}",
+            "verified CC identity, v{protocol}: {}",
             all[0]
         );
         assert_eq!(
             picked(&all[1]),
             &json!("deny"),
-            "other tool, v{protocol}: {}",
+            "missing provenance must fail closed, v{protocol}: {}",
             all[1]
+        );
+        assert_eq!(
+            picked(&all[2]),
+            &json!("deny"),
+            "unrelated provider same name, v{protocol}: {}",
+            all[2]
+        );
+        assert_eq!(
+            picked(&all[3]),
+            &json!("deny"),
+            "external tool, v{protocol}: {}",
+            all[3]
         );
         h.wait_message("the agent carried on", Some(bot.id)).await;
 
         let pending = h.core.pending_permissions(h.main).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(&*pending[0].title, "external_tool");
+        assert_eq!(pending.len(), 3, "v{protocol}: {pending:#?}");
+        let titles: Vec<_> = pending.iter().map(|r| r.title.as_ref()).collect();
+        assert!(titles.contains(&"chat_send"), "v{protocol}: {pending:#?}");
+        assert!(
+            titles.contains(&"external_tool"),
+            "v{protocol}: {pending:#?}"
+        );
+
         let log = h.core.permission_log(h.main, 50).await.unwrap();
-        assert_eq!(log.len(), 2);
-        assert_eq!(&*log[0].title, "external_tool");
-        assert_eq!(log[0].state, PermissionState::Pending);
-        assert_eq!(&*log[1].title, "chat_send");
-        assert_eq!(log[1].state, PermissionState::AutoApproved);
-        assert!(!log[1].read_only);
+        let auto: Vec<_> = log
+            .iter()
+            .filter(|r| r.state == PermissionState::AutoApproved)
+            .collect();
+        assert_eq!(
+            auto.len(),
+            1,
+            "only verified CC tool auto-allowed, v{protocol}: {log:#?}"
+        );
+        assert_eq!(auto[0].decided_by, Some(DecidedBy::AutoMode));
     }
 }
 
@@ -894,7 +988,8 @@ async fn control_plane_read_tools_require_approval_while_scoped_actions_are_auto
                     json!({"permission_kind": {"title": "a tool", "name": name, "kind": "execute"}})
                 })
                 .collect();
-            steps.push(json!({"permission_kind": {"title": "a tool", "name": "chat_react", "kind": "execute"}}));
+            // Scoped CC control-plane action auto-allow requires verified CC provenance.
+            steps.push(json!({"permission_kind": {"title": "chat_react", "name": "chaos-control/chat_react", "kind": "execute"}}));
             steps.push(json!({"text": "Done."}));
             let bot = h
                 .agent(

@@ -803,3 +803,167 @@ async fn queued_execution_context_is_captured_bound_and_exposed() {
     assert_eq!(st2["cwd"], json!(cwd_s), "{st2}");
     assert_eq!(st2["run_state"], json!("done"), "{st2}");
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_cwd_with_configured_agent_cwd_is_unrunnable_and_never_falls_back() {
+    let mut h = Harness::new().await;
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                {"permission_kind": {"title": "echo hi", "kind": "execute", "raw_input": {
+                    "command": "echo hi",
+                    "cwd": "/tmp/conflict-a",
+                    "rawInput": {"cwd": "/tmp/conflict-b"}
+                }}},
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot run").await;
+    let req = wait_permission_state(&mut h, PermissionState::Pending).await;
+    assert_eq!(req.command.as_deref(), Some("echo hi"), "{req:#?}");
+    assert_eq!(
+        req.cwd, None,
+        "ambiguous cwd must not fallback to agent cwd: {req:#?}"
+    );
+    assert_eq!(req.run_state.as_deref(), Some("unrunnable"), "{req:#?}");
+
+    h.core
+        .answer_permission(req.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+    // Approval must not make an ambiguous/missing-safe-context descriptor runnable.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let after = h
+        .core
+        .with_engine(move |e, _| chaos_core::permission::get(e.conn(), req.id).unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.run_state.as_deref(), Some("unrunnable"), "{after:#?}");
+    assert_eq!(
+        after.cwd, None,
+        "ambiguous cwd must never fallback: {after:#?}"
+    );
+    assert_ne!(after.run_state.as_deref(), Some("running"), "{after:#?}");
+    assert_ne!(after.run_state.as_deref(), Some("done"), "{after:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_cwd_may_fallback_to_configured_agent_cwd() {
+    let mut h = Harness::new().await;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                {"permission_kind": {"title": "pwd", "kind": "execute", "raw_input": {
+                    "command": "pwd"
+                }}},
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot pwd").await;
+    let req = wait_permission_state(&mut h, PermissionState::Pending).await;
+    assert_eq!(req.command.as_deref(), Some("pwd"), "{req:#?}");
+    assert_eq!(
+        req.cwd.as_deref(),
+        Some(cwd.as_str()),
+        "missing cwd may fallback: {req:#?}"
+    );
+    assert_eq!(req.run_state.as_deref(), Some("queued"), "{req:#?}");
+
+    h.core
+        .answer_permission(req.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+    let done = wait_run_state(&h, req.id, "done").await;
+    assert_eq!(done.run_exit_code, Some(0), "{done:#?}");
+    assert_eq!(done.cwd.as_deref(), Some(cwd.as_str()), "{done:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_command_candidate_alongside_valid_candidate_fails_closed() {
+    let mut h = Harness::new().await;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                {"permission_kind": {"title": "echo safe", "kind": "execute", "raw_input": {
+                    "command": "echo safe",
+                    "cmd": ["sh", 123],
+                    "cwd": cwd
+                }}},
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot run").await;
+    let req = wait_permission_state(&mut h, PermissionState::Pending).await;
+    assert_eq!(
+        req.command, None,
+        "malformed recognized candidate must invalidate: {req:#?}"
+    );
+    assert_eq!(req.run_state.as_deref(), Some("unrunnable"), "{req:#?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_argv_positional_params_are_preserved_and_executed_as_approved() {
+    let mut h = Harness::new().await;
+    let cwd = std::env::temp_dir().to_string_lossy().to_string();
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                {"permission_kind": {"title": "bash positional", "kind": "execute", "raw_input": {
+                    "command": ["bash", "-lc", "printf '%s' \"$0\"", "important-argument"],
+                    "cwd": cwd
+                }}},
+                {"text": "done"}
+            ]}]})),
+        )
+        .await;
+    h.core
+        .set_approval_mode(bot.id, ApprovalMode::AcceptEdits)
+        .await
+        .unwrap();
+    h.say("@bot run").await;
+    let req = wait_permission_state(&mut h, PermissionState::Pending).await;
+    let approved_cmd = req.command.clone().expect("command captured");
+    assert!(
+        approved_cmd.contains("important-argument") && approved_cmd.contains("$0"),
+        "approved descriptor must preserve positional arg semantics: {req:#?}"
+    );
+    assert_eq!(req.run_state.as_deref(), Some("queued"), "{req:#?}");
+
+    h.core
+        .answer_permission(req.id, h.hx.id, true, None)
+        .await
+        .unwrap();
+    let done = wait_run_state(&h, req.id, "done").await;
+    assert_eq!(done.run_exit_code, Some(0), "{done:#?}");
+    assert_eq!(
+        done.command.as_deref(),
+        Some(approved_cmd.as_ref()),
+        "execution must use exact approved descriptor: {done:#?}"
+    );
+    let out = done.run_output.as_deref().unwrap_or_default();
+    assert!(
+        out.starts_with("important-argument"),
+        "execution must preserve positional args: {done:#?}"
+    );
+}

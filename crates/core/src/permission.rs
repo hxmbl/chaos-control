@@ -469,14 +469,6 @@ pub fn request_kind_from_wire(kind: Option<&str>) -> RequestKind {
     }
 }
 
-/// True when `name` is an exact CC control-plane chat tool name eligible for
-/// scoped native auto-approval on the mediated path (separate from "selected
-/// MCP" allowances). Read/status and policy/answer tools are excluded and must
-/// require human approval. Identity matching is exact (no normalization).
-pub fn is_auto_allowed_cc_control_plane_tool(name: &str) -> bool {
-    AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name)
-}
-
 /// Execution-time evidence for a mediated structured edit on the production
 /// path (STRM-596/606). Auto-allow eligibility in `accept-edits` requires
 /// explicit editable-root authorization and sufficient execution-time scope
@@ -626,14 +618,41 @@ fn detail_json(detail: Option<&str>) -> Option<Value> {
     detail.and_then(|d| serde_json::from_str(d).ok())
 }
 
+/// Explicit extraction result for security-relevant execution descriptors.
+/// `Missing`: no recognized descriptor present (may use safe fallback where allowed).
+/// `Resolved`: exactly one unambiguous, valid descriptor.
+/// `AmbiguousOrInvalid`: conflicting, malformed, or unsafe recognized descriptors
+/// (must fail closed; never silently fallback or choose a parseable subset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Extracted<T> {
+    Missing,
+    Resolved(T),
+    AmbiguousOrInvalid,
+}
+
+impl<T> Extracted<T> {
+    pub fn resolved(self) -> Option<T> {
+        match self {
+            Extracted::Resolved(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
 /// Best-effort extraction of an executable shell command from stored request
-/// detail (STRM-542). Prefers authoritative command fields when unambiguous;
-/// heuristic extraction is fallback-only. Returns None when no safe command can
-/// be inferred or when candidates conflict/are ambiguous (fail closed).
-pub fn extract_command(detail: Option<&str>) -> Option<String> {
-    let v = detail_json(detail)?;
+/// detail. Prefers authoritative command fields when unambiguous; heuristic
+/// extraction is fallback-only. Recognized but malformed descriptors, conflicts,
+/// and ambiguous candidates fail closed.
+pub fn extract_command(detail: Option<&str>) -> Extracted<String> {
+    let Some(v) = detail_json(detail) else {
+        return Extracted::Missing;
+    };
     let mut candidates: Vec<String> = Vec::new();
-    collect_command_candidates(&v, &mut candidates);
+    let mut invalid = false;
+    collect_command_candidates(&v, &mut candidates, &mut invalid);
+    if invalid {
+        return Extracted::AmbiguousOrInvalid;
+    }
     let mut unique: Vec<String> = Vec::new();
     for c in candidates {
         let c = c.trim().to_string();
@@ -645,21 +664,26 @@ pub fn extract_command(detail: Option<&str>) -> Option<String> {
         }
     }
     match unique.as_slice() {
-        [one] => Some(one.clone()),
-        _ => None,
+        [] => Extracted::Missing,
+        [one] => Extracted::Resolved(one.clone()),
+        _ => Extracted::AmbiguousOrInvalid,
     }
 }
 
-fn collect_command_candidates(v: &Value, out: &mut Vec<String>) {
+fn collect_command_candidates(v: &Value, out: &mut Vec<String>, invalid: &mut bool) {
+    if *invalid {
+        return;
+    }
     match v {
         Value::Object(obj) => {
             for key in ["command", "cmd", "script", "shell"] {
                 if let Some(c) = obj.get(key) {
-                    collect_command_value(c, out);
+                    collect_command_value(c, out, invalid);
+                    if *invalid {
+                        return;
+                    }
                 }
             }
-            // Recurse into common nested locations that may carry the actual
-            // execution descriptor (e.g. ACP rawInput/arguments/toolCall).
             for key in [
                 "rawInput",
                 "input",
@@ -672,52 +696,76 @@ fn collect_command_candidates(v: &Value, out: &mut Vec<String>) {
                 "content",
             ] {
                 if let Some(inner) = obj.get(key) {
-                    collect_command_candidates(inner, out);
+                    collect_command_candidates(inner, out, invalid);
+                    if *invalid {
+                        return;
+                    }
                 }
             }
         }
         Value::Array(arr) => {
-            // Arrays of descriptor objects may appear in some payload shapes;
-            // collect from elements but do not treat a bare argv-like array as a
-            // command unless it is the value of a command key (handled above).
             for item in arr {
-                collect_command_candidates(item, out);
+                collect_command_candidates(item, out, invalid);
+                if *invalid {
+                    return;
+                }
             }
         }
         _ => {}
     }
 }
 
-fn collect_command_value(v: &Value, out: &mut Vec<String>) {
+fn collect_command_value(v: &Value, out: &mut Vec<String>, invalid: &mut bool) {
+    if *invalid {
+        return;
+    }
     match v {
-        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                *invalid = true;
+            } else {
+                out.push(s.clone());
+            }
+        }
         Value::Array(a) => {
+            if a.is_empty() {
+                *invalid = true;
+                return;
+            }
             let mut parts = Vec::with_capacity(a.len());
             for x in a {
                 let Some(s) = x.as_str() else {
-                    // Ambiguous/non-string argv element: do not guess.
+                    *invalid = true;
                     return;
                 };
                 parts.push(s.to_string());
             }
-            if !parts.is_empty() {
-                out.push(shell_join(&parts));
+            match shell_join(&parts) {
+                Some(cmd) => out.push(cmd),
+                None => *invalid = true,
             }
         }
         Value::Object(o) => {
-            // Some shapes nest the actual command, e.g. {command:{command:"..."}}
-            collect_command_candidates(&Value::Object(o.clone()), out);
+            collect_command_candidates(&Value::Object(o.clone()), out, invalid);
         }
-        _ => {}
+        // Recognized command field present but malformed/unusable.
+        _ => *invalid = true,
     }
 }
 
 /// Best-effort extraction of a working directory from stored request detail.
-/// Returns None when no safe cwd can be inferred or when candidates conflict.
-pub fn extract_cwd(detail: Option<&str>) -> Option<String> {
-    let v = detail_json(detail)?;
+/// `Missing` allows safe fallback to configured agent cwd where permitted.
+/// Conflicting or malformed recognized cwd descriptors fail closed.
+pub fn extract_cwd(detail: Option<&str>) -> Extracted<String> {
+    let Some(v) = detail_json(detail) else {
+        return Extracted::Missing;
+    };
     let mut candidates: Vec<String> = Vec::new();
-    collect_cwd_candidates(&v, &mut candidates);
+    let mut invalid = false;
+    collect_cwd_candidates(&v, &mut candidates, &mut invalid);
+    if invalid {
+        return Extracted::AmbiguousOrInvalid;
+    }
     let mut unique: Vec<String> = Vec::new();
     for c in candidates {
         let c = c.trim().to_string();
@@ -729,12 +777,16 @@ pub fn extract_cwd(detail: Option<&str>) -> Option<String> {
         }
     }
     match unique.as_slice() {
-        [one] => Some(one.clone()),
-        _ => None,
+        [] => Extracted::Missing,
+        [one] => Extracted::Resolved(one.clone()),
+        _ => Extracted::AmbiguousOrInvalid,
     }
 }
 
-fn collect_cwd_candidates(v: &Value, out: &mut Vec<String>) {
+fn collect_cwd_candidates(v: &Value, out: &mut Vec<String>, invalid: &mut bool) {
+    if *invalid {
+        return;
+    }
     match v {
         Value::Object(obj) => {
             for key in [
@@ -745,10 +797,15 @@ fn collect_cwd_candidates(v: &Value, out: &mut Vec<String>) {
                 "directory",
                 "dir",
             ] {
-                if let Some(Value::String(s)) = obj.get(key)
-                    && !s.trim().is_empty()
-                {
-                    out.push(s.clone());
+                if let Some(c) = obj.get(key) {
+                    match c {
+                        Value::String(s) if !s.trim().is_empty() => out.push(s.clone()),
+                        // Recognized cwd field present but malformed/empty.
+                        _ => {
+                            *invalid = true;
+                            return;
+                        }
+                    }
                 }
             }
             for key in [
@@ -762,21 +819,30 @@ fn collect_cwd_candidates(v: &Value, out: &mut Vec<String>) {
                 "fields",
             ] {
                 if let Some(inner) = obj.get(key) {
-                    collect_cwd_candidates(inner, out);
+                    collect_cwd_candidates(inner, out, invalid);
+                    if *invalid {
+                        return;
+                    }
                 }
             }
         }
         Value::Array(arr) => {
             for item in arr {
-                collect_cwd_candidates(item, out);
+                collect_cwd_candidates(item, out, invalid);
+                if *invalid {
+                    return;
+                }
             }
         }
         _ => {}
     }
 }
 
-fn shell_join(parts: &[String]) -> String {
-    // If this looks like ["bash","-lc","<script>"] or ["sh","-c","<script>"], prefer the script.
+/// Convert an argv-style command descriptor into a shell command string only when
+/// semantics can be preserved faithfully under `sh -lc <command>` execution.
+/// Returns None for ambiguous cases (e.g. shell `-c/-lc` with positional args
+/// that would be dropped) so callers can fail closed instead of mutating meaning.
+fn shell_join(parts: &[String]) -> Option<String> {
     if parts.len() >= 3 {
         let shell = parts[0].as_str();
         let flag = parts[1].as_str();
@@ -785,15 +851,30 @@ fn shell_join(parts: &[String]) -> String {
             "bash" | "sh" | "zsh" | "/bin/bash" | "/bin/sh" | "/bin/zsh"
         ) && matches!(flag, "-lc" | "-c")
         {
-            return parts[2].clone();
+            // `bash -lc <script> [arg0 ...]` binds positional params/$0; dropping
+            // trailing args changes semantics. Preserve them by forwarding through
+            // an explicit sh -c wrapper.
+            if parts.len() == 3 {
+                return Some(parts[2].clone());
+            }
+            let script = &parts[2];
+            let mut forwarded = Vec::with_capacity(2 + parts.len() - 3);
+            forwarded.push(script.clone());
+            forwarded.extend(parts[3..].iter().cloned());
+            let inner = shell_quote_parts(&forwarded);
+            return Some(format!("sh -c {inner}"));
         }
     }
-    // Otherwise join as a simple command line (best-effort).
+    Some(shell_quote_parts(parts))
+}
+
+fn shell_quote_parts(parts: &[String]) -> String {
     parts
         .iter()
         .map(|p| {
             if p.chars()
-                .any(|c| c.is_whitespace() || "\"'\\$`".contains(c))
+                .any(|c| c.is_whitespace() || "\"'\\$`!*?()[]{};|&<>#~".contains(c))
+                || p.is_empty()
             {
                 format!("'{}'", p.replace('\'', "'\\''"))
             } else {
@@ -1353,13 +1434,39 @@ pub fn pending_presence(c: &Connection, agent: MemberId, channel: ChannelId) -> 
 }
 
 impl Engine {
-    /// Marks where an agent runs. Agents default to the host.
+    /// Marks where an agent is configured/requested to run. Agents default to
+    /// the host. VM auto-approval requires separately verified isolation evidence;
+    /// config alone must never be treated as proof of isolation.
     pub fn set_runs_in(&mut self, agent: MemberId, runs_in: RunsIn) {
         self.runs_in.insert(agent, runs_in);
+        if runs_in != RunsIn::Vm {
+            self.vm_isolation_verified.remove(&agent);
+        }
     }
 
     pub fn runs_in(&self, agent: MemberId) -> RunsIn {
         self.runs_in.get(&agent).copied().unwrap_or_default()
+    }
+
+    /// Records whether VM isolation has been verified by a trustworthy capability.
+    /// This must not be derived from user configuration alone.
+    pub fn set_vm_isolation_verified(&mut self, agent: MemberId, verified: bool) {
+        if verified {
+            self.vm_isolation_verified.insert(agent, true);
+        } else {
+            self.vm_isolation_verified.remove(&agent);
+        }
+    }
+
+    pub fn vm_isolation_verified(&self, agent: MemberId) -> bool {
+        self.vm_isolation_verified
+            .get(&agent)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn verified_vm_auto_approval(&self, agent: MemberId) -> bool {
+        self.runs_in(agent) == RunsIn::Vm && self.vm_isolation_verified(agent)
     }
 
     /// Sets the host-side approval mode for `agent` (STRM-542). Persisted.
@@ -1462,25 +1569,55 @@ impl Engine {
         channel: ChannelId,
         ask: PermissionAsk,
     ) -> PermissionVerdict {
-        if let Some(name) = ask
-            .tool_name
-            .as_deref()
-            .filter(|name| is_auto_allowed_cc_control_plane_tool(name))
-        {
-            return match self.auto_approve_chat_tool(
-                now,
-                agent,
-                channel,
-                ask.turn,
-                name,
-                ask.detail.as_deref(),
-            ) {
-                Ok(r) => PermissionVerdict::Allow { request: r.id },
-                Err(e) => {
-                    self.rt_note(agent, channel, format!("internal error: {e}"));
-                    PermissionVerdict::Decline
+        if let Some(name) = ask.tool_name.as_deref() {
+            let base = cc_control_plane_base_name(name);
+            if is_auto_allowed_cc_control_plane_tool(name) || base.is_some() {
+                if is_verified_cc_control_plane_tool(name, ask.detail.as_deref()) {
+                    let canonical = base.unwrap_or(name.trim());
+                    return match self.auto_approve_chat_tool(
+                        now,
+                        agent,
+                        channel,
+                        ask.turn,
+                        canonical,
+                        ask.detail.as_deref(),
+                    ) {
+                        Ok(r) => PermissionVerdict::Allow { request: r.id },
+                        Err(e) => {
+                            self.rt_note(agent, channel, format!("internal error: {e}"));
+                            PermissionVerdict::Decline
+                        }
+                    };
                 }
-            };
+                // Missing/unverified/conflicting provenance for a control-plane-shaped
+                // tool identity must fail closed (no auto-allow exception).
+                let kind = effective_request_kind(ask.kind, ask.detail.as_deref());
+                return match self.ask_permission(
+                    now,
+                    agent,
+                    channel,
+                    ask.turn,
+                    PermissionSource::Native,
+                    &ask.title,
+                    ask.detail.as_deref(),
+                    None,
+                    ask.key.as_deref(),
+                    kind,
+                ) {
+                    Ok(r) => match r.state {
+                        PermissionState::Approved | PermissionState::AutoApproved => {
+                            PermissionVerdict::Allow { request: r.id }
+                        }
+                        PermissionState::Pending | PermissionState::Denied => {
+                            PermissionVerdict::Sent { request: r.id }
+                        }
+                    },
+                    Err(e) => {
+                        self.rt_note(agent, channel, format!("internal error: {e}"));
+                        PermissionVerdict::Decline
+                    }
+                };
+            }
         }
         // STRM-596/606: URL fetch/open, unselected MCP, and unknown/changed
         // identities must be asked in both modes. Verified web-search (search-only)
@@ -1629,7 +1766,7 @@ impl Engine {
             None => store::in_flight_batch(self.conn(), agent, channel)?.map(|b| b.id),
         };
         let handle = handle_of(self.conn(), agent);
-        if self.runs_in(agent) == RunsIn::Vm {
+        if self.verified_vm_auto_approval(agent) {
             let r = self.store.tx(|c| {
                 insert(
                     c,
@@ -1655,7 +1792,7 @@ impl Engine {
             self.rt_note(
                 agent,
                 channel,
-                format!("ran {} (own VM, auto-approved)", short(title)),
+                format!("ran {} (verified VM, auto-approved)", short(title)),
             );
             self.effects
                 .push(Effect::Event(Box::new(CoreEvent::Permission(r.clone()))));
@@ -1740,27 +1877,28 @@ impl Engine {
         }
         let asked_of = self.route(channel, turn);
         let queued = outcome == ModeOutcome::Queue;
-        let command = if queued && kind == RequestKind::Execute {
-            extract_command(detail)
-        } else {
-            None
-        };
-        let (req_cwd, run_state_seed) = if queued && kind == RequestKind::Execute {
-            match command.as_deref() {
-                Some(_) => {
-                    let resolved = extract_cwd(detail).or_else(|| {
-                        self.agent_cwd(agent)
-                            .map(|p| p.to_string_lossy().into_owned())
-                    });
-                    match resolved {
-                        Some(cwd) => (Some(cwd), Some("queued")),
-                        None => (None, Some("unrunnable")),
+        let (command, req_cwd, run_state_seed) = if queued && kind == RequestKind::Execute {
+            let cmd = extract_command(detail);
+            match cmd {
+                Extracted::Resolved(command) => {
+                    let cwd = match extract_cwd(detail) {
+                        Extracted::Resolved(cwd) => Some(cwd),
+                        Extracted::Missing => self
+                            .agent_cwd(agent)
+                            .map(|p| p.to_string_lossy().into_owned()),
+                        Extracted::AmbiguousOrInvalid => None,
+                    };
+                    match cwd {
+                        Some(cwd) => (Some(command), Some(cwd), Some("queued")),
+                        None => (Some(command), None, Some("unrunnable")),
                     }
                 }
-                None => (None, Some("unrunnable")),
+                Extracted::Missing | Extracted::AmbiguousOrInvalid => {
+                    (None, None, Some("unrunnable"))
+                }
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
         let r = self.store.tx(|c| {
             let r = insert(
@@ -2126,13 +2264,10 @@ pub const TOOL_NAMES: [&str; 4] = [
 ];
 
 /// CC-internal control-plane chat tools that may be auto-approved without
-/// per-call human approval when requested natively, but only as exact
-/// CC-owned tool identities on the mediated path (separate from "explicitly
-/// selected MCP" allowances; STRM-596/606 v3). Read/status control-plane tools
-/// (`chat_context`, `chat_read`, `chat_search`, `chat_permission_status`,
-/// `chat_approval_mode_status`) require human approval in both modes and are
-/// therefore excluded. Policy/authorization actions remain separately
-/// controlled and must not be agent-self-approved.
+/// per-call human approval when requested natively, but only as verified
+/// CC-injected tool identities/origin on the mediated path. Read/status
+/// control-plane tools and policy/authorization actions remain human-approved.
+/// If trustworthy provenance cannot be established, no exception is granted.
 pub const AUTO_ALLOWED_CHAT_TOOL_NAMES: [&str; 6] = [
     "chat_send",
     "chat_react",
@@ -2141,6 +2276,137 @@ pub const AUTO_ALLOWED_CHAT_TOOL_NAMES: [&str; 6] = [
     "chat_status",
     "chat_request_permission",
 ];
+
+/// CC MCP server name as injected into agent sessions.
+pub const CC_MCP_SERVER_NAME: &str = "chaos-control";
+
+fn cc_control_plane_base_name(name: &str) -> Option<&str> {
+    let name = name.trim();
+    if AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name) {
+        return Some(name);
+    }
+    for sep in ["__", "/", ".", ":"] {
+        let prefix = format!("{CC_MCP_SERVER_NAME}{sep}");
+        if let Some(rest) = name.strip_prefix(&prefix)
+            && AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&rest)
+        {
+            return Some(rest);
+        }
+        let mcp_prefix = format!("mcp__{CC_MCP_SERVER_NAME}{sep}");
+        if let Some(rest) = name.strip_prefix(&mcp_prefix)
+            && AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&rest)
+        {
+            return Some(rest);
+        }
+    }
+    // mcp__chaos-control__chat_send style already covered, also tolerate tool
+    // names that end with a known separator+base after containing server id.
+    for base in AUTO_ALLOWED_CHAT_TOOL_NAMES {
+        if name.ends_with(&format!("__{CC_MCP_SERVER_NAME}__{base}"))
+            || name.ends_with(&format!("/{CC_MCP_SERVER_NAME}/{base}"))
+        {
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// True only when the request identifies an exact CC control-plane tool with
+/// trustworthy CC MCP provenance. Bare/unqualified names without verifiable CC
+/// origin fail closed. Conflicting/malformed provenance fails closed.
+pub fn is_verified_cc_control_plane_tool(name: &str, detail: Option<&str>) -> bool {
+    let Some(base) = cc_control_plane_base_name(name) else {
+        return false;
+    };
+    if name.trim() != base {
+        // Explicit server-qualified identity binds to CC origin.
+        return true;
+    }
+    let Some(detail) = detail else {
+        return false;
+    };
+    if let Ok(v) = serde_json::from_str::<Value>(detail) {
+        let mut ids = Vec::new();
+        collect_server_identities(&v, &mut ids);
+        if ids.is_empty() {
+            return false;
+        }
+        let mut uniq: Vec<&str> = Vec::new();
+        for id in &ids {
+            if !uniq.iter().any(|u| u == id) {
+                uniq.push(id.as_str());
+            }
+        }
+        return uniq.as_slice() == [CC_MCP_SERVER_NAME];
+    }
+    false
+}
+
+fn collect_server_identities(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::Object(map) => {
+            for k in [
+                "serverName",
+                "server_name",
+                "mcpServer",
+                "mcp_server",
+                "mcpServerName",
+                "mcp_server_name",
+                "sourceServer",
+                "source_server",
+            ] {
+                if let Some(Value::String(s)) = map.get(k) {
+                    out.push(s.clone());
+                }
+            }
+            // Generic "server" can be string identity or object; only treat
+            // explicit string/object-name forms as server identity markers.
+            if let Some(sv) = map.get("server") {
+                match sv {
+                    Value::String(s) => out.push(s.clone()),
+                    Value::Object(m) => {
+                        if let Some(Value::String(s)) = m
+                            .get("name")
+                            .or_else(|| m.get("id"))
+                            .or_else(|| m.get("serverName"))
+                        {
+                            out.push(s.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for k in ["mcpServer", "mcp_server", "source", "origin", "toolCall"] {
+                if let Some(inner) = map.get(k) {
+                    collect_server_identities(inner, out);
+                }
+            }
+            for (k, v) in map {
+                // Avoid double-walking keys we specially handled in ways that
+                // already recurse; but recursion is cheap and safe.
+                if !matches!(
+                    k.as_str(),
+                    "server" | "mcpServer" | "mcp_server" | "source" | "origin" | "toolCall"
+                ) {
+                    collect_server_identities(v, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                collect_server_identities(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Exact allowlisted control-plane base name (no provenance, exact match).
+/// Do not use for authorization decisions; use
+/// [`is_verified_cc_control_plane_tool`].
+pub fn is_auto_allowed_cc_control_plane_tool(name: &str) -> bool {
+    AUTO_ALLOWED_CHAT_TOOL_NAMES.contains(&name)
+}
 
 pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<Tool> {
     vec![
@@ -2627,81 +2893,187 @@ mod tests {
 
     #[test]
     fn extract_command_accepts_unambiguous_candidates_and_rejects_conflicts() {
-        assert_eq!(extract_command(None), None);
-        assert_eq!(extract_command(Some("not json")), None);
+        assert_eq!(extract_command(None), Extracted::Missing);
+        assert_eq!(extract_command(Some("not json")), Extracted::Missing);
         assert_eq!(
             extract_command(Some(r#"{"command":"echo hi"}"#)),
-            Some("echo hi".into())
+            Extracted::Resolved("echo hi".into())
         );
         assert_eq!(
             extract_command(Some(r#"{"rawInput":{"command":"echo nested"}}"#)),
-            Some("echo nested".into())
+            Extracted::Resolved("echo nested".into())
         );
-        // argv array -> shell-quoted command string (bash -lc script form preserves script)
+        // argv array -> safe shell command string
         assert_eq!(
             extract_command(Some(r#"{"command":["bash","-lc","echo hi && pwd"]}"#)),
-            Some("echo hi && pwd".into())
+            Extracted::Resolved("echo hi && pwd".into())
+        );
+        // Shell argv with positional parameters must not be dropped.
+        assert_eq!(
+            extract_command(Some(
+                r#"{"command":["bash","-lc","echo \"$0\"","important-argument"]}"#
+            )),
+            Extracted::Resolved("sh -c 'echo \"$0\"' important-argument".into())
         );
         assert_eq!(
             extract_command(Some(r#"{"command":["echo","hello world","$x","a'b"]}"#)),
-            Some("echo 'hello world' '$x' 'a'\\''b'".into())
+            Extracted::Resolved("echo 'hello world' '$x' 'a'\\''b'".into())
         );
         // Consistent duplicates across locations are unambiguous.
         assert_eq!(
             extract_command(Some(
                 r#"{"command":"echo same","rawInput":{"command":"echo same"}}"#
             )),
-            Some("echo same".into())
+            Extracted::Resolved("echo same".into())
         );
         // Conflicting candidates fail closed.
         assert_eq!(
             extract_command(Some(
                 r#"{"command":"echo one","rawInput":{"command":"echo two"}}"#
             )),
-            None
+            Extracted::AmbiguousOrInvalid
         );
         assert_eq!(
             extract_command(Some(
                 r#"{"toolCall":{"rawInput":{"command":"echo a"}},"arguments":{"cmd":"echo b"}}"#
             )),
-            None
+            Extracted::AmbiguousOrInvalid
         );
-        // Ambiguous/non-string argv elements fail closed.
-        assert_eq!(extract_command(Some(r#"{"command":["echo",123]}"#)), None);
-        assert_eq!(extract_command(Some(r#"{"command":["echo",null]}"#)), None);
-        // Empty/missing/blank are not executable descriptors.
-        assert_eq!(extract_command(Some(r#"{"command":"   "}"#)), None);
-        assert_eq!(extract_command(Some(r#"{"command":[]}"#)), None);
-        assert_eq!(extract_command(Some(r#"{"cwd":"/tmp"}"#)), None);
+        // Malformed recognized descriptor invalidates extraction even if another
+        // candidate is otherwise parseable/valid.
+        assert_eq!(
+            extract_command(Some(r#"{"command":"echo safe","cmd":["sh",123]}"#)),
+            Extracted::AmbiguousOrInvalid
+        );
+        assert_eq!(
+            extract_command(Some(
+                r#"{"cmd":["sh",123],"rawInput":{"command":"echo safe"}}"#
+            )),
+            Extracted::AmbiguousOrInvalid
+        );
+        // Ambiguous/non-string/empty recognized descriptors fail closed.
+        assert_eq!(
+            extract_command(Some(r#"{"command":["echo",123]}"#)),
+            Extracted::AmbiguousOrInvalid
+        );
+        assert_eq!(
+            extract_command(Some(r#"{"command":["echo",null]}"#)),
+            Extracted::AmbiguousOrInvalid
+        );
+        assert_eq!(
+            extract_command(Some(r#"{"command":"   "}"#)),
+            Extracted::AmbiguousOrInvalid
+        );
+        assert_eq!(
+            extract_command(Some(r#"{"command":[]}"#)),
+            Extracted::AmbiguousOrInvalid
+        );
+        assert_eq!(
+            extract_command(Some(r#"{"cwd":"/tmp"}"#)),
+            Extracted::Missing
+        );
         // Embedded newlines are preserved in the captured descriptor.
         assert_eq!(
             extract_command(Some(r#"{"command":"echo a\necho b"}"#)),
-            Some("echo a\necho b".into())
+            Extracted::Resolved("echo a\necho b".into())
         );
         assert_eq!(
             extract_command(Some(r#"{"script":"printf 'x\\n'"}"#)),
-            Some("printf 'x\\n'".into())
+            Extracted::Resolved("printf 'x\\n'".into())
         );
     }
 
     #[test]
     fn extract_cwd_accepts_unambiguous_candidates_and_rejects_conflicts() {
-        assert_eq!(extract_cwd(None), None);
-        assert_eq!(extract_cwd(Some("not json")), None);
-        assert_eq!(extract_cwd(Some(r#"{"cwd":"/tmp"}"#)), Some("/tmp".into()));
+        assert_eq!(extract_cwd(None), Extracted::Missing);
+        assert_eq!(extract_cwd(Some("not json")), Extracted::Missing);
+        assert_eq!(
+            extract_cwd(Some(r#"{"cwd":"/tmp"}"#)),
+            Extracted::Resolved("/tmp".into())
+        );
         assert_eq!(
             extract_cwd(Some(r#"{"rawInput":{"cwd":"/work"}}"#)),
-            Some("/work".into())
+            Extracted::Resolved("/work".into())
         );
         assert_eq!(
             extract_cwd(Some(r#"{"cwd":"/a","arguments":{"cwd":"/a"}}"#)),
-            Some("/a".into())
+            Extracted::Resolved("/a".into())
         );
+        // Conflicting cwd candidates must fail closed (never fallback).
         assert_eq!(
             extract_cwd(Some(r#"{"cwd":"/a","arguments":{"cwd":"/b"}}"#)),
-            None
+            Extracted::AmbiguousOrInvalid
         );
-        assert_eq!(extract_cwd(Some(r#"{"cwd":"   "}"#)), None);
-        assert_eq!(extract_cwd(Some(r#"{"command":"echo hi"}"#)), None);
+        // Malformed recognized cwd descriptor must fail closed.
+        assert_eq!(
+            extract_cwd(Some(r#"{"cwd":"   "}"#)),
+            Extracted::AmbiguousOrInvalid
+        );
+        assert_eq!(
+            extract_cwd(Some(r#"{"cwd":123}"#)),
+            Extracted::AmbiguousOrInvalid
+        );
+        assert_eq!(
+            extract_cwd(Some(r#"{"command":"echo hi"}"#)),
+            Extracted::Missing
+        );
+    }
+
+    #[test]
+    fn cc_control_plane_provenance_requires_verified_identity() {
+        // Correct injected tool identity (server-qualified) is verified.
+        assert!(is_verified_cc_control_plane_tool(
+            "chaos-control/chat_send",
+            None
+        ));
+        assert!(is_verified_cc_control_plane_tool(
+            "mcp__chaos-control__chat_status",
+            None
+        ));
+        assert!(is_verified_cc_control_plane_tool(
+            "chat_send",
+            Some(r#"{"subject":{"toolCall":{"serverName":"chaos-control","name":"chat_send"}}}"#)
+        ));
+
+        // Missing provenance for bare names fails closed.
+        assert!(!is_verified_cc_control_plane_tool("chat_send", None));
+        assert!(!is_verified_cc_control_plane_tool(
+            "chat_react",
+            Some(r#"{"command":"echo hi"}"#)
+        ));
+
+        // Same-name tool from unrelated provider fails closed.
+        assert!(!is_verified_cc_control_plane_tool(
+            "evil-mcp/chat_send",
+            None
+        ));
+        assert!(!is_verified_cc_control_plane_tool(
+            "chat_send",
+            Some(r#"{"serverName":"evil-mcp"}"#)
+        ));
+
+        // Malformed/conflicting provenance fails closed.
+        assert!(!is_verified_cc_control_plane_tool(
+            "chat_send",
+            Some("not json")
+        ));
+        assert!(!is_verified_cc_control_plane_tool(
+            "chat_send",
+            Some(r#"{"serverName":"chaos-control","source":{"serverName":"evil-mcp"}}"#)
+        ));
+        assert!(!is_verified_cc_control_plane_tool(
+            "chat_send",
+            Some(r#"{"server":"evil-mcp","toolCall":{"serverName":"chaos-control"}}"#)
+        ));
+
+        // Non-control-plane names are never verified as CC control-plane tools.
+        assert!(!is_verified_cc_control_plane_tool(
+            "chaos-control/external_tool",
+            None
+        ));
+        assert!(!is_verified_cc_control_plane_tool(
+            "external_tool",
+            Some(r#"{"serverName":"chaos-control"}"#)
+        ));
     }
 }
