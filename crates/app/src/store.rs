@@ -518,6 +518,46 @@ impl ChatStore {
         .detach();
     }
 
+    /// Adds the local human's `emoji` to the message identified by `message_id`
+    /// in `channel`, or takes it back if it is already theirs. Resolves the
+    /// target by stable message identity rather than a captured list index.
+    pub fn toggle_reaction_for_message(
+        &mut self,
+        channel: Id,
+        message_id: Id,
+        emoji: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(attached) = self.core.as_ref().filter(|a| a.channel == channel) else {
+            return;
+        };
+        let Some(id) = self.logs.get(&channel).and_then(|log| {
+            (0..log.len()).find_map(|i| {
+                log.get(i)
+                    .filter(|m| m.id == message_id)
+                    .and_then(|m| core_message_id(m.id))
+            })
+        }) else {
+            return;
+        };
+        let human = attached.link.human;
+        let mine = attached
+            .reactions
+            .get(&id)
+            .is_some_and(|v| v.iter().any(|r| r.member == human && &*r.emoji == emoji));
+        let core = attached.link.core.clone();
+        let emoji = emoji.to_string();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = core.react(human, id, &emoji, !mine).await {
+                this.update(cx, |store, cx| {
+                    store.system_note(&format!("Couldn't react: {e}"), cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// A member's display name: "You" for the local human, a linked agent's
     /// name, else what core calls them.
     fn reactor_name(&self, member: ct::MemberId) -> Arc<str> {

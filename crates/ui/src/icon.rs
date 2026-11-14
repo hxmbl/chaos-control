@@ -9,6 +9,7 @@ pub enum IconName {
     /// The Chaos Control mark (single colour, like the rest).
     AppMark,
     Archive,
+    ArrowBendUpLeft,
     ArrowUp,
     ArrowClockwise,
     CaretDown,
@@ -18,6 +19,7 @@ pub enum IconName {
     Check,
     CircleDashed,
     CopySimple,
+    DotsThree,
     DownloadSimple,
     GearSix,
     Hash,
@@ -44,9 +46,10 @@ pub enum IconName {
 }
 
 impl IconName {
-    pub const ALL: [IconName; 34] = [
+    pub const ALL: [IconName; 36] = [
         IconName::AppMark,
         IconName::Archive,
+        IconName::ArrowBendUpLeft,
         IconName::ArrowUp,
         IconName::ArrowClockwise,
         IconName::CaretDown,
@@ -56,6 +59,7 @@ impl IconName {
         IconName::Check,
         IconName::CircleDashed,
         IconName::CopySimple,
+        IconName::DotsThree,
         IconName::DownloadSimple,
         IconName::GearSix,
         IconName::Hash,
@@ -85,6 +89,7 @@ impl IconName {
         match self {
             IconName::AppMark => "icons/chaos-control.svg",
             IconName::Archive => "icons/phosphor/archive.svg",
+            IconName::ArrowBendUpLeft => "icons/phosphor/arrow-bend-up-left.svg",
             IconName::ArrowUp => "icons/phosphor/arrow-up.svg",
             IconName::ArrowClockwise => "icons/phosphor/arrow-clockwise.svg",
             IconName::CaretDown => "icons/phosphor/caret-down.svg",
@@ -94,6 +99,7 @@ impl IconName {
             IconName::Check => "icons/phosphor/check.svg",
             IconName::CircleDashed => "icons/phosphor/circle-dashed.svg",
             IconName::CopySimple => "icons/phosphor/copy-simple.svg",
+            IconName::DotsThree => "icons/phosphor/dots-three.svg",
             IconName::DownloadSimple => "icons/phosphor/download-simple.svg",
             IconName::GearSix => "icons/phosphor/gear-six.svg",
             IconName::Hash => "icons/phosphor/hash.svg",

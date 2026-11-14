@@ -9,11 +9,12 @@
 use std::{borrow::Cow, sync::Arc};
 
 use gpui::{
-    AnyElement, App, Context, ElementId, Entity, HighlightStyle, ListAlignment, ListOffset,
-    ListState, SharedString, StyledText, Subscription, TextRun, WeakEntity, Window, div, list,
+    AnyElement, App, ClipboardItem, Context, Corner, ElementId, Entity, FocusHandle, KeyDownEvent,
+    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
+    StyledText, Subscription, TextRun, WeakEntity, Window, anchored, deferred, div, list,
     prelude::*, px,
 };
-use model::{Author, Id, PaneContent, mentions, pane};
+use model::{Author, Id, Message, PaneContent, ReplyRef, mentions, pane};
 use ui::{
     ActiveTheme, Elevation, Ellipsis, IconName, Tooltip, TypeStyleExt, brand_icon, icon,
     tokens::{icon as icons, radius, size, space, text},
@@ -21,37 +22,51 @@ use ui::{
 };
 
 use crate::{
+    composer::Composer,
     mention_highlight::{self, KnownMentions},
     pane_host::PaneHost,
     store::{ChatStore, ReactionChip, Reader, StoreEvent},
 };
 
-/// The quick picker's emoji, shown on message hover. Short on purpose: a
-/// full emoji picker is the system's (ctrl-cmd-space on macOS) once the
-/// composer can react.
+/// Emoji reactions offered in the message actions menu.
 const QUICK_REACTIONS: [&str; 6] = ["👍", "✅", "👀", "😂", "❤️", "💀"];
 
 /// The empty state's blurb wraps at about 50 characters.
 const EMPTY_MAX_W: f32 = 384.;
 
+#[derive(Clone)]
+struct MessageMenu {
+    message_id: Id,
+    channel: Id,
+    body: Arc<str>,
+    reply: ReplyRef,
+    can_react: bool,
+    position: Point<Pixels>,
+}
+
 pub struct Conversation {
     store: Entity<ChatStore>,
     pane: Entity<PaneHost>,
+    composer: Entity<Composer>,
     channel: Id,
     list: ListState,
     /// Message picked in search, tinted until the channel changes.
     highlighted: Option<usize>,
-    /// The row under the pointer: the only one that shows the quick picker.
-    /// Tracked here (each row's `on_hover`) rather than with a GPUI hover
-    /// group, whose `invisible` + `group_hover` picker never appeared in this
-    /// cached, `list`-rendered view (STRM-467).
-    hovered: Option<usize>,
+    /// The message under the pointer (by id), so hover tracks message identity.
+    hovered: Option<Id>,
+    menu: Option<MessageMenu>,
+    menu_focus: FocusHandle,
     this: WeakEntity<Self>,
     _store_events: Subscription,
 }
 
 impl Conversation {
-    pub fn new(store: Entity<ChatStore>, pane: Entity<PaneHost>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Entity<ChatStore>,
+        pane: Entity<PaneHost>,
+        composer: Entity<Composer>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let channel = store.read(cx).selected();
         let count = store.read(cx).log(channel).map_or(0, |l| l.len());
         let subscription = cx.subscribe(&store, |this, store, event, cx| match event {
@@ -62,6 +77,7 @@ impl Conversation {
                 this.list.reset(count);
                 this.highlighted = None;
                 this.hovered = None;
+                this.menu = None;
                 cx.notify();
             }
             StoreEvent::Reveal { channel, index } if *channel == this.channel => {
@@ -100,13 +116,75 @@ impl Conversation {
         Self {
             store,
             pane,
+            composer,
             channel,
             list: ListState::new(count, ListAlignment::Bottom, px(600.)),
             highlighted: None,
             hovered: None,
+            menu: None,
+            menu_focus: cx.focus_handle(),
             this: cx.entity().downgrade(),
             _store_events: subscription,
         }
+    }
+
+    fn close_menu(&mut self, restore_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+            if restore_focus {
+                self.composer.update(cx, |c, cx| c.focus(window, cx));
+            }
+        }
+    }
+
+    fn open_menu(
+        &mut self,
+        message: &Message,
+        can_react: bool,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.menu = Some(MessageMenu {
+            message_id: message.id,
+            channel: self.channel,
+            body: message.body.clone(),
+            reply: ReplyRef::to(message),
+            can_react,
+            position,
+        });
+        cx.notify();
+        self.menu_focus.focus(window);
+    }
+
+    fn reply_to(&mut self, reply: ReplyRef, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.composer
+            .update(cx, |c, cx| c.set_reply(reply, window, cx));
+        cx.notify();
+    }
+
+    fn copy_body(&mut self, body: &str, window: &mut Window, cx: &mut Context<Self>) {
+        cx.write_to_clipboard(ClipboardItem::new_string(body.to_string()));
+        self.menu = None;
+        cx.notify();
+        self.composer.update(cx, |c, cx| c.focus(window, cx));
+    }
+
+    fn toggle_reaction_for(
+        &mut self,
+        channel: Id,
+        message_id: Id,
+        emoji: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.store.update(cx, |s, cx| {
+            s.toggle_reaction_for_message(channel, message_id, emoji, cx)
+        });
+        self.menu = None;
+        cx.notify();
+        self.composer.update(cx, |c, cx| c.focus(window, cx));
     }
 
     fn render_message(&self, ix: usize, window: &mut Window, cx: &mut App) -> AnyElement {
@@ -153,6 +231,7 @@ impl Conversation {
             )
         };
         let this = self.this.clone();
+        let this_right = self.this.clone();
         let body: AnyElement = if is_long {
             self.render_collapsed_with(ix, &message, &display, &known, &t, window)
         } else {
@@ -165,6 +244,13 @@ impl Conversation {
                 .into_any_element()
         };
 
+        let message_id = message.id;
+        let menu_open = self
+            .menu
+            .as_ref()
+            .is_some_and(|menu| menu.message_id == message_id);
+        let hovered = self.hovered == Some(message_id);
+
         div()
             .w_full()
             .flex()
@@ -175,8 +261,8 @@ impl Conversation {
                     .on_hover(move |over: &bool, _, cx| {
                         this.update(cx, |c, cx| {
                             let next = if *over {
-                                Some(ix)
-                            } else if c.hovered == Some(ix) {
+                                Some(message_id)
+                            } else if c.hovered == Some(message_id) {
                                 None
                             } else {
                                 c.hovered
@@ -187,6 +273,17 @@ impl Conversation {
                             }
                         })
                         .ok();
+                    })
+                    .on_mouse_down(MouseButton::Right, {
+                        let message = message.clone();
+                        move |event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let pos = event.position;
+                            let msg = message.clone();
+                            this_right
+                                .update(cx, |c, cx| c.open_menu(&msg, can_react, pos, window, cx))
+                                .ok();
+                        }
                     })
                     .relative()
                     .w_full()
@@ -287,17 +384,222 @@ impl Conversation {
                                 ))
                             }),
                     )
-                    .when(can_react && self.hovered == Some(ix), |row| {
-                        row.child(self.quick_picker(ix, &t))
+                    .when(hovered && !menu_open, |row| {
+                        row.child(self.action_bar(ix, &message, can_react, &t, window, cx))
                     }),
             )
             .into_any_element()
     }
 
+    fn action_bar(
+        &self,
+        ix: usize,
+        message: &Message,
+        can_react: bool,
+        t: &ui::Theme,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> AnyElement {
+        let this_reply = self.this.clone();
+        let this_copy = self.this.clone();
+        let this_more = self.this.clone();
+        let reply = ReplyRef::to(message);
+        let body = message.body.to_string();
+        let message = message.clone();
+        let hover = t.hover;
+
+        let btn = |id: ElementId, icon_name: IconName| {
+            div()
+                .id(id)
+                .size(size::BUTTON_SM)
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(radius::MD)
+                .text_color(t.ink_soft)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover))
+                .child(icon(icon_name, icons::SM, t.ink_soft))
+        };
+
+        div()
+            .absolute()
+            .bottom(space::X1)
+            .right(space::X2)
+            .flex()
+            .items_center()
+            .gap(space::X1)
+            .p(space::X0_5)
+            .rounded(radius::MD)
+            .bg(t.surface)
+            .shadow(t.elevation(Elevation::Float))
+            .child(
+                btn(
+                    ElementId::Name(format!("reply-action-{ix}").into()),
+                    IconName::ArrowBendUpLeft,
+                )
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    let reply = reply.clone();
+                    this_reply
+                        .update(cx, |c, cx| c.reply_to(reply, window, cx))
+                        .ok();
+                }),
+            )
+            .child(
+                btn(
+                    ElementId::Name(format!("copy-action-{ix}").into()),
+                    IconName::CopySimple,
+                )
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    this_copy
+                        .update(cx, |c, cx| c.copy_body(&body, window, cx))
+                        .ok();
+                }),
+            )
+            .child(
+                btn(
+                    ElementId::Name(format!("more-action-{ix}").into()),
+                    IconName::DotsThree,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let pos = event.position;
+                        let msg = message.clone();
+                        this_more
+                            .update(cx, |c, cx| c.open_menu(&msg, can_react, pos, window, cx))
+                            .ok();
+                    },
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.menu.as_ref()?.clone();
+        let t = *cx.theme();
+        let this = cx.entity().downgrade();
+
+        let mut items = div()
+            .id("message-menu")
+            .occlude()
+            .min_w(px(180.))
+            .p(space::X1)
+            .rounded(radius::MD)
+            .bg(t.surface)
+            .border_1()
+            .border_color(t.line)
+            .shadow(t.elevation(Elevation::Overlay))
+            .flex()
+            .flex_col()
+            .gap(space::X0_5)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(menu_item(
+                "menu-reply",
+                IconName::ArrowBendUpLeft,
+                "Reply",
+                t,
+                cx.listener(move |this, _, window, cx| {
+                    this.reply_to(menu.reply.clone(), window, cx);
+                }),
+            ))
+            .child(menu_item(
+                "menu-copy",
+                IconName::CopySimple,
+                "Copy text",
+                t,
+                {
+                    let body = menu.body.to_string();
+                    cx.listener(move |this, _, window, cx| {
+                        this.copy_body(&body, window, cx);
+                    })
+                },
+            ));
+
+        if menu.can_react {
+            items = items.child(div().h(px(1.)).mx(space::X1).bg(t.line)).child(
+                div()
+                    .px(space::X2)
+                    .pt(space::X1)
+                    .pb(space::X0_5)
+                    .type_style(text::CAPTION)
+                    .text_color(t.muted)
+                    .child("React"),
+            );
+            let row = QUICK_REACTIONS.iter().enumerate().fold(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::X1)
+                    .px(space::X1)
+                    .pb(space::X1),
+                |row, (i, emoji)| {
+                    let this = this.clone();
+                    let emoji_str = *emoji;
+                    row.child(
+                        div()
+                            .id(("menu-react", i))
+                            .size(size::BUTTON_SM)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(radius::MD)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.hover))
+                            .on_click(move |_, window, cx| {
+                                this.update(cx, |c, cx| {
+                                    c.toggle_reaction_for(
+                                        menu.channel,
+                                        menu.message_id,
+                                        emoji_str,
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                            })
+                            .child(SharedString::from(*emoji)),
+                    )
+                },
+            );
+            items = items.child(row);
+        }
+
+        Some(
+            deferred(
+                anchored()
+                    .position(menu.position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .track_focus(&self.menu_focus)
+                            .on_mouse_down_out(
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_menu(true, window, cx)
+                                }),
+                            )
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.key.as_str() == "escape" {
+                                    cx.stop_propagation();
+                                    this.close_menu(true, window, cx);
+                                }
+                            }))
+                            .child(items),
+                    ),
+            )
+            .with_priority(10)
+            .into_any_element(),
+        )
+    }
+
     /// Small, quiet chips under a message: the emoji and how many, in order
     /// of first use. Hover lists who; clicking adds the local human's own
-    /// (or takes it back if it is already theirs). Monochrome: yours is a
-    /// step darker, never a colour.
+    /// (or takes it back if it is already theirs).
     fn reaction_chips(
         &self,
         ix: usize,
@@ -331,6 +633,7 @@ impl Conversation {
                     d.cursor_pointer()
                         .hover(move |s| s.bg(hover))
                         .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
                             store.update(cx, |s, cx| s.toggle_reaction(channel, ix, &emoji, cx));
                         })
                 })
@@ -344,134 +647,12 @@ impl Conversation {
             .into_any_element()
     }
 
-    /// The hover bar at the row's top right: a few common emoji, one click
-    /// each. Clicking one that is already yours takes it back.
-    fn quick_picker(&self, ix: usize, t: &ui::Theme) -> AnyElement {
-        let channel = self.channel;
-        let hover = t.hover;
-        let buttons = QUICK_REACTIONS.iter().enumerate().map(|(n, emoji)| {
-            let store = self.store.clone();
-            div()
-                .id(ElementId::Name(format!("quick-react-{ix}-{n}").into()))
-                .size(size::BUTTON_SM)
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .rounded(radius::MD)
-                .type_style(text::SMALL)
-                .cursor_pointer()
-                .hover(move |s| s.bg(hover))
-                .on_click(move |_, _, cx| {
-                    cx.stop_propagation();
-                    store.update(cx, |s, cx| s.toggle_reaction(channel, ix, emoji, cx));
-                })
-                .child(SharedString::from(*emoji))
-        });
-        div()
-            .id(ElementId::Name(format!("quick-picker-{ix}").into()))
-            .absolute()
-            .top(space::X1)
-            .right(space::X2)
-            .flex()
-            .items_center()
-            .gap(space::X0_5)
-            .p(space::X0_5)
-            .rounded(radius::MD)
-            .bg(t.surface)
-            .shadow(t.elevation(Elevation::Float))
-            .children(buttons)
-            .into_any_element()
-    }
-}
-
-/// How many reader faces fit under a message before the rest collapse into a
-/// "+N" chip. The tooltip always names every reader.
-const READ_MARKS_SHOWN: usize = 4;
-
-/// Who has read up to this message and no further, at the end of the row
-/// (Slack/iMessage style). Each reader is a small initial avatar — an agent's
-/// harness mark says which runtime it uses, not which agent read — and several
-/// readers overlap into a stack. Hover lists every name and time. Read with no
-/// reply is a normal outcome, so the marks stay quiet.
-fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Theme) -> AnyElement {
-    let names = readers
-        .iter()
-        .map(|r| format!("{} at {}", r.name, clock(r.read_at)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let tip = format!("Read by {names}");
-    let shown = readers.len().min(READ_MARKS_SHOWN);
-    let more = readers.len().saturating_sub(shown);
-    let marks = readers.iter().take(shown).enumerate().map(|(n, r)| {
-        let name = match r.author {
-            Author::Agent(id) => ws.agent(id).map_or(&*r.name, |a| &a.name),
-            _ => &r.name,
-        };
-        // Each face overlaps the one before; a canvas-coloured rim keeps the
-        // stack readable on the message background.
-        div()
-            .size(size::READ_MARK)
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .bg(t.sunken)
-            .border_2()
-            .border_color(t.canvas)
-            .when(n > 0, |d| d.ml(px(-6.)))
-            .child(initial(name, t))
-    });
-    div()
-        .id(("read-marks", ix))
-        .mt(space::X1)
-        .flex()
-        .items_center()
-        .justify_end()
-        .children(marks)
-        .when(more > 0, |d| {
-            d.child(
-                div()
-                    .size(size::READ_MARK)
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .ml(px(-6.))
-                    .rounded_full()
-                    .bg(t.sunken)
-                    .border_2()
-                    .border_color(t.canvas)
-                    .type_style(text::CAPTION)
-                    .font_weight(text::MEDIUM)
-                    .text_color(t.muted)
-                    .child(format!("+{more}")),
-            )
-        })
-        .tooltip(Tooltip::text(tip))
-        .into_any_element()
-}
-
-/// A reader without a picture: their first letter, dark enough to tell apart
-/// at a glance.
-fn initial(name: &str, t: &ui::Theme) -> AnyElement {
-    let c: String = name.chars().take(1).collect();
-    div()
-        .type_style(text::CAPTION)
-        .font_weight(text::SEMIBOLD)
-        .text_color(t.ink_soft)
-        .child(SharedString::from(c))
-        .into_any_element()
-}
-
-impl Conversation {
     /// A long message's first lines, ending in "…", with "Open" to read it in
     /// full in the pane (see `model::pane::is_long` for the threshold).
     fn render_collapsed_with(
         &self,
         ix: usize,
-        message: &model::Message,
+        message: &Message,
         display: &SharedString,
         known: &KnownMentions,
         t: &ui::Theme,
@@ -539,12 +720,123 @@ impl Conversation {
             )
             .into_any_element()
     }
+
+    fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let t = *cx.theme();
+        let store = self.store.read(cx);
+        let channel = store.selected_channel();
+
+        if self.list.item_count() > 0 {
+            let this = cx.entity().downgrade();
+            return list(self.list.clone(), move |ix, window, cx| {
+                this.upgrade()
+                    .map(|view| {
+                        view.update(cx, |view, view_cx| view.render_message(ix, window, view_cx))
+                    })
+                    .unwrap_or_else(|| div().into_any_element())
+            })
+            .size_full()
+            .into_any_element();
+        }
+
+        let project = store.workspace().project.name.clone();
+        let blurb: SharedString = if channel.project_wide {
+            format!("The project-wide room. Everyone on {project}, human or AI, can talk here.")
+                .into()
+        } else if let Some(issue) = &channel.linear_issue {
+            format!("Linked to {issue} on Linear. Nothing here yet.").into()
+        } else {
+            "Nothing here yet.".into()
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(space::X6)
+            .child(
+                div()
+                    .max_w(px(EMPTY_MAX_W))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(space::X2)
+                    .text_center()
+                    .child(
+                        div()
+                            .size(size::ROW_LG)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(radius::MD)
+                            .bg(t.sunken)
+                            .child(icon(IconName::Hash, icons::LG, t.faint)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .type_style(text::BODY)
+                            .font_weight(text::SEMIBOLD)
+                            .text_color(t.ink_soft)
+                            .child(SharedString::from(channel.name.clone())),
+                    )
+                    .child(
+                        div()
+                            .type_style(text::SMALL)
+                            .text_color(t.muted)
+                            .child(blurb),
+                    ),
+            )
+            .into_any_element()
+    }
 }
 
-/// A message's text as the chat draws it: a mention of an agent that was in
-/// this project and has been removed from it reads as `@previous-agent`,
-/// like its author label (STRM-561); any other mention is drawn as typed.
-/// The stored text, which Copy and Reply use, never changes.
+fn menu_item(
+    id: impl Into<ElementId>,
+    icon_name: IconName,
+    label: &'static str,
+    t: ui::Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id.into())
+        .px(space::X2)
+        .py(space::X1_5)
+        .rounded(radius::SM)
+        .flex()
+        .items_center()
+        .gap(space::X2)
+        .type_style(text::SMALL)
+        .text_color(t.ink)
+        .cursor_pointer()
+        .hover(|s| s.bg(t.hover))
+        .on_click(on_click)
+        .child(icon(icon_name, icons::SM, t.ink_soft))
+        .child(label)
+}
+
+impl Render for Conversation {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
+        let store = self.store.read(cx);
+        let channel = store.selected_channel();
+        let header = header(channel, &store.workspace().project, &t);
+        let body = self.render_body(cx);
+        let menu = self.render_menu(cx);
+        div().size_full().flex().flex_col().child(header).child(
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .child(body)
+                .children(menu),
+        )
+    }
+}
+
+/// A message's text as the chat draws it.
 fn shown_body(store: &ChatStore, body: &Arc<str>) -> SharedString {
     match mentions::rewrite_former_mentions(body, |token| {
         store.is_former_project_agent_mention(token)
@@ -554,8 +846,7 @@ fn shown_body(store: &ChatStore, body: &Arc<str>) -> SharedString {
     }
 }
 
-/// Known mention targets for highlighting: current project members' handles
-/// and nicknames, plus supported broadcast targets.
+/// Known mention targets for highlighting.
 fn known_mentions(store: &ChatStore) -> KnownMentions {
     let mut known = KnownMentions::new();
     for member in store.mention_candidates() {
@@ -569,8 +860,7 @@ fn known_mentions(store: &ChatStore) -> KnownMentions {
     known
 }
 
-/// Builds a `StyledText` element for `text`, highlighting known mentions
-/// while keeping the base text color and font style.
+/// Builds a `StyledText` element for `text`, highlighting known mentions.
 fn highlighted_text(
     text: SharedString,
     known: &KnownMentions,
@@ -599,7 +889,7 @@ fn runs_for_highlights(
     text: &str,
     base: &gpui::TextStyle,
     base_color: gpui::Hsla,
-    highlights: &[(std::ops::Range<usize>, HighlightStyle)],
+    highlights: &[(std::ops::Range<usize>, gpui::HighlightStyle)],
 ) -> Vec<TextRun> {
     let mut runs = Vec::new();
     let mut ix = 0;
@@ -635,22 +925,13 @@ fn runs_for_highlights(
     runs
 }
 
-/// "HH:MM" (UTC) without pulling in a date library. Good enough for sample data.
+/// "HH:MM" (UTC)
 fn clock(secs: u64) -> SharedString {
     let minutes = secs / 60;
     format!("{:02}:{:02}", (minutes / 60) % 24, minutes % 60).into()
 }
 
-/// The channel header, Discord style:
-///
-/// ```text
-/// # main
-/// ~/Projects/everything ::1
-/// ```
-///
-/// `::N` is the channel's number within its project (creation order, never
-/// reused, unchanged by renames). Channels that only exist locally have no
-/// number and show the path alone.
+/// The channel header
 fn header(
     channel: &model::Channel,
     project: &model::Project,
@@ -694,94 +975,71 @@ fn header(
         )
 }
 
-impl Render for Conversation {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = *cx.theme();
-        let store = self.store.read(cx);
-        let channel = store.selected_channel();
-        let header = header(channel, &store.workspace().project, &t);
-        let body = self.render_body(cx);
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(header)
-            .child(div().flex_1().min_h_0().child(body))
-    }
-}
+const READ_MARKS_SHOWN: usize = 4;
 
-impl Conversation {
-    fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let t = *cx.theme();
-        let store = self.store.read(cx);
-        let channel = store.selected_channel();
-
-        if self.list.item_count() > 0 {
-            let this = cx.entity().downgrade();
-            return list(self.list.clone(), move |ix, window, cx| {
-                this.upgrade()
-                    .map(|view| {
-                        view.update(cx, |view, view_cx| view.render_message(ix, window, view_cx))
-                    })
-                    .unwrap_or_else(|| div().into_any_element())
-            })
-            .size_full()
-            .into_any_element();
-        }
-
-        let project = store.workspace().project.name.clone();
-        let blurb: SharedString = if channel.project_wide {
-            format!("The project-wide room. Everyone on {project}, human or AI, can talk here.")
-                .into()
-        } else if let Some(issue) = &channel.linear_issue {
-            format!("Linked to {issue} on Linear. Nothing here yet.").into()
-        } else {
-            "Nothing here yet.".into()
+fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Theme) -> AnyElement {
+    let names = readers
+        .iter()
+        .map(|r| format!("{} at {}", r.name, clock(r.read_at)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let tip = format!("Read by {names}");
+    let shown = readers.len().min(READ_MARKS_SHOWN);
+    let more = readers.len().saturating_sub(shown);
+    let marks = readers.iter().take(shown).enumerate().map(|(n, r)| {
+        let name = match r.author {
+            Author::Agent(id) => ws.agent(id).map_or(&*r.name, |a| &a.name),
+            _ => &r.name,
         };
-
-        // Empty state: no backend, no agents yet.
         div()
-            .size_full()
+            .size(size::READ_MARK)
+            .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .px(space::X6)
-            .child(
+            .rounded_full()
+            .bg(t.sunken)
+            .border_2()
+            .border_color(t.canvas)
+            .when(n > 0, |d| d.ml(px(-6.)))
+            .child(initial(name, t))
+    });
+    div()
+        .id(("read-marks", ix))
+        .mt(space::X1)
+        .flex()
+        .items_center()
+        .justify_end()
+        .children(marks)
+        .when(more > 0, |d| {
+            d.child(
                 div()
-                    .max_w(px(EMPTY_MAX_W))
+                    .size(size::READ_MARK)
+                    .flex_none()
                     .flex()
-                    .flex_col()
                     .items_center()
-                    .gap(space::X2)
-                    .text_center()
-                    .child(
-                        // flex_none: the blurb below is measured unwrapped first,
-                        // so the column can come out short and squash its items.
-                        div()
-                            .size(size::ROW_LG)
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(radius::MD)
-                            .bg(t.sunken)
-                            .child(icon(IconName::Hash, icons::LG, t.faint)),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .type_style(text::BODY)
-                            .font_weight(text::SEMIBOLD)
-                            .text_color(t.ink_soft)
-                            .child(SharedString::from(channel.name.clone())),
-                    )
-                    .child(
-                        div()
-                            .type_style(text::SMALL)
-                            .text_color(t.muted)
-                            .child(blurb),
-                    ),
+                    .justify_center()
+                    .ml(px(-6.))
+                    .rounded_full()
+                    .bg(t.sunken)
+                    .border_2()
+                    .border_color(t.canvas)
+                    .type_style(text::CAPTION)
+                    .font_weight(text::MEDIUM)
+                    .text_color(t.muted)
+                    .child(format!("+{more}")),
             )
-            .into_any_element()
-    }
+        })
+        .tooltip(Tooltip::text(tip))
+        .into_any_element()
+}
+
+fn initial(name: &str, t: &ui::Theme) -> AnyElement {
+    let c: String = name.chars().take(1).collect();
+    div()
+        .type_style(text::CAPTION)
+        .font_weight(text::SEMIBOLD)
+        .text_color(t.ink_soft)
+        .child(SharedString::from(c))
+        .into_any_element()
 }
