@@ -65,7 +65,8 @@
 //! fixture format). `chat_tools` is `"auto"` (HTTP when the agent offers it,
 //! else the stdio bridge) or `"stdio"`. `runs_in` is `"host"` (the default:
 //! permission requests go to the humans, without blocking the agent) or
-//! `"vm"` (the agent's own VM: everything is approved).
+//! `"vm"` (VM-configured runtime; VM configuration alone grants no approval and
+//! requests use host-side policy until trusted isolation verification exists).
 //!
 //! An `agents` entry may also set `ping_answer_reactions`: that agent's own
 //! list of reactions that answer a ping, over the project's (Settings) and
@@ -178,7 +179,9 @@ pub struct AgentConfig {
     #[serde(default)]
     pub chat_tools: ChatTools,
     /// `"host"` (default: permission requests go to the humans, never
-    /// blocking) or `"vm"` (the agent's own VM: everything is approved).
+    /// blocking) or `"vm"` (VM-configured runtime; VM configuration alone grants
+    /// no approval and requests use host-side policy until trusted isolation
+    /// verification exists).
     #[serde(default)]
     pub runs_in: RunsIn,
     /// This agent's own reactions that answer a ping (see the module docs).

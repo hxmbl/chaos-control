@@ -303,7 +303,8 @@ CREATE INDEX stances_by_target ON stances (target_id);
 "#,
     // 6: permission requests (STRM-401). One row per request an agent made,
     // natively or through `chat_request_permission`: pending until a human
-    // answers (never times out), or auto_approved for agents in their own VM.
+    // answers (never times out), or auto_approved only when a trusted isolation
+    // mechanism has verified isolation (VM config alone grants no approval).
     // An approval is a one-shot grant, spent when the retried call runs
     // (`used_at`). `asked_of` is the comma-separated member ids it was routed
     // to; any human in the channel may answer.

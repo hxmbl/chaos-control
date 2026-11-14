@@ -123,8 +123,9 @@ pub struct AgentSpec {
     pub name: String,
     pub adapter: Arc<dyn AgentAdapter>,
     pub cwd: Option<PathBuf>,
-    /// Where the agent runs: on the host its permission requests go to the
-    /// humans; in its own VM they are approved (see `permission`).
+    /// Where the agent is configured/requested to run. VM configuration alone
+    /// grants no approval; requests use host-side policy until trusted isolation
+    /// verification exists (see `permission`).
     pub runs_in: RunsIn,
     /// How much host-side work a human signs off on (STRM-542).
     pub approval: crate::types::ApprovalMode,

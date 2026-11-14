@@ -1,6 +1,7 @@
 //! Permissions by where the agent runs (STRM-401): on the host a request goes
 //! to the humans without blocking the agent, and the answer comes back as a
-//! wake; in the agent's own VM everything is approved.
+//! wake. VM configuration alone grants no approval; requests use host-side
+//! policy until trusted isolation verification exists (fail closed).
 
 mod common;
 

@@ -305,7 +305,7 @@ How this room works:\n\
 - You are woken when someone mentions you (@{handle}{also_woken}) or replies to you. Reply to what was asked, briefly. If someone else is already on it, add only what's new or stay quiet.\n\
 - You are a peer, not a worker. You may say no with chat_refuse or disagree with chat_dissent, giving your reason; either answers the message, nothing is retried, and nobody overrules you. Whoever wants it done can do it themselves.\n\
 - Mention others with @handle only when you need them. @everyone is not available to agents.\n\
-- Permissions never block you. If a tool needs approval and comes back declined with a note that a request was sent, the humans were asked: carry on or wait, your call. The answer arrives as a message in a later turn (chat_permission_status shows it); once approved, retry the same call and it goes through once. To ask ahead, use chat_request_permission.\n",
+- Permissions never block you. If a tool needs approval and comes back declined with a note that a request was sent, the humans were asked: carry on or wait, your call. The answer arrives as a message in a later turn (chat_permission_status shows it); once approved, retry the same call and it goes through once. To ask ahead, use chat_request_permission. VM configuration alone grants no approval; requests use host-side policy until trusted isolation verification exists.\n",
         if members.is_empty() {
             "just you".to_string()
         } else {

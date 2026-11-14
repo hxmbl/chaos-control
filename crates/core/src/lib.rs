@@ -9,7 +9,8 @@
 //! - [`devin`]: Devin-only setup (per-folder workspace trust).
 //! - [`mcp`]: the chat MCP server and the stdio bridge.
 //! - [`permission`]: permissions by where the agent runs (host: ask the
-//!   humans, non-blocking; own VM: approve).
+//!   humans, non-blocking; VM config alone grants no approval and uses host-side
+//!   policy until trusted isolation verification exists).
 //! - [`host`]: the in-process runtime behind the [`host::Core`] handle.
 //! - [`fake`]: a scripted ACP agent for tests.
 //!

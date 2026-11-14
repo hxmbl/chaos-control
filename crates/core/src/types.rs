@@ -82,7 +82,7 @@ pub enum ApprovalMode {
     /// and their output is steered back to the agent.
     AcceptEdits,
     /// Nothing asks. Recorded for the log as auto-approved-by-mode,
-    /// distinct from a VM's auto-approval so the log can tell them apart.
+    /// distinct from verified-isolation auto-approval so the log can tell them apart.
     Yolo,
 }
 
@@ -461,7 +461,8 @@ pub struct Reaction {
 pub enum DecidedBy {
     /// A human member approved or denied it.
     Human(MemberId),
-    /// Auto-approved by the agent running in its own VM.
+    /// Auto-approved by a trusted, verified isolated runtime (never by VM
+    /// configuration alone; disabled until trusted isolation verification exists).
     AutoVm,
     /// Auto-approved by an approval mode (`accept-edits` edits, `yolo`).
     AutoMode,

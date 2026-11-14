@@ -6,8 +6,11 @@
 //!   with a request id at once and decides whether to wait or do something
 //!   else. A human's Approve or Deny arrives later, as a message that wakes the
 //!   agent (its next turn). Nothing times out into an approval.
-//! - **In the agent's own VM** ([`RunsIn::Vm`]) everything is approved: a broken
-//!   VM is replaced, not protected.
+//! - **VM-configured** ([`RunsIn::Vm`]) agents are **not** auto-approved by
+//!   configuration alone. VM auto-approval remains disabled until a trusted
+//!   isolation mechanism verifies isolation with evidence bound to the
+//!   agent/runtime/session; until then, requests use normal host-side policy
+//!   (fail closed).
 //!
 //! A protocol whose permission call blocks (ACP `session/request_permission`)
 //! is answered at once: with the agent's own allow-once option when the
@@ -35,8 +38,10 @@
 //!   delete/move, fetch/URL-open, execute/shell, unselected/unverified MCP, and
 //!   unknown/changed/mixed/unclassifiable operations require human approval in
 //!   both `ask-all` and `accept-edits` unless `yolo` allows everything
-//!   (recorded as auto-approved-by-mode). Agents running in their own VM are
-//!   auto-approved (`RunsIn::Vm`, recorded as auto-approved-by-VM). Execute in
+//!   (recorded as auto-approved-by-mode). `RunsIn::Vm` configuration alone grants
+//!   no approval; VM auto-approval remains disabled until a trusted isolation
+//!   mechanism verifies isolation with evidence bound to the agent/runtime/session,
+//!   so VM-configured requests use host-side policy (fail closed). Execute in
 //!   `accept-edits` is queued for approval-gated command execution (not
 //!   auto-allowed); missing/uncapturable command/cwd fail closed for safe
 //!   execution capture.
@@ -94,7 +99,8 @@ pub enum RunsIn {
     /// The user's computer: requests go to the humans, non-blocking.
     #[default]
     Host,
-    /// The agent's own VM: every request is approved.
+    /// VM-configured runtime. VM configuration alone grants no approval;
+    /// requests use host-side policy until trusted isolation verification exists.
     Vm,
 }
 
@@ -218,7 +224,8 @@ pub struct PermissionRequest {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LogOutcome {
-    /// Allowed without a human: a read, or anything from an agent in its own VM.
+    /// Allowed without a human: a read, or a request auto-approved by a trusted,
+    /// verified isolated runtime (never by VM configuration alone).
     AutoAllowed,
     /// Waiting for a human decision (live queue, STRM-542).
     Pending,
@@ -2316,7 +2323,7 @@ pub fn tools(schema: fn(Value) -> Arc<serde_json::Map<String, Value>>) -> Vec<To
     vec![
         Tool::new(
             "chat_request_permission",
-            "Ask the humans for permission to do something, without blocking. Returns at once with status \"request_sent\" and a request_id (or \"approved\" if you run in your own VM): keep working or wait, your call. The answer arrives as a message in a later turn; chat_permission_status shows it too. Asking again with the same `action` reuses the request. A tool call that needs approval is asked for by the call itself: once a human approves it, retry that exact call and it goes through once.",
+            "Ask the humans for permission to do something, without blocking. Returns at once with status \"request_sent\" and a request_id (or \"approved\" only when already approved by a trusted, verified isolated runtime — VM configuration alone grants no approval; requests use host-side policy until trusted isolation verification exists): keep working or wait, your call. The answer arrives as a message in a later turn; chat_permission_status shows it too. Asking again with the same `action` reuses the request. A tool call that needs approval is asked for by the call itself: once a human approves it, retry that exact call and it goes through once.",
             schema(
                 json!({"type": "object", "required": ["action"], "properties": {
                     "action": {"type": "string", "description": "What you want to do, e.g. the command or the tool call's title."},
@@ -2441,7 +2448,8 @@ pub fn call_tool(
             v["next"] = json!(match r.state {
                 PermissionState::Pending =>
                     "Carry on with other work or wait; the answer arrives as a message in a later turn.",
-                PermissionState::AutoApproved => "You run in your own VM: go ahead.",
+                PermissionState::AutoApproved =>
+                    "Approved by a trusted, verified isolated runtime.",
                 PermissionState::Approved => "Approved: go ahead.",
                 PermissionState::Denied => "Denied: carry on without it, or talk it through.",
             });

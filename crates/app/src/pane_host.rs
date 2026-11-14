@@ -776,7 +776,7 @@ fn permission_text(p: &model::PermissionPrompt) -> String {
     if let Some(outcome) = p.logged {
         out.push_str(&match outcome {
             model::PermissionOutcome::AutoAllowed => format!(
-                "Request #{}: allowed without asking anyone (a read, or an agent in its own VM).",
+                "Request #{}: allowed without asking anyone (a read, or a trusted, verified isolated runtime; VM configuration alone grants no approval).",
                 p.request
             ),
             model::PermissionOutcome::Declined => format!(

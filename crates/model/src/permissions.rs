@@ -17,7 +17,8 @@ pub const LOG_LEN: usize = 200;
 /// How a request ended, as the log shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionOutcome {
-    /// Allowed without asking anyone: a read, or an agent in its own VM.
+    /// Allowed without asking anyone: a read, or a trusted, verified isolated
+    /// runtime (never by VM configuration alone).
     AutoAllowed,
     /// Waiting for a human decision (STRM-542).
     Pending,

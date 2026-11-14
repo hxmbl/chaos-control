@@ -376,7 +376,7 @@ cases require human approval (or are otherwise held/fail closed) as applicable.
 | Where | What happens |
 | --- | --- |
 | `host` (the user's computer, default) | Decided by mediated classification + approval mode (below). Requests that require approval are **non-blocking**: the agent is answered at once with a "request sent" / pending outcome (and request id) so it can continue other work or wait; a human Approve/Deny arrives later as a wake/message. Approved one-shot grants apply only to the exact retried request identity. Nothing times out into an approval. |
-| `vm` (agent configured/requested to run in its own VM) | **VM auto-approval is disabled** until a trusted isolation mechanism verifies isolation with evidence bound to the agent/runtime/session. A configuration flag alone is never proof of isolation, and there is no public/caller-controlled verification setter; until a real trusted mechanism exists, requests fall back to normal host-side permission enforcement (fail closed). |
+| `vm` (agent configured/requested to run in a VM) | **VM auto-approval is disabled** until a trusted isolation mechanism verifies isolation with evidence bound to the agent/runtime/session. A configuration flag alone is never proof of isolation, and there is no public/caller-controlled verification setter; until a real trusted mechanism exists, requests fall back to normal host-side permission enforcement (fail closed). |
 
 `yolo` mode explicitly allows mediated requests on the host (`DecidedBy::AutoMode`),
 logged distinctly from verified VM auto-approval. Unverified `runs_in: "vm"` configuration must not grant auto-approval.
