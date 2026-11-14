@@ -676,21 +676,7 @@ impl Render for Composer {
         let hover = t.hover;
         let working = self.working_indicator(cx);
 
-        div()
-            .key_context(KEY_CONTEXT)
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::accept_mention_action))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if !this.suggestions_open() {
-                    return;
-                }
-                let key = event.keystroke.key.as_str();
-                match key {
-                    "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
-                    "down" if this.move_mention_selection(1, cx) => cx.stop_propagation(),
-                    _ => {}
-                }
-            }))
+        let box_el = div()
             .w_full()
             .flex()
             .flex_col()
@@ -702,16 +688,6 @@ impl Render for Composer {
             .pt(space::X3)
             .pb(space::X2)
             .shadow(t.elevation(Elevation::Float))
-            .when_some(working, |d, label| {
-                d.child(
-                    div()
-                        .px(space::X2)
-                        .mb(space::X1_5)
-                        .type_style(text::SMALL)
-                        .text_color(t.muted)
-                        .child(label),
-                )
-            })
             .when(unwired, |d| {
                 d.child(
                     div()
@@ -765,7 +741,37 @@ impl Render for Composer {
                             .on_click(cx.listener(|this, _, _, cx| this.send(cx)))
                             .child(icon(IconName::ArrowUp, icons::MD, t.surface)),
                     ),
-            )
+            );
+
+        div()
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::accept_mention_action))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if !this.suggestions_open() {
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
+                    "down" if this.move_mention_selection(1, cx) => cx.stop_propagation(),
+                    _ => {}
+                }
+            }))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(space::X1_5)
+            .when_some(working, |d, label| {
+                d.child(
+                    div()
+                        .px(space::X2)
+                        .type_style(text::SMALL)
+                        .text_color(t.muted)
+                        .child(label),
+                )
+            })
+            .child(box_el)
     }
 }
 
