@@ -15,6 +15,7 @@ use ui::{
     truncated,
 };
 
+use crate::mention_highlight::{self, KnownMentions};
 use crate::store::{ChatStore, MentionCandidate, SendRoute, StoreEvent, UNWIRED_NOTE};
 
 actions!(composer, [Cancel, AcceptMention]);
@@ -182,6 +183,27 @@ impl Composer {
         // its text (see `TextInput::multiline`).
         let input =
             cx.new(|cx| TextInput::new(placeholder(store.read(cx)), cx).multiline(MAX_LINES));
+        {
+            let store_for_highlight = store.clone();
+            input.update(cx, |input, cx| {
+                input.set_highlighter(
+                    move |text, appearance, app| {
+                        let store = store_for_highlight.read(app);
+                        let mut known = KnownMentions::new();
+                        for member in store.mention_candidates() {
+                            known.insert_member(
+                                member.handle.as_ref(),
+                                member.handle.as_ref(),
+                                &member.nicknames,
+                            );
+                        }
+                        known.insert_broadcasts();
+                        mention_highlight::mention_highlights(text, &known, appearance)
+                    },
+                    cx,
+                );
+            });
+        }
         window.focus(&input.focus_handle(cx));
         let channel = store.read(cx).selected();
         let subscriptions = [

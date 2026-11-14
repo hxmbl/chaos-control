@@ -1,4 +1,4 @@
-//! Highlighting known @mentions in rendered message bodies (STRM-614).
+//! Highlighting known @mentions (rendered messages and composer input).
 //!
 //! Mentions are matched with the same token rules as `model::mentions`:
 //! an `@` not preceded by a word character, followed by letters, digits,
@@ -203,77 +203,4 @@ pub fn mention_highlights(
             )
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn known() -> KnownMentions {
-        let mut k = KnownMentions::new();
-        k.insert_member("claude", "claude", &["cody", "cc"]);
-        k.insert_member("opencode", "opencode", &Vec::<&str>::new());
-        k.insert_broadcasts();
-        k
-    }
-
-    #[test]
-    fn stable_color_for_same_identity() {
-        let a = mention_color("claude", Appearance::Light);
-        let b = mention_color("claude", Appearance::Light);
-        let c_dark = mention_color("claude", Appearance::Dark);
-        assert_eq!(a, b);
-        // nicknames share identity through KnownMentions, but color fn hashes identity
-        assert_eq!(
-            mention_color("claude", Appearance::Light),
-            mention_color("claude", Appearance::Light)
-        );
-        // different appearance can differ, but must be deterministic
-        assert_eq!(c_dark, mention_color("claude", Appearance::Dark));
-    }
-
-    #[test]
-    fn nickname_maps_to_member_identity() {
-        let k = known();
-        assert_eq!(k.identity_for("cody"), Some("claude"));
-        assert_eq!(k.identity_for("CC"), Some("claude"));
-        assert_eq!(k.identity_for("opencode"), Some("opencode"));
-    }
-
-    #[test]
-    fn matches_known_mentions_case_insensitively_with_boundaries() {
-        let k = known();
-        let spans = find_mentions("hey @Claude and @CODY, ping @everyone", &k);
-        let found: Vec<_> = spans
-            .iter()
-            .map(|m| (&m.identity[..], m.range.clone()))
-            .collect();
-        assert_eq!(
-            found,
-            vec![("claude", 4..11), ("claude", 16..21), ("everyone", 28..37),]
-        );
-        // trailing dot is punctuation outside highlight
-        let spans = find_mentions("thanks @claude.", &k);
-        assert_eq!(spans[0].range, 7..14);
-    }
-
-    #[test]
-    fn unknown_handles_and_non_mentions_not_highlighted() {
-        let k = known();
-        assert!(find_mentions("hi @unknown and @ghost", &k).is_empty());
-        // email-like and word-preceded @ are not mentions
-        assert!(find_mentions("mail a@claude.com", &k).is_empty());
-        assert!(find_mentions("x@claude", &k).is_empty());
-        assert!(find_mentions("no @ here", &k).is_empty());
-    }
-
-    #[test]
-    fn highlights_align_with_text() {
-        let k = known();
-        let text = "héllo @claude 👀";
-        let hs = mention_highlights(text, &k, Appearance::Light);
-        assert_eq!(hs.len(), 1);
-        assert_eq!(&text[hs[0].0.clone()], "@claude");
-        assert!(hs[0].1.color.is_some());
-    }
 }

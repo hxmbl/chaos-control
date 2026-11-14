@@ -175,6 +175,9 @@ pub enum TextInputEvent {
     Submit,
 }
 
+type HighlightFn =
+    dyn Fn(&str, crate::Appearance, &App) -> Vec<(Range<usize>, gpui::HighlightStyle)>;
+
 pub struct TextInput {
     focus_handle: FocusHandle,
     content: SharedString,
@@ -186,6 +189,8 @@ pub struct TextInput {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
+    /// Extra text highlights (e.g. @mentions), merged with the IME mark.
+    highlighter: Option<Box<HighlightFn>>,
     last_layout: Option<ShapedLine>,
     /// A multi-line field's shaped text from the last paint (instead of
     /// `last_layout`).
@@ -220,6 +225,7 @@ impl TextInput {
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
+            highlighter: None,
             last_layout: None,
             last_multi: None,
             last_bounds: None,
@@ -247,6 +253,24 @@ impl TextInput {
     pub fn centered(mut self) -> Self {
         self.centered = true;
         self
+    }
+
+    /// Sets extra text highlights (e.g. mention coloring) applied to the content.
+    /// The provider receives the current text, appearance, and app context.
+    pub fn set_highlighter(
+        &mut self,
+        highlighter: impl Fn(&str, crate::Appearance, &App) -> Vec<(Range<usize>, gpui::HighlightStyle)>
+        + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.highlighter = Some(Box::new(highlighter));
+        cx.notify();
+    }
+
+    pub fn clear_highlighter(&mut self, cx: &mut Context<Self>) {
+        if self.highlighter.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// Switch centring on or off after construction (the search field is
@@ -1064,34 +1088,121 @@ fn enter(composing: bool) -> Enter {
     }
 }
 
-/// The style runs for `run`'s text, with the IME's marked range underlined.
-fn text_runs(run: TextRun, marked: Option<&Range<usize>>) -> Vec<TextRun> {
-    let Some(marked) = marked else {
-        return vec![run];
+/// The style runs for `display_text`: extra highlights (e.g. mentions) merged
+/// with the IME's marked range underline.
+fn styled_runs(
+    display_text: &str,
+    base: &TextRun,
+    marked: Option<&Range<usize>>,
+    extra: Vec<(Range<usize>, gpui::HighlightStyle)>,
+) -> Vec<TextRun> {
+    let len = display_text.len();
+    let marked_highlight = marked.and_then(|range| {
+        let start = range.start.min(len);
+        let end = range.end.min(len);
+        (start < end).then(|| {
+            vec![(
+                start..end,
+                gpui::HighlightStyle {
+                    underline: Some(UnderlineStyle {
+                        color: Some(base.color),
+                        thickness: px(1.0),
+                        wavy: false,
+                    }),
+                    ..Default::default()
+                },
+            )]
+        })
+    });
+    let highlights = match marked_highlight {
+        Some(m) if !extra.is_empty() => gpui::combine_highlights(extra, m).collect::<Vec<_>>(),
+        Some(m) => m,
+        None => extra,
     };
-    let len = run.len;
-    [
-        TextRun {
-            len: marked.start,
-            ..run.clone()
-        },
-        TextRun {
-            len: marked.end - marked.start,
-            underline: Some(UnderlineStyle {
-                color: Some(run.color),
-                thickness: px(1.0),
-                wavy: false,
-            }),
-            ..run.clone()
-        },
-        TextRun {
-            len: len - marked.end,
-            ..run
-        },
-    ]
-    .into_iter()
-    .filter(|run| run.len > 0)
-    .collect()
+    if highlights.is_empty() {
+        return vec![base.clone()];
+    }
+
+    let make_run = |seg_len: usize, highlight: Option<gpui::HighlightStyle>| -> TextRun {
+        let mut run = base.clone();
+        run.len = seg_len;
+        if let Some(h) = highlight {
+            if let Some(color) = h.color {
+                run.color = color;
+            }
+            if let Some(weight) = h.font_weight {
+                run.font.weight = weight;
+            }
+            if let Some(style) = h.font_style {
+                run.font.style = style;
+            }
+            if let Some(bg) = h.background_color {
+                run.background_color = Some(bg);
+            }
+            if let Some(underline) = h.underline {
+                run.underline = Some(underline);
+            }
+            if let Some(strike) = h.strikethrough {
+                run.strikethrough = Some(strike);
+            }
+            if let Some(fade) = h.fade_out {
+                run.color.fade_out(fade);
+            }
+        }
+        run
+    };
+
+    let mut runs = Vec::new();
+    let mut ix = 0;
+    for (range, highlight) in highlights {
+        if range.start >= range.end || range.end > len {
+            continue;
+        }
+        if ix < range.start {
+            if !display_text.is_char_boundary(range.start) || !display_text.is_char_boundary(ix) {
+                continue;
+            }
+            runs.push(make_run(range.start - ix, None));
+            ix = range.start;
+        }
+        if !display_text.is_char_boundary(range.start) || !display_text.is_char_boundary(range.end)
+        {
+            continue;
+        }
+        runs.push(make_run(range.len(), Some(highlight)));
+        ix = range.end;
+    }
+    if ix < len {
+        runs.push(make_run(len - ix, None));
+    }
+    if runs.is_empty() {
+        vec![base.clone()]
+    } else {
+        runs
+    }
+}
+
+fn input_extra_highlights(
+    input: &TextInput,
+    text: &str,
+    appearance: crate::Appearance,
+    cx: &App,
+) -> Vec<(Range<usize>, gpui::HighlightStyle)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let Some(highlighter) = &input.highlighter else {
+        return Vec::new();
+    };
+    highlighter(text, appearance, cx)
+        .into_iter()
+        .filter(|(r, _)| {
+            r.start < r.end
+                && r.end <= text.len()
+                && text.is_char_boundary(r.start)
+                && text.is_char_boundary(r.end)
+        })
+        .collect()
 }
 
 /// A multi-line field's text, shaped and wrapped: one `WrappedLine` per
@@ -1280,7 +1391,13 @@ impl TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = text_runs(run, input.marked_range.as_ref().filter(|_| !empty));
+        let extra = if empty {
+            Vec::new()
+        } else {
+            input_extra_highlights(input, display_text.as_ref(), theme.appearance, cx)
+        };
+        let marked = input.marked_range.clone().filter(|_| !empty);
+        let runs = styled_runs(display_text.as_ref(), &run, marked.as_ref(), extra);
         // The placeholder stays on one row; the text wraps to the field.
         let wrap = (!empty).then(|| wrap_width(bounds.size.width));
         let layout = MultiLayout::shape(display_text, &runs, font_size, wrap, line_height, window);
@@ -1472,6 +1589,9 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
+        let appearance = cx.theme().appearance;
+        let extra = input_extra_highlights(input, content.as_ref(), appearance, cx);
+        let runs = styled_runs(content.as_ref(), &run, None, extra);
         let layout_id =
             window.request_measured_layout(style, move |known, available, window, _| {
                 let width = known.width.or(match available.width {
@@ -1483,7 +1603,7 @@ impl Element for TextElement {
                 } else {
                     MultiLayout::shape(
                         content.clone(),
-                        std::slice::from_ref(&run),
+                        &runs,
                         font_size,
                         width.map(wrap_width),
                         line_height,
@@ -1518,7 +1638,8 @@ impl Element for TextElement {
         let cursor = input.cursor_offset();
         let style = window.text_style();
 
-        let (display_text, text_color) = if content.is_empty() {
+        let is_empty = content.is_empty();
+        let (display_text, text_color) = if is_empty {
             (input.placeholder.clone(), theme.muted)
         } else {
             (content, style.color)
@@ -1532,32 +1653,21 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
-            vec![
-                TextRun {
-                    len: marked_range.start,
-                    ..run.clone()
-                },
-                TextRun {
-                    len: marked_range.end - marked_range.start,
-                    underline: Some(UnderlineStyle {
-                        color: Some(run.color),
-                        thickness: px(1.0),
-                        wavy: false,
-                    }),
-                    ..run.clone()
-                },
-                TextRun {
-                    len: display_text.len() - marked_range.end,
-                    ..run
-                },
-            ]
-            .into_iter()
-            .filter(|run| run.len > 0)
-            .collect()
+        let extra = if is_empty {
+            Vec::new()
         } else {
-            vec![run]
+            input_extra_highlights(input, display_text.as_ref(), theme.appearance, cx)
         };
+        let runs = styled_runs(
+            display_text.as_ref(),
+            &run,
+            if is_empty {
+                None
+            } else {
+                input.marked_range.as_ref()
+            },
+            extra,
+        );
 
         let font_size = style.font_size.to_pixels(window.rem_size());
         let mut runs = runs;
