@@ -9,9 +9,10 @@
 use std::{borrow::Cow, sync::Arc};
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Corner, ElementId, Entity, ListAlignment, ListOffset,
-    ListState, MouseButton, MouseDownEvent, Pixels, Point, SharedString, StyledText, Subscription,
-    TextRun, WeakEntity, Window, anchored, deferred, div, list, prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Corner, ElementId, Entity, FocusHandle, KeyDownEvent,
+    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
+    StyledText, Subscription, TextRun, WeakEntity, Window, anchored, deferred, div, list,
+    prelude::*, px,
 };
 use model::{Author, Id, Message, PaneContent, ReplyRef, mentions, pane};
 use ui::{
@@ -37,7 +38,6 @@ const EMPTY_MAX_W: f32 = 384.;
 struct MessageMenu {
     message_id: Id,
     channel: Id,
-    index: usize,
     body: Arc<str>,
     reply: ReplyRef,
     can_react: bool,
@@ -55,6 +55,7 @@ pub struct Conversation {
     /// The message under the pointer (by id), so hover tracks message identity.
     hovered: Option<Id>,
     menu: Option<MessageMenu>,
+    menu_focus: FocusHandle,
     this: WeakEntity<Self>,
     _store_events: Subscription,
 }
@@ -121,35 +122,39 @@ impl Conversation {
             highlighted: None,
             hovered: None,
             menu: None,
+            menu_focus: cx.focus_handle(),
             this: cx.entity().downgrade(),
             _store_events: subscription,
         }
     }
 
-    fn close_menu(&mut self, cx: &mut Context<Self>) {
+    fn close_menu(&mut self, restore_focus: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.menu.take().is_some() {
             cx.notify();
+            if restore_focus {
+                self.composer.update(cx, |c, cx| c.focus(window, cx));
+            }
         }
     }
 
     fn open_menu(
         &mut self,
         message: &Message,
-        index: usize,
         can_react: bool,
         position: Point<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.menu = Some(MessageMenu {
             message_id: message.id,
             channel: self.channel,
-            index,
             body: message.body.clone(),
             reply: ReplyRef::to(message),
             can_react,
             position,
         });
         cx.notify();
+        self.menu_focus.focus(window);
     }
 
     fn reply_to(&mut self, reply: ReplyRef, window: &mut Window, cx: &mut Context<Self>) {
@@ -159,23 +164,27 @@ impl Conversation {
         cx.notify();
     }
 
-    fn copy_body(&mut self, body: &str, cx: &mut Context<Self>) {
+    fn copy_body(&mut self, body: &str, window: &mut Window, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(body.to_string()));
         self.menu = None;
         cx.notify();
+        self.composer.update(cx, |c, cx| c.focus(window, cx));
     }
 
     fn toggle_reaction_for(
         &mut self,
         channel: Id,
-        index: usize,
+        message_id: Id,
         emoji: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.store
-            .update(cx, |s, cx| s.toggle_reaction(channel, index, emoji, cx));
+        self.store.update(cx, |s, cx| {
+            s.toggle_reaction_for_message(channel, message_id, emoji, cx)
+        });
         self.menu = None;
         cx.notify();
+        self.composer.update(cx, |c, cx| c.focus(window, cx));
     }
 
     fn render_message(&self, ix: usize, window: &mut Window, cx: &mut App) -> AnyElement {
@@ -267,12 +276,12 @@ impl Conversation {
                     })
                     .on_mouse_down(MouseButton::Right, {
                         let message = message.clone();
-                        move |event: &MouseDownEvent, _window, cx| {
+                        move |event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             let pos = event.position;
                             let msg = message.clone();
                             this_right
-                                .update(cx, |c, cx| c.open_menu(&msg, ix, can_react, pos, cx))
+                                .update(cx, |c, cx| c.open_menu(&msg, can_react, pos, window, cx))
                                 .ok();
                         }
                     })
@@ -389,7 +398,7 @@ impl Conversation {
         can_react: bool,
         t: &ui::Theme,
         _window: &mut Window,
-        cx: &mut App,
+        _cx: &mut App,
     ) -> AnyElement {
         let this_reply = self.this.clone();
         let this_copy = self.this.clone();
@@ -442,9 +451,11 @@ impl Conversation {
                     ElementId::Name(format!("copy-action-{ix}").into()),
                     IconName::CopySimple,
                 )
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     cx.stop_propagation();
-                    this_copy.update(cx, |c, cx| c.copy_body(&body, cx)).ok();
+                    this_copy
+                        .update(cx, |c, cx| c.copy_body(&body, window, cx))
+                        .ok();
                 }),
             )
             .child(
@@ -454,12 +465,12 @@ impl Conversation {
                 )
                 .on_mouse_down(
                     MouseButton::Left,
-                    move |event: &MouseDownEvent, _, cx| {
+                    move |event: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
                         let pos = event.position;
                         let msg = message.clone();
                         this_more
-                            .update(cx, |c, cx| c.open_menu(&msg, ix, can_react, pos, cx))
+                            .update(cx, |c, cx| c.open_menu(&msg, can_react, pos, window, cx))
                             .ok();
                     },
                 ),
@@ -503,8 +514,8 @@ impl Conversation {
                 t,
                 {
                     let body = menu.body.to_string();
-                    cx.listener(move |this, _, _, cx| {
-                        this.copy_body(&body, cx);
+                    cx.listener(move |this, _, window, cx| {
+                        this.copy_body(&body, window, cx);
                     })
                 },
             ));
@@ -539,9 +550,15 @@ impl Conversation {
                             .rounded(radius::MD)
                             .cursor_pointer()
                             .hover(|s| s.bg(t.hover))
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
                                 this.update(cx, |c, cx| {
-                                    c.toggle_reaction_for(menu.channel, menu.index, emoji_str, cx)
+                                    c.toggle_reaction_for(
+                                        menu.channel,
+                                        menu.message_id,
+                                        emoji_str,
+                                        window,
+                                        cx,
+                                    )
                                 })
                                 .ok();
                             })
@@ -560,7 +577,18 @@ impl Conversation {
                     .snap_to_window_with_margin(px(8.))
                     .child(
                         div()
-                            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_menu(cx)))
+                            .track_focus(&self.menu_focus)
+                            .on_mouse_down_out(
+                                cx.listener(|this, _, window, cx| {
+                                    this.close_menu(true, window, cx)
+                                }),
+                            )
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.key.as_str() == "escape" {
+                                    cx.stop_propagation();
+                                    this.close_menu(true, window, cx);
+                                }
+                            }))
                             .child(items),
                     ),
             )
