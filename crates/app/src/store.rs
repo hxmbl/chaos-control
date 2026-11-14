@@ -42,6 +42,31 @@ const CORE_MESSAGE_BASE: u32 = 0x4000_0000;
 /// Shown in the composer where sending is off (see [`SendRoute::Unwired`]).
 pub const UNWIRED_NOTE: &str = "Only #main is live for now";
 
+/// Receives events/notifications from store mutations without depending on GPUI
+/// in tests for the core event-folding logic.
+pub(crate) trait EventSink {
+    fn emit(&mut self, event: StoreEvent);
+    fn notify(&mut self);
+}
+
+fn emit_store_event(cx: &mut Context<'_, ChatStore>, event: StoreEvent) {
+    cx.emit(event);
+}
+
+fn notify_store(cx: &mut Context<'_, ChatStore>) {
+    cx.notify();
+}
+
+impl EventSink for Context<'_, ChatStore> {
+    fn emit(&mut self, event: StoreEvent) {
+        emit_store_event(self, event);
+    }
+
+    fn notify(&mut self) {
+        notify_store(self);
+    }
+}
+
 /// Where a composer message in the selected channel goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SendRoute {
@@ -905,7 +930,7 @@ impl ChatStore {
     }
 
     /// A harness's own model list arrived.
-    fn set_models(&mut self, id: &str, list: Vec<ModelInfo>, cx: &mut Context<Self>) {
+    fn set_models(&mut self, id: &str, list: Vec<ModelInfo>, cx: &mut impl EventSink) {
         let Some(attached) = &mut self.core else {
             return;
         };
@@ -919,7 +944,7 @@ impl ChatStore {
     }
 
     /// Discovery for `id` ended without a list (`why` when it failed).
-    fn note_models(&mut self, id: &str, why: Option<Arc<str>>, cx: &mut Context<Self>) {
+    fn note_models(&mut self, id: &str, why: Option<Arc<str>>, cx: &mut impl EventSink) {
         if let Some(entry) = self
             .core
             .as_mut()
@@ -1637,30 +1662,103 @@ impl ChatStore {
     }
 
     /// Folds one core event into the app's state.
-    pub fn apply_core_event(&mut self, event: CoreEvent, cx: &mut Context<Self>) {
-        let Some(attached) = &self.core else {
+    pub fn apply_core_event(&mut self, event: CoreEvent, cx: &mut impl EventSink) {
+        // Models has side effects (cache write, harness lookup) that need the
+        // attached link; handle it separately.
+        if let CoreEvent::Models { harness, models } = event {
+            let Some(attached) = &self.core else { return };
+            let found = attached.link.harness(&harness).map(|h| {
+                (
+                    h.preset.id,
+                    h.version(),
+                    attached.link.model_cache_dir.clone(),
+                )
+            });
+            if let Some((id, version, dir)) = found
+                && !models.is_empty()
+            {
+                let cached = CachedModels::new(id, &version, model_cache::now_secs(), &models);
+                std::thread::spawn(move || {
+                    if let Err(e) = model_cache::save(&dir, &cached) {
+                        eprintln!("chaos-control: could not cache the {id} models: {e}");
+                    }
+                });
+                if let Some(a) = &mut self.core {
+                    a.stale.remove(id);
+                }
+                self.set_models(id, models, cx);
+            }
+            return;
+        }
+
+        let Some(attached_ref) = &self.core else {
             return;
         };
+        let main = attached_ref.link.main();
+        let human = attached_ref.link.human;
+        let app_channel = attached_ref.channel;
+        let agents: Vec<ct::MemberId> = attached_ref.link.agents.iter().map(|a| a.member).collect();
+        let agent_ids_snapshot = attached_ref.agent_ids.clone();
+        let (mut seen, mut by_seq, mut receipts, mut reactions) = (
+            std::mem::take(&mut self.core.as_mut().unwrap().seen),
+            std::mem::take(&mut self.core.as_mut().unwrap().by_seq),
+            std::mem::take(&mut self.core.as_mut().unwrap().receipts),
+            std::mem::take(&mut self.core.as_mut().unwrap().reactions),
+        );
+        self.apply_core_event_state(
+            event,
+            main,
+            human,
+            app_channel,
+            &agents,
+            &agent_ids_snapshot,
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+            cx,
+        );
+        if let Some(attached) = &mut self.core {
+            attached.seen = seen;
+            attached.by_seq = by_seq;
+            attached.receipts = receipts;
+            attached.reactions = reactions;
+        }
+    }
+
+    /// UI-free core of [`apply_core_event`] for message/read/reaction/agent
+    /// events. Mutates the provided state and app/channel/log state on `self`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_core_event_state(
+        &mut self,
+        event: CoreEvent,
+        main: ct::ChannelId,
+        human: ct::MemberId,
+        app_channel: Id,
+        agents: &[ct::MemberId],
+        agent_ids: &HashSet<ct::MemberId>,
+        seen: &mut HashMap<ct::MessageId, usize>,
+        by_seq: &mut BTreeMap<ct::Seq, usize>,
+        receipts: &mut HashMap<ct::MemberId, ct::Receipt>,
+        reactions: &mut HashMap<ct::MessageId, Vec<ct::Reaction>>,
+        cx: &mut impl EventSink,
+    ) {
         match event {
             CoreEvent::Message(m) => {
-                if m.channel != attached.link.main() || attached.seen.contains_key(&m.id) {
+                if m.channel != main || seen.contains_key(&m.id) {
                     return;
                 }
+                let is_linked_agent = m.author.is_some_and(|id| agents.contains(&id));
+                let known_agent = m.author.is_some_and(|id| agent_ids.contains(&id));
                 let author = match m.author {
                     _ if m.origin == ct::Origin::System => Author::System,
                     None => Author::System,
-                    Some(id)
-                        if attached.link.agents.iter().any(|a| a.member == id)
-                            || attached.agent_ids.contains(&id) =>
-                    {
-                        Author::Agent(agent_id(id))
-                    }
+                    Some(id) if is_linked_agent || known_agent => Author::Agent(agent_id(id)),
                     Some(_) => Author::Human,
                 };
-                let channel = attached.channel;
                 let reply_to = m.reply_to.and_then(|r| {
-                    let ix = *attached.seen.get(&r)?;
-                    self.logs.get(&channel)?.get(ix).map(ReplyRef::to)
+                    let ix = *seen.get(&r)?;
+                    self.logs.get(&app_channel)?.get(ix).map(ReplyRef::to)
                 });
                 let message = Message {
                     id: Id(CORE_MESSAGE_BASE.saturating_add(m.id.0 as u32)),
@@ -1674,40 +1772,47 @@ impl ChatStore {
                         _ => None,
                     },
                 };
-                let ix = self.logs.get(&channel).map_or(0, |l| l.len());
-                // A receipt already past this message moves down onto it.
-                let moved: Vec<usize> = attached
-                    .receipts
+                let ix = self.logs.get(&app_channel).map_or(0, |l| l.len());
+                let moved: Vec<usize> = receipts
                     .values()
                     .filter(|r| r.read_through >= m.seq)
-                    .filter_map(|r| row_at(&attached.by_seq, r.read_through))
+                    .filter_map(|r| row_at(by_seq, r.read_through))
                     .collect();
-                if let Some(attached) = &mut self.core {
-                    attached.seen.insert(m.id, ix);
-                    attached.by_seq.insert(m.seq, ix);
+                seen.insert(m.id, ix);
+                by_seq.insert(m.seq, ix);
+                if let Some(log) = self.logs.get_mut(&app_channel) {
+                    let range = log.extend(vec![message]);
+                    if !range.is_empty() {
+                        cx.emit(StoreEvent::Appended {
+                            channel: app_channel,
+                            range,
+                        });
+                    }
                 }
-                self.append(channel, vec![message], cx);
                 if !moved.is_empty() {
-                    let rows = moved.into_iter().chain([ix]).collect();
-                    cx.emit(StoreEvent::Receipts { channel, rows });
+                    let mut rows = moved;
+                    rows.push(ix);
+                    cx.emit(StoreEvent::Receipts {
+                        channel: app_channel,
+                        rows,
+                    });
                 }
             }
             CoreEvent::Read(r) => {
-                if r.channel != attached.link.main() || r.member == attached.link.human {
+                if r.channel != main || r.member == human {
                     return;
                 }
-                let channel = attached.channel;
-                let old = attached
-                    .receipts
+                let old = receipts
                     .get(&r.member)
-                    .and_then(|k| row_at(&attached.by_seq, k.read_through));
-                let new = row_at(&attached.by_seq, r.read_through);
-                if let Some(attached) = &mut self.core {
-                    attached.receipts.insert(r.member, r);
-                }
+                    .and_then(|k| row_at(by_seq, k.read_through));
+                let new = row_at(by_seq, r.read_through);
+                receipts.insert(r.member, r);
                 let rows: Vec<usize> = old.into_iter().chain(new).collect();
                 if !rows.is_empty() {
-                    cx.emit(StoreEvent::Receipts { channel, rows });
+                    cx.emit(StoreEvent::Receipts {
+                        channel: app_channel,
+                        rows,
+                    });
                 }
                 cx.notify();
             }
@@ -1730,15 +1835,11 @@ impl ChatStore {
                 emoji,
                 added,
             } => {
-                if channel != attached.link.main() {
+                if channel != main {
                     return;
                 }
-                let row = attached.seen.get(&message).copied();
-                let app_channel = attached.channel;
-                let Some(attached) = &mut self.core else {
-                    return;
-                };
-                let list = attached.reactions.entry(message).or_default();
+                let row = seen.get(&message).copied();
+                let list = reactions.entry(message).or_default();
                 let at = list
                     .iter()
                     .position(|r| r.member == member && r.emoji == emoji);
@@ -1765,31 +1866,7 @@ impl ChatStore {
                 }
                 cx.notify();
             }
-            CoreEvent::Models { harness, models } => {
-                // A live session reported its harness's models: show them and
-                // keep them in the on-disk cache (off the UI thread).
-                let found = attached.link.harness(&harness).map(|h| {
-                    (
-                        h.preset.id,
-                        h.version(),
-                        attached.link.model_cache_dir.clone(),
-                    )
-                });
-                if let Some((id, version, dir)) = found
-                    && !models.is_empty()
-                {
-                    let cached = CachedModels::new(id, &version, model_cache::now_secs(), &models);
-                    std::thread::spawn(move || {
-                        if let Err(e) = model_cache::save(&dir, &cached) {
-                            eprintln!("chaos-control: could not cache the {id} models: {e}");
-                        }
-                    });
-                    if let Some(a) = &mut self.core {
-                        a.stale.remove(id);
-                    }
-                    self.set_models(id, models, cx);
-                }
-            }
+            CoreEvent::Models { .. } => {}
         }
     }
 
@@ -2040,5 +2117,745 @@ mod tests {
             parse_ping_answers_input("*"),
             PingAnswersInput::Entries(vec!["*".into()])
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_core_event_tests {
+    use super::*;
+    use chaos_core::engine::{AgentStatus, CoreEvent};
+    use chaos_core::types as ct;
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::sync::Arc;
+
+    #[derive(Default)]
+    struct Sink {
+        events: Vec<StoreEvent>,
+        notifies: usize,
+    }
+
+    impl EventSink for Sink {
+        fn emit(&mut self, event: StoreEvent) {
+            self.events.push(event);
+        }
+        fn notify(&mut self) {
+            self.notifies += 1;
+        }
+    }
+
+    fn workspace_with_main(app_channel: Id) -> Workspace {
+        Workspace {
+            project: model::Project {
+                id: Id(1),
+                name: Arc::from("test"),
+                emoji: Arc::from("🧪"),
+                path: None,
+            },
+            projects: Vec::new(),
+            channels: vec![model::Channel {
+                id: app_channel,
+                name: Arc::from("main"),
+                ordinal: Some(1),
+                linear_issue: None,
+                unread: false,
+                project_wide: true,
+            }],
+            quick_links: Vec::new(),
+            agents: Vec::new(),
+            mentions: Vec::new(),
+        }
+    }
+
+    fn store_with_main(app_channel: Id) -> ChatStore {
+        let mut store = ChatStore::new(workspace_with_main(app_channel));
+        // ensure log exists
+        store.logs.entry(app_channel).or_default();
+        store
+    }
+
+    fn core_msg(
+        id: i64,
+        seq: u64,
+        channel: ct::ChannelId,
+        author: Option<ct::MemberId>,
+        body: &str,
+        origin: ct::Origin,
+        reply_to: Option<ct::MessageId>,
+        sent_at: ct::Millis,
+    ) -> ct::Message {
+        ct::Message {
+            id: ct::MessageId(id),
+            channel,
+            seq,
+            author,
+            origin,
+            body: Arc::from(body),
+            reply_to,
+            mentions: Vec::new(),
+            hop: 0,
+            sent_at,
+        }
+    }
+
+    fn apply(
+        store: &mut ChatStore,
+        sink: &mut Sink,
+        event: CoreEvent,
+        main: ct::ChannelId,
+        human: ct::MemberId,
+        app_channel: Id,
+        agents: &[ct::MemberId],
+        agent_ids: &HashSet<ct::MemberId>,
+        seen: &mut HashMap<ct::MessageId, usize>,
+        by_seq: &mut BTreeMap<ct::Seq, usize>,
+        receipts: &mut HashMap<ct::MemberId, ct::Receipt>,
+        reactions: &mut HashMap<ct::MessageId, Vec<ct::Reaction>>,
+    ) {
+        store.apply_core_event_state(
+            event,
+            main,
+            human,
+            app_channel,
+            agents,
+            agent_ids,
+            seen,
+            by_seq,
+            receipts,
+            reactions,
+            sink,
+        );
+    }
+
+    #[test]
+    fn message_appends_and_maps_author_stance_and_time() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+        let agent = ct::MemberId(42);
+        let agent_ids: HashSet<_> = [agent].into_iter().collect();
+
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                7,
+                3,
+                main,
+                Some(agent),
+                "hello",
+                ct::Origin::ChatTool,
+                None,
+                12_345,
+            )),
+            main,
+            ct::MemberId(1),
+            app_channel,
+            &[],
+            &agent_ids,
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+
+        let log = store.log(app_channel).unwrap();
+        assert_eq!(log.len(), 1);
+        let m = log.get(0).unwrap();
+        assert_eq!(m.id, Id(CORE_MESSAGE_BASE + 7));
+        assert_eq!(m.author, Author::Agent(agent_id(agent)));
+        assert_eq!(&*m.body, "hello");
+        assert_eq!(m.sent_at, 12); // ms -> s
+        assert_eq!(m.stance, None);
+        assert_eq!(seen.get(&ct::MessageId(7)), Some(&0));
+        assert_eq!(by_seq.get(&3), Some(&0));
+        assert!(matches!(
+            sink.events.as_slice(),
+            [StoreEvent::Appended { channel, range }] if *channel == app_channel && range.start == 0 && range.end == 1
+        ));
+
+        // refusal stance
+        sink.events.clear();
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                8,
+                4,
+                main,
+                Some(agent),
+                "no",
+                ct::Origin::Refusal,
+                None,
+                20_000,
+            )),
+            main,
+            ct::MemberId(1),
+            app_channel,
+            &[],
+            &agent_ids,
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert_eq!(
+            store.log(app_channel).unwrap().get(1).unwrap().stance,
+            Some(Stance::Refusal)
+        );
+    }
+
+    #[test]
+    fn history_vs_live_dedupe_by_core_message_id() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+        let human = ct::MemberId(1);
+        let author = ct::MemberId(2);
+
+        let msg = core_msg(
+            7,
+            1,
+            main,
+            Some(author),
+            "same",
+            ct::Origin::Composer,
+            None,
+            1000,
+        );
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(msg.clone()),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(msg),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+
+        assert_eq!(store.log(app_channel).unwrap().len(), 1);
+        assert_eq!(sink.events.len(), 1); // only first append
+    }
+
+    #[test]
+    fn reply_refs_resolve_to_seen_messages() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+        let author = ct::MemberId(2);
+        let agent_ids: HashSet<_> = [author].into_iter().collect();
+
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                1,
+                1,
+                main,
+                Some(author),
+                "parent",
+                ct::Origin::ChatTool,
+                None,
+                1000,
+            )),
+            main,
+            ct::MemberId(1),
+            app_channel,
+            &[],
+            &agent_ids,
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                2,
+                2,
+                main,
+                Some(author),
+                "child",
+                ct::Origin::ChatTool,
+                Some(ct::MessageId(1)),
+                2000,
+            )),
+            main,
+            ct::MemberId(1),
+            app_channel,
+            &[],
+            &agent_ids,
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+
+        let child = store.log(app_channel).unwrap().get(1).unwrap();
+        let reply = child.reply_to.as_ref().expect("reply ref");
+        assert_eq!(reply.message, Id(CORE_MESSAGE_BASE + 1));
+        assert_eq!(reply.author, Author::Agent(agent_id(author)));
+    }
+
+    #[test]
+    fn read_receipts_track_rows_and_emit_updates() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+        let human = ct::MemberId(1);
+        let reader = ct::MemberId(9);
+
+        // seed two messages
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                1,
+                1,
+                main,
+                Some(human),
+                "a",
+                ct::Origin::Composer,
+                None,
+                1000,
+            )),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                2,
+                2,
+                main,
+                Some(human),
+                "b",
+                ct::Origin::Composer,
+                None,
+                2000,
+            )),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        sink.events.clear();
+        sink.notifies = 0;
+
+        // reader moves to seq 1
+        let r1 = ct::Receipt {
+            member: reader,
+            channel: main,
+            read_through: 1,
+            read_at: 3000,
+        };
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Read(r1.clone()),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert_eq!(receipts.get(&reader), Some(&r1));
+        assert!(
+            matches!(sink.events.as_slice(), [StoreEvent::Receipts { channel, rows }] if *channel == app_channel && rows == &vec![0])
+        );
+        assert_eq!(sink.notifies, 1);
+
+        // moves forward -> old and new rows emitted
+        sink.events.clear();
+        let r2 = ct::Receipt {
+            member: reader,
+            channel: main,
+            read_through: 2,
+            read_at: 4000,
+        };
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Read(r2),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert!(
+            matches!(sink.events.as_slice(), [StoreEvent::Receipts { channel, rows }] if *channel == app_channel && rows == &vec![0, 1])
+        );
+
+        // own receipt ignored
+        sink.events.clear();
+        sink.notifies = 0;
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Read(ct::Receipt {
+                member: human,
+                channel: main,
+                read_through: 2,
+                read_at: 5000,
+            }),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert!(sink.events.is_empty());
+        assert_eq!(sink.notifies, 0);
+    }
+
+    #[test]
+    fn message_after_receipt_emits_receipt_move_to_new_row() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+        let human = ct::MemberId(1);
+        let reader = ct::MemberId(9);
+
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                1,
+                1,
+                main,
+                Some(human),
+                "a",
+                ct::Origin::Composer,
+                None,
+                1000,
+            )),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        receipts.insert(
+            reader,
+            ct::Receipt {
+                member: reader,
+                channel: main,
+                read_through: 5,
+                read_at: 1000,
+            },
+        );
+        sink.events.clear();
+
+        // new message with seq 2 is still <= read_through 5, so receipt "moves down" onto it
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                2,
+                2,
+                main,
+                Some(human),
+                "b",
+                ct::Origin::Composer,
+                None,
+                2000,
+            )),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert!(sink.events.iter().any(|e| matches!(e, StoreEvent::Receipts { channel, rows } if *channel == app_channel && rows.contains(&1))));
+    }
+
+    #[test]
+    fn reactions_add_remove_and_toggle_state() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+        let human = ct::MemberId(1);
+        let member = ct::MemberId(2);
+
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                7,
+                1,
+                main,
+                Some(human),
+                "hi",
+                ct::Origin::Composer,
+                None,
+                1000,
+            )),
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        sink.events.clear();
+        sink.notifies = 0;
+
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Reaction {
+                channel: main,
+                message: ct::MessageId(7),
+                member,
+                emoji: Arc::from("👍"),
+                added: true,
+            },
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert_eq!(reactions.get(&ct::MessageId(7)).unwrap().len(), 1);
+        assert!(
+            matches!(sink.events.as_slice(), [StoreEvent::Reactions { channel, rows }] if *channel == app_channel && rows == &vec![0])
+        );
+        assert_eq!(sink.notifies, 1);
+
+        // duplicate add ignored (no change)
+        sink.events.clear();
+        sink.notifies = 0;
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Reaction {
+                channel: main,
+                message: ct::MessageId(7),
+                member,
+                emoji: Arc::from("👍"),
+                added: true,
+            },
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert!(sink.events.is_empty());
+        assert_eq!(sink.notifies, 0);
+
+        // remove
+        sink.events.clear();
+        sink.notifies = 0;
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Reaction {
+                channel: main,
+                message: ct::MessageId(7),
+                member,
+                emoji: Arc::from("👍"),
+                added: false,
+            },
+            main,
+            human,
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        assert!(reactions.get(&ct::MessageId(7)).unwrap().is_empty());
+        assert!(
+            matches!(sink.events.as_slice(), [StoreEvent::Reactions { channel, rows }] if *channel == app_channel && rows == &vec![0])
+        );
+        assert_eq!(sink.notifies, 1);
+    }
+
+    #[test]
+    fn agent_glow_and_presence_update_workspace() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let agent_core = ct::MemberId(5);
+        let app_id = agent_id(agent_core);
+        store.workspace.agents.push(model::Agent {
+            id: app_id,
+            name: Arc::from("bot"),
+            brand: model::Brand::OpenAi,
+            state: AgentState::Sleeping,
+            presence: None,
+            harness: None,
+            removable: false,
+        });
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Agent(AgentStatus {
+                agent: agent_core,
+                channel: main,
+                glow: ct::Glow::Active,
+                presence: Some(Arc::from("thinking")),
+            }),
+            main,
+            ct::MemberId(1),
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+
+        let a = store
+            .workspace
+            .agents
+            .iter()
+            .find(|a| a.id == app_id)
+            .unwrap();
+        assert_eq!(a.state, AgentState::Active);
+        assert_eq!(a.presence.as_deref(), Some("thinking"));
+        assert_eq!(sink.notifies, 1);
+    }
+
+    #[test]
+    fn system_origin_messages_become_system_author() {
+        let app_channel = Id(10);
+        let main = ct::ChannelId(1);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut seen = HashMap::new();
+        let mut by_seq = BTreeMap::new();
+        let mut receipts = HashMap::new();
+        let mut reactions = HashMap::new();
+
+        apply(
+            &mut store,
+            &mut sink,
+            CoreEvent::Message(core_msg(
+                1,
+                1,
+                main,
+                Some(ct::MemberId(99)),
+                "sys",
+                ct::Origin::System,
+                None,
+                1000,
+            )),
+            main,
+            ct::MemberId(1),
+            app_channel,
+            &[],
+            &HashSet::new(),
+            &mut seen,
+            &mut by_seq,
+            &mut receipts,
+            &mut reactions,
+        );
+        let m = store.log(app_channel).unwrap().get(0).unwrap();
+        assert_eq!(m.author, Author::System);
     }
 }
