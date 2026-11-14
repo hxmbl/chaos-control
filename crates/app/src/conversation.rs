@@ -489,18 +489,25 @@ impl Conversation {
             .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
             .child(menu_item(
                 "menu-reply",
+                IconName::ArrowBendUpLeft,
                 "Reply",
                 t,
                 cx.listener(move |this, _, window, cx| {
                     this.reply_to(menu.reply.clone(), window, cx);
                 }),
             ))
-            .child(menu_item("menu-copy", "Copy text", t, {
-                let body = menu.body.to_string();
-                cx.listener(move |this, _, _, cx| {
-                    this.copy_body(&body, cx);
-                })
-            }));
+            .child(menu_item(
+                "menu-copy",
+                IconName::CopySimple,
+                "Copy text",
+                t,
+                {
+                    let body = menu.body.to_string();
+                    cx.listener(move |this, _, _, cx| {
+                        this.copy_body(&body, cx);
+                    })
+                },
+            ));
 
         if menu.can_react {
             items = items.child(div().h(px(1.)).mx(space::X1).bg(t.line)).child(
@@ -760,6 +767,7 @@ impl Conversation {
 
 fn menu_item(
     id: impl Into<ElementId>,
+    icon_name: IconName,
     label: &'static str,
     t: ui::Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -769,11 +777,15 @@ fn menu_item(
         .px(space::X2)
         .py(space::X1_5)
         .rounded(radius::SM)
+        .flex()
+        .items_center()
+        .gap(space::X2)
         .type_style(text::SMALL)
         .text_color(t.ink)
         .cursor_pointer()
         .hover(|s| s.bg(t.hover))
         .on_click(on_click)
+        .child(icon(icon_name, icons::SM, t.ink_soft))
         .child(label)
 }
 
