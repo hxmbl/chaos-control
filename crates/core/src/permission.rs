@@ -1705,7 +1705,9 @@ impl Engine {
         Ok(r)
     }
 
-    /// Records a request and works out its state: auto-approved in a VM, the
+    /// Records a request and works out its state: auto-approved only when a
+    /// trusted isolation mechanism has verified isolation (VM configuration
+    /// alone is never sufficient; requests otherwise follow host-side policy), the
     /// grant a human already gave (used up here), the same request already
     /// pending, or a new pending request for the humans. "The same" means the
     /// same `key` ([`request_key`]). If the request identity cannot be stably

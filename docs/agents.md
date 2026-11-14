@@ -510,8 +510,11 @@ implemented yet).
 
 **Chat tools.** `chat_request_permission {action, reason?}` asks ahead: on
 the host it answers `{status: "request_sent", request_id, asked}` (or
-`approved` if that action is already approved and unused); auto-approval requires a trusted isolation mechanism with evidence bound to the agent/runtime/session (not available/config-only today),
-`approved`. It is keyed on the `action` text, so it no longer pre-clears a
+`approved` if that action is already approved and unused). Auto-approval
+requires a trusted isolation mechanism with evidence bound to the
+agent/runtime/session (not available/config-only today), so VM configuration
+alone grants no approval and requests use host-side policy. It is keyed on
+the `action` text, so it no longer pre-clears a
 tool call with that title (STRM-572): the tool call is approved through its
 own native request. `chat_permission_status {request_id?}` lists the agent's requests in
 the channel with their answers, plus the queued-command run fields
