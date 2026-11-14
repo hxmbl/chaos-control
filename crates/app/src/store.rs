@@ -15,15 +15,12 @@ use chaos_core::{
     engine::CoreEvent,
     harness::{self, Catalog, HarnessModels, ModelInfo, ModelSource},
     model_cache::{self, CachedModels, Freshness},
-    permission::{LogOutcome, PermissionId, PermissionRequest, PermissionState},
     types as ct,
 };
 use gpui::{Context, EventEmitter, Task};
 use model::{
-    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PERMISSION_LOG_LEN,
-    PaneActionKind, PaneContent, PermissionLog, PermissionLogEntry, PermissionOutcome,
-    PermissionPrompt, ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus,
-    Stance, Workspace,
+    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PaneActionKind, PaneContent,
+    ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus, Stance, Workspace,
 };
 
 use crate::{
@@ -31,12 +28,6 @@ use crate::{
     agents_file,
     project::{self, Confirm, Question, Target},
 };
-
-/// Whether an agent's permission request opens the Approve / Deny pane.
-/// Muted (Hxmbl, 2026-10-31): requests are answered at once (reads allowed,
-/// everything else declined) and listed in the right sidebar's permission
-/// log instead. The pane path stays wired for when human approvals return.
-const PERMISSION_PANE: bool = false;
 
 /// How long after a failed probe (signed out, timed out) a harness is left
 /// alone before the picker opening asks it again.
@@ -89,11 +80,6 @@ pub enum StoreEvent {
     /// Reactions changed on these rows of `channel` (a chip row may appear,
     /// change or go, so their heights may change).
     Reactions { channel: Id, rows: Vec<usize> },
-    /// An agent asked for permission: show it in the pane (Approve / Deny).
-    PermissionAsked(PaneContent),
-    /// A permission request was answered (here or by someone else): close its
-    /// pane if it is still showing.
-    PermissionAnswered { request: i64 },
     /// Sending a human message failed; the composer keeps its draft.
     SendFailed {
         channel: Id,
@@ -126,8 +112,6 @@ pub struct ChatStore {
     selected: Id,
     next_message_id: u32,
     core: Option<Attached>,
-    /// #main's permission requests, newest first (the right sidebar's log).
-    permissions: PermissionLog,
 }
 
 /// One emoji under a message: how many put it there and who.
@@ -349,24 +333,11 @@ impl ChatStore {
             selected,
             next_message_id: 1_000_000,
             core: None,
-            permissions: PermissionLog::default(),
         }
     }
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
-    }
-
-    /// #main's permission requests, newest first (reads included).
-    pub fn permission_log(&self) -> &PermissionLog {
-        &self.permissions
-    }
-
-    /// Replaces the permission log with what core has stored.
-    fn reset_permission_log(&mut self, rows: Vec<PermissionRequest>, cx: &mut Context<Self>) {
-        let entries = rows.iter().map(|r| self.log_entry(r)).collect();
-        self.permissions.reset(entries);
-        cx.notify();
     }
 
     pub fn selected(&self) -> Id {
@@ -753,26 +724,6 @@ impl ChatStore {
                         store.apply_core_event(CoreEvent::Read(r), cx);
                     }
                     store.mark_main_read(cx);
-                });
-                if ok.is_err() {
-                    return;
-                }
-            }
-            // The permission log, as core stored it (requests asked while
-            // the app was closed included).
-            if let Ok(log) = core.permission_log(main, PERMISSION_LOG_LEN).await {
-                let ok = this.update(cx, |store, cx| store.reset_permission_log(log, cx));
-                if ok.is_err() {
-                    return;
-                }
-            }
-            // Requests asked while the app was closed are still pending
-            // (they only reach the pane when it isn't muted).
-            if PERMISSION_PANE && let Ok(pending) = core.pending_permissions(main).await {
-                let ok = this.update(cx, |store, cx| {
-                    for r in pending {
-                        store.apply_core_event(CoreEvent::Permission(r), cx);
-                    }
                 });
                 if ok.is_err() {
                     return;
@@ -1657,10 +1608,6 @@ impl ChatStore {
                 })
                 .ok();
             }
-            if let Ok(log) = core.permission_log(main, PERMISSION_LOG_LEN).await {
-                this.update(cx, |store, cx| store.reset_permission_log(log, cx))
-                    .ok();
-            }
         })
         .detach();
     }
@@ -1687,8 +1634,6 @@ impl ChatStore {
         self.load_ping_answers(cx);
         self.load_nicknames(cx);
         self.load_former_project_agents(cx);
-        // Each project's #main has its own log; it reloads after the switch.
-        self.permissions = PermissionLog::default();
     }
 
     /// Folds one core event into the app's state.
@@ -1776,24 +1721,6 @@ impl ChatStore {
                     };
                     agent.presence = status.presence.clone();
                     cx.notify();
-                }
-            }
-            CoreEvent::Permission(r) => {
-                if r.channel != attached.link.main() {
-                    return;
-                }
-                let entry = self.log_entry(&r);
-                self.permissions.upsert(entry);
-                cx.notify();
-                // Muted: no request opens the pane (see `PERMISSION_PANE`).
-                if !PERMISSION_PANE {
-                    return;
-                }
-                if r.state == PermissionState::Pending {
-                    let prompt = self.permission_prompt(&r);
-                    cx.emit(StoreEvent::PermissionAsked(PaneContent::Permission(prompt)));
-                } else {
-                    cx.emit(StoreEvent::PermissionAnswered { request: r.id.0 });
                 }
             }
             CoreEvent::Reaction {
@@ -1893,112 +1820,6 @@ impl ChatStore {
             });
         }
         cx.notify();
-    }
-
-    /// A core member's display name, if the app knows it.
-    fn member_name(&self, id: ct::MemberId) -> Option<Arc<str>> {
-        let attached = self.core.as_ref()?;
-        attached
-            .link
-            .agents
-            .iter()
-            .find(|x| x.member == id)
-            .map(|x| x.name.clone())
-            .or_else(|| attached.names.get(&id).cloned())
-    }
-
-    /// Who a request was routed to, by name ("Hx").
-    fn asked_names(&self, r: &PermissionRequest) -> Arc<str> {
-        let asked = r
-            .asked_of
-            .iter()
-            .map(|m| {
-                self.member_name(*m)
-                    .map_or_else(|| "someone".to_string(), |n| n.to_string())
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        Arc::from(asked)
-    }
-
-    /// The pane's view of a pending permission request.
-    fn permission_prompt(&self, r: &PermissionRequest) -> PermissionPrompt {
-        PermissionPrompt {
-            request: r.id.0,
-            agent: self
-                .member_name(r.agent)
-                .unwrap_or_else(|| Arc::from("An agent")),
-            action: r.title.clone(),
-            reason: r.reason.clone(),
-            detail: r.detail.clone(),
-            asked: self.asked_names(r),
-            logged: None,
-            command: r.command.clone(),
-            cwd: r.cwd.clone(),
-            run_state: r.run_state.clone(),
-            run_output: r.run_output.clone(),
-            run_exit_code: r.run_exit_code,
-        }
-    }
-
-    /// The permission log's row for a stored request. A member who has left
-    /// reads as "Previous agent", with no mark.
-    fn log_entry(&self, r: &PermissionRequest) -> PermissionLogEntry {
-        let agent = self.workspace.agent(agent_id(r.agent));
-        PermissionLogEntry {
-            request: r.id.0,
-            agent: agent.map(|a| a.id),
-            brand: agent.map(|a| a.brand),
-            agent_name: agent.map_or_else(
-                || {
-                    self.member_name(r.agent)
-                        .unwrap_or_else(|| Arc::from(model::PREVIOUS_AGENT))
-                },
-                |a| a.name.clone(),
-            ),
-            action: r.title.clone(),
-            outcome: match r.outcome() {
-                LogOutcome::AutoAllowed => PermissionOutcome::AutoAllowed,
-                LogOutcome::Pending => PermissionOutcome::Pending,
-                LogOutcome::Declined => PermissionOutcome::Declined,
-                LogOutcome::Approved => PermissionOutcome::Approved,
-                LogOutcome::Running => PermissionOutcome::Running,
-                LogOutcome::Done => PermissionOutcome::Done,
-                LogOutcome::Failed => PermissionOutcome::Failed,
-            },
-            at: r.created_at / 1000,
-            read_only: r.read_only,
-            reason: r.reason.clone(),
-            detail: r.detail.clone(),
-            asked: self.asked_names(r),
-            command: r.command.clone(),
-            cwd: r.cwd.clone(),
-            run_state: r.run_state.clone(),
-            run_output: r.run_output.clone(),
-            run_exit_code: r.run_exit_code,
-        }
-    }
-
-    /// The local human's answer to a permission request. Core posts it and
-    /// wakes the agent; a refusal (already answered) shows as a local note.
-    pub fn answer_permission(&mut self, request: i64, approve: bool, cx: &mut Context<Self>) {
-        let Some(attached) = &self.core else {
-            return;
-        };
-        let core = attached.link.core.clone();
-        let human = attached.link.human;
-        cx.spawn(async move |this, cx| {
-            if let Err(e) = core
-                .answer_permission(PermissionId(request), human, approve, None)
-                .await
-            {
-                this.update(cx, |store, cx| {
-                    store.system_note(&format!("Couldn't answer request #{request}: {e}"), cx)
-                })
-                .ok();
-            }
-        })
-        .detach();
     }
 
     /// A local notice in the selected channel (e.g. a post core refused).

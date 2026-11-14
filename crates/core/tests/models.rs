@@ -11,9 +11,7 @@ use chaos_core::{
     engine::CoreEvent,
     fake::{self, FakeAgent},
     host::MemberSpec,
-    permission::RunsIn,
     roster::ModelMember,
-    types::*,
 };
 use common::*;
 use serde_json::json;
@@ -35,7 +33,6 @@ async fn add(
     model: Option<&str>,
     name: &str,
     adapter: Arc<dyn AgentAdapter>,
-    runs_in: RunsIn,
 ) -> ModelMember {
     h.core
         .add_model_member(
@@ -45,8 +42,6 @@ async fn add(
                 model_name: name.into(),
                 adapter,
                 cwd: Some(std::env::temp_dir()),
-                runs_in,
-                approval: ApprovalMode::AskAll,
             },
             h.main,
         )
@@ -87,7 +82,6 @@ async fn acp_member_runs_its_model_through_the_session_model_option() {
         Some("big-2"),
         "Big Two",
         acp_adapter(&fake, Some("big-2")),
-        RunsIn::Host,
     )
     .await;
     assert_eq!(&*m.member.handle, "big-two");
@@ -126,7 +120,6 @@ async fn a_model_the_harness_does_not_offer_runs_the_default_and_says_so() {
         Some("gone-9"),
         "Gone Nine",
         acp_adapter(&fake, Some("gone-9")),
-        RunsIn::Host,
     )
     .await;
     h.say("@gone-nine hello").await;
@@ -144,15 +137,7 @@ async fn a_model_the_harness_does_not_offer_runs_the_default_and_says_so() {
 async fn the_default_model_member_sets_nothing() {
     let mut h = Harness::new().await;
     let fake = FakeAgent::new(script(models_script()));
-    let m = add(
-        &h,
-        "fx",
-        None,
-        "fx default",
-        acp_adapter(&fake, None),
-        RunsIn::Host,
-    )
-    .await;
+    let m = add(&h, "fx", None, "fx default", acp_adapter(&fake, None)).await;
     assert_eq!(&*m.member.handle, "fx");
     h.say("@fx hello").await;
     h.wait_message("the reply", Some(m.member.id)).await;
@@ -235,8 +220,6 @@ async fn devin_folders_are_trusted_before_discovery_and_sessions() {
                 model_name: "Devin".into(),
                 adapter,
                 cwd: Some(work_dir.clone()),
-                runs_in: RunsIn::Host,
-                approval: ApprovalMode::AskAll,
             },
             h.main,
         )
@@ -276,7 +259,6 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
         Some("fast-1"),
         "Fast One",
         acp_adapter(&fake_a, Some("fast-1")),
-        RunsIn::Host,
     )
     .await;
     let b = add(
@@ -285,7 +267,6 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
         Some("big-2"),
         "Big Two",
         acp_adapter(&fake_b, Some("big-2")),
-        RunsIn::Host,
     )
     .await;
     assert_ne!(a.member.id, b.member.id);
@@ -303,7 +284,6 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
         Some("big-2"),
         "Big Two",
         acp_adapter(&fake_b, Some("big-2")),
-        RunsIn::Host,
     )
     .await;
     assert_eq!(again.member.id, b.member.id);

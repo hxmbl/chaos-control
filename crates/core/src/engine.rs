@@ -8,14 +8,13 @@
 //! The rules (triggers, batches, acceptance, obligations, fallback) are written
 //! up in `docs/agents.md`; the comments here point at the code that enforces them.
 
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use rusqlite::Connection;
 
 use crate::{
     adapter::{AgentError, AgentErrorKind, AgentEvent, Probe, SessionInfo, TurnOutcome},
     notify,
-    permission::{self, PermissionRequest, RunsIn},
     policy::{self, Damp, Policy, PolicyState},
     reaction::{self, PingAnswers, PingAnswersError},
     store::{self, NewMessage, Store},
@@ -60,8 +59,6 @@ pub enum CoreEvent {
     Agent(AgentStatus),
     /// A member's read receipt moved forward.
     Read(Receipt),
-    /// A permission request was sent, answered, auto-approved or used.
-    Permission(PermissionRequest),
     /// A harness reported the models it offers (from a live session); they
     /// are cached in the store too.
     Models {
@@ -245,7 +242,7 @@ struct Rt {
     status: Option<Arc<str>>,
     /// Coarse activity from the adapter during a turn.
     activity: Option<Arc<str>>,
-    /// Last runtime note (declined permission, hop limit, finished silently).
+    /// Last runtime note (hop limit, finished silently).
     note: Option<Arc<str>>,
     idle_since: Option<Millis>,
     /// Messages the agent posted during the in-flight turn.
@@ -261,12 +258,6 @@ pub struct Engine {
     pstate: PolicyState,
     rt: HashMap<(MemberId, ChannelId), Rt>,
     pub(crate) effects: Vec<Effect>,
-    /// Where each agent runs (see `permission`); absent means the host.
-    pub(crate) runs_in: HashMap<MemberId, RunsIn>,
-    /// Host-side approval mode per agent (STRM-542). Absent means AskAll.
-    pub(crate) approval_mode: HashMap<MemberId, ApprovalMode>,
-    /// The agent's working directory, when known (used for command execution).
-    pub(crate) agent_cwd: HashMap<MemberId, PathBuf>,
     /// Per-agent ping-answer lists from `agents.json`; absent means the
     /// project's setting, then the default (see [`Engine::ping_answers`]).
     ping_answers: HashMap<MemberId, PingAnswers>,
@@ -290,13 +281,9 @@ impl Engine {
             pstate: PolicyState::default(),
             rt: HashMap::new(),
             effects: Vec::new(),
-            runs_in: HashMap::new(),
-            approval_mode: HashMap::new(),
-            agent_cwd: HashMap::new(),
             ping_answers: HashMap::new(),
         };
         let pending = engine.store.tx(|c| store::recover(c, now))?;
-        engine.recover_interrupted_command_runs(now);
         for (agent, channel) in pending {
             engine.pump(now, agent, channel);
         }
@@ -461,12 +448,6 @@ impl Engine {
             )))
         } else {
             rt.note.clone().or_else(|| rt.status.clone())
-        };
-        // A pending permission request shows as such (never "blocked": the
-        // agent may well be doing something else meanwhile).
-        let presence = match rt.red {
-            Some(_) => presence,
-            None => permission::pending_presence(self.conn(), agent, channel).or(presence),
         };
         AgentStatus {
             agent,
@@ -995,43 +976,6 @@ impl Engine {
         }
     }
 
-    /// Per-channel approval mode override (STRM-542). Affects new requests only.
-    pub fn set_channel_approval_mode_override(
-        &mut self,
-        channel: ChannelId,
-        mode: Option<ApprovalMode>,
-    ) -> Result<(), rusqlite::Error> {
-        self.store
-            .tx(|c| crate::store::set_channel_approval_mode(c, channel, mode.map(|m| m.as_str())))
-    }
-
-    /// Per-project approval mode override (STRM-542). Affects new requests only.
-    pub fn set_project_approval_mode_override(
-        &mut self,
-        project: &ProjectId,
-        mode: Option<ApprovalMode>,
-        now: Millis,
-    ) -> Result<(), rusqlite::Error> {
-        self.store.tx(|c| {
-            crate::store::set_project_setting(
-                c,
-                project,
-                "approval_mode",
-                mode.map(|m| m.as_str()),
-                now,
-            )
-        })
-    }
-
-    /// Workspace-level approval mode override (STRM-542). Affects new requests only.
-    pub fn set_workspace_approval_mode_override(
-        &mut self,
-        mode: Option<ApprovalMode>,
-    ) -> Result<(), rusqlite::Error> {
-        self.store
-            .tx(|c| crate::store::set_app_setting(c, "approval_mode", mode.map(|m| m.as_str())))
-    }
-
     /// A roster model member's own ping-answer list, or `None` when it has
     /// none (or is not a model member).
     pub fn member_ping_answers(
@@ -1173,23 +1117,6 @@ impl Engine {
             .filter(|t| !t.is_empty())
             .map(|t| Arc::from(t.chars().take(120).collect::<String>()));
         self.publish_status(agent, channel);
-    }
-
-    /// Sets the agent's runtime note (its presence when idle).
-    pub(crate) fn rt_note(&mut self, agent: MemberId, channel: ChannelId, note: String) {
-        self.rt.entry((agent, channel)).or_default().note = Some(Arc::from(note));
-        self.publish_status(agent, channel);
-    }
-
-    /// A human turned to this agent: clear a red state so it can be tried again.
-    pub(crate) fn human_fresh_start(&mut self, agent: MemberId, channel: ChannelId) {
-        let max = self.policy.max_failures;
-        let rt = self.rt.entry((agent, channel)).or_default();
-        if rt.failures >= max || rt.red.is_some() {
-            rt.failures = 0;
-            rt.red = None;
-            rt.retry_at = None;
-        }
     }
 
     // ---------- delivery ----------

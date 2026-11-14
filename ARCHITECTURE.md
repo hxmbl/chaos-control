@@ -72,8 +72,10 @@ channels from core and #main is the project's own `main` channel:
   `chaos-control mcp-bridge` (URL and token in its environment).
 
 Only #main is wired to post through core so far; other channels arrive with
-channel management. The delivery, batching, obligation and permission rules are
-in [docs/agents.md](docs/agents.md).
+channel management. The delivery, batching and obligation rules are in
+[docs/agents.md](docs/agents.md). Agent permissions are currently not
+mediated (being redesigned): an agent's permission request is answered at once
+with its own allow option (see "Permissions" there).
 
 ## Storage model
 
@@ -122,7 +124,8 @@ Migration 3 adds `projects.unclaimed_import`, set only on that "Imported"
 project, so it can be adopted by one folder, once (see Relinking imported
 history below). Migrations 4 to 6 add read receipts, stances and permission
 requests; migration 7 adds model members and rosters, migration 8 the
-permission log's `read_only`; migration 9 rebuilds `reactions` with each
+permission log's `read_only` (the permission tables are unused since the
+permission model was removed; the migrations stay); migration 9 rebuilds `reactions` with each
 reaction's channel (see "Reactions" in [docs/agents.md](docs/agents.md));
 migration 10 adds `project_settings`, one JSON value per (project, key), holding
 `ping_answer_reactions` so far; migration 11 adds a roster model member's own
@@ -286,8 +289,7 @@ never moves and there is never more than one.
 
 - **Content is model data.** `model::PaneContent` (GPUI-free) says what is
   shown: `LongMessage`, `Attachment`, `Settings`, `Review`, `Compose`,
-  `Search`, `ProjectIdentity`, `Permission` (Approve / Deny, muted for now;
-  read-only when opened from the permission log). Each knows its title and its quick actions (`PaneAction` /
+  `Search`, `ProjectIdentity`. Each knows its title and its quick actions (`PaneAction` /
   `PaneActionKind`), so the agent runtime can open a pane by building one and
   calling `PaneHost::open`. The UI only decides how each body looks.
 - **Element and state.** `ui::Pane` is the element: a red macOS-style close dot
@@ -487,32 +489,6 @@ Each sidebar has a mode, `Auto` by default:
   popovers); the grace starts when that ends.
 - Motion: docking and collapsing slide the panel off its edge and reflow the
   column over 180ms (ease-out cubic), reversible mid-slide.
-
-### The right sidebar's permission log
-
-Agents' permission requests no longer open the pane (muted, Hxmbl
-2026-10-31; `store::PERMISSION_PANE = false`). The right sidebar shows them
-instead, in a **Permissions** section between mentions and Agent status:
-
-- One borderless row per request in #main, newest first: the agent's mark
-  (monochrome `ink_soft`, or its initial once the member has left), the tool
-  call's title (first line, ellipsis), the outcome in caption type
-  (**Auto-allowed** or **Declined**; **Approved** only if a human approved
-  through core) and a relative time ("now", "4m", "2h", "3d", "5w",
-  `model::relative_time`, redrawn every 30s while the log has rows). The
-  tooltip has the agent's name, the full title and the request id.
-- The section hugs its rows, caps at five and scrolls past that, like the
-  left sidebar's channel section. It isn't drawn while the log is empty
-  (the sample shell, or no requests yet).
-- Clicking a row opens the pane read-only (`PermissionPrompt::logged`): the
-  title is "<agent> · <outcome>", the body has the title, reason and detail,
-  and there are no quick actions.
-- Data: `ChatStore` keeps a `model::PermissionLog` (200 rows, newest first by
-  request id, updated in place). It loads `Core::permission_log` when core
-  starts and after a project switch, then folds in every
-  `CoreEvent::Permission`, which core now also sends for each allowed read
-  (reads are stored with `read_only = 1`, migration 8; see
-  `docs/agents.md`, "Permissions").
 
 ## Shortcuts
 

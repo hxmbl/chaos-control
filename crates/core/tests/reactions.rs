@@ -14,9 +14,7 @@ use chaos_core::{
     engine::PostError,
     fake::{self, FakeAgent},
     host::MemberSpec,
-    mcp,
-    permission::RunsIn,
-    reaction,
+    mcp, reaction,
     types::*,
 };
 use common::*;
@@ -671,8 +669,6 @@ async fn model_member(h: &Harness, name: &str, script: fake::Script) -> Member {
                 model_name: name.into(),
                 adapter,
                 cwd: Some(std::env::temp_dir()),
-                runs_in: RunsIn::Host,
-                approval: ApprovalMode::AskAll,
             },
             h.main,
         )

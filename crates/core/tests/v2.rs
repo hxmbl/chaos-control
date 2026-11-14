@@ -155,32 +155,23 @@ async fn v2_fallback_text_follows_keyed_message_and_tool_call_upserts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_permission_request_is_sent_and_declined_natively_for_now() {
+async fn v2_permission_request_is_auto_allowed() {
+    // Permissions are not mediated (being redesigned): the agent's own allow
+    // option is selected at once, with no note, prompt or queue.
     let mut h = Harness::new().await;
     let bot = h
         .agent(
             "bot",
             v2(json!([{"steps": [
                 {"permission": "rm -rf build/"},
-                {"text": "I wasn't allowed to delete build/."}
+                {"text": "Deleted build/."}
             ]}])),
         )
         .await;
     let ping = h.say("@bot clean the build dir").await;
-    let note = h.wait_message("system note", None).await;
-    assert!(
-        note.body.contains("@bot asked to run rm -rf build/"),
-        "{}",
-        note.body
-    );
-    assert!(
-        note.body.contains("permission request #1, sent to @hx"),
-        "{}",
-        note.body
-    );
     let reply = h.wait_message("fallback", Some(bot.id)).await;
     assert_eq!(reply.reply_to, Some(ping.id));
-    assert_eq!(&*reply.body, "I wasn't allowed to delete build/.");
+    assert_eq!(&*reply.body, "Deleted build/.");
     let outcomes = h
         .fake("bot")
         .observed
@@ -192,17 +183,11 @@ async fn v2_permission_request_is_sent_and_declined_natively_for_now() {
     assert_eq!(outcomes[0]["outcome"]["outcome"], json!("selected"));
     assert_eq!(
         outcomes[0]["outcome"]["optionId"],
-        json!("deny"),
-        "never auto-approved on the host: {}",
-        outcomes[0]
-    );
-    assert_eq!(
-        outcomes[0]["_meta"]["chaosControl"]["status"],
-        json!("request_sent"),
+        json!("allow"),
         "{}",
         outcomes[0]
     );
-    assert_eq!(outcomes[0]["_meta"]["chaosControl"]["requestId"], json!(1));
+    assert!(outcomes[0].get("_meta").is_none(), "{}", outcomes[0]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -6,7 +6,7 @@
 //! created in the data directory when there is none.
 //!
 //! Only `members` changes. Every other key, and every other field of an
-//! existing member entry (`cwd`, `runs_in`, anything unknown), is kept, in
+//! existing member entry (`cwd`, anything unknown), is kept, in
 //! its order; the file is re-indented with two spaces. A file that isn't
 //! valid JSON is never overwritten: the change is refused and reported, so a
 //! typo the user is in the middle of fixing can't cost them the file. Writes
@@ -18,7 +18,6 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use chaos_core::types::ApprovalMode;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
@@ -29,9 +28,6 @@ pub struct Entry {
     /// The harness's model id; `None` runs its default.
     pub model: Option<String>,
     pub name: String,
-    /// The approval mode for this agent (STRM-542). Defaults to `AskAll`.
-    #[serde(default)]
-    pub approval: ApprovalMode,
 }
 
 impl Entry {
@@ -40,7 +36,6 @@ impl Entry {
             harness: harness.to_string(),
             model: model.map(str::to_string),
             name: name.to_string(),
-            approval: ApprovalMode::AskAll,
         }
     }
 
@@ -51,10 +46,6 @@ impl Entry {
             m.insert("model".into(), json!(model));
         }
         m.insert("name".into(), json!(self.name));
-        // Only include approval if it's not the default
-        if self.approval != ApprovalMode::AskAll {
-            m.insert("approval".into(), json!(self.approval.as_str()));
-        }
         Value::Object(m)
     }
 }

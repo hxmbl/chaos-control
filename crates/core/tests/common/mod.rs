@@ -11,7 +11,6 @@ use chaos_core::{
     engine::CoreEvent,
     fake::{self, FakeAgent, Script},
     host::{AgentSpec, Core, HostConfig, ManualClock},
-    permission::RunsIn,
     store,
     types::*,
 };
@@ -64,16 +63,7 @@ impl Harness {
     }
 
     pub async fn agent(&mut self, handle: &str, script: Script) -> Member {
-        self.agent_in(handle, script, RunsIn::Host).await
-    }
-
-    /// An agent that runs in its own VM (every permission is approved).
-    pub async fn agent_in_vm(&mut self, handle: &str, script: Script) -> Member {
-        self.agent_in(handle, script, RunsIn::Vm).await
-    }
-
-    pub async fn agent_in(&mut self, handle: &str, script: Script, runs_in: RunsIn) -> Member {
-        self.agent_with(handle, script, runs_in, None).await
+        self.agent_with(handle, script, None).await
     }
 
     /// An agent with its own list of reactions that answer a ping (as
@@ -85,15 +75,13 @@ impl Harness {
         answers: &[&str],
     ) -> Member {
         let answers = chaos_core::reaction::PingAnswers::parse(answers).expect("valid list");
-        self.agent_with(handle, script, RunsIn::Host, Some(answers))
-            .await
+        self.agent_with(handle, script, Some(answers)).await
     }
 
     pub async fn agent_with(
         &mut self,
         handle: &str,
         script: Script,
-        runs_in: RunsIn,
         ping_answers: Option<chaos_core::reaction::PingAnswers>,
     ) -> Member {
         let fake = FakeAgent::new(script);
@@ -110,8 +98,6 @@ impl Harness {
                     name: handle.into(),
                     adapter: adapter.clone(),
                     cwd: Some(std::env::temp_dir()),
-                    runs_in,
-                    approval: ApprovalMode::AskAll,
                     ping_answers,
                 },
                 self.main,
