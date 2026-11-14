@@ -14,8 +14,9 @@ macro_rules! embed {
 static FILES: &[(&str, &[u8])] = embed![
     "icons/chaos-control.svg",
     "icons/phosphor/archive.svg",
-    "icons/phosphor/arrow-up.svg",
+    "icons/phosphor/arrow-bend-up-left.svg",
     "icons/phosphor/arrow-clockwise.svg",
+    "icons/phosphor/arrow-up.svg",
     "icons/phosphor/caret-down.svg",
     "icons/phosphor/caret-right.svg",
     "icons/phosphor/caret-up.svg",
@@ -23,6 +24,7 @@ static FILES: &[(&str, &[u8])] = embed![
     "icons/phosphor/check.svg",
     "icons/phosphor/circle-dashed.svg",
     "icons/phosphor/copy-simple.svg",
+    "icons/phosphor/dots-three.svg",
     "icons/phosphor/download-simple.svg",
     "icons/phosphor/gear-six.svg",
     "icons/phosphor/hash.svg",
