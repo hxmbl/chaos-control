@@ -43,7 +43,8 @@ impl KnownMentions {
     /// Adds broadcast targets as known mentions.
     pub fn insert_broadcasts(&mut self) {
         for token in BROADCASTS {
-            self.by_token.insert((*token).to_string(), (*token).to_string());
+            self.by_token
+                .insert((*token).to_string(), (*token).to_string());
         }
     }
 
@@ -183,7 +184,11 @@ pub fn mention_color(identity: &str, appearance: Appearance) -> Hsla {
 }
 
 /// Highlight styles for mention spans in `text`.
-pub fn mention_highlights(text: &str, known: &KnownMentions, appearance: Appearance) -> Vec<(Range<usize>, HighlightStyle)> {
+pub fn mention_highlights(
+    text: &str,
+    known: &KnownMentions,
+    appearance: Appearance,
+) -> Vec<(Range<usize>, HighlightStyle)> {
     find_mentions(text, known)
         .into_iter()
         .map(|m| {
@@ -219,7 +224,10 @@ mod tests {
         let c_dark = mention_color("claude", Appearance::Dark);
         assert_eq!(a, b);
         // nicknames share identity through KnownMentions, but color fn hashes identity
-        assert_eq!(mention_color("claude", Appearance::Light), mention_color("claude", Appearance::Light));
+        assert_eq!(
+            mention_color("claude", Appearance::Light),
+            mention_color("claude", Appearance::Light)
+        );
         // different appearance can differ, but must be deterministic
         assert_eq!(c_dark, mention_color("claude", Appearance::Dark));
     }
@@ -236,14 +244,13 @@ mod tests {
     fn matches_known_mentions_case_insensitively_with_boundaries() {
         let k = known();
         let spans = find_mentions("hey @Claude and @CODY, ping @everyone", &k);
-        let found: Vec<_> = spans.iter().map(|m| (&m.identity[..], m.range.clone())).collect();
+        let found: Vec<_> = spans
+            .iter()
+            .map(|m| (&m.identity[..], m.range.clone()))
+            .collect();
         assert_eq!(
             found,
-            vec![
-                ("claude", 4..11),
-                ("claude", 16..21),
-                ("everyone", 28..37),
-            ]
+            vec![("claude", 4..11), ("claude", 16..21), ("everyone", 28..37),]
         );
         // trailing dot is punctuation outside highlight
         let spans = find_mentions("thanks @claude.", &k);

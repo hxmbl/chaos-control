@@ -4,9 +4,9 @@ mod agents;
 mod agents_file;
 mod composer;
 mod conversation;
-mod mention_highlight;
 #[cfg(target_os = "macos")]
 mod dock;
+mod mention_highlight;
 mod model_picker;
 mod pane_host;
 mod panels;

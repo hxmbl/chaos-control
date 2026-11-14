@@ -720,7 +720,9 @@ impl Conversation {
             let this = cx.entity().downgrade();
             return list(self.list.clone(), move |ix, window, cx| {
                 this.upgrade()
-                    .map(|view| view.update(cx, |view, view_cx| view.render_message(ix, window, view_cx)))
+                    .map(|view| {
+                        view.update(cx, |view, view_cx| view.render_message(ix, window, view_cx))
+                    })
                     .unwrap_or_else(|| div().into_any_element())
             })
             .size_full()
