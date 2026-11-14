@@ -27,7 +27,7 @@ const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const HOVER_TEXT_FADE: Duration = Duration::from_millis(140);
 /// Update-check animation: spin the refresh arrow, break it into a dashed
 /// ring, then land on the tick — where it stops (it never cycles past it).
-const UPDATE_SPIN: Duration = Duration::from_millis(200);
+const UPDATE_SPIN: Duration = Duration::from_millis(400);
 const UPDATE_DASH: Duration = Duration::from_millis(800); // NOTE: should be temporary, wait till self updating is hooked
 const UPDATE_POP: Duration = Duration::from_millis(300);
 /// Crossfade between two glyphs of the update animation.
@@ -118,9 +118,9 @@ impl Titlebar {
 
         let mut el = resting;
         if arrow_op > 0.001 {
-            // Two eased turns over the spin.
+            // One eased turn over the spin.
             let p = (e / spin).min(1.0);
-            let angle = TAU * 2.0 * (1.0 - (1.0 - p).powi(2));
+            let angle = TAU * (1.0 - (1.0 - p).powi(2));
             el = el.child(
                 icon(IconName::ArrowClockwise, md, color)
                     .absolute()
