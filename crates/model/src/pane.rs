@@ -14,9 +14,9 @@ use std::sync::Arc;
 use crate::{Author, Id, Message, SearchResult, Workspace};
 
 /// A message is collapsed in the chat when it has more characters than this…
-pub const LONG_MESSAGE_CHARS: usize = 2400;
+pub const LONG_MESSAGE_CHARS: usize = 3600;
 /// …or more lines than this.
-pub const LONG_MESSAGE_LINES: usize = 40;
+pub const LONG_MESSAGE_LINES: usize = 50;
 /// The collapsed preview keeps at most this many characters…
 pub const PREVIEW_CHARS: usize = 320;
 /// …and this many lines.
