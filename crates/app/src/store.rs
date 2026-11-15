@@ -292,6 +292,25 @@ pub struct MentionCandidate {
     pub nicknames: Vec<Arc<str>>,
 }
 
+/// A slash command the composer can suggest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashCommandCandidate {
+    /// Command name without the leading `/`.
+    pub name: Arc<str>,
+    pub description: Arc<str>,
+    /// Optional argument hint shown after the command name (e.g. `<path>`).
+    pub argument_hint: Option<Arc<str>>,
+}
+
+/// A slash command invocation selected in the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashCommandInvocation {
+    /// Command name without the leading `/`.
+    pub name: Arc<str>,
+    /// Arguments text after the command token.
+    pub arguments: String,
+}
+
 /// One change from the Settings nickname field.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NicknameEdit {
@@ -1354,6 +1373,39 @@ impl ChatStore {
                     .unwrap_or_default(),
             })
             .collect()
+    }
+
+    /// Slash commands available to the composer. Populated by the application
+    /// command registry/dispatcher (STRM-590); empty until wired.
+    pub fn slash_command_candidates(&self) -> Vec<SlashCommandCandidate> {
+        vec![
+            SlashCommandCandidate {
+                name: Arc::from("test"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+            SlashCommandCandidate {
+                name: Arc::from("test2"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+            SlashCommandCandidate {
+                name: Arc::from("test3"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+            SlashCommandCandidate {
+                name: Arc::from("thisisalsoatest"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+        ]
+    }
+
+    /// Hands a slash-command invocation to the application dispatcher.
+    /// The composer does not execute commands itself (STRM-589/590).
+    pub fn dispatch_slash_command(&mut self, _invocation: SlashCommandInvocation) {
+        // Wired by STRM-590.
     }
 
     /// Applies the Settings nickname field (`@handle cody -cx`; see
