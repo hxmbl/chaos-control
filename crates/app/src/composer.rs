@@ -105,8 +105,8 @@ fn working_indicator_text(
             font: base_style.font(),
             color,
             background_color: base_style.background_color,
-            underline: base_style.underline.clone(),
-            strikethrough: base_style.strikethrough.clone(),
+            underline: base_style.underline,
+            strikethrough: base_style.strikethrough,
         });
     }
     StyledText::new(label).with_runs(runs)
