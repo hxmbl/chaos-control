@@ -15,6 +15,7 @@ rust-version = "1.88"
 # local builds resolve the same thing; bump deliberately.
 gpui = "=0.2.2"
 unicode-segmentation = "1.12"
+pulldown-cmark = { version = "0.13", default-features = false, features = ["simd"] }
 model = { path = "crates/model" }
 chaos-core = { path = "crates/core" }
 ui = { path = "crates/ui" }

@@ -235,13 +235,13 @@ impl Conversation {
         let body: AnyElement = if is_long {
             self.render_collapsed_with(ix, &message, &display, &known, &t, window)
         } else {
-            div()
-                .w_full()
-                .min_w_0()
-                .whitespace_normal()
-                .text_color(t.ink_soft)
-                .child(highlighted_text(display, &known, t.ink_soft, &t, window))
-                .into_any_element()
+            crate::markdown::render_message_markdown(
+                display.as_ref(),
+                &known,
+                t.ink_soft,
+                &window.text_style(),
+                &t,
+            )
         };
 
         let message_id = message.id;
