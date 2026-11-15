@@ -799,6 +799,14 @@ impl Render for Composer {
                 if !this.suggestions_open() {
                     return;
                 }
+                // Don't steal Shift+Arrow (text selection) or other modified navigation.
+                if event.keystroke.modifiers.shift
+                    || event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.platform
+                {
+                    return;
+                }
                 let key = event.keystroke.key.as_str();
                 match key {
                     "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
