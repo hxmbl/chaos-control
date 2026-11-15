@@ -127,10 +127,7 @@ fn highlight_code_runs(
     base_color: Hsla,
     is_dark: bool,
 ) -> Vec<Vec<TextRun>> {
-    use std::{
-        collections::HashMap,
-        sync::{Mutex, OnceLock},
-    };
+    use std::sync::{Mutex, OnceLock};
     #[derive(Clone, Eq, Hash, PartialEq)]
     struct Key(String, Option<String>, bool);
     static CACHE: OnceLock<Mutex<StdHashMap<Key, Vec<Vec<TextRun>>>>> = OnceLock::new();
@@ -211,8 +208,8 @@ fn highlight_code_runs(
                 font,
                 color,
                 background_color: base_style.background_color,
-                underline: base_style.underline.clone(),
-                strikethrough: base_style.strikethrough.clone(),
+                underline: base_style.underline,
+                strikethrough: base_style.strikethrough,
             });
         }
         out.push(runs);
@@ -248,6 +245,8 @@ struct ListState {
     start: u64,
 }
 
+type ListStack = Vec<(ListState, Vec<(Option<String>, Vec<AnyElement>)>)>;
+
 struct Renderer<'a> {
     known: &'a KnownMentions,
     text_color: Hsla,
@@ -269,7 +268,7 @@ struct Renderer<'a> {
     table_rows: Vec<Vec<AnyElement>>,
     current_table_row: Vec<AnyElement>,
     in_table_cell: bool,
-    list_stack: Vec<(ListState, Vec<(Option<String>, Vec<AnyElement>)>)>,
+    list_stack: ListStack,
     item_block_stack: Vec<Vec<AnyElement>>,
     item_marker_stack: Vec<Option<String>>,
     in_list_item: usize,
@@ -327,11 +326,11 @@ impl<'a> Renderer<'a> {
             return;
         }
         let style = self.current_style();
-        if let Some(last) = self.para_spans.last_mut() {
-            if last.style == style {
-                last.text.push_str(text);
-                return;
-            }
+        if let Some(last) = self.para_spans.last_mut()
+            && last.style == style
+        {
+            last.text.push_str(text);
+            return;
         }
         self.para_spans.push(Span {
             text: text.to_string(),
@@ -356,11 +355,11 @@ impl<'a> Renderer<'a> {
 
     fn push_block(&mut self, element: AnyElement) {
         let element = self.wrap_blockquote(element);
-        if self.in_list_item > 0 {
-            if let Some(item) = self.item_block_stack.last_mut() {
-                item.push(element);
-                return;
-            }
+        if self.in_list_item > 0
+            && let Some(item) = self.item_block_stack.last_mut()
+        {
+            item.push(element);
+            return;
         }
         self.blocks.push(element);
     }
@@ -476,6 +475,7 @@ impl<'a> Renderer<'a> {
         container.into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_styled_runs(
         &self,
         full: &str,
@@ -522,8 +522,8 @@ impl<'a> Renderer<'a> {
                 self.text_color
             };
             let mut bg = base.background_color;
-            let mut underline = base.underline.clone();
-            let mut strike = base.strikethrough.clone();
+            let mut underline = base.underline;
+            let mut strike = base.strikethrough;
             if style.strike {
                 strike = Some(StrikethroughStyle {
                     thickness: px(1.),
@@ -758,8 +758,8 @@ impl<'a> Renderer<'a> {
                                         font: self.base_style.font(),
                                         color: t.ink,
                                         background_color: self.base_style.background_color,
-                                        underline: self.base_style.underline.clone(),
-                                        strikethrough: self.base_style.strikethrough.clone(),
+                                        underline: self.base_style.underline,
+                                        strikethrough: self.base_style.strikethrough,
                                     }];
                                 }
                                 let styled = StyledText::new(display).with_runs(runs);
@@ -887,10 +887,10 @@ impl<'a> Renderer<'a> {
             TagEnd::Item => {
                 self.flush_paragraph();
                 let marker = self.item_marker_stack.pop().flatten();
-                if let Some(item_blocks) = self.item_block_stack.pop() {
-                    if let Some((_, items)) = self.list_stack.last_mut() {
-                        items.push((marker, item_blocks));
-                    }
+                if let Some(item_blocks) = self.item_block_stack.pop()
+                    && let Some((_, items)) = self.list_stack.last_mut()
+                {
+                    items.push((marker, item_blocks));
                 }
                 self.in_list_item = self.in_list_item.saturating_sub(1);
             }
@@ -973,56 +973,6 @@ impl<'a> Renderer<'a> {
             col = col.child(b);
         }
         col.into_any_element()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use gpui::{TextStyle, px};
-
-    fn base_style() -> TextStyle {
-        TextStyle {
-            font_family: "test".into(),
-            font_size: px(15.).into(),
-            ..Default::default()
-        }
-    }
-
-    fn render_ok(source: &str) {
-        let theme = ui::Theme::light();
-        let known = KnownMentions::new();
-        let _ = render_message_markdown(
-            source,
-            &known,
-            theme.ink_soft,
-            &base_style(),
-            &theme,
-            "test",
-        );
-    }
-
-    #[test]
-    fn common_formatting_renders() {
-        render_ok("**bold** *italic* ~~strike~~ `code` [link](https://x.test)");
-        render_ok(
-            "# Heading\n\nParagraph with **bold** and _italic_.\n\n- item 1\n- item 2\n\n1. one\n2. two\n\n> quote\n\n---\n\n```\nfn main() {}\n```",
-        );
-    }
-
-    #[test]
-    fn incomplete_syntax_renders_without_panic() {
-        render_ok("**bold but not closed");
-        render_ok("`code without end");
-        render_ok("[link text](unterminated");
-        render_ok("> quote\n> still quote\n\n- list\n  - nested but maybe odd");
-        render_ok("```rust\nfn x() {");
-    }
-
-    #[test]
-    fn multiline_content_renders() {
-        render_ok("line1\nline2\n\npara2\nline3  \nline4");
-        render_ok("a\n\n\n\nb");
     }
 }
 
@@ -1183,3 +1133,54 @@ pub fn markdown_marker_highlights(
     out.sort_by_key(|(r, _)| (r.start, r.end));
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TextStyle, px};
+
+    fn base_style() -> TextStyle {
+        TextStyle {
+            font_family: "test".into(),
+            font_size: px(15.).into(),
+            ..Default::default()
+        }
+    }
+
+    fn render_ok(source: &str) {
+        let theme = ui::Theme::light();
+        let known = KnownMentions::new();
+        let _ = render_message_markdown(
+            source,
+            &known,
+            theme.ink_soft,
+            &base_style(),
+            &theme,
+            "test",
+        );
+    }
+
+    #[test]
+    fn common_formatting_renders() {
+        render_ok("**bold** *italic* ~~strike~~ `code` [link](https://x.test)");
+        render_ok(
+            "# Heading\n\nParagraph with **bold** and _italic_.\n\n- item 1\n- item 2\n\n1. one\n2. two\n\n> quote\n\n---\n\n```\nfn main() {}\n```",
+        );
+    }
+
+    #[test]
+    fn incomplete_syntax_renders_without_panic() {
+        render_ok("**bold but not closed");
+        render_ok("`code without end");
+        render_ok("[link text](unterminated");
+        render_ok("> quote\n> still quote\n\n- list\n  - nested but maybe odd");
+        render_ok("```rust\nfn x() {");
+    }
+
+    #[test]
+    fn multiline_content_renders() {
+        render_ok("line1\nline2\n\npara2\nline3  \nline4");
+        render_ok("a\n\n\n\nb");
+    }
+}
+

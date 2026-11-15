@@ -11,8 +11,7 @@ use std::{borrow::Cow, sync::Arc};
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Corner, ElementId, Entity, FocusHandle, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
-    StyledText, Subscription, TextRun, WeakEntity, Window, anchored, deferred, div, list,
-    prelude::*, px,
+    Subscription, WeakEntity, Window, anchored, deferred, div, list, prelude::*, px,
 };
 use model::{Author, Id, Message, PaneContent, ReplyRef, mentions, pane};
 use ui::{
