@@ -4,8 +4,9 @@
 use std::{collections::HashMap, ops::Range, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt, Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString,
-    Subscription, Window, actions, div, linear, prelude::*, px,
+    Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent,
+    SharedString, StyledText, Subscription, TextRun, TextStyle, Window, actions, div, linear,
+    prelude::*,
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
@@ -66,6 +67,49 @@ fn sendable(text: &str) -> bool {
 /// Core echoes the posted text trimmed; compare against that.
 fn sent_body(text: &str) -> &str {
     text.trim()
+}
+
+fn working_indicator_text(
+    label: &str,
+    delta: f32,
+    base_style: &TextStyle,
+    base: Hsla,
+    bright: Hsla,
+) -> StyledText {
+    let label: SharedString = label.to_string().into();
+    let chars: Vec<(usize, char)> = label.char_indices().collect();
+    if chars.is_empty() {
+        return StyledText::new(label);
+    }
+    let n = chars.len() as f32;
+    // Sweep center moves across the text (with a bit of lead-in/out).
+    let center = -0.25 + delta * 1.5;
+    let mut runs: Vec<TextRun> = Vec::with_capacity(chars.len());
+    for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
+        let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label.len());
+        let len = next - byte_ix;
+        let p = (i as f32 + 0.5) / n;
+        let d = (p - center).abs();
+        // Soft highlight band with falloff.
+        let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
+        // Gentle global pulse so text smoothly fades in/out overall.
+        let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
+        let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
+        let mut color = base;
+        color.h = base.h + (bright.h - base.h) * mix;
+        color.s = base.s + (bright.s - base.s) * mix;
+        color.l = base.l + (bright.l - base.l) * mix;
+        color.a = (0.45 + 0.55 * mix).clamp(0.0, 1.0);
+        runs.push(TextRun {
+            len,
+            font: base_style.font(),
+            color,
+            background_color: base_style.background_color,
+            underline: base_style.underline.clone(),
+            strikethrough: base_style.strikethrough.clone(),
+        });
+    }
+    StyledText::new(label).with_runs(runs)
 }
 
 fn echo_matches_in(
@@ -763,59 +807,28 @@ impl Render for Composer {
             .flex_col()
             .gap(space::X1_5)
             .when_some(working, |d, label| {
-                let ink = t.ink;
-                let muted = t.muted;
+                let base_style = window.text_style();
+                let base = t.muted;
+                let bright = t.ink;
                 d.child(
-                    div()
-                        .relative()
-                        .overflow_hidden()
-                        .px(space::X2)
-                        .py(space::X0_5)
-                        .rounded(radius::SM)
-                        .child(
-                            div()
-                                .relative()
-                                .child(
-                                    div().id("working-indicator-label").with_animation(
-                                        "working-indicator-fade",
-                                        Animation::new(Duration::from_millis(2200))
-                                            .repeat()
-                                            .with_easing(linear),
-                                        move |el, delta| {
-                                            let pulse = if delta < 0.5 {
-                                                delta * 2.0
-                                            } else {
-                                                (1.0 - delta) * 2.0
-                                            };
-                                            el.opacity(0.45 + 0.55 * pulse)
-                                                .type_style(text::SMALL)
-                                                .text_color(muted)
-                                                .child(label.clone())
-                                        },
-                                    ),
-                                )
-                                .child(
-                                    div()
-                                        .id("working-indicator-shimmer")
-                                        .absolute()
-                                        .top(px(0.))
-                                        .bottom(px(0.))
-                                        .w(px(56.))
-                                        .rounded(radius::SM)
-                                        .bg(ink.opacity(0.10))
-                                        .with_animation(
-                                            "working-indicator-sweep",
-                                            Animation::new(Duration::from_millis(1800))
-                                                .repeat()
-                                                .with_easing(linear),
-                                            |el, delta| {
-                                                // Sweep across the label area (approximate width).
-                                                let x = -56.0 + delta * 320.0;
-                                                el.left(px(x))
-                                            },
-                                        ),
-                                ),
+                    div().px(space::X2).py(space::X0_5).child(
+                        div().id("working-indicator-shimmer").with_animation(
+                            "working-indicator-shimmer",
+                            Animation::new(Duration::from_millis(1800))
+                                .repeat()
+                                .with_easing(linear),
+                            move |el, delta| {
+                                let text = working_indicator_text(
+                                    label.as_ref(),
+                                    delta,
+                                    &base_style,
+                                    base,
+                                    bright,
+                                );
+                                el.child(text)
+                            },
                         ),
+                    ),
                 )
             })
             .child(box_el)
