@@ -827,8 +827,7 @@ impl<'a> Renderer<'a> {
                                 lines_col = lines_col.child(div().w_full().min_w_0().child(styled));
                             }
                         } else {
-                            lines_col = lines_col
-                                .child(div().w_full().min_w_0().whitespace_normal().child(display));
+                            lines_col = lines_col.child(div().w_full().min_w_0().child(display));
                         }
                     }
                 }
@@ -1066,8 +1065,9 @@ impl<'a> Renderer<'a> {
 /// Highlight styles for markdown syntax markers (delimiters/punctuation) in `text`,
 /// dimmed so the content stands out while markers remain visible.
 ///
-/// Uses a parser-aware pass to avoid styling inside code spans/blocks and to only
-/// dim markers that belong to recognized markdown constructs where possible.
+/// Parser-aware: uses pulldown-cmark structure to protect code regions and to
+/// identify actual link/image constructs; applies conservative delimiter dimming
+/// elsewhere to avoid styling ordinary punctuation/identifiers.
 pub fn markdown_marker_highlights(
     text: &str,
     theme: &ui::Theme,
@@ -1082,10 +1082,12 @@ pub fn markdown_marker_highlights(
     };
     let mut out: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
+    let bytes = text.as_bytes();
+    let len = text.len();
 
     let mut push = |r: std::ops::Range<usize>| {
         if r.start < r.end
-            && r.end <= text.len()
+            && r.end <= len
             && text.is_char_boundary(r.start)
             && text.is_char_boundary(r.end)
             && seen.insert((r.start, r.end))
@@ -1094,21 +1096,16 @@ pub fn markdown_marker_highlights(
         }
     };
 
-    let bytes = text.as_bytes();
-    let len = text.len();
-
-    // Protected regions: inline code and fenced/indented code blocks from parser.
-    let mut protected: Vec<std::ops::Range<usize>> = Vec::new();
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_TASKLISTS);
+
+    // Protected regions: inline code and fenced/indented code blocks.
+    let mut protected: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut linkish: Vec<std::ops::Range<usize>> = Vec::new(); // parsed Link/Image event ranges
     for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
         match event {
-            Event::Start(Tag::CodeBlock(_)) | Event::End(TagEnd::CodeBlock) => {
-                // We still want to dim fence markers on fence lines; handled by line scan,
-                // but protect contents by excluding interior heuristics below.
-            }
             Event::Code(_) if range.start < range.end && range.end <= len => {
                 protected.push(range.clone());
                 // dim backtick delimiters of inline code if present at edges
@@ -1140,11 +1137,18 @@ pub fn markdown_marker_highlights(
                     }
                 }
             }
+            Event::Start(Tag::Link { .. })
+            | Event::End(TagEnd::Link)
+            | Event::Start(Tag::Image { .. })
+            | Event::End(TagEnd::Image)
+                if range.start < range.end && range.end <= len =>
+            {
+                linkish.push(range);
+            }
             _ => {}
         }
     }
-
-    // Add code block body protection by tracking parser code block ranges more explicitly.
+    // code block protection
     let mut in_code_block = false;
     let mut code_block_start = 0usize;
     for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
@@ -1165,28 +1169,33 @@ pub fn markdown_marker_highlights(
             _ => {}
         }
     }
-    // merge protected ranges
-    protected.sort_by_key(|r| (r.start, r.end));
-    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
-    for r in protected {
-        if let Some(last) = merged.last_mut()
-            && r.start <= last.end
-        {
-            if r.end > last.end {
-                last.end = r.end;
+
+    fn merge_ranges(mut rs: Vec<std::ops::Range<usize>>) -> Vec<std::ops::Range<usize>> {
+        rs.sort_by_key(|r| (r.start, r.end));
+        let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+        for r in rs {
+            if let Some(last) = merged.last_mut()
+                && r.start <= last.end
+            {
+                if r.end > last.end {
+                    last.end = r.end;
+                }
+                continue;
             }
-            continue;
+            merged.push(r);
         }
-        merged.push(r);
+        merged
     }
-    let protected = merged;
+    let protected = merge_ranges(protected);
+    let linkish = merge_ranges(linkish);
 
-    let is_protected = |idx: usize| -> bool {
-        // idx is byte index
-        protected.iter().any(|r| idx >= r.start && idx < r.end)
+    let in_ranges = |idx: usize, ranges: &[std::ops::Range<usize>]| -> bool {
+        ranges.iter().any(|r| idx >= r.start && idx < r.end)
     };
+    let is_protected = |idx: usize| in_ranges(idx, &protected);
+    let in_linkish = |idx: usize| in_ranges(idx, &linkish);
 
-    // Line-start markers (headings, blockquotes, list markers) and fence markers
+    // Line-start markers and fence markers
     let mut i = 0usize;
     while i < len {
         if i == 0 || bytes.get(i.wrapping_sub(1)) == Some(&b'\n') {
@@ -1194,7 +1203,6 @@ pub fn markdown_marker_highlights(
             while j < len && bytes[j] == b' ' {
                 j += 1;
             }
-            // heading hashes
             let mut k = j;
             while k < len && bytes[k] == b'#' && k - j < 6 {
                 k += 1;
@@ -1202,7 +1210,6 @@ pub fn markdown_marker_highlights(
             if k > j && k < len && bytes[k] == b' ' && !is_protected(j) {
                 push(j..k + 1);
             }
-            // blockquote
             if j < len && bytes[j] == b'>' && !is_protected(j) {
                 let mut k2 = j + 1;
                 if k2 < len && bytes[k2] == b' ' {
@@ -1210,15 +1217,14 @@ pub fn markdown_marker_highlights(
                 }
                 push(j..k2);
             }
-            // unordered list marker
             if j + 1 < len
                 && (bytes[j] == b'-' || bytes[j] == b'*' || bytes[j] == b'+')
                 && bytes[j + 1] == b' '
                 && !is_protected(j)
             {
+                // only dim '-'/'+'/'*' as list marker in this list context
                 push(j..j + 2);
             }
-            // ordered list marker
             let mut d = j;
             while d < len && bytes[d].is_ascii_digit() {
                 d += 1;
@@ -1231,7 +1237,6 @@ pub fn markdown_marker_highlights(
             {
                 push(j..d + 2);
             }
-            // fenced code fence line marker (``` or ~~~)
             if j + 3 <= len
                 && !is_protected(j)
                 && (&bytes[j..j + 3] == b"```" || &bytes[j..j + 3] == b"~~~")
@@ -1239,7 +1244,6 @@ pub fn markdown_marker_highlights(
                 push(j..j + 3);
             }
         }
-        // advance to next line start
         if let Some(pos) = text[i..].find('\n') {
             i += pos + 1;
         } else {
@@ -1247,9 +1251,7 @@ pub fn markdown_marker_highlights(
         }
     }
 
-    // Emphasis/strike/link/image markers in non-protected regions using a careful scan.
-    // We only dim delimiter chars when they are likely markdown syntax (not escaped, not in code),
-    // and we avoid naive dimming of standalone underscores/brackets/parens in ordinary text.
+    // Inline markers: be conservative to avoid dimming ordinary punctuation/text.
     let mut idx = 0usize;
     while idx < len {
         let b = bytes[idx];
@@ -1257,37 +1259,49 @@ pub fn markdown_marker_highlights(
             idx += 1;
             continue;
         }
-        // skip escaped char
         if b == b'\\' {
             idx += 2;
             continue;
         }
-        // inline code already handled/protected; but if somehow not, skip backtick runs
-        if b == b'`' {
-            idx += 1;
-            continue;
-        }
-        // strikethrough ~~
+        // strikethrough ~~ (CommonMark extension marker)
         if b == b'~' && idx + 1 < len && bytes[idx + 1] == b'~' {
             push(idx..idx + 2);
             idx += 2;
             continue;
         }
-        // bold ** or __
+        // emphasis/strong runs: dim **/__ and * / _ only when not intraword for underscores
         if (b == b'*' || b == b'_') && idx + 1 < len && bytes[idx + 1] == b {
-            // dim as likely delimiter
-            push(idx..idx + 2);
-            idx += 2;
+            // could be strong; dim the delimiter run
+            let mut end = idx + 2;
+            while end < len && bytes[end] == b {
+                end += 1;
+            }
+            if b == b'_' {
+                let prev_alnum = idx > 0
+                    && text[..idx]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric());
+                let next_alnum = text[end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_alphanumeric());
+                if !(prev_alnum && next_alnum) {
+                    push(idx..end);
+                }
+            } else {
+                push(idx..end);
+            }
+            idx = end;
             continue;
         }
-        // italic * or _ as single delimiter: only when it looks like a delimiter, not intraword underscore
         if b == b'*' {
+            // single * - dim only if not surrounded as multiplication-like "a * b"? keep conservative: dim
             push(idx..idx + 1);
             idx += 1;
             continue;
         }
         if b == b'_' {
-            // avoid intraword underscores like snake_case
             let prev_alnum = idx > 0
                 && text[..idx]
                     .chars()
@@ -1303,48 +1317,46 @@ pub fn markdown_marker_highlights(
             idx += 1;
             continue;
         }
-        // image/link markers only when they form a construct: ![, ], (, )
-        if b == b'!' && idx + 1 < len && bytes[idx + 1] == b'[' {
+        // Link/image markers: only dim when near/within parser-recognized link/image constructs
+        if b == b'!'
+            && idx + 1 < len
+            && bytes[idx + 1] == b'['
+            && (in_linkish(idx) || in_linkish(idx + 1) || text[idx..].contains("]("))
+        {
             push(idx..idx + 2);
             idx += 2;
             continue;
         }
         if b == b'[' {
-            // dim if there is a matching ] later (rough) - better to check for link/image pattern
-            if text[idx..].contains(']') {
+            if in_linkish(idx) {
                 push(idx..idx + 1);
             }
             idx += 1;
             continue;
         }
         if b == b']' {
-            // dim if followed by ( or [ for links/images/ref links
-            if idx + 1 < len && (bytes[idx + 1] == b'(' || bytes[idx + 1] == b'[') {
-                push(idx..idx + 1);
-            } else if text[..idx].contains('[') {
-                // closing bracket of a construct started earlier
+            if in_linkish(idx)
+                || (idx + 1 < len && (bytes[idx + 1] == b'(' || bytes[idx + 1] == b'['))
+            {
                 push(idx..idx + 1);
             }
             idx += 1;
             continue;
         }
         if b == b'(' {
-            // dim if preceded by ] (link/image url)
-            if idx > 0 && bytes[idx - 1] == b']' {
+            if idx > 0 && bytes[idx - 1] == b']' && (in_linkish(idx) || in_linkish(idx - 1)) {
                 push(idx..idx + 1);
             }
             idx += 1;
             continue;
         }
         if b == b')' {
-            // dim if there's a ]( before it recently
-            if text[..idx].rfind("](").is_some() {
+            if in_linkish(idx) {
                 push(idx..idx + 1);
             }
             idx += 1;
             continue;
         }
-        // advance by char
         if let Some(ch) = text[idx..].chars().next() {
             idx += ch.len_utf8();
         } else {
@@ -1507,5 +1519,115 @@ mod tests {
         render_ok("![diagram](https://example.com/diagram.png)");
         render_ok("![](https://example.com/diagram.png)");
         render_ok("![a *formatted* description](https://example.com/diagram.png)");
+    }
+
+    #[test]
+    fn marker_highlights_escaped_and_unmatched_markers() {
+        let theme = ui::Theme::light();
+        // escaped markers should not be treated as active delimiters
+        let src = "\\*literal\\* \\_x\\_";
+        let h = super::markdown_marker_highlights(src, &theme);
+        assert!(
+            !h.iter().any(|(r, _)| {
+                let s = &src[r.clone()];
+                s == "*" || s == "_"
+            }),
+            "escaped markers should not be dimmed as active delimiters: {h:?}"
+        );
+
+        // unmatched marker in plain text: we still dim single '*' conservatively in current impl,
+        // but it must not break UTF-8 boundaries and rendering remains stable.
+        let src2 = "unmatched * marker";
+        let h2 = super::markdown_marker_highlights(src2, &theme);
+        for (r, _) in &h2 {
+            assert!(src2.is_char_boundary(r.start) && src2.is_char_boundary(r.end));
+        }
+    }
+
+    #[test]
+    fn marker_highlights_nested_adjacent_emphasis_and_utf8() {
+        let theme = ui::Theme::light();
+        let src = "**bold _nested_** and ~~strike~~ — café ✓";
+        let h = super::markdown_marker_highlights(src, &theme);
+        for (r, _) in &h {
+            assert!(src.is_char_boundary(r.start) && src.is_char_boundary(r.end));
+        }
+        // should include some emphasis/strike delimiters
+        assert!(
+            h.iter()
+                .any(|(r, _)| &src[r.clone()] == "**" || &src[r.clone()] == "~~")
+        );
+        render_ok(src);
+    }
+
+    #[test]
+    fn marker_highlights_reference_links_and_images() {
+        let theme = ui::Theme::light();
+        let src = "See [ref][id] and ![alt][img]\n\n[id]: https://example.com\n[img]: https://example.com/i.png";
+        let h = super::markdown_marker_highlights(src, &theme);
+        for (r, _) in &h {
+            assert!(src.is_char_boundary(r.start) && src.is_char_boundary(r.end));
+        }
+        render_ok(src);
+        render_ok("[ref]: https://example.com\n\n[use][ref]");
+    }
+
+    #[test]
+    fn marker_highlights_plain_brackets_not_link_syntax() {
+        let theme = ui::Theme::light();
+        let src = "[see notes] and (small example)";
+        let h = super::markdown_marker_highlights(src, &theme);
+        // plain parentheses should not be dimmed
+        assert!(
+            !h.iter().any(|(r, _)| {
+                let s = &src[r.clone()];
+                s == "(" || s == ")"
+            }),
+            "plain parentheses should not be dimmed: {h:?}"
+        );
+        // plain brackets without link/image construct should be less aggressively dimmed;
+        // ensure no crash and valid boundaries.
+        for (r, _) in &h {
+            assert!(src.is_char_boundary(r.start) && src.is_char_boundary(r.end));
+        }
+    }
+
+    #[test]
+    fn safe_link_dest_validation() {
+        assert!(super::is_safe_link_dest("https://example.com"));
+        assert!(super::is_safe_link_dest("http://example.com"));
+        assert!(super::is_safe_link_dest("mailto:test@example.com"));
+        assert!(!super::is_safe_link_dest("javascript:alert(1)"));
+        assert!(!super::is_safe_link_dest("file:///etc/passwd"));
+        assert!(!super::is_safe_link_dest("data:text/html,x"));
+        assert!(!super::is_safe_link_dest(""));
+    }
+
+    #[test]
+    fn links_and_images_render_without_affecting_plain_text() {
+        render_ok("Visit [Example](https://example.com) now");
+        render_ok("Visit [Example](http://example.com) now");
+        render_ok("Email [me](mailto:test@example.com)");
+        render_ok("Bad [x](javascript:alert(1)) stays text");
+        render_ok("Plain text without links");
+        render_ok("[ref](https://example.com/path)");
+    }
+
+    #[test]
+    fn code_blocks_preserve_structure_in_both_paths() {
+        // highlighted (known language), plain fallback/unsupported, indented, and whitespace cases
+        render_ok("```rust\n    indented\n        more indented\n```");
+        render_ok("```text\none    two      three\n```");
+        render_ok("```text\n  leading spaces\ntrailing spaces  \n```");
+        render_ok("```\n  indented\n\tmixed\n```");
+        render_ok("    indented code block\n        more");
+        render_ok("```unknownlang\nfn main() {}\n\n    spaces\n```");
+    }
+
+    #[test]
+    fn tables_render_with_alignments_and_uneven_rows() {
+        render_ok("| L | C | R |\n|:--|:--:|--:|\n| a | b | c |");
+        render_ok("| a | b |\n|---|---|\n| 1 | 2 | 3 |");
+        render_ok("| only |\n|---|\n| x |");
     }
 }
