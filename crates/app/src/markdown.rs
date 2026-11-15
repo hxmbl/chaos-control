@@ -1183,4 +1183,3 @@ mod tests {
         render_ok("a\n\n\n\nb");
     }
 }
-
