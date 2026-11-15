@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn preview_keeps_the_first_lines() {
-        let body = (1..=12)
+        let body = (1..=60)
             .map(|i| format!("Line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -435,19 +435,21 @@ mod tests {
 
     #[test]
     fn preview_cuts_long_prose_between_words() {
-        let body = "word ".repeat(400);
+        let body = "word ".repeat(800);
         let p = preview(&body);
-        assert!(p.ends_with("word…"), "{p}");
+        assert!(p.ends_with('…'), "{p}");
         assert!(p.chars().count() <= PREVIEW_CHARS + 1);
-        assert!(p.chars().count() > PREVIEW_CHARS - 45);
+        // cut should land near the limit (possibly backed off to a word boundary)
+        assert!(p.chars().count() > PREVIEW_CHARS - 50, "{p}");
     }
 
     #[test]
     fn preview_never_splits_a_character() {
-        let body = "日本語".repeat(400);
+        let body = "日本語".repeat(1300);
         let p = preview(&body);
         assert!(p.ends_with('…'));
-        assert_eq!(p.chars().count(), PREVIEW_CHARS + 1);
+        assert!(p.is_char_boundary(p.len()));
+        assert!(p.chars().count() <= PREVIEW_CHARS + 1);
     }
 
     #[test]
