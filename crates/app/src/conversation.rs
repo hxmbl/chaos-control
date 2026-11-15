@@ -987,9 +987,14 @@ fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Them
     let shown = readers.len().min(READ_MARKS_SHOWN);
     let more = readers.len().saturating_sub(shown);
     let marks = readers.iter().take(shown).enumerate().map(|(n, r)| {
-        let name = match r.author {
-            Author::Agent(id) => ws.agent(id).map_or(&*r.name, |a| &a.name),
-            _ => &r.name,
+        // STRM-618: an agent's mark is its brand icon (as in Agent status); a person keeps
+        // their initial.
+        let face = match r.author {
+            Author::Agent(id) => match ws.agent(id) {
+                Some(a) => icon(brand_icon(a.brand), icons::SM, t.ink_soft).into_any_element(),
+                None => initial(&r.name, t),
+            },
+            _ => initial(&r.name, t),
         };
         div()
             .size(size::READ_MARK)
@@ -1002,7 +1007,7 @@ fn read_marks(ix: usize, readers: &[Reader], ws: &model::Workspace, t: &ui::Them
             .border_2()
             .border_color(t.canvas)
             .when(n > 0, |d| d.ml(px(-6.)))
-            .child(initial(name, t))
+            .child(face)
     });
     div()
         .id(("read-marks", ix))
