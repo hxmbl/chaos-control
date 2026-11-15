@@ -1756,6 +1756,17 @@ impl ChatStore {
                 })
                 .ok();
             }
+            if let Ok(members) = core.members(main).await {
+                this.update(cx, |store, _| {
+                    if let Some(a) = &mut store.core {
+                        // Only apply if this is still the active project's main channel.
+                        if a.link.main() == main {
+                            a.names = members.into_iter().map(|m| (m.id, m.name)).collect();
+                        }
+                    }
+                })
+                .ok();
+            }
         })
         .detach();
     }
