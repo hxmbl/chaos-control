@@ -1,11 +1,11 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, time::Duration};
 
 use gpui::{
-    Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
-    actions, div, prelude::*,
+    Animation, AnimationExt, Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString,
+    Subscription, Window, actions, div, linear, prelude::*, px,
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
@@ -763,12 +763,59 @@ impl Render for Composer {
             .flex_col()
             .gap(space::X1_5)
             .when_some(working, |d, label| {
+                let ink = t.ink;
+                let muted = t.muted;
                 d.child(
                     div()
+                        .relative()
+                        .overflow_hidden()
                         .px(space::X2)
-                        .type_style(text::SMALL)
-                        .text_color(t.muted)
-                        .child(label),
+                        .py(space::X0_5)
+                        .rounded(radius::SM)
+                        .child(
+                            div()
+                                .relative()
+                                .child(
+                                    div().id("working-indicator-label").with_animation(
+                                        "working-indicator-fade",
+                                        Animation::new(Duration::from_millis(2200))
+                                            .repeat()
+                                            .with_easing(linear),
+                                        move |el, delta| {
+                                            let pulse = if delta < 0.5 {
+                                                delta * 2.0
+                                            } else {
+                                                (1.0 - delta) * 2.0
+                                            };
+                                            el.opacity(0.45 + 0.55 * pulse)
+                                                .type_style(text::SMALL)
+                                                .text_color(muted)
+                                                .child(label.clone())
+                                        },
+                                    ),
+                                )
+                                .child(
+                                    div()
+                                        .id("working-indicator-shimmer")
+                                        .absolute()
+                                        .top(px(0.))
+                                        .bottom(px(0.))
+                                        .w(px(56.))
+                                        .rounded(radius::SM)
+                                        .bg(ink.opacity(0.10))
+                                        .with_animation(
+                                            "working-indicator-sweep",
+                                            Animation::new(Duration::from_millis(1800))
+                                                .repeat()
+                                                .with_easing(linear),
+                                            |el, delta| {
+                                                // Sweep across the label area (approximate width).
+                                                let x = -56.0 + delta * 320.0;
+                                                el.left(px(x))
+                                            },
+                                        ),
+                                ),
+                        ),
                 )
             })
             .child(box_el)
