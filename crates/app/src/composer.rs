@@ -180,7 +180,7 @@ fn subsequence_positions(hay: &[char], needle: &[char], start: usize) -> Option<
     let mut first = None;
     let mut last = start;
     while i < hay.len() && j < needle.len() {
-        if hay[i].to_ascii_lowercase() == needle[j].to_ascii_lowercase() {
+        if hay[i].eq_ignore_ascii_case(&needle[j]) {
             if first.is_none() {
                 first = Some(i);
             }
@@ -204,7 +204,7 @@ fn subsequence_score(haystack: &str, needle: &str) -> Option<(usize, usize, usiz
     let n: Vec<char> = needle.chars().collect();
     let mut best: Option<(usize, usize, usize)> = None; // (start, gap_penalty, boundary_penalty)
     for start in 0..h.len() {
-        if h[start].to_ascii_lowercase() != n[0].to_ascii_lowercase() {
+        if !h[start].eq_ignore_ascii_case(&n[0]) {
             continue;
         }
         if let Some((s, end)) = subsequence_positions(&h, &n, start) {
@@ -218,7 +218,7 @@ fn subsequence_score(haystack: &str, needle: &str) -> Option<(usize, usize, usiz
                 1
             };
             let cand = (s, gap_penalty, boundary_penalty);
-            if best.map_or(true, |b| cand < b) {
+            if best.is_none_or(|b| cand < b) {
                 best = Some(cand);
             }
         }
@@ -273,13 +273,19 @@ fn best_mention_rank(
     for (prio, field) in fields {
         if let Some((rank, pos, penalty, bmiss)) = field_match_rank(field, q) {
             let cand = (rank, prio, pos, penalty, bmiss);
-            if best.map_or(true, |b| cand < b) {
+            if best.is_none_or(|b| cand < b) {
                 best = Some(cand);
             }
         }
     }
     best
 }
+
+type MentionScore = (
+    (MatchRank, usize, usize, usize, usize),
+    u32, // frequency
+    u64, // age (smaller = more recent)
+);
 
 fn filter_mentions(
     candidates: &[MentionCandidate],
@@ -288,33 +294,29 @@ fn filter_mentions(
     now: u64,
 ) -> Vec<MentionCandidate> {
     let q = query.trim_start_matches('@').to_ascii_lowercase();
-    let mut scored: Vec<(
-        MentionCandidate,
-        (MatchRank, usize, usize, usize, usize),
-        u32,
-        u64,
-    )> = candidates
+    let mut scored: Vec<(MentionCandidate, MentionScore)> = candidates
         .iter()
         .filter_map(|c| {
             best_mention_rank(c, &q).map(|rank| {
                 let key = c.handle.to_ascii_lowercase();
                 let u = usage.get(&key).copied().unwrap_or_default();
                 let age = now.saturating_sub(u.last_used);
-                (c.clone(), rank, u.count, age)
+                (c.clone(), (rank, u.count, age))
             })
         })
         .collect();
     scored.sort_by(|a, b| {
-        a.1.cmp(&b.1) // text match quality: exact/prefix/boundary/subsequence, then field/pos/penalty
-            .then_with(|| b.2.cmp(&a.2)) // higher frequency
-            .then_with(|| a.3.cmp(&b.3)) // more recent (smaller age)
+        a.1.0
+            .cmp(&b.1.0) // text match quality
+            .then_with(|| b.1.1.cmp(&a.1.1)) // higher frequency
+            .then_with(|| a.1.2.cmp(&b.1.2)) // more recent (smaller age)
             .then_with(|| {
                 a.0.handle
                     .to_ascii_lowercase()
                     .cmp(&b.0.handle.to_ascii_lowercase())
             })
     });
-    scored.into_iter().map(|(c, _, _, _)| c).collect()
+    scored.into_iter().map(|(c, _)| c).collect()
 }
 
 fn is_shortcode_query_char(c: char) -> bool {
@@ -434,7 +436,7 @@ fn now_secs() -> u64 {
 }
 
 fn rank_emoji_matches(
-    matches: &mut Vec<EmojiMatch>,
+    matches: &mut [EmojiMatch],
     usage: &HashMap<String, UsageStat>,
     _now: u64,
     empty_query: bool,
@@ -509,14 +511,14 @@ fn usage_map_to_json(usage: &HashMap<String, UsageStat>) -> serde_json::Value {
         b.1.count
             .cmp(&a.1.count)
             .then_with(|| b.1.last_used.cmp(&a.1.last_used))
-            .then_with(|| a.0.cmp(&b.0))
+            .then_with(|| a.0.cmp(b.0))
     });
     entries.truncate(SUGGESTION_USAGE_MAX_ENTRIES);
     let mut m = serde_json::Map::new();
     for (k, v) in entries {
         m.insert(
             k.clone(),
-            serde_json::json!({ "count": v.count.min(u32::MAX), "last_used": v.last_used }),
+            serde_json::json!({ "count": v.count, "last_used": v.last_used }),
         );
     }
     serde_json::Value::Object(m)
@@ -1779,7 +1781,7 @@ mod tests {
                 last_used: 1,
             },
         );
-        let mut emoji = std::collections::HashMap::new();
+        let emoji = std::collections::HashMap::new();
         save_suggestion_usage(None, &mentions, &emoji);
         let (lm3, le3) = load_suggestion_usage(None);
         assert!(lm3.is_empty() && le3.is_empty());
