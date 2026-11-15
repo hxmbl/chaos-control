@@ -1,7 +1,7 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
 
 use chaos_core::emoji::{self, EmojiMatch};
 use gpui::{
@@ -105,6 +105,12 @@ impl Draft {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct UsageStat {
+    count: u32,
+    last_used: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MentionState {
     /// Byte range in the draft text to replace: `@` through the mention token.
@@ -152,19 +158,113 @@ fn mention_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
     Some((at..end, prefix.to_string()))
 }
 
-fn filter_mentions(candidates: &[MentionCandidate], query: &str) -> Vec<MentionCandidate> {
-    let q = query.to_ascii_lowercase();
-    candidates
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchRank {
+    Exact = 0,
+    Prefix = 1,
+    WordBoundary = 2,
+    Subsequence = 3,
+}
+
+fn subsequence_positions(hay: &[char], needle: &[char], start: usize) -> Option<(usize, usize)> {
+    if needle.is_empty() { return Some((start, start)); }
+    let mut i = start;
+    let mut j = 0usize;
+    let mut first = None;
+    let mut last = start;
+    while i < hay.len() && j < needle.len() {
+        if hay[i].to_ascii_lowercase() == needle[j].to_ascii_lowercase() {
+            if first.is_none() { first = Some(i); }
+            last = i;
+            j += 1;
+        }
+        i += 1;
+    }
+    if j == needle.len() { Some((first.unwrap_or(start), last + 1)) } else { None }
+}
+
+fn subsequence_score(haystack: &str, needle: &str) -> Option<(usize, usize, usize)> {
+    if needle.is_empty() { return Some((0, 0, 0)); }
+    let h: Vec<char> = haystack.chars().collect();
+    let n: Vec<char> = needle.chars().collect();
+    let mut best: Option<(usize, usize, usize)> = None; // (start, gap_penalty, boundary_penalty)
+    for start in 0..h.len() {
+        if h[start].to_ascii_lowercase() != n[0].to_ascii_lowercase() { continue; }
+        if let Some((s, end)) = subsequence_positions(&h, &n, start) {
+            let gap_penalty = (end - s).saturating_sub(n.len());
+            let boundary_penalty = if s == 0
+                || !h[s - 1].is_ascii_alphanumeric()
+                || (h[s - 1].is_ascii_lowercase() && h[s].is_ascii_uppercase())
+            { 0 } else { 1 };
+            let cand = (s, gap_penalty, boundary_penalty);
+            if best.map_or(true, |b| cand < b) { best = Some(cand); }
+        }
+    }
+    best
+}
+
+fn field_match_rank(field: &str, q: &str) -> Option<(MatchRank, usize, usize, usize)> {
+    if q.is_empty() {
+        return Some((MatchRank::Prefix, 0, 0, 0));
+    }
+    let f = field.to_ascii_lowercase();
+    if f == q {
+        return Some((MatchRank::Exact, 0, 0, 0));
+    }
+    if f.starts_with(q) {
+        return Some((MatchRank::Prefix, 0, 0, 0));
+    }
+    if let Some(pos) = f.find(q) {
+        let boundary = pos == 0
+            || !field.as_bytes().get(pos.saturating_sub(1)).is_some_and(|b| b.is_ascii_alphanumeric())
+            || (field[..pos].chars().last().is_some_and(|c| c.is_ascii_lowercase())
+                && field[pos..].chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+        let rank = if boundary { MatchRank::WordBoundary } else { MatchRank::Subsequence };
+        return Some((rank, pos, 0, 0));
+    }
+    subsequence_score(&f, q).map(|(pos, gaps, bmiss)| (MatchRank::Subsequence, pos, gaps, bmiss))
+}
+
+fn best_mention_rank(candidate: &MentionCandidate, q: &str) -> Option<(MatchRank, usize, usize, usize, usize)> {
+    // (rank, field_prio, pos, penalty, extra_for_stability)
+    let mut best: Option<(MatchRank, usize, usize, usize, usize)> = None;
+    let fields = std::iter::once((0usize, candidate.handle.as_ref()))
+        .chain(std::iter::once((1usize, candidate.name.as_ref())))
+        .chain(candidate.nicknames.iter().map(|n| (2usize, n.as_ref())));
+    for (prio, field) in fields {
+        if let Some((rank, pos, penalty, bmiss)) = field_match_rank(field, q) {
+            let cand = (rank, prio, pos, penalty, bmiss);
+            if best.map_or(true, |b| cand < b) { best = Some(cand); }
+        }
+    }
+    best
+}
+
+fn filter_mentions(
+    candidates: &[MentionCandidate],
+    query: &str,
+    usage: &std::collections::HashMap<String, UsageStat>,
+    now: u64,
+) -> Vec<MentionCandidate> {
+    let q = query.trim_start_matches('@').to_ascii_lowercase();
+    let mut scored: Vec<(MentionCandidate, (MatchRank, usize, usize, usize, usize), u32, u64)> = candidates
         .iter()
-        .filter(|c| {
-            c.handle.to_ascii_lowercase().contains(&q)
-                || c.name.to_ascii_lowercase().contains(&q)
-                || c.nicknames
-                    .iter()
-                    .any(|n| n.to_ascii_lowercase().contains(&q))
+        .filter_map(|c| {
+            best_mention_rank(c, &q).map(|rank| {
+                let key = c.handle.to_ascii_lowercase();
+                let u = usage.get(&key).copied().unwrap_or_default();
+                let age = now.saturating_sub(u.last_used);
+                (c.clone(), rank, u.count, age)
+            })
         })
-        .cloned()
-        .collect()
+        .collect();
+    scored.sort_by(|a, b| {
+        a.1.cmp(&b.1) // text match quality: exact/prefix/boundary/subsequence, then field/pos/penalty
+            .then_with(|| b.2.cmp(&a.2)) // higher frequency
+            .then_with(|| a.3.cmp(&b.3)) // more recent (smaller age)
+            .then_with(|| a.0.handle.to_ascii_lowercase().cmp(&b.0.handle.to_ascii_lowercase()))
+    });
+    scored.into_iter().map(|(c, _, _, _)| c).collect()
 }
 
 fn is_shortcode_query_char(c: char) -> bool {
@@ -267,7 +367,148 @@ pub struct Composer {
     pending: Option<(Id, Draft)>,
     mention: Option<MentionState>,
     emoji: Option<EmojiState>,
+    mention_usage: HashMap<String, UsageStat>,
+    emoji_usage: HashMap<String, UsageStat>,
+    usage_path: Option<PathBuf>,
     _subscriptions: [Subscription; 3],
+}
+
+const SUGGESTION_USAGE_SCHEMA_VERSION: u64 = 1;
+const SUGGESTION_USAGE_MAX_ENTRIES: usize = 500;
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn rank_emoji_matches(
+    matches: &mut Vec<EmojiMatch>,
+    usage: &HashMap<String, UsageStat>,
+    _now: u64,
+    empty_query: bool,
+) {
+    // MRU/frequent ranking is applied to empty-query recommendations first.
+    // Typed-query usage weighting is intentionally deferred (secondary signal) to
+    // avoid regressing existing shortcode/text relevance from emoji::suggest.
+    if !empty_query {
+        return;
+    }
+    let original: std::collections::HashMap<String, usize> = matches
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.emoji.as_ref().to_string(), i))
+        .collect();
+    matches.sort_by(|a, b| {
+        let ua = usage.get(a.emoji.as_ref()).copied().unwrap_or_default();
+        let ub = usage.get(b.emoji.as_ref()).copied().unwrap_or_default();
+        let a_used = ua.count > 0;
+        let b_used = ub.count > 0;
+        b_used.cmp(&a_used)
+            .then_with(|| ub.count.cmp(&ua.count))
+            .then_with(|| ub.last_used.cmp(&ua.last_used))
+            .then_with(|| {
+                original
+                    .get(a.emoji.as_ref())
+                    .cmp(&original.get(b.emoji.as_ref()))
+            })
+            .then_with(|| a.shortcode.cmp(&b.shortcode))
+    });
+}
+
+fn bounded_count(value: Option<&serde_json::Value>) -> u32 {
+    match value.and_then(|v| v.as_u64()) {
+        Some(n) => n.min(u32::MAX as u64) as u32,
+        None => 0,
+    }
+}
+
+fn bounded_time(value: Option<&serde_json::Value>) -> u64 {
+    value.and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+fn parse_usage_map(value: Option<&serde_json::Value>) -> HashMap<String, UsageStat> {
+    let mut entries: Vec<(String, UsageStat)> = Vec::new();
+    if let Some(m) = value.and_then(|v| v.as_object()) {
+        for (k, v) in m {
+            entries.push((
+                k.clone(),
+                UsageStat {
+                    count: bounded_count(v.get("count")),
+                    last_used: bounded_time(v.get("last_used")),
+                },
+            ));
+        }
+    }
+    // Bound persisted state: keep most relevant entries (count, then recency).
+    entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| b.1.last_used.cmp(&a.1.last_used)).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(SUGGESTION_USAGE_MAX_ENTRIES);
+    entries.into_iter().collect()
+}
+
+fn usage_map_to_json(usage: &HashMap<String, UsageStat>) -> serde_json::Value {
+    let mut entries: Vec<(&String, &UsageStat)> = usage.iter().collect();
+    entries.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| b.1.last_used.cmp(&a.1.last_used)).then_with(|| a.0.cmp(&b.0)));
+    entries.truncate(SUGGESTION_USAGE_MAX_ENTRIES);
+    let mut m = serde_json::Map::new();
+    for (k, v) in entries {
+        m.insert(
+            k.clone(),
+            serde_json::json!({ "count": v.count.min(u32::MAX), "last_used": v.last_used }),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn load_suggestion_usage(
+    path: Option<&std::path::Path>,
+) -> (HashMap<String, UsageStat>, HashMap<String, UsageStat>) {
+    let Some(path) = path else { return (HashMap::new(), HashMap::new()) };
+    let Ok(text) = std::fs::read_to_string(path) else { return (HashMap::new(), HashMap::new()) };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return (HashMap::new(), HashMap::new())
+    };
+    // Unknown/missing schema version: best-effort parse for forward/backward tolerance.
+    let _version = value.get("version").and_then(|v| v.as_u64());
+    (
+        parse_usage_map(value.get("mentions")),
+        parse_usage_map(value.get("emoji")),
+    )
+}
+
+fn save_suggestion_usage(
+    path: Option<&std::path::Path>,
+    mentions: &HashMap<String, UsageStat>,
+    emoji: &HashMap<String, UsageStat>,
+) {
+    let Some(path) = path else { return };
+    let root = serde_json::json!({
+        "version": SUGGESTION_USAGE_SCHEMA_VERSION,
+        "mentions": usage_map_to_json(mentions),
+        "emoji": usage_map_to_json(emoji),
+    });
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(text) = serde_json::to_string_pretty(&root) else { return };
+    // Atomic-ish write: write temp then rename to avoid truncating a valid file on failure.
+    let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now_secs()));
+    let write_ok = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.flush()?;
+        f.sync_all()?;
+        Ok(())
+    })();
+    if write_ok.is_ok() {
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
 }
 
 /// Rows the composer grows to before it scrolls.
@@ -278,7 +519,12 @@ fn placeholder(store: &ChatStore) -> String {
 }
 
 impl Composer {
-    pub fn new(store: Entity<ChatStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Entity<ChatStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        usage_path: Option<PathBuf>,
+    ) -> Self {
         // Enter sends, shift-enter starts a new line, and the field grows with
         // its text (see `TextInput::multiline`).
         let input =
@@ -368,6 +614,7 @@ impl Composer {
                 _ => {}
             }),
         ];
+        let (mention_usage, emoji_usage) = load_suggestion_usage(usage_path.as_deref());
         Self {
             store,
             input,
@@ -377,6 +624,9 @@ impl Composer {
             pending: None,
             mention: None,
             emoji: None,
+            mention_usage,
+            emoji_usage,
+            usage_path,
             _subscriptions: subscriptions,
         }
     }
@@ -490,7 +740,7 @@ impl Composer {
             return false;
         };
         let candidates = self.store.read(cx).mention_candidates();
-        let matches = filter_mentions(&candidates, &query);
+        let matches = filter_mentions(&candidates, &query, &self.mention_usage, now_secs());
         if matches.is_empty() {
             let changed = self.mention.take().is_some();
             self.emoji = None;
@@ -533,13 +783,14 @@ impl Composer {
             }
             return;
         };
-        let matches = emoji::suggest(&query, 12);
+        let mut matches = emoji::suggest(&query, 12);
         if matches.is_empty() {
             if self.emoji.take().is_some() {
                 cx.notify();
             }
             return;
         }
+        rank_emoji_matches(&mut matches, &self.emoji_usage, now_secs(), query.trim().is_empty());
         let selected = self
             .emoji
             .as_ref()
@@ -621,6 +872,7 @@ impl Composer {
             return false;
         }
         let handle = candidate.handle.to_string();
+        self.record_mention_use(&handle);
         let mut new = String::with_capacity(text.len() - state.range.len() + handle.len() + 2);
         new.push_str(&text.as_ref()[..state.range.start]);
         new.push('@');
@@ -662,6 +914,7 @@ impl Composer {
             return false;
         }
         let emoji = candidate.emoji.as_ref();
+        self.record_emoji_use(emoji);
         let mut new = String::with_capacity(text.len() - state.range.len() + emoji.len() + 1);
         new.push_str(&text.as_ref()[..state.range.start]);
         new.push_str(emoji);
@@ -698,6 +951,22 @@ impl Composer {
         if !self.accept_suggestion(cx) {
             cx.propagate();
         }
+    }
+
+    fn record_mention_use(&mut self, handle: &str) {
+        let key = handle.to_ascii_lowercase();
+        let entry = self.mention_usage.entry(key).or_default();
+        entry.count = entry.count.saturating_add(1);
+        entry.last_used = now_secs();
+        save_suggestion_usage(self.usage_path.as_deref(), &self.mention_usage, &self.emoji_usage);
+    }
+
+    fn record_emoji_use(&mut self, emoji: &str) {
+        let key = emoji.to_string();
+        let entry = self.emoji_usage.entry(key).or_default();
+        entry.count = entry.count.saturating_add(1);
+        entry.last_used = now_secs();
+        save_suggestion_usage(self.usage_path.as_deref(), &self.mention_usage, &self.emoji_usage);
     }
 
     fn send(&mut self, cx: &mut Context<Self>) {
@@ -1238,11 +1507,124 @@ mod tests {
                 nicknames: vec![],
             },
         ];
-        assert_eq!(filter_mentions(&candidates, "cla").len(), 1);
-        assert_eq!(filter_mentions(&candidates, "cli").len(), 1);
-        assert_eq!(filter_mentions(&candidates, "CX").len(), 1);
-        assert_eq!(filter_mentions(&candidates, "").len(), 2);
-        assert!(filter_mentions(&candidates, "zzz").is_empty());
+        let usage = std::collections::HashMap::new();
+        let cla = filter_mentions(&candidates, "cla", &usage, 0);
+        assert_eq!(cla.first().map(|c| c.handle.as_ref()), Some("claude"));
+        assert!(!cla.iter().any(|c| c.handle.as_ref() == "codex"));
+        let cli = filter_mentions(&candidates, "cli", &usage, 0);
+        assert_eq!(cli.first().map(|c| c.handle.as_ref()), Some("codex"));
+        assert!(!cli.iter().any(|c| c.handle.as_ref() == "claude"));
+        let cx = filter_mentions(&candidates, "CX", &usage, 0);
+        assert_eq!(cx.first().map(|c| c.handle.as_ref()), Some("claude"));
+        assert_eq!(filter_mentions(&candidates, "", &usage, 0).len(), 2);
+        assert!(filter_mentions(&candidates, "zzz", &usage, 0).is_empty());
+    }
+
+    #[test]
+    fn mention_ranking_prefers_exact_prefix_then_subsequence() {
+        let candidates = vec![
+            MentionCandidate { handle: "albert".into(), name: "Albert".into(), nicknames: vec![] },
+            MentionCandidate { handle: "al".into(), name: "Al".into(), nicknames: vec![] },
+            MentionCandidate { handle: "gal".into(), name: "Gal".into(), nicknames: vec![] },
+        ];
+        let usage = std::collections::HashMap::new();
+        let ranked = filter_mentions(&candidates, "al", &usage, 0);
+        assert_eq!(ranked[0].handle.as_ref(), "al");
+        assert_eq!(ranked[1].handle.as_ref(), "albert");
+    }
+
+    #[test]
+    fn mention_ranking_uses_frequency_and_recency() {
+        let candidates = vec![
+            MentionCandidate { handle: "alex".into(), name: "Alex".into(), nicknames: vec![] },
+            MentionCandidate { handle: "alice".into(), name: "Alice".into(), nicknames: vec![] },
+        ];
+        let mut usage = std::collections::HashMap::new();
+        usage.insert("alex".to_string(), UsageStat { count: 1, last_used: 10 });
+        usage.insert("alice".to_string(), UsageStat { count: 5, last_used: 5 });
+        let ranked = filter_mentions(&candidates, "al", &usage, 20);
+        assert_eq!(ranked[0].handle.as_ref(), "alice"); // higher frequency wins among same match rank
+        let mut usage2 = std::collections::HashMap::new();
+        usage2.insert("alex".to_string(), UsageStat { count: 2, last_used: 20 });
+        usage2.insert("alice".to_string(), UsageStat { count: 2, last_used: 5 });
+        let ranked2 = filter_mentions(&candidates, "al", &usage2, 20);
+        assert_eq!(ranked2[0].handle.as_ref(), "alex"); // more recent when counts equal
+    }
+
+    #[test]
+    fn mention_usage_lookup_is_case_insensitive_for_handles() {
+        let candidates = vec![
+            MentionCandidate { handle: "CodeX".into(), name: "Codex".into(), nicknames: vec![] },
+            MentionCandidate { handle: "Coder".into(), name: "Coder".into(), nicknames: vec![] },
+        ];
+        let mut usage = std::collections::HashMap::new();
+        usage.insert("codex".to_string(), UsageStat { count: 10, last_used: 50 }); // stored normalized
+        let ranked = filter_mentions(&candidates, "cod", &usage, 60);
+        assert_eq!(ranked.first().map(|c| c.handle.as_ref()), Some("CodeX"));
+    }
+
+    #[test]
+    fn suggestion_usage_persists_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("cc-composer-test-{}-{}", std::process::id(), now_secs()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("composer_suggestions.json");
+        let mut mentions = std::collections::HashMap::new();
+        mentions.insert("codex".to_string(), UsageStat { count: 3, last_used: 42 });
+        let mut emoji = std::collections::HashMap::new();
+        emoji.insert("👍".to_string(), UsageStat { count: 2, last_used: 99 });
+        save_suggestion_usage(Some(&path), &mentions, &emoji);
+        let (lm, le) = load_suggestion_usage(Some(&path));
+        assert_eq!(lm.get("codex"), Some(&UsageStat { count: 3, last_used: 42 }));
+        assert_eq!(le.get("👍"), Some(&UsageStat { count: 2, last_used: 99 }));
+        // malformed JSON recovers to empty state
+        std::fs::write(&path, "{not valid json").unwrap();
+        let (lm2, le2) = load_suggestion_usage(Some(&path));
+        assert!(lm2.is_empty() && le2.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suggestion_usage_bounds_and_no_path() {
+        let dir = std::env::temp_dir().join(format!("cc-composer-bounds-{}-{}", std::process::id(), now_secs()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("composer_suggestions.json");
+        // oversized count clamps
+        let text = r#"{"version":1,"mentions":{"a":{"count":99999999999,"last_used":5}},"emoji":{}}"#;
+        std::fs::write(&path, text).unwrap();
+        let (lm, _) = load_suggestion_usage(Some(&path));
+        assert_eq!(lm.get("a"), Some(&UsageStat { count: u32::MAX, last_used: 5 }));
+        // no path => no persistence side effects / empty load
+        let mut mentions = std::collections::HashMap::new();
+        mentions.insert("x".to_string(), UsageStat { count: 1, last_used: 1 });
+        let mut emoji = std::collections::HashMap::new();
+        save_suggestion_usage(None, &mentions, &emoji);
+        let (lm3, le3) = load_suggestion_usage(None);
+        assert!(lm3.is_empty() && le3.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn emoji_mru_ranking_empty_query_and_stability() {
+        let mk = |sc: &str, e: &str| EmojiMatch { shortcode: sc.into(), emoji: e.into(), name: sc.into() };
+        let mut matches = vec![mk("a", "😀"), mk("b", "😃"), mk("c", "😄")];
+        let mut usage = std::collections::HashMap::new();
+        usage.insert("😃".to_string(), UsageStat { count: 5, last_used: 10 });
+        usage.insert("😄".to_string(), UsageStat { count: 2, last_used: 20 });
+        rank_emoji_matches(&mut matches, &usage, 30, true);
+        assert_eq!(matches[0].emoji.as_ref(), "😃"); // highest count
+        assert_eq!(matches[1].emoji.as_ref(), "😄");
+        assert_eq!(matches[2].emoji.as_ref(), "😀");
+        // stability when usage equal: preserve original order among unused
+        let mut matches2 = vec![mk("a", "😀"), mk("b", "😃"), mk("c", "😄")];
+        let usage2 = std::collections::HashMap::new();
+        rank_emoji_matches(&mut matches2, &usage2, 30, true);
+        assert_eq!(matches2.iter().map(|m| m.emoji.as_ref()).collect::<Vec<_>>(), vec!["😀", "😃", "😄"]);
+        // non-empty query: preserve suggest order (no usage rerank in this slice)
+        let mut matches3 = vec![mk("a", "😀"), mk("b", "😃")];
+        let mut usage3 = std::collections::HashMap::new();
+        usage3.insert("😃".to_string(), UsageStat { count: 99, last_used: 99 });
+        rank_emoji_matches(&mut matches3, &usage3, 30, false);
+        assert_eq!(matches3.iter().map(|m| m.emoji.as_ref()).collect::<Vec<_>>(), vec!["😀", "😃"]);
     }
 
     #[test]
