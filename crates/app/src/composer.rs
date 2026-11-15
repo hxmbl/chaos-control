@@ -189,6 +189,7 @@ impl Composer {
                 input.set_highlighter(
                     move |text, appearance, app| {
                         let store = store_for_highlight.read(app);
+                        let theme = *app.theme();
                         let mut known = KnownMentions::new();
                         for member in store.mention_candidates() {
                             known.insert_member(
@@ -198,7 +199,10 @@ impl Composer {
                             );
                         }
                         known.insert_broadcasts();
-                        mention_highlight::mention_highlights(text, &known, appearance)
+                        let mentions =
+                            mention_highlight::mention_highlights(text, &known, appearance);
+                        let md = crate::markdown::markdown_marker_highlights(text, &theme);
+                        gpui::combine_highlights(mentions, md).collect()
                     },
                     cx,
                 );

@@ -21,6 +21,7 @@ tokio = { version = "1.54", features = ["rt-multi-thread"] }
 toml = "0.8"
 uuid = { version = "1", features = ["v4"] }
 pulldown-cmark.workspace = true
+syntect.workspace = true
 
 # Dock icon (src/dock.rs), macOS only. The menu bar item (src/tray.rs) is
 # disabled for now; re-add futures, image and tray-icon 0.24.2 to bring it back.

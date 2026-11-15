@@ -8,25 +8,43 @@
 //! Mention highlighting (known `@members`/broadcasts) is applied to rendered
 //! text so it stays consistent with plain-text rendering.
 
+use std::{
+    collections::HashMap as StdHashMap,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
+
 use gpui::{
-    AnyElement, FontStyle, FontWeight, Hsla, SharedString, StrikethroughStyle, StyledText, TextRun,
-    UnderlineStyle, div, prelude::*, px,
+    Animation, AnimationExt, AnyElement, ClipboardItem, ElementId, FontStyle, FontWeight, Hsla,
+    SharedString, StrikethroughStyle, StyledText, TextRun, UnderlineStyle, div, prelude::*, px,
 };
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle as SynFontStyle, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
+};
 use ui::{
-    TypeStyleExt,
-    tokens::{radius, space, text},
+    IconName, Tooltip, TypeStyleExt, icon,
+    tokens::{icon as icons, radius, size, space, text},
 };
 
 use crate::mention_highlight::{self, KnownMentions};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct InlineStyle {
     bold: bool,
     italic: bool,
     strike: bool,
     code: bool,
-    link: bool,
+    link_dest: Option<String>,
+}
+
+impl InlineStyle {
+    fn is_link(&self) -> bool {
+        self.link_dest.is_some()
+    }
 }
 
 #[derive(Clone)]
@@ -35,17 +53,191 @@ struct Span {
     style: InlineStyle,
 }
 
+fn syntect_assets() -> &'static (
+    SyntaxSet,
+    syntect::highlighting::Theme,
+    syntect::highlighting::Theme,
+) {
+    use std::{io::Cursor, sync::OnceLock};
+    static ASSETS: OnceLock<(
+        SyntaxSet,
+        syntect::highlighting::Theme,
+        syntect::highlighting::Theme,
+    )> = OnceLock::new();
+    ASSETS.get_or_init(|| {
+        let ss = SyntaxSet::load_defaults_newlines();
+        let mut dark = ThemeSet::load_from_reader(&mut Cursor::new(include_bytes!(
+            "../themes/tokyonight_night.tmTheme"
+        ) as &[u8]))
+        .unwrap_or_else(|_| {
+            ThemeSet::load_defaults()
+                .themes
+                .remove("base16-ocean.dark")
+                .expect("default theme")
+        });
+        let mut light = ThemeSet::load_from_reader(&mut Cursor::new(include_bytes!(
+            "../themes/tokyonight_day.tmTheme"
+        ) as &[u8]))
+        .unwrap_or_else(|_| {
+            ThemeSet::load_defaults()
+                .themes
+                .remove("InspiredGitHub")
+                .expect("default theme")
+        });
+        let _ = (&mut dark, &mut light);
+        (ss, dark, light)
+    })
+}
+
+static COPIED_BLOCKS: OnceLock<Mutex<StdHashMap<String, Instant>>> = OnceLock::new();
+
+const COPIED_FOR: Duration = Duration::from_secs(3);
+
+fn is_block_copied(key: &str) -> bool {
+    COPIED_BLOCKS
+        .get_or_init(|| Mutex::new(StdHashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|m| m.get(key).copied())
+        .is_some_and(|until| Instant::now() < until)
+}
+
+fn mark_block_copied(key: String) {
+    if let Ok(mut m) = COPIED_BLOCKS
+        .get_or_init(|| Mutex::new(StdHashMap::new()))
+        .lock()
+    {
+        m.insert(key, Instant::now() + COPIED_FOR);
+    }
+}
+
+fn clear_block_copied(key: &str) {
+    if let Ok(mut m) = COPIED_BLOCKS
+        .get_or_init(|| Mutex::new(StdHashMap::new()))
+        .lock()
+    {
+        m.remove(key);
+    }
+}
+
+fn highlight_code_runs(
+    code: &str,
+    lang: Option<&str>,
+    base_style: &gpui::TextStyle,
+    base_color: Hsla,
+    is_dark: bool,
+) -> Vec<Vec<TextRun>> {
+    use std::{
+        collections::HashMap,
+        sync::{Mutex, OnceLock},
+    };
+    #[derive(Clone, Eq, Hash, PartialEq)]
+    struct Key(String, Option<String>, bool);
+    static CACHE: OnceLock<Mutex<StdHashMap<Key, Vec<Vec<TextRun>>>>> = OnceLock::new();
+    let key = Key(code.to_string(), lang.map(|s| s.to_string()), is_dark);
+    if let Some(hit) = CACHE
+        .get_or_init(|| Mutex::new(StdHashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&key).cloned())
+    {
+        let _ = (base_style, base_color);
+        return hit;
+    }
+
+    let (ss, dark, light) = syntect_assets();
+    let first = code.lines().next().unwrap_or("");
+    let syntax = lang
+        .and_then(|l| {
+            ss.find_syntax_by_token(l)
+                .or_else(|| ss.find_syntax_by_extension(l))
+                .or_else(|| ss.find_syntax_by_name(l))
+        })
+        .or_else(|| ss.find_syntax_by_first_line(first))
+        .or_else(|| {
+            let c = code;
+            if c.contains("fn ") && c.contains('{') {
+                ss.find_syntax_by_extension("rs")
+            } else if c.contains("const ")
+                || c.contains("function ")
+                || c.contains("=>")
+                || c.contains("export ")
+            {
+                ss.find_syntax_by_extension("js")
+            } else if c.contains("def ") && c.contains(':') {
+                ss.find_syntax_by_extension("py")
+            } else if c.contains("#include") {
+                ss.find_syntax_by_extension("c")
+            } else if c.contains("<div") || c.contains("</") || c.contains("<html") {
+                ss.find_syntax_by_extension("html")
+            } else if c.trim_start().starts_with('{') && c.contains(':') {
+                ss.find_syntax_by_extension("json")
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| ss.find_syntax_plain_text());
+    let theme = if is_dark { dark } else { light };
+    let mut h = HighlightLines::new(syntax, theme);
+    let mut out = Vec::new();
+    for line in LinesWithEndings::from(code) {
+        let ranges = h.highlight_line(line, ss).unwrap_or_default();
+        let mut runs = Vec::new();
+        for (style, text) in ranges {
+            let text = text
+                .strip_suffix('\n')
+                .unwrap_or(text)
+                .strip_suffix('\r')
+                .unwrap_or(text);
+            if text.is_empty() {
+                continue;
+            }
+            let mut font = base_style.font();
+            if style.font_style.contains(SynFontStyle::BOLD) {
+                font.weight = FontWeight::BOLD;
+            }
+            if style.font_style.contains(SynFontStyle::ITALIC) {
+                font.style = FontStyle::Italic;
+            }
+            let rgba = gpui::Rgba {
+                r: style.foreground.r as f32 / 255.0,
+                g: style.foreground.g as f32 / 255.0,
+                b: style.foreground.b as f32 / 255.0,
+                a: style.foreground.a as f32 / 255.0,
+            };
+            let color: Hsla = rgba.into();
+            runs.push(TextRun {
+                len: text.len(),
+                font,
+                color,
+                background_color: base_style.background_color,
+                underline: base_style.underline.clone(),
+                strikethrough: base_style.strikethrough.clone(),
+            });
+        }
+        out.push(runs);
+    }
+    let _ = base_color;
+    if let Ok(mut m) = CACHE.get_or_init(|| Mutex::new(StdHashMap::new())).lock() {
+        m.insert(key, out.clone());
+    }
+    out
+}
+
 pub fn render_message_markdown(
     source: &str,
     known: &KnownMentions,
     text_color: Hsla,
     base_style: &gpui::TextStyle,
     theme: &ui::Theme,
+    context_key: &str,
 ) -> AnyElement {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_TASKLISTS);
     let parser = Parser::new_ext(source, opts);
-    let mut renderer = Renderer::new(known, text_color, theme, base_style);
+    let mut renderer = Renderer::new(known, text_color, theme, base_style, context_key);
     renderer.run(parser);
     renderer.finish().into_any_element()
 }
@@ -67,10 +259,22 @@ struct Renderer<'a> {
     blockquote_depth: usize,
     in_code_block: bool,
     code_block_text: String,
+    code_block_lang: Option<String>,
     pending_heading: Option<HeadingLevel>,
-    list_stack: Vec<(ListState, Vec<Vec<AnyElement>>)>,
+    // tables
+    in_table: bool,
+    in_table_head: bool,
+    table_alignments: Vec<pulldown_cmark::Alignment>,
+    table_header: Vec<AnyElement>,
+    table_rows: Vec<Vec<AnyElement>>,
+    current_table_row: Vec<AnyElement>,
+    in_table_cell: bool,
+    list_stack: Vec<(ListState, Vec<(Option<String>, Vec<AnyElement>)>)>,
     item_block_stack: Vec<Vec<AnyElement>>,
+    item_marker_stack: Vec<Option<String>>,
     in_list_item: usize,
+    code_block_index: usize,
+    context_key: String,
 }
 
 impl<'a> Renderer<'a> {
@@ -79,6 +283,7 @@ impl<'a> Renderer<'a> {
         text_color: Hsla,
         theme: &'a ui::Theme,
         base_style: &'a gpui::TextStyle,
+        context_key: &str,
     ) -> Self {
         Self {
             known,
@@ -91,15 +296,26 @@ impl<'a> Renderer<'a> {
             blockquote_depth: 0,
             in_code_block: false,
             code_block_text: String::new(),
+            code_block_lang: None,
             pending_heading: None,
+            in_table: false,
+            in_table_head: false,
+            table_alignments: Vec::new(),
+            table_header: Vec::new(),
+            table_rows: Vec::new(),
+            current_table_row: Vec::new(),
+            in_table_cell: false,
             list_stack: Vec::new(),
             item_block_stack: Vec::new(),
+            item_marker_stack: Vec::new(),
             in_list_item: 0,
+            code_block_index: 0,
+            context_key: context_key.to_string(),
         }
     }
 
     fn current_style(&self) -> InlineStyle {
-        *self.style_stack.last().unwrap_or(&InlineStyle::default())
+        self.style_stack.last().cloned().unwrap_or_default()
     }
 
     fn push_text(&mut self, text: &str) {
@@ -131,6 +347,10 @@ impl<'a> Renderer<'a> {
         let spans = std::mem::take(&mut self.para_spans);
         let heading = self.pending_heading.take();
         let element = self.render_inline_paragraph(spans, heading);
+        if self.in_table_cell {
+            self.current_table_row.push(element);
+            return;
+        }
         self.push_block(element);
     }
 
@@ -175,38 +395,85 @@ impl<'a> Renderer<'a> {
         let mention_spans =
             mention_highlight::mention_highlights(&full, self.known, self.theme.appearance);
         let base_style = self.base_style;
-        let mut runs: Vec<TextRun> = Vec::new();
+        // If no links, render as single StyledText for proper text flow.
+        let has_links = spans.iter().any(|s| s.style.is_link());
+        let mut container = div().w_full().min_w_0().text_color(self.text_color);
+        if let Some(level) = heading {
+            let (ts, weight, color) = match level {
+                HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => {
+                    (text::BODY, FontWeight::BOLD, self.theme.ink)
+                }
+                _ => (text::BODY, text::MEDIUM, self.theme.ink),
+            };
+            container = container
+                .type_style(ts)
+                .font_weight(weight)
+                .text_color(color);
+        }
+        if !has_links {
+            let mut runs: Vec<TextRun> = Vec::new();
+            let mut offset = 0usize;
+            for span in &spans {
+                let start = offset;
+                let end = offset + span.text.len();
+                self.push_styled_runs(
+                    &full,
+                    base_style,
+                    start,
+                    end,
+                    span.style.clone(),
+                    &mention_spans,
+                    &mut runs,
+                );
+                offset = end;
+            }
+            let text_el = StyledText::new(SharedString::from(full)).with_runs(runs);
+            return container
+                .whitespace_normal()
+                .child(text_el)
+                .into_any_element();
+        }
+
+        // With links: render segments so links can have tooltips.
+        container = container.flex().flex_wrap().items_baseline();
         let mut offset = 0usize;
-        for span in spans {
+        let mut link_idx = 0usize;
+        for span in &spans {
             let start = offset;
             let end = offset + span.text.len();
+            let seg_text = &full[start..end];
+            if seg_text.is_empty() {
+                offset = end;
+                continue;
+            }
+            let mut runs: Vec<TextRun> = Vec::new();
             self.push_styled_runs(
                 &full,
                 base_style,
                 start,
                 end,
-                span.style,
+                span.style.clone(),
                 &mention_spans,
                 &mut runs,
             );
+            let styled = StyledText::new(SharedString::from(seg_text.to_string())).with_runs(runs);
+            if let Some(dest) = &span.style.link_dest {
+                let id = ElementId::Name(format!("md-link-{start}-{link_idx}").into());
+                link_idx += 1;
+                let tip = dest.clone();
+                container = container.child(
+                    div()
+                        .id(id)
+                        .cursor_pointer()
+                        .tooltip(Tooltip::text(tip))
+                        .child(styled),
+                );
+            } else {
+                container = container.child(div().whitespace_normal().child(styled));
+            }
             offset = end;
         }
-        let text_el = StyledText::new(SharedString::from(full)).with_runs(runs);
-        let mut d = div()
-            .w_full()
-            .min_w_0()
-            .whitespace_normal()
-            .text_color(self.text_color);
-        if let Some(level) = heading {
-            let (ts, weight, color) = match level {
-                HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => {
-                    (text::BODY, text::SEMIBOLD, self.theme.ink)
-                }
-                _ => (text::BODY, text::MEDIUM, self.theme.ink),
-            };
-            d = d.type_style(ts).font_weight(weight).text_color(color);
-        }
-        d.child(text_el).into_any_element()
+        container.into_any_element()
     }
 
     fn push_styled_runs(
@@ -244,12 +511,12 @@ impl<'a> Renderer<'a> {
                 .map(|(_, h)| *h);
             let mut font = base.font();
             if style.bold {
-                font.weight = FontWeight::SEMIBOLD;
+                font.weight = FontWeight::BOLD;
             }
             if style.italic {
                 font.style = FontStyle::Italic;
             }
-            let mut color = if style.link {
+            let mut color = if style.is_link() {
                 self.theme.accent
             } else {
                 self.text_color
@@ -263,7 +530,7 @@ impl<'a> Renderer<'a> {
                     color: Some(color),
                 });
             }
-            if style.link {
+            if style.is_link() {
                 underline = Some(UnderlineStyle {
                     thickness: px(1.),
                     color: Some(color),
@@ -321,7 +588,8 @@ impl<'a> Renderer<'a> {
                         style: s,
                     });
                 }
-                Event::SoftBreak | Event::HardBreak => self.push_text("\n"),
+                Event::SoftBreak => self.push_text(" "),
+                Event::HardBreak => self.push_text("\n"),
                 Event::Rule => {
                     self.flush_paragraph();
                     let t = self.theme;
@@ -337,7 +605,13 @@ impl<'a> Renderer<'a> {
                 Event::Html(t) | Event::InlineHtml(t) => self.push_text(&t),
                 Event::FootnoteReference(t) => self.push_text(&format!("[{t}]")),
                 Event::TaskListMarker(checked) => {
-                    self.push_text(if checked { "[x] " } else { "[ ] " });
+                    if let Some(marker) = self.item_marker_stack.last_mut() {
+                        *marker = Some(if checked {
+                            "☑".to_string()
+                        } else {
+                            "☐".to_string()
+                        });
+                    }
                 }
                 _ => {}
             }
@@ -354,10 +628,21 @@ impl<'a> Renderer<'a> {
                 self.flush_paragraph();
                 self.blockquote_depth += 1;
             }
-            Tag::CodeBlock(_) => {
+            Tag::CodeBlock(kind) => {
                 self.flush_paragraph();
                 self.in_code_block = true;
                 self.code_block_text.clear();
+                self.code_block_lang = match kind {
+                    pulldown_cmark::CodeBlockKind::Fenced(info) => {
+                        let lang = info.split_whitespace().next().unwrap_or("").trim();
+                        if lang.is_empty() {
+                            None
+                        } else {
+                            Some(lang.to_string())
+                        }
+                    }
+                    pulldown_cmark::CodeBlockKind::Indented => None,
+                };
             }
             Tag::List(start) => {
                 self.flush_paragraph();
@@ -372,6 +657,26 @@ impl<'a> Renderer<'a> {
             Tag::Item => {
                 self.in_list_item += 1;
                 self.item_block_stack.push(Vec::new());
+                self.item_marker_stack.push(None);
+            }
+            Tag::Table(alignments) => {
+                self.flush_paragraph();
+                self.in_table = true;
+                self.in_table_head = false;
+                self.table_alignments = alignments;
+                self.table_header.clear();
+                self.table_rows.clear();
+            }
+            Tag::TableHead => {
+                self.in_table_head = true;
+                self.current_table_row.clear();
+            }
+            Tag::TableRow => {
+                self.current_table_row.clear();
+            }
+            Tag::TableCell => {
+                self.in_table_cell = true;
+                self.para_spans.clear();
             }
             Tag::Emphasis => {
                 let mut s = self.current_style();
@@ -388,9 +693,9 @@ impl<'a> Renderer<'a> {
                 s.strike = true;
                 self.style_stack.push(s);
             }
-            Tag::Link { .. } => {
+            Tag::Link { dest_url, .. } => {
                 let mut s = self.current_style();
-                s.link = true;
+                s.link_dest = Some(dest_url.to_string());
                 self.style_stack.push(s);
             }
             Tag::Image { .. } => {
@@ -410,31 +715,154 @@ impl<'a> Renderer<'a> {
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
                 let code = std::mem::take(&mut self.code_block_text);
+                let lang = self.code_block_lang.take();
                 let t = self.theme;
-                let text: SharedString = code.trim_end_matches('\n').to_string().into();
-                let el = div()
+                let is_dark = matches!(t.appearance, ui::Appearance::Dark);
+                let code_trimmed = code.trim_end_matches('\n').to_string();
+                let highlighted = highlight_code_runs(
+                    &code_trimmed,
+                    lang.as_deref(),
+                    self.base_style,
+                    t.ink,
+                    is_dark,
+                );
+                let mut lines_col = div()
                     .w_full()
                     .px(space::X2)
                     .py(space::X1_5)
-                    .rounded(radius::SM)
-                    .bg(t.sunken)
                     .text_color(t.ink)
                     .type_style(text::SMALL)
-                    .whitespace_normal()
-                    .child(text);
-                self.push_block(el.into_any_element());
+                    .flex()
+                    .flex_col();
+                if code_trimmed.is_empty() {
+                    lines_col = lines_col.child(SharedString::from(" "));
+                } else {
+                    let lines: Vec<&str> = code_trimmed.split('\n').collect();
+                    for (i, line) in lines.iter().enumerate() {
+                        let display: SharedString = if line.is_empty() {
+                            " ".into()
+                        } else {
+                            (*line).to_string().into()
+                        };
+                        if let Some(runs) = highlighted.get(i) {
+                            if runs.is_empty() || line.is_empty() {
+                                lines_col = lines_col.child(
+                                    div().w_full().min_w_0().whitespace_normal().child(display),
+                                );
+                            } else {
+                                let total: usize = runs.iter().map(|r| r.len).sum();
+                                let mut runs = runs.clone();
+                                if total != display.len() && !runs.is_empty() {
+                                    runs = vec![TextRun {
+                                        len: display.len(),
+                                        font: self.base_style.font(),
+                                        color: t.ink,
+                                        background_color: self.base_style.background_color,
+                                        underline: self.base_style.underline.clone(),
+                                        strikethrough: self.base_style.strikethrough.clone(),
+                                    }];
+                                }
+                                let styled = StyledText::new(display).with_runs(runs);
+                                lines_col = lines_col.child(
+                                    div().w_full().min_w_0().whitespace_normal().child(styled),
+                                );
+                            }
+                        } else {
+                            lines_col = lines_col
+                                .child(div().w_full().min_w_0().whitespace_normal().child(display));
+                        }
+                    }
+                }
+
+                let idx = self.code_block_index;
+                self.code_block_index += 1;
+                let copy_text = code_trimmed.clone();
+                let copy_key = format!("{}::code::{}", self.context_key, idx);
+                let copied = is_block_copied(&copy_key);
+                let (btn_icon, tip) = if copied {
+                    (IconName::Check, "Copied")
+                } else {
+                    (IconName::CopySimple, "Copy code")
+                };
+                let key_for_click = copy_key.clone();
+                let icon_fade_id =
+                    SharedString::from(format!("md-code-copy-fade-{copy_key}-{copied}"));
+                let icon_wrap_id =
+                    SharedString::from(format!("md-code-copy-icon-{copy_key}-{copied}"));
+                let btn_id = SharedString::from(format!("md-code-copy-{copy_key}"));
+                let icon_color = t.ink;
+                let icon_el = div().id(icon_wrap_id).with_animation(
+                    icon_fade_id,
+                    Animation::new(Duration::from_millis(180)),
+                    move |el, delta| {
+                        el.opacity(delta)
+                            .child(icon(btn_icon, icons::SM, icon_color))
+                    },
+                );
+                let copy_btn = div()
+                    .id(btn_id)
+                    .size(size::BUTTON_SM)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius::SM)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(t.hover))
+                    .tooltip(Tooltip::text(tip))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                        mark_block_copied(key_for_click.clone());
+                        cx.refresh_windows();
+                        let k = key_for_click.clone();
+                        cx.spawn(async move |cx| {
+                            cx.background_executor().timer(COPIED_FOR).await;
+                            clear_block_copied(&k);
+                            let _ = cx.update(|cx| cx.refresh_windows());
+                        })
+                        .detach();
+                    })
+                    .child(icon_el);
+
+                let header = div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px(space::X2)
+                    .pt(space::X1)
+                    .child(
+                        div()
+                            .type_style(text::CAPTION)
+                            .text_color(t.muted)
+                            .when_some(lang.filter(|l| !l.is_empty()), |d, lang| {
+                                d.child(SharedString::from(lang))
+                            }),
+                    )
+                    .child(copy_btn);
+
+                let block = div()
+                    .w_full()
+                    .rounded(radius::SM)
+                    .bg(t.sunken)
+                    .flex()
+                    .flex_col()
+                    .child(header)
+                    .child(lines_col);
+                self.push_block(block.into_any_element());
             }
             TagEnd::List(_) => {
                 self.flush_paragraph();
                 if let Some((state, items)) = self.list_stack.pop() {
                     let t = self.theme;
                     let mut col = div().flex().flex_col().gap(space::X0_5);
-                    for (i, item_blocks) in items.into_iter().enumerate() {
-                        let marker = if state.ordered {
-                            format!("{}.", state.start + i as u64)
-                        } else {
-                            "•".to_string()
-                        };
+                    for (i, (task_marker, item_blocks)) in items.into_iter().enumerate() {
+                        let marker = task_marker.unwrap_or_else(|| {
+                            if state.ordered {
+                                format!("{}.", state.start + i as u64)
+                            } else {
+                                "•".to_string()
+                            }
+                        });
                         let mut item_col =
                             div().flex().flex_col().gap(space::X0_5).min_w_0().flex_1();
                         for b in item_blocks {
@@ -458,12 +886,72 @@ impl<'a> Renderer<'a> {
             }
             TagEnd::Item => {
                 self.flush_paragraph();
+                let marker = self.item_marker_stack.pop().flatten();
                 if let Some(item_blocks) = self.item_block_stack.pop() {
                     if let Some((_, items)) = self.list_stack.last_mut() {
-                        items.push(item_blocks);
+                        items.push((marker, item_blocks));
                     }
                 }
                 self.in_list_item = self.in_list_item.saturating_sub(1);
+            }
+            TagEnd::TableCell => {
+                self.flush_paragraph();
+                self.in_table_cell = false;
+            }
+            TagEnd::TableRow => {
+                if self.in_table_head {
+                    self.table_header = std::mem::take(&mut self.current_table_row);
+                } else {
+                    self.table_rows
+                        .push(std::mem::take(&mut self.current_table_row));
+                }
+            }
+            TagEnd::TableHead => {
+                self.in_table_head = false;
+            }
+            TagEnd::Table => {
+                self.in_table = false;
+                let t = self.theme;
+                let mut table = div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .border_1()
+                    .border_color(t.line)
+                    .rounded(radius::SM);
+                if !self.table_header.is_empty() {
+                    let mut row = div().w_full().flex().bg(t.sunken);
+                    for cell in std::mem::take(&mut self.table_header) {
+                        row = row.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px(space::X2)
+                                .py(space::X1)
+                                .border_r_1()
+                                .border_color(t.line)
+                                .child(cell),
+                        );
+                    }
+                    table = table.child(row);
+                }
+                for body_row in std::mem::take(&mut self.table_rows) {
+                    let mut row = div().w_full().flex().border_t_1().border_color(t.line);
+                    for cell in body_row {
+                        row = row.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .px(space::X2)
+                                .py(space::X1)
+                                .border_r_1()
+                                .border_color(t.line)
+                                .child(cell),
+                        );
+                    }
+                    table = table.child(row);
+                }
+                self.push_block(table.into_any_element());
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
                 if self.style_stack.len() > 1 {
@@ -504,7 +992,14 @@ mod tests {
     fn render_ok(source: &str) {
         let theme = ui::Theme::light();
         let known = KnownMentions::new();
-        let _ = render_message_markdown(source, &known, theme.ink_soft, &base_style(), &theme);
+        let _ = render_message_markdown(
+            source,
+            &known,
+            theme.ink_soft,
+            &base_style(),
+            &theme,
+            "test",
+        );
     }
 
     #[test]
@@ -529,4 +1024,162 @@ mod tests {
         render_ok("line1\nline2\n\npara2\nline3  \nline4");
         render_ok("a\n\n\n\nb");
     }
+}
+
+/// Highlight styles for markdown syntax markers (delimiters/punctuation) in `text`,
+/// dimmed so the content stands out while markers remain visible.
+pub fn markdown_marker_highlights(
+    text: &str,
+    theme: &ui::Theme,
+) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
+    use gpui::HighlightStyle;
+    let mut out: Vec<(std::ops::Range<usize>, HighlightStyle)> = Vec::new();
+    let dim = theme.faint;
+    let style = HighlightStyle {
+        color: Some(dim),
+        ..Default::default()
+    };
+    let push = |out: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
+                r: std::ops::Range<usize>| {
+        if r.start < r.end && text.is_char_boundary(r.start) && text.is_char_boundary(r.end) {
+            out.push((r, style));
+        }
+    };
+
+    let bytes = text.as_bytes();
+    let len = text.len();
+    let mut i = 0;
+    while i < len {
+        // Line-start markers: heading #, blockquote >, list markers, task boxes handled via text
+        if i == 0 || bytes.get(i - 1) == Some(&b'\n') {
+            let mut j = i;
+            while j < len && bytes[j] == b' ' {
+                j += 1;
+            }
+            // heading hashes
+            let mut k = j;
+            while k < len && bytes[k] == b'#' && k - j < 6 {
+                k += 1;
+            }
+            if k > j && k < len && bytes[k] == b' ' {
+                push(&mut out, j..k + 1);
+            }
+            // blockquote
+            if j < len && bytes[j] == b'>' {
+                let mut k = j + 1;
+                if k < len && bytes[k] == b' ' {
+                    k += 1;
+                }
+                push(&mut out, j..k);
+            }
+            // unordered list marker
+            if j < len
+                && (bytes[j] == b'-' || bytes[j] == b'*' || bytes[j] == b'+')
+                && j + 1 < len
+                && bytes[j + 1] == b' '
+            {
+                push(&mut out, j..j + 2);
+            }
+            // ordered list marker
+            let mut k = j;
+            while k < len && bytes[k].is_ascii_digit() {
+                k += 1;
+            }
+            if k > j
+                && k + 1 < len
+                && (bytes[k] == b'.' || bytes[k] == b')')
+                && bytes[k + 1] == b' '
+            {
+                push(&mut out, j..k + 2);
+            }
+        }
+
+        // fenced code block markers ```
+        if i + 3 <= len && text.is_char_boundary(i + 3) && &bytes[i..i + 3] == b"```" {
+            // dim backtick fence marker
+            push(&mut out, i..i + 3);
+            i += 3;
+            continue;
+        }
+        if i + 3 <= len && text.is_char_boundary(i + 3) && &bytes[i..i + 3] == b"~~~" {
+            push(&mut out, i..i + 3);
+            i += 3;
+            continue;
+        }
+
+        // inline code
+        if bytes[i] == b'`' {
+            let mut j = i + 1;
+            while j < len && bytes[j] == b'`' {
+                j += 1;
+            }
+            let ticks = j - i;
+            push(&mut out, i..j);
+            // find closing run of same length
+            let mut k = j;
+            while k < len {
+                if bytes[k] == b'`' {
+                    let mut m = k + 1;
+                    while m < len && bytes[m] == b'`' {
+                        m += 1;
+                    }
+                    if m - k == ticks {
+                        push(&mut out, k..m);
+                        i = m;
+                        break;
+                    }
+                    k = m;
+                } else {
+                    k += 1;
+                }
+            }
+            if k >= len {
+                i = j;
+            }
+            continue;
+        }
+
+        // bold/italic/strike markers
+        if i + 1 < len
+            && ((bytes[i] == b'*' && bytes[i + 1] == b'*')
+                || (bytes[i] == b'_' && bytes[i + 1] == b'_'))
+        {
+            push(&mut out, i..i + 2);
+            i += 2;
+            continue;
+        }
+        if i + 1 < len && bytes[i] == b'~' && bytes[i + 1] == b'~' {
+            push(&mut out, i..i + 2);
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'*' || bytes[i] == b'_' {
+            push(&mut out, i..i + 1);
+            i += 1;
+            continue;
+        }
+
+        // links/images: dim [ ] ( ) !
+        if bytes[i] == b'!' && i + 1 < len && bytes[i + 1] == b'[' {
+            push(&mut out, i..i + 2);
+            i += 2;
+            continue;
+        }
+        if bytes[i] == b'[' || bytes[i] == b']' || bytes[i] == b'(' || bytes[i] == b')' {
+            push(&mut out, i..i + 1);
+            i += 1;
+            continue;
+        }
+
+        // advance by char
+        if let Some(ch) = text[i..].chars().next() {
+            i += ch.len_utf8();
+        } else {
+            i += 1;
+        }
+    }
+
+    // merge/sort not strictly necessary; combine_highlights handles overlaps in text_input
+    out.sort_by_key(|(r, _)| (r.start, r.end));
+    out
 }

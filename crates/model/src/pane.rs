@@ -14,9 +14,9 @@ use std::sync::Arc;
 use crate::{Author, Id, Message, SearchResult, Workspace};
 
 /// A message is collapsed in the chat when it has more characters than this…
-pub const LONG_MESSAGE_CHARS: usize = 600;
+pub const LONG_MESSAGE_CHARS: usize = 2400;
 /// …or more lines than this.
-pub const LONG_MESSAGE_LINES: usize = 8;
+pub const LONG_MESSAGE_LINES: usize = 40;
 /// The collapsed preview keeps at most this many characters…
 pub const PREVIEW_CHARS: usize = 320;
 /// …and this many lines.
@@ -419,7 +419,7 @@ mod tests {
 
     #[test]
     fn character_count_not_bytes() {
-        // 600 two-byte characters are 1200 bytes but not long.
+        // Multi-byte characters at the limit are not long.
         assert!(!is_long(&"é".repeat(LONG_MESSAGE_CHARS)));
     }
 
