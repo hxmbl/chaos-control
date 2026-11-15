@@ -332,6 +332,8 @@ impl Titlebar {
         } else {
             space::X3
         };
+        // Leave room for the profile button rendered by Workspace to the right.
+        let toggle_right_x = right_x + size::BUTTON_SM + space::X1;
 
         let (hover, selected) = (t.hover, t.selected);
         let toggle = |id: &'static str, name: IconName, on: bool| {
@@ -447,7 +449,7 @@ impl Titlebar {
         div().absolute().inset_0().child(app_group).child(
             toggle("toggle-right-sidebar", IconName::SidebarRight, right_open)
                 .top(space::X3)
-                .right(right_x)
+                .right(toggle_right_x)
                 .tooltip(Tooltip::text(right_tip))
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(ToggleRightSidebar), cx)),
         )

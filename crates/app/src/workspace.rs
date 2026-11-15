@@ -5,16 +5,18 @@ use std::time::Instant;
 
 use gpui::{
     AnyView, Context, CursorStyle, Decorations, DispatchPhase, Entity, FocusHandle, MouseButton,
-    MouseExitEvent, MouseMoveEvent, Pixels, ResizeEdge, StyleRefinement, Subscription, Window,
+    Focusable, MouseExitEvent, MouseMoveEvent, Pixels, ResizeEdge, StyleRefinement, Subscription, Window,
     canvas, div, prelude::*, px,
 };
 use ui::{
-    ActiveTheme, Elevation, FONT_FAMILY, Theme, TypeStyleExt,
-    tokens::{radius, space, text},
+    ActiveTheme, Elevation, FONT_FAMILY, IconName, TextInput, Theme, Tooltip,
+    TypeStyleExt, icon,
+    tokens::{icon as icons, radius, size, space, text},
 };
 
 use crate::{
     composer::Composer,
+    profile,
     conversation::Conversation,
     model_picker::{ModelPicker, ModelPickerEvent},
     pane_host::{PaneEvent, PaneHost, pane_frame},
@@ -94,6 +96,12 @@ pub struct Workspace {
     /// Tracks keyboard focus anywhere inside each sidebar, so a peek holds
     /// open while the user is typing or tabbing in it.
     side_focus: [FocusHandle; 2],
+    /// Local user profile (display name/avatar placeholder), persisted outside
+    /// project-scoped state so it survives project switches.
+    profile: profile::Profile,
+    profile_path: std::path::PathBuf,
+    profile_editor_open: bool,
+    profile_input: Option<Entity<TextInput>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -190,6 +198,10 @@ impl Workspace {
             pane.update(cx, |p, cx| p.open(question, window, cx));
         }
 
+        let data_dir = crate::agents::data_dir();
+        let profile_path = profile::path(&data_dir);
+        let loaded_profile = profile::load(&data_dir);
+
         Self {
             titlebar: cx.new(|cx| Titlebar::new(panels.clone(), search.clone(), window, cx)),
             panels,
@@ -203,6 +215,10 @@ impl Workspace {
             composer,
             composer_height: COMPOSER_ONE_LINE,
             side_focus,
+            profile: loaded_profile,
+            profile_path,
+            profile_editor_open: false,
+            profile_input: None,
             _subscriptions: [
                 appearance,
                 panels_changed,
@@ -278,6 +294,7 @@ impl Render for Workspace {
                     .flex_none()
                     .child(cached(&self.titlebar)),
             )
+            .child(self.profile_button(window, cx))
             .child(
                 div()
                     .relative()
@@ -344,7 +361,8 @@ impl Render for Workspace {
                             cached(&self.right_sidebar),
                             cx,
                         ))
-                    }),
+                    })
+                    .children(self.profile_editor_overlay(right, window, cx)),
             )
             // Edge hover zones: watch every pointer move (capture phase, so
             // nothing on top can swallow it) and let `Panels` decide.
@@ -411,6 +429,262 @@ impl Workspace {
                 .bottom(composer_clearance(self.composer_height))
                 .child(pane),
         )
+    }
+
+
+
+    fn toggle_profile_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_editor_open = !self.profile_editor_open;
+        if self.profile_editor_open {
+            let input = cx.new(|cx| TextInput::new("Your name", cx));
+            let name = self.profile.name.clone();
+            input.update(cx, |input, cx| {
+                if !name.is_empty() {
+                    input.restore_draft_state(name.into(), 0..0, false, cx);
+                }
+            });
+            let focus = input.focus_handle(cx);
+            window.focus(&focus);
+            self.profile_input = Some(input);
+        } else {
+            self.profile_input = None;
+        }
+        cx.notify();
+    }
+
+    fn save_profile_name(&mut self, cx: &mut Context<Self>) {
+        let name = self
+            .profile_input
+            .as_ref()
+            .map(|i| i.read(cx).text().to_string())
+            .unwrap_or_default();
+        self.profile.name = name.trim().to_string();
+        profile::save_in_background(
+            self.profile_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .to_path_buf()
+                .into(),
+            self.profile.clone(),
+        );
+        cx.notify();
+    }
+
+    fn profile_button(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = *cx.theme();
+        let client_decorations = matches!(window.window_decorations(), Decorations::Client { .. });
+        let right_x = if client_decorations {
+            space::X3 + px(96.) // WINDOW_CONTROLS_WIDTH
+        } else {
+            space::X3
+        };
+        let open = self.profile_editor_open;
+        let monogram = self.profile.monogram();
+        let seed = self.profile.color_seed();
+        let hue = (seed % 360) as f32 / 360.0;
+        let avatar_bg = gpui::hsla(hue, 0.45, 0.38, 1.0);
+        let hover = t.hover;
+
+        div()
+            .id("profile-button")
+            .absolute()
+            .top(space::X3)
+            .right(right_x)
+            .size(size::BUTTON_SM)
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .bg(avatar_bg)
+            .when(open, |d| d.border_2().border_color(t.accent))
+            .hover(move |s| s.bg(if open { avatar_bg } else { hover }))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.toggle_profile_editor(window, cx);
+            }))
+            .tooltip(Tooltip::text("Profile"))
+            .child(
+                div()
+                    .text_color(gpui::white())
+                    .text_size(px(11.))
+                    .font_weight(text::SEMIBOLD)
+                    .child(monogram),
+            )
+    }
+
+    fn profile_editor_overlay(
+        &self,
+        right_frame: SideFrame,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        if !self.profile_editor_open || right_frame.shown <= 0.0 {
+            return None;
+        }
+        let t = *cx.theme();
+        let offset = SIDE_INSET - (Side::Right.width() + SIDE_INSET) * (1. - right_frame.shown);
+        let monogram = self.profile.monogram();
+        let seed = self.profile.color_seed();
+        let hue = (seed % 360) as f32 / 360.0;
+        let avatar_bg = gpui::hsla(hue, 0.45, 0.38, 1.0);
+        let name_display = self.profile.display_name().to_string();
+        let name_is_empty = self.profile.name.trim().is_empty();
+        let input = self.profile_input.clone();
+
+        let overlay = div()
+            .id("profile-editor-overlay")
+            .absolute()
+            .right(offset)
+            .w(Side::Right.width())
+            .top(SIDE_TOP)
+            .bottom(SIDE_INSET)
+            .occlude()
+            .rounded(SIDE_RADIUS)
+            .bg(t.surface)
+            .border_1()
+            .border_color(t.line)
+            .shadow(t.elevation(Elevation::Overlay))
+            .p(space::X4)
+            .flex()
+            .flex_col()
+            .gap(space::X3)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .type_style(text::SMALL)
+                            .font_weight(text::SEMIBOLD)
+                            .text_color(t.ink)
+                            .child("Profile"),
+                    )
+                    .child(
+                        div()
+                            .id("profile-close")
+                            .size(size::BUTTON_SM)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(radius::MD)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.hover))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.profile_editor_open = false;
+                                this.profile_input = None;
+                                cx.notify();
+                            }))
+                            .child(icon(IconName::X, icons::SM, t.muted)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(space::X3)
+                    .child(
+                        div()
+                            .size(px(40.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(avatar_bg)
+                            .child(
+                                div()
+                                    .text_color(gpui::white())
+                                    .text_size(px(16.))
+                                    .font_weight(text::SEMIBOLD)
+                                    .child(monogram),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.))
+                            .child(
+                                div()
+                                    .type_style(text::BODY)
+                                    .font_weight(text::SEMIBOLD)
+                                    .text_color(t.ink)
+                                    .child(if name_is_empty {
+                                        "Set your name".to_string()
+                                    } else {
+                                        name_display
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .type_style(text::SMALL)
+                                    .text_color(t.muted)
+                                    .child("PFP placeholder · shown in chat/mentions (wiring next)"),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(space::X2)
+                    .child(
+                        div()
+                            .type_style(text::SMALL)
+                            .text_color(t.ink_soft)
+                            .child("Display name"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::X2)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(px(32.))
+                                    .px(space::X2)
+                                    .flex()
+                                    .items_center()
+                                    .rounded(radius::MD)
+                                    .bg(t.surface)
+                                    .border_1()
+                                    .border_color(t.line)
+                                    .when_some(input.clone(), |d, input| d.child(input)),
+                            )
+                            .child(
+                                div()
+                                    .id("profile-save")
+                                    .h(px(32.))
+                                    .px(space::X3)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(radius::MD)
+                                    .bg(t.selected)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(t.hover))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.save_profile_name(cx);
+                                        this.profile_editor_open = false;
+                                        this.profile_input = None;
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        div()
+                                            .type_style(text::SMALL)
+                                            .text_color(t.ink)
+                                            .child("Save"),
+                                    ),
+                            ),
+                    ),
+            );
+
+        Some(overlay)
     }
 
     /// An invisible canvas laid over the composer that reads its height on

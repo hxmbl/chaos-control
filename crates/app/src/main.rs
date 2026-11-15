@@ -12,6 +12,7 @@ mod model_picker;
 mod pane_host;
 mod panels;
 mod project;
+mod profile;
 mod refused;
 mod right_sidebar;
 mod search;
