@@ -780,7 +780,15 @@ impl<'a> Renderer<'a> {
                 let lang = self.code_block_lang.take();
                 let t = self.theme;
                 let is_dark = matches!(t.appearance, ui::Appearance::Dark);
-                let code_trimmed = code.trim_end_matches('\n').to_string();
+                // Trim a single trailing line terminator for display/copy parity.
+                let mut code_trimmed = code.as_str();
+                if let Some(s) = code_trimmed.strip_suffix('\n') {
+                    code_trimmed = s;
+                }
+                if let Some(s) = code_trimmed.strip_suffix('\r') {
+                    code_trimmed = s;
+                }
+                let code_trimmed = code_trimmed.to_string();
                 let highlighted = highlight_code_runs(
                     &code_trimmed,
                     lang.as_deref(),
@@ -788,6 +796,37 @@ impl<'a> Renderer<'a> {
                     t.ink,
                     is_dark,
                 );
+                // Split lines without terminators, supporting \n, \r\n, and bare \r.
+                let mut lines: Vec<String> = Vec::new();
+                {
+                    let b = code_trimmed.as_bytes();
+                    let mut start = 0usize;
+                    while start < b.len() {
+                        let mut end = start;
+                        while end < b.len() {
+                            if b[end] == b'\n' {
+                                break;
+                            }
+                            if b[end] == b'\r' {
+                                break;
+                            }
+                            end += 1;
+                        }
+                        lines.push(code_trimmed[start..end].to_string());
+                        if end >= b.len() {
+                            break;
+                        }
+                        // skip terminator
+                        if b[end] == b'\r' && end + 1 < b.len() && b[end + 1] == b'\n' {
+                            start = end + 2;
+                        } else {
+                            start = end + 1;
+                        }
+                    }
+                    if code_trimmed.is_empty() {
+                        lines.clear();
+                    }
+                }
                 let mut lines_col = div()
                     .w_full()
                     .px(space::X2)
@@ -799,12 +838,11 @@ impl<'a> Renderer<'a> {
                 if code_trimmed.is_empty() {
                     lines_col = lines_col.child(SharedString::from(" "));
                 } else {
-                    let lines: Vec<&str> = code_trimmed.split('\n').collect();
                     for (i, line) in lines.iter().enumerate() {
                         let display: SharedString = if line.is_empty() {
                             " ".into()
                         } else {
-                            (*line).to_string().into()
+                            line.clone().into()
                         };
                         if let Some(runs) = highlighted.get(i) {
                             if runs.is_empty() || line.is_empty() {
