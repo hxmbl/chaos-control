@@ -435,38 +435,17 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn rank_emoji_matches(
-    matches: &mut [EmojiMatch],
-    usage: &HashMap<String, UsageStat>,
-    _now: u64,
-    empty_query: bool,
-) {
-    // MRU/frequent ranking is applied to empty-query recommendations first.
-    // Typed-query usage weighting is intentionally deferred (secondary signal) to
-    // avoid regressing existing shortcode/text relevance from emoji::suggest.
-    if !empty_query {
-        return;
-    }
-    let original: std::collections::HashMap<String, usize> = matches
-        .iter()
-        .enumerate()
-        .map(|(i, m)| (m.emoji.as_ref().to_string(), i))
-        .collect();
+/// Emoji the user has picked before come first (more uses, then more
+/// recent), whether or not a shortcode was typed. A typed query only ever
+/// reorders `emoji::suggest`'s matches, so relevance still decides what shows;
+/// unused matches keep their original order (the sort is stable).
+fn rank_emoji_matches(matches: &mut [EmojiMatch], usage: &HashMap<String, UsageStat>) {
     matches.sort_by(|a, b| {
         let ua = usage.get(a.emoji.as_ref()).copied().unwrap_or_default();
         let ub = usage.get(b.emoji.as_ref()).copied().unwrap_or_default();
-        let a_used = ua.count > 0;
-        let b_used = ub.count > 0;
-        b_used
-            .cmp(&a_used)
-            .then_with(|| ub.count.cmp(&ua.count))
+        ub.count
+            .cmp(&ua.count)
             .then_with(|| ub.last_used.cmp(&ua.last_used))
-            .then_with(|| {
-                original
-                    .get(a.emoji.as_ref())
-                    .cmp(&original.get(b.emoji.as_ref()))
-            })
-            .then_with(|| a.shortcode.cmp(&b.shortcode))
     });
 }
 
@@ -859,12 +838,7 @@ impl Composer {
             }
             return;
         }
-        rank_emoji_matches(
-            &mut matches,
-            &self.emoji_usage,
-            now_secs(),
-            query.trim().is_empty(),
-        );
+        rank_emoji_matches(&mut matches, &self.emoji_usage);
         let selected = self
             .emoji
             .as_ref()
@@ -1811,14 +1785,14 @@ mod tests {
                 last_used: 20,
             },
         );
-        rank_emoji_matches(&mut matches, &usage, 30, true);
+        rank_emoji_matches(&mut matches, &usage);
         assert_eq!(matches[0].emoji.as_ref(), "😃"); // highest count
         assert_eq!(matches[1].emoji.as_ref(), "😄");
         assert_eq!(matches[2].emoji.as_ref(), "😀");
         // stability when usage equal: preserve original order among unused
         let mut matches2 = vec![mk("a", "😀"), mk("b", "😃"), mk("c", "😄")];
         let usage2 = std::collections::HashMap::new();
-        rank_emoji_matches(&mut matches2, &usage2, 30, true);
+        rank_emoji_matches(&mut matches2, &usage2);
         assert_eq!(
             matches2
                 .iter()
@@ -1826,7 +1800,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["😀", "😃", "😄"]
         );
-        // non-empty query: preserve suggest order (no usage rerank in this slice)
+        // typed query: used emoji still rise above unused matches
         let mut matches3 = vec![mk("a", "😀"), mk("b", "😃")];
         let mut usage3 = std::collections::HashMap::new();
         usage3.insert(
@@ -1836,13 +1810,13 @@ mod tests {
                 last_used: 99,
             },
         );
-        rank_emoji_matches(&mut matches3, &usage3, 30, false);
+        rank_emoji_matches(&mut matches3, &usage3);
         assert_eq!(
             matches3
                 .iter()
                 .map(|m| m.emoji.as_ref())
                 .collect::<Vec<_>>(),
-            vec!["😀", "😃"]
+            vec!["😃", "😀"]
         );
     }
 

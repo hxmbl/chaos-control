@@ -144,7 +144,9 @@ impl Workspace {
             )
         });
         let pane = cx.new(|cx| PaneHost::new(store.clone(), cx));
-        let composer = cx.new(|cx| Composer::new(store.clone(), window, cx, None));
+        // Mention and emoji usage, so suggestions remember picks across launches.
+        let usage_path = crate::agents::data_dir().join("composer_suggestions.json");
+        let composer = cx.new(|cx| Composer::new(store.clone(), window, cx, Some(usage_path)));
         let pane_events =
             cx.subscribe_in(&pane, window, |this, _, event, window, cx| match event {
                 PaneEvent::Reply(reply) => this
