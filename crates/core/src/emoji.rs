@@ -223,7 +223,7 @@ pub fn search(query: &str, limit: usize) -> Vec<EmojiMatch> {
         let sc_l = sc.to_ascii_lowercase();
         let sc_norm = sc_l.replace('-', "_");
         let name_l = e.name().to_ascii_lowercase();
-        let name_norm = name_l.replace('-', " ").replace('_', " ");
+        let name_norm = name_l.replace(['-', '_'], " ");
         let direct_hit = exact.is_some_and(|x| x.as_str() == e.as_str());
         let score = if direct_hit || sc_l.starts_with(&q) || sc_norm.starts_with(&q_norm) {
             Some((0usize, sc_l.len()))
@@ -234,7 +234,7 @@ pub fn search(query: &str, limit: usize) -> Vec<EmojiMatch> {
             Some((1, sc_l.len()))
         } else if name_l.contains(&q)
             || name_norm.contains(&q_name_norm)
-            || name_l.replace(' ', "_").replace('-', "_").contains(&q_norm)
+            || name_l.replace([' ', '-'], "_").contains(&q_norm)
         {
             Some((2, sc_l.len()))
         } else {
@@ -254,26 +254,31 @@ pub fn search(query: &str, limit: usize) -> Vec<EmojiMatch> {
     }
     // If the query resolves to a known emoji but wasn't included (e.g. no
     // shortcode field), ensure it's present.
-    if let Some(e) = exact {
-        if !prefix.iter().any(|(_, m)| &*m.emoji == e.as_str())
-            && !other.iter().any(|(_, m)| &*m.emoji == e.as_str())
-        {
-            let sc = canonical_shortcode(e);
-            prefix.insert(
-                0,
-                (
-                    (0, sc.len()),
-                    EmojiMatch {
-                        shortcode: Arc::from(sc),
-                        emoji: Arc::from(e.as_str()),
-                        name: Arc::from(e.name()),
-                    },
-                ),
-            );
-        }
+    if let Some(e) = exact
+        && !prefix.iter().any(|(_, m)| &*m.emoji == e.as_str())
+        && !other.iter().any(|(_, m)| &*m.emoji == e.as_str())
+    {
+        let sc = canonical_shortcode(e);
+        prefix.insert(
+            0,
+            (
+                (0, sc.len()),
+                EmojiMatch {
+                    shortcode: Arc::from(sc),
+                    emoji: Arc::from(e.as_str()),
+                    name: Arc::from(e.name()),
+                },
+            ),
+        );
     }
-    prefix.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.shortcode.cmp(&b.1.shortcode)));
-    other.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.shortcode.cmp(&b.1.shortcode)));
+    prefix.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.shortcode.cmp(&b.1.shortcode))
+    });
+    other.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| a.1.shortcode.cmp(&b.1.shortcode))
+    });
     prefix.extend(other);
     // de-dup by emoji value preserving order
     let mut seen = std::collections::HashSet::new();
@@ -382,7 +387,10 @@ mod tests {
         assert_eq!(normalize_emoji_input(":+1:").as_deref(), Some("👍"));
         assert_eq!(normalize_emoji_input("🇬🇧").as_deref(), Some("🇬🇧"));
         assert_eq!(normalize_emoji_input("👨‍👩‍👧‍👦").as_deref(), Some("👨‍👩‍👧‍👦"));
-        assert_eq!(normalize_emoji_input(":not_a_real_shortcode:").as_deref(), None);
+        assert_eq!(
+            normalize_emoji_input(":not_a_real_shortcode:").as_deref(),
+            None
+        );
         assert_eq!(normalize_emoji_input("hello").as_deref(), None);
     }
 

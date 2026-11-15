@@ -293,6 +293,7 @@ pub struct MentionCandidate {
 }
 
 /// A slash command the composer can suggest.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommandCandidate {
     /// Command name without the leading `/`.
@@ -303,6 +304,7 @@ pub struct SlashCommandCandidate {
 }
 
 /// A slash command invocation selected in the composer.
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommandInvocation {
     /// Command name without the leading `/`.
@@ -463,6 +465,7 @@ impl ChatStore {
     /// Agents actively working in `channel`, as `(display name, verb)` pairs in
     /// a stable order. Derived from authoritative per-agent/per-channel core
     /// status (an in-flight turn reported as Active with a "working" presence).
+    #[allow(dead_code)]
     pub fn working_agents(&self, channel: Id) -> Vec<(Arc<str>, &'static str)> {
         let Some(attached) = self.core.as_ref().filter(|a| a.channel == channel) else {
             return Vec::new();
@@ -1377,12 +1380,14 @@ impl ChatStore {
 
     /// Slash commands available to the composer. Populated by the application
     /// command registry/dispatcher (STRM-590); empty until wired.
+    #[allow(dead_code)]
     pub fn slash_command_candidates(&self) -> Vec<SlashCommandCandidate> {
         Vec::new()
     }
 
     /// Hands a slash-command invocation to the application dispatcher.
     /// The composer does not execute commands itself (STRM-589/590).
+    #[allow(dead_code)]
     pub fn dispatch_slash_command(&mut self, _invocation: SlashCommandInvocation) {
         // Wired by STRM-590.
     }
@@ -2119,6 +2124,7 @@ fn core_message_id(id: Id) -> Option<ct::MessageId> {
         .map(|n| ct::MessageId(i64::from(n)))
 }
 
+#[allow(dead_code)]
 const WORKING_VERBS: &[&str] = &[
     "Accomplishing",
     "Actioning",
@@ -2203,6 +2209,7 @@ const WORKING_VERBS: &[&str] = &[
     "Zesting",
 ];
 
+#[allow(dead_code)]
 fn working_verb(agent: ct::MemberId, channel: ct::ChannelId) -> &'static str {
     // Stable per agent+channel so the label doesn't flicker between renders.
     let mut h: u64 = 1469598103934665603;

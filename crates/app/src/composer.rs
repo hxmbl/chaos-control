@@ -522,13 +522,11 @@ impl Composer {
             .as_ref()
             .filter(|m| m.query == query)
             .and_then(|m| {
-                m.matches
-                    .get(m.selected)
-                    .and_then(|keep| {
-                        matches
-                            .iter()
-                            .position(|c| c.shortcode == keep.shortcode && c.emoji == keep.emoji)
-                    })
+                m.matches.get(m.selected).and_then(|keep| {
+                    matches
+                        .iter()
+                        .position(|c| c.shortcode == keep.shortcode && c.emoji == keep.emoji)
+                })
             })
             .unwrap_or(0);
         let next = EmojiState {
@@ -1226,10 +1224,7 @@ mod tests {
 
     #[test]
     fn emoji_query_parses_shortcode_token() {
-        assert_eq!(
-            emoji_query("hi :thu", 7),
-            Some((3..7, "thu".to_string()))
-        );
+        assert_eq!(emoji_query("hi :thu", 7), Some((3..7, "thu".to_string())));
         assert_eq!(emoji_query("time: 10:30", 10), None);
         assert_eq!(emoji_query("http://x", 7), None);
         assert_eq!(emoji_query(":fire:", 6), Some((0..6, "fire".to_string())));
