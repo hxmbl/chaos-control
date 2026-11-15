@@ -7,13 +7,14 @@
 //! (the close dot, Escape, a click outside) hands the keyboard back to
 //! whatever had it before the pane opened, while the pane fades out.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Pixels, SharedString,
     Subscription, Task, Window, div, prelude::*, px,
 };
-use model::{Author, PaneActionKind, PaneContent, ReplyRef, pane::author_name};
+use model::{Author, PaneActionKind, PaneContent, ReplyRef, mentions, pane::author_name};
 use ui::{
     ActiveTheme, IconName, Pane, PaneState, QuickAction, TextInput, TextInputEvent, TypeStyleExt,
     brand_icon, icon, switch,
@@ -230,9 +231,37 @@ impl PaneHost {
             .on_close(move |window, cx| close.update(cx, |this, cx| this.close(window, cx)))
             .actions(actions.collect::<Vec<_>>());
         let pane = match &content {
-            PaneContent::LongMessage { message, .. } => pane
-                .child(self.byline(message.author, message.sent_at, cx))
-                .children(paragraphs(&message.body)),
+            PaneContent::LongMessage { message, .. } => {
+                let (display, known) = {
+                    let store = self.store.read(cx);
+                    let display = match mentions::rewrite_former_mentions(&message.body, |token| {
+                        store.is_former_project_agent_mention(token)
+                    }) {
+                        Cow::Borrowed(_) => SharedString::from(message.body.clone()),
+                        Cow::Owned(shown) => SharedString::from(shown),
+                    };
+                    let mut known = crate::mention_highlight::KnownMentions::new();
+                    for member in store.mention_candidates() {
+                        known.insert_member(
+                            member.handle.as_ref(),
+                            member.handle.as_ref(),
+                            &member.nicknames,
+                        );
+                    }
+                    known.insert_broadcasts();
+                    (display, known)
+                };
+                let body = crate::markdown::render_message_markdown(
+                    display.as_ref(),
+                    &known,
+                    cx.theme().ink_soft,
+                    &window.text_style(),
+                    cx.theme(),
+                    &format!("pane-long:{:?}", message.id),
+                );
+                pane.child(self.byline(message.author, message.sent_at, cx))
+                    .child(body)
+            }
             PaneContent::Settings => pane.children(self.settings_rows(cx)),
             PaneContent::Attachment(a) => pane
                 .child(

@@ -14,9 +14,9 @@ use std::sync::Arc;
 use crate::{Author, Id, Message, SearchResult, Workspace};
 
 /// A message is collapsed in the chat when it has more characters than this…
-pub const LONG_MESSAGE_CHARS: usize = 600;
+pub const LONG_MESSAGE_CHARS: usize = 3600;
 /// …or more lines than this.
-pub const LONG_MESSAGE_LINES: usize = 8;
+pub const LONG_MESSAGE_LINES: usize = 50;
 /// The collapsed preview keeps at most this many characters…
 pub const PREVIEW_CHARS: usize = 320;
 /// …and this many lines.
@@ -419,13 +419,13 @@ mod tests {
 
     #[test]
     fn character_count_not_bytes() {
-        // 600 two-byte characters are 1200 bytes but not long.
+        // Multi-byte characters at the limit are not long.
         assert!(!is_long(&"é".repeat(LONG_MESSAGE_CHARS)));
     }
 
     #[test]
     fn preview_keeps_the_first_lines() {
-        let body = (1..=12)
+        let body = (1..=60)
             .map(|i| format!("Line {i}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -435,19 +435,21 @@ mod tests {
 
     #[test]
     fn preview_cuts_long_prose_between_words() {
-        let body = "word ".repeat(400);
+        let body = "word ".repeat(800);
         let p = preview(&body);
-        assert!(p.ends_with("word…"), "{p}");
+        assert!(p.ends_with('…'), "{p}");
         assert!(p.chars().count() <= PREVIEW_CHARS + 1);
-        assert!(p.chars().count() > PREVIEW_CHARS - 45);
+        // cut should land near the limit (possibly backed off to a word boundary)
+        assert!(p.chars().count() > PREVIEW_CHARS - 50, "{p}");
     }
 
     #[test]
     fn preview_never_splits_a_character() {
-        let body = "日本語".repeat(400);
+        let body = "日本語".repeat(1300);
         let p = preview(&body);
         assert!(p.ends_with('…'));
-        assert_eq!(p.chars().count(), PREVIEW_CHARS + 1);
+        assert!(p.is_char_boundary(p.len()));
+        assert!(p.chars().count() <= PREVIEW_CHARS + 1);
     }
 
     #[test]

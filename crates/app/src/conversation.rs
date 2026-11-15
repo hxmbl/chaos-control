@@ -11,8 +11,7 @@ use std::{borrow::Cow, sync::Arc};
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Corner, ElementId, Entity, FocusHandle, KeyDownEvent,
     ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, Pixels, Point, SharedString,
-    StyledText, Subscription, TextRun, WeakEntity, Window, anchored, deferred, div, list,
-    prelude::*, px,
+    Subscription, WeakEntity, Window, anchored, deferred, div, list, prelude::*, px,
 };
 use model::{Author, Id, Message, PaneContent, ReplyRef, mentions, pane};
 use ui::{
@@ -23,7 +22,7 @@ use ui::{
 
 use crate::{
     composer::Composer,
-    mention_highlight::{self, KnownMentions},
+    mention_highlight::KnownMentions,
     pane_host::PaneHost,
     store::{ChatStore, ReactionChip, Reader, StoreEvent},
 };
@@ -235,13 +234,14 @@ impl Conversation {
         let body: AnyElement = if is_long {
             self.render_collapsed_with(ix, &message, &display, &known, &t, window)
         } else {
-            div()
-                .w_full()
-                .min_w_0()
-                .whitespace_normal()
-                .text_color(t.ink_soft)
-                .child(highlighted_text(display, &known, t.ink_soft, &t, window))
-                .into_any_element()
+            crate::markdown::render_message_markdown(
+                display.as_ref(),
+                &known,
+                t.ink_soft,
+                &window.text_style(),
+                &t,
+                &format!("conv:{ix}"),
+            )
         };
 
         let message_id = message.id;
@@ -659,14 +659,14 @@ impl Conversation {
         window: &mut Window,
     ) -> AnyElement {
         let preview = pane::preview(display.as_ref());
-        let lines = preview.lines().map(|line| {
-            let line: SharedString = line.to_string().into();
-            div()
-                .w_full()
-                .min_w_0()
-                .whitespace_normal()
-                .child(highlighted_text(line, known, t.ink_soft, t, window))
-        });
+        let preview_md = crate::markdown::render_message_markdown(
+            &preview,
+            known,
+            t.ink_soft,
+            &window.text_style(),
+            t,
+            &format!("conv-preview:{ix}"),
+        );
         let content = PaneContent::LongMessage {
             channel: self.channel,
             index: ix,
@@ -682,7 +682,7 @@ impl Conversation {
             .flex_col()
             .gap(space::X0_5)
             .text_color(t.ink_soft)
-            .children(lines)
+            .child(preview_md)
             .child(
                 div()
                     .mt(space::X1_5)
@@ -858,71 +858,6 @@ fn known_mentions(store: &ChatStore) -> KnownMentions {
     }
     known.insert_broadcasts();
     known
-}
-
-/// Builds a `StyledText` element for `text`, highlighting known mentions.
-fn highlighted_text(
-    text: SharedString,
-    known: &KnownMentions,
-    base_color: gpui::Hsla,
-    theme: &ui::Theme,
-    window: &mut Window,
-) -> StyledText {
-    let spans = mention_highlight::mention_highlights(&text, known, theme.appearance);
-    let base = window.text_style();
-    if spans.is_empty() {
-        let run = TextRun {
-            len: text.len(),
-            font: base.font(),
-            color: base_color,
-            background_color: base.background_color,
-            underline: base.underline,
-            strikethrough: base.strikethrough,
-        };
-        return StyledText::new(text).with_runs(vec![run]);
-    }
-    let runs = runs_for_highlights(&text, &base, base_color, &spans);
-    StyledText::new(text).with_runs(runs)
-}
-
-fn runs_for_highlights(
-    text: &str,
-    base: &gpui::TextStyle,
-    base_color: gpui::Hsla,
-    highlights: &[(std::ops::Range<usize>, gpui::HighlightStyle)],
-) -> Vec<TextRun> {
-    let mut runs = Vec::new();
-    let mut ix = 0;
-    for (range, highlight) in highlights {
-        if ix < range.start {
-            debug_assert!(text.is_char_boundary(range.start));
-            runs.push(TextRun {
-                len: range.start - ix,
-                font: base.font(),
-                color: base_color,
-                background_color: base.background_color,
-                underline: base.underline,
-                strikethrough: base.strikethrough,
-            });
-        }
-        debug_assert!(text.is_char_boundary(range.end));
-        let mut style = base.clone();
-        style.color = base_color;
-        let style = style.highlight(*highlight);
-        runs.push(style.to_run(range.len()));
-        ix = range.end;
-    }
-    if ix < text.len() {
-        runs.push(TextRun {
-            len: text.len() - ix,
-            font: base.font(),
-            color: base_color,
-            background_color: base.background_color,
-            underline: base.underline,
-            strikethrough: base.strikethrough,
-        });
-    }
-    runs
 }
 
 /// "HH:MM" (UTC)
