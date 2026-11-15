@@ -811,24 +811,28 @@ impl Render for Composer {
                 let base = t.muted;
                 let bright = t.ink;
                 d.child(
-                    div().px(space::X2).py(space::X0_5).child(
-                        div().id("working-indicator-shimmer").with_animation(
-                            "working-indicator-shimmer",
-                            Animation::new(Duration::from_millis(1800))
-                                .repeat()
-                                .with_easing(linear),
-                            move |el, delta| {
-                                let text = working_indicator_text(
-                                    label.as_ref(),
-                                    delta,
-                                    &base_style,
-                                    base,
-                                    bright,
-                                );
-                                el.child(text)
-                            },
+                    div()
+                        .px(space::X2)
+                        .py(space::X0_5)
+                        .type_style(text::SMALL)
+                        .child(
+                            div().id("working-indicator-shimmer").with_animation(
+                                "working-indicator-shimmer",
+                                Animation::new(Duration::from_millis(1800))
+                                    .repeat()
+                                    .with_easing(linear),
+                                move |el, delta| {
+                                    let text = working_indicator_text(
+                                        label.as_ref(),
+                                        delta,
+                                        &base_style,
+                                        base,
+                                        bright,
+                                    );
+                                    el.child(text)
+                                },
+                            ),
                         ),
-                    ),
                 )
             })
             .child(box_el)
