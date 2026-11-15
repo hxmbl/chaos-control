@@ -194,9 +194,34 @@ fn emoji_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
         return None;
     }
     let before = &text[..cursor];
+
+    // Detect a completed shortcode token `:name:` when the cursor is at or just
+    // after its closing colon.
+    if before.ends_with(':') && before.len() >= 3 {
+        let inner_end = before.len() - 1;
+        if let Some(open) = before[..inner_end].rfind(':') {
+            let name = &before[open + 1..inner_end];
+            if !name.is_empty() && name.chars().all(is_shortcode_query_char) {
+                if in_inline_code(text, open) {
+                    return None;
+                }
+                let boundary_ok = if open == 0 {
+                    true
+                } else if let Some(prev) = before[..open].chars().last() {
+                    prev != '/' && (prev.is_whitespace() || "([{\"'!?,.;".contains(prev))
+                } else {
+                    false
+                };
+                if boundary_ok {
+                    return Some((open..before.len(), name.to_string()));
+                }
+            }
+        }
+    }
+
     let colon = before.rfind(':')?;
-    let prefix = &before[colon + 1..];
-    if prefix.is_empty() || !prefix.chars().all(is_shortcode_query_char) {
+    let raw_prefix = &before[colon + 1..];
+    if raw_prefix.is_empty() || !raw_prefix.chars().all(is_shortcode_query_char) {
         return None;
     }
     if in_inline_code(text, colon) {
@@ -221,15 +246,13 @@ fn emoji_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
         .take_while(|&c| is_shortcode_query_char(c))
         .map(char::len_utf8)
         .sum::<usize>();
-    let end = cursor + suffix_len;
+    let mut end = cursor + suffix_len;
     // If there's an immediate closing colon after the token, include it in the
     // replacement range so completing `:thumbs_up:` works naturally.
-    let end = if text[end..].starts_with(':') {
-        end + 1
-    } else {
-        end
-    };
-    Some((colon..end, prefix.to_string()))
+    if text[end..].starts_with(':') {
+        end += 1;
+    }
+    Some((colon..end, raw_prefix.to_string()))
 }
 
 pub struct Composer {
