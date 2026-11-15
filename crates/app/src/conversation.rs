@@ -6,7 +6,11 @@
 //! Messages arrive whole; appending splices rows onto the end of the list state
 //! without touching the heights already measured.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{
+    borrow::Cow,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Corner, ElementId, Entity, FocusHandle, KeyDownEvent,
@@ -32,6 +36,8 @@ const QUICK_REACTIONS: [&str; 6] = ["👍", "✅", "👀", "😂", "❤️", "�
 
 /// The empty state's blurb wraps at about 50 characters.
 const EMPTY_MAX_W: f32 = 384.;
+/// Hover highlight fade duration for message rows.
+const HOVER_FADE: Duration = Duration::from_millis(140);
 
 #[derive(Clone)]
 struct MessageMenu {
@@ -41,6 +47,14 @@ struct MessageMenu {
     reply: ReplyRef,
     can_react: bool,
     position: Point<Pixels>,
+}
+
+#[derive(Clone, Copy)]
+struct HoverAnim {
+    id: Id,
+    started_at: Instant,
+    from: f32,
+    entering: bool,
 }
 
 pub struct Conversation {
@@ -53,6 +67,8 @@ pub struct Conversation {
     highlighted: Option<usize>,
     /// The message under the pointer (by id), so hover tracks message identity.
     hovered: Option<Id>,
+    /// Fades the message row hover highlight in and out.
+    hover_anim: Option<HoverAnim>,
     menu: Option<MessageMenu>,
     menu_focus: FocusHandle,
     this: WeakEntity<Self>,
@@ -76,6 +92,7 @@ impl Conversation {
                 this.list.reset(count);
                 this.highlighted = None;
                 this.hovered = None;
+                this.hover_anim = None;
                 this.menu = None;
                 cx.notify();
             }
@@ -120,6 +137,7 @@ impl Conversation {
             list: ListState::new(count, ListAlignment::Bottom, px(600.)),
             highlighted: None,
             hovered: None,
+            hover_anim: None,
             menu: None,
             menu_focus: cx.focus_handle(),
             this: cx.entity().downgrade(),
@@ -134,6 +152,55 @@ impl Conversation {
                 self.composer.update(cx, |c, cx| c.focus(window, cx));
             }
         }
+    }
+
+    fn hover_progress_for(&self, id: Id, now: Instant) -> f32 {
+        let Some(anim) = self.hover_anim else {
+            return if self.hovered == Some(id) { 1. } else { 0. };
+        };
+        if anim.id != id {
+            return if self.hovered == Some(id) { 1. } else { 0. };
+        }
+        let t = (now.saturating_duration_since(anim.started_at).as_secs_f32()
+            / HOVER_FADE.as_secs_f32())
+        .min(1.);
+        let p = ease_out(t);
+        if anim.entering {
+            anim.from + (1. - anim.from) * p
+        } else {
+            anim.from * (1. - p)
+        }
+    }
+
+    fn set_hovered(&mut self, next: Option<Id>, cx: &mut Context<Self>) {
+        if next == self.hovered {
+            return;
+        }
+        let now = Instant::now();
+        match next {
+            Some(id) => {
+                let from = self.hover_progress_for(id, now);
+                self.hovered = Some(id);
+                self.hover_anim = Some(HoverAnim {
+                    id,
+                    started_at: now,
+                    from,
+                    entering: true,
+                });
+            }
+            None => {
+                if let Some(old) = self.hovered.take() {
+                    let from = self.hover_progress_for(old, now);
+                    self.hover_anim = Some(HoverAnim {
+                        id: old,
+                        started_at: now,
+                        from,
+                        entering: false,
+                    });
+                }
+            }
+        }
+        cx.notify();
     }
 
     fn open_menu(
@@ -260,16 +327,9 @@ impl Conversation {
                     .id(ElementId::Name(format!("message-row-{ix}").into()))
                     .on_hover(move |over: &bool, _, cx| {
                         this.update(cx, |c, cx| {
-                            let next = if *over {
-                                Some(message_id)
-                            } else if c.hovered == Some(message_id) {
-                                None
-                            } else {
-                                c.hovered
-                            };
-                            if next != c.hovered {
-                                c.hovered = next;
-                                cx.notify();
+                            let next = if *over { Some(message_id) } else { None };
+                            if *over || c.hovered == Some(message_id) {
+                                c.set_hovered(next, cx);
                             }
                         })
                         .ok();
@@ -292,6 +352,21 @@ impl Conversation {
                     .px(space::X2)
                     .py(space::X2)
                     .rounded(radius::MD)
+                    .when(
+                        {
+                            let p = self.hover_progress_for(message_id, Instant::now());
+                            if p > 0. && p < 1. {
+                                window.request_animation_frame();
+                            }
+                            p > 0.001 && self.highlighted != Some(ix)
+                        },
+                        |row| {
+                            let p = self.hover_progress_for(message_id, Instant::now());
+                            let mut bg = t.hover;
+                            bg.a *= p;
+                            row.bg(bg)
+                        },
+                    )
                     .when(self.highlighted == Some(ix), |row| row.bg(t.selected))
                     .child(
                         div()
@@ -793,6 +868,10 @@ impl Conversation {
     }
 }
 
+fn ease_out(t: f32) -> f32 {
+    1. - (1. - t.clamp(0., 1.)).powi(3)
+}
+
 fn menu_item(
     id: impl Into<ElementId>,
     icon_name: IconName,
@@ -818,7 +897,15 @@ fn menu_item(
 }
 
 impl Render for Conversation {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(anim) = self.hover_anim {
+            let p = self.hover_progress_for(anim.id, Instant::now());
+            if (!anim.entering && p <= 0.001) || (anim.entering && p >= 0.999) {
+                self.hover_anim = None;
+            } else {
+                window.request_animation_frame();
+            }
+        }
         let t = *cx.theme();
         let store = self.store.read(cx);
         let channel = store.selected_channel();
