@@ -209,6 +209,11 @@ pub struct TextInput {
     /// The column up/down aim for, kept across a run of up/down presses so
     /// passing a short line doesn't lose it.
     goal_x: Option<Pixels>,
+    /// When true, plain vertical navigation actions (Up/Down) are not handled
+    /// here and propagate to parent handlers (e.g. mention suggestion
+    /// navigation in the composer). Selection variants still work for text
+    /// selection.
+    suppress_vertical_navigation: bool,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -236,6 +241,7 @@ impl TextInput {
             scroll_y: px(0.),
             autoscroll: false,
             goal_x: None,
+            suppress_vertical_navigation: false,
         }
     }
 
@@ -253,6 +259,13 @@ impl TextInput {
     pub fn centered(mut self) -> Self {
         self.centered = true;
         self
+    }
+
+    /// When true, plain Up/Down are not consumed by this input and propagate
+    /// to parent handlers (used by the composer to let mention suggestion
+    /// navigation take precedence while suggestions are open).
+    pub fn set_suppress_vertical_navigation(&mut self, suppress: bool) {
+        self.suppress_vertical_navigation = suppress;
     }
 
     /// Sets extra text highlights (e.g. mention coloring) applied to the content.
@@ -557,6 +570,9 @@ impl TextInput {
     /// Up/down and shift-up/down. Returns `false` (and moves nothing) when the
     /// field has no lines to move through.
     fn move_vertically(&mut self, down: bool, select: bool, cx: &mut Context<Self>) -> bool {
+        if self.suppress_vertical_navigation && !select {
+            return false;
+        }
         if !self.multiline {
             return false;
         }
