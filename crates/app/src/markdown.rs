@@ -1073,7 +1073,7 @@ pub fn markdown_marker_highlights(
     theme: &ui::Theme,
 ) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)> {
     use gpui::HighlightStyle;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     let dim = theme.faint;
     let style = HighlightStyle {
@@ -1104,6 +1104,9 @@ pub fn markdown_marker_highlights(
     // Protected regions: inline code and fenced/indented code blocks.
     let mut protected: Vec<std::ops::Range<usize>> = Vec::new();
     let mut linkish: Vec<std::ops::Range<usize>> = Vec::new(); // parsed Link/Image event ranges
+    let mut emphasis_tags: HashMap<(usize, usize, u8), usize> = HashMap::new();
+    let mut strikethrough_ranges = Vec::new();
+    let mut code_block: Option<(std::ops::Range<usize>, bool, Vec<std::ops::Range<usize>>)> = None;
     for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
         match event {
             Event::Code(_) if range.start < range.end && range.end <= len => {
@@ -1137,36 +1140,120 @@ pub fn markdown_marker_highlights(
                     }
                 }
             }
-            Event::Start(Tag::Link { .. })
-            | Event::End(TagEnd::Link)
-            | Event::Start(Tag::Image { .. })
-            | Event::End(TagEnd::Image)
+            Event::Start(Tag::Emphasis) if range.start < range.end && range.end <= len => {
+                if let Some(marker @ (b'*' | b'_')) = bytes.get(range.start).copied() {
+                    *emphasis_tags
+                        .entry((range.start, range.end, marker))
+                        .or_default() += 1;
+                }
+            }
+            Event::Start(Tag::Strong) if range.start < range.end && range.end <= len => {
+                if let Some(marker @ (b'*' | b'_')) = bytes.get(range.start).copied() {
+                    *emphasis_tags
+                        .entry((range.start, range.end, marker))
+                        .or_default() += 2;
+                }
+            }
+            Event::Start(Tag::Strikethrough) if range.start < range.end && range.end <= len => {
+                strikethrough_ranges.push(range);
+            }
+            Event::Start(Tag::Link { .. }) | Event::Start(Tag::Image { .. })
                 if range.start < range.end && range.end <= len =>
             {
                 linkish.push(range);
             }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                code_block = Some((
+                    range,
+                    matches!(kind, pulldown_cmark::CodeBlockKind::Fenced(_)),
+                    Vec::new(),
+                ));
+            }
+            Event::Text(_) if code_block.is_some() => {
+                if let Some((_, _, contents)) = &mut code_block {
+                    contents.push(range);
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some((block, fenced, contents)) = code_block.take() {
+                    if fenced {
+                        if let (Some(first), Some(last)) = (contents.first(), contents.last()) {
+                            // Code-block offsets include fences; Text offsets isolate their contents.
+                            protected.push(first.start..last.end);
+
+                            let opening = block.start..first.start;
+                            let opening_start = opening
+                                .clone()
+                                .find(|idx| !matches!(bytes[*idx], b' ' | b'\t'))
+                                .unwrap_or(opening.end);
+                            let fence_marker = if opening_start < opening.end {
+                                let marker = bytes[opening_start];
+                                let run_end = (opening_start..opening.end)
+                                    .take_while(|idx| bytes[*idx] == marker)
+                                    .last()
+                                    .map_or(opening_start, |idx| idx + 1);
+                                if run_end - opening_start >= 3 && matches!(marker, b'`' | b'~') {
+                                    push(opening_start..run_end);
+                                    Some(marker)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+
+                            let closing = last.end..block.end;
+                            let closing_end = closing
+                                .clone()
+                                .rev()
+                                .find(|idx| !matches!(bytes[*idx], b' ' | b'\t' | b'\r' | b'\n'))
+                                .map_or(closing.start, |idx| idx + 1);
+                            if closing.start < closing_end {
+                                let marker = bytes[closing_end - 1];
+                                let run_start = (closing.start..closing_end)
+                                    .rev()
+                                    .take_while(|idx| bytes[*idx] == marker)
+                                    .last()
+                                    .unwrap_or(closing_end - 1);
+                                if closing_end - run_start >= 3 && fence_marker == Some(marker) {
+                                    push(run_start..closing_end);
+                                }
+                            }
+                        } else {
+                            protected.push(block);
+                        }
+                    } else {
+                        protected.push(block);
+                    }
+                }
+            }
             _ => {}
         }
     }
-    // code block protection
-    let mut in_code_block = false;
-    let mut code_block_start = 0usize;
-    for (event, range) in Parser::new_ext(text, opts).into_offset_iter() {
-        match event {
-            Event::Start(Tag::CodeBlock(_)) => {
-                in_code_block = true;
-                code_block_start = range.start;
-            }
-            Event::End(TagEnd::CodeBlock) => {
-                if in_code_block {
-                    let end = range.end.min(len);
-                    if code_block_start < end {
-                        protected.push(code_block_start..end);
-                    }
-                }
-                in_code_block = false;
-            }
-            _ => {}
+
+    // Tag event ranges cover full constructs; tag kinds identify active delimiter widths.
+    for ((start, end, marker), width) in emphasis_tags {
+        let opening_width = (start..end)
+            .take_while(|idx| bytes[*idx] == marker)
+            .count()
+            .min(width);
+        let closing_width = (start..end)
+            .rev()
+            .take_while(|idx| bytes[*idx] == marker)
+            .count()
+            .min(width);
+        if opening_width > 0 && closing_width > 0 {
+            push(start..start + opening_width);
+            push(end - closing_width..end);
+        }
+    }
+    for range in strikethrough_ranges {
+        if range.end - range.start >= 4
+            && bytes.get(range.start..range.start + 2) == Some(b"~~")
+            && bytes.get(range.end - 2..range.end) == Some(b"~~")
+        {
+            push(range.start..range.start + 2);
+            push(range.end - 2..range.end);
         }
     }
 
@@ -1237,12 +1324,6 @@ pub fn markdown_marker_highlights(
             {
                 push(j..d + 2);
             }
-            if j + 3 <= len
-                && !is_protected(j)
-                && (&bytes[j..j + 3] == b"```" || &bytes[j..j + 3] == b"~~~")
-            {
-                push(j..j + 3);
-            }
         }
         if let Some(pos) = text[i..].find('\n') {
             i += pos + 1;
@@ -1260,68 +1341,18 @@ pub fn markdown_marker_highlights(
             continue;
         }
         if b == b'\\' {
-            idx += 2;
-            continue;
-        }
-        // strikethrough ~~ (CommonMark extension marker)
-        if b == b'~' && idx + 1 < len && bytes[idx + 1] == b'~' {
-            push(idx..idx + 2);
-            idx += 2;
-            continue;
-        }
-        // emphasis/strong runs: dim **/__ and * / _ only when not intraword for underscores
-        if (b == b'*' || b == b'_') && idx + 1 < len && bytes[idx + 1] == b {
-            // could be strong; dim the delimiter run
-            let mut end = idx + 2;
-            while end < len && bytes[end] == b {
-                end += 1;
-            }
-            if b == b'_' {
-                let prev_alnum = idx > 0
-                    && text[..idx]
-                        .chars()
-                        .next_back()
-                        .is_some_and(|c| c.is_alphanumeric());
-                let next_alnum = text[end..]
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_alphanumeric());
-                if !(prev_alnum && next_alnum) {
-                    push(idx..end);
-                }
+            if idx + 1 < len && bytes[idx + 1].is_ascii_punctuation() {
+                idx += 2;
             } else {
-                push(idx..end);
+                idx += 1;
             }
-            idx = end;
-            continue;
-        }
-        if b == b'*' {
-            // single * - dim only if not surrounded as multiplication-like "a * b"? keep conservative: dim
-            push(idx..idx + 1);
-            idx += 1;
-            continue;
-        }
-        if b == b'_' {
-            let prev_alnum = idx > 0
-                && text[..idx]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric());
-            let next_alnum = text[idx + 1..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_alphanumeric());
-            if !(prev_alnum && next_alnum) {
-                push(idx..idx + 1);
-            }
-            idx += 1;
             continue;
         }
         // Link/image markers: only dim when near/within parser-recognized link/image constructs
         if b == b'!'
             && idx + 1 < len
             && bytes[idx + 1] == b'['
-            && (in_linkish(idx) || in_linkish(idx + 1) || text[idx..].contains("]("))
+            && (in_linkish(idx) || in_linkish(idx + 1))
         {
             push(idx..idx + 2);
             idx += 2;
@@ -1335,9 +1366,7 @@ pub fn markdown_marker_highlights(
             continue;
         }
         if b == b']' {
-            if in_linkish(idx)
-                || (idx + 1 < len && (bytes[idx + 1] == b'(' || bytes[idx + 1] == b'['))
-            {
+            if in_linkish(idx) {
                 push(idx..idx + 1);
             }
             idx += 1;
@@ -1391,6 +1420,23 @@ mod tests {
             &theme,
             "test",
         );
+    }
+
+    fn highlighted_ranges(source: &str) -> Vec<std::ops::Range<usize>> {
+        let theme = ui::Theme::light();
+        let highlights = super::markdown_marker_highlights(source, &theme);
+        for (range, _) in &highlights {
+            assert!(source.is_char_boundary(range.start));
+            assert!(source.is_char_boundary(range.end));
+        }
+        highlights.iter().map(|(range, _)| range.clone()).collect()
+    }
+
+    fn highlighted_slices(source: &str) -> Vec<&str> {
+        highlighted_ranges(source)
+            .iter()
+            .map(|range| &source[range.clone()])
+            .collect()
     }
 
     #[test]
@@ -1523,73 +1569,90 @@ mod tests {
 
     #[test]
     fn marker_highlights_escaped_and_unmatched_markers() {
-        let theme = ui::Theme::light();
-        // escaped markers should not be treated as active delimiters
-        let src = "\\*literal\\* \\_x\\_";
-        let h = super::markdown_marker_highlights(src, &theme);
-        assert!(
-            !h.iter().any(|(r, _)| {
-                let s = &src[r.clone()];
-                s == "*" || s == "_"
-            }),
-            "escaped markers should not be dimmed as active delimiters: {h:?}"
+        assert!(highlighted_slices(r"\*literal\* and \_literal\_").is_empty());
+        assert!(highlighted_slices("unmatched * marker and **strong").is_empty());
+        assert!(highlighted_slices("2 * 3 = 6; 2 ** 3").is_empty());
+        assert_eq!(
+            highlighted_slices(r"\\*two slashes* and *valid*"),
+            ["*", "*", "*", "*"]
         );
-
-        // unmatched marker in plain text: we still dim single '*' conservatively in current impl,
-        // but it must not break UTF-8 boundaries and rendering remains stable.
-        let src2 = "unmatched * marker";
-        let h2 = super::markdown_marker_highlights(src2, &theme);
-        for (r, _) in &h2 {
-            assert!(src2.is_char_boundary(r.start) && src2.is_char_boundary(r.end));
-        }
+        assert_eq!(highlighted_slices(r"\*escaped\* but *active*"), ["*", "*"]);
     }
 
     #[test]
-    fn marker_highlights_nested_adjacent_emphasis_and_utf8() {
-        let theme = ui::Theme::light();
-        let src = "**bold _nested_** and ~~strike~~ — café ✓";
-        let h = super::markdown_marker_highlights(src, &theme);
-        for (r, _) in &h {
-            assert!(src.is_char_boundary(r.start) && src.is_char_boundary(r.end));
-        }
-        // should include some emphasis/strike delimiters
-        assert!(
-            h.iter()
-                .any(|(r, _)| &src[r.clone()] == "**" || &src[r.clone()] == "~~")
+    fn marker_highlights_only_parser_recognized_emphasis() {
+        assert_eq!(
+            highlighted_slices("**bold _nested_** *one* **two**"),
+            ["**", "_", "_", "**", "*", "*", "**", "**"]
         );
-        render_ok(src);
+        assert_eq!(highlighted_slices("***both***"), ["*", "**", "**", "*"]);
+        assert_eq!(highlighted_slices("*one*_two_"), ["*", "*", "_", "_"]);
+        assert_eq!(highlighted_slices("snake_case and _italic_"), ["_", "_"]);
+        render_ok("**bold _nested_** *one* **two**");
+    }
+
+    #[test]
+    fn marker_highlights_are_utf8_safe_after_backslashes() {
+        for prefix in [r"\é", r"\界", r"\🙂"] {
+            let source = format!("{prefix} *active*");
+            let actual = highlighted_ranges(&source);
+            let expected: Vec<_> = source
+                .match_indices('*')
+                .map(|(start, marker)| start..start + marker.len())
+                .collect();
+            assert_eq!(actual, expected);
+        }
+        assert_eq!(highlighted_slices(r"\\*emphasis* \! \["), ["*", "*"]);
     }
 
     #[test]
     fn marker_highlights_reference_links_and_images() {
-        let theme = ui::Theme::light();
         let src = "See [ref][id] and ![alt][img]\n\n[id]: https://example.com\n[img]: https://example.com/i.png";
-        let h = super::markdown_marker_highlights(src, &theme);
-        for (r, _) in &h {
-            assert!(src.is_char_boundary(r.start) && src.is_char_boundary(r.end));
-        }
+        assert_eq!(
+            highlighted_slices(src),
+            ["[", "]", "[", "]", "![", "]", "[", "]"]
+        );
+        assert_eq!(
+            highlighted_slices("![*alt*](https://example.com/image.png)"),
+            ["![", "*", "*", "]", "(", ")"]
+        );
         render_ok(src);
         render_ok("[ref]: https://example.com\n\n[use][ref]");
     }
 
     #[test]
     fn marker_highlights_plain_brackets_not_link_syntax() {
-        let theme = ui::Theme::light();
         let src = "[see notes] and (small example)";
-        let h = super::markdown_marker_highlights(src, &theme);
-        // plain parentheses should not be dimmed
-        assert!(
-            !h.iter().any(|(r, _)| {
-                let s = &src[r.clone()];
-                s == "(" || s == ")"
-            }),
-            "plain parentheses should not be dimmed: {h:?}"
+        assert!(highlighted_slices(src).is_empty());
+        assert!(highlighted_slices("plain text, then unrelated ]( later").is_empty());
+        assert!(highlighted_slices("![not an image] then unrelated ]( later").is_empty());
+        assert_eq!(
+            highlighted_slices("[**bold**](https://example.com)"),
+            ["[", "**", "**", "]", "(", ")"]
         );
-        // plain brackets without link/image construct should be less aggressively dimmed;
-        // ensure no crash and valid boundaries.
-        for (r, _) in &h {
-            assert!(src.is_char_boundary(r.start) && src.is_char_boundary(r.end));
-        }
+    }
+
+    #[test]
+    fn marker_highlights_only_parser_recognized_strikethrough() {
+        assert_eq!(highlighted_slices("~~valid~~"), ["~~", "~~"]);
+        assert!(highlighted_slices("~~unmatched and ~ also").is_empty());
+        assert!(highlighted_slices(r"\~\~escaped\~\~").is_empty());
+        assert_eq!(
+            highlighted_slices("~~one~~ ~~two~~"),
+            ["~~", "~~", "~~", "~~"]
+        );
+        render_ok("~~valid~~");
+    }
+
+    #[test]
+    fn marker_highlights_fences_but_protects_code_content() {
+        assert_eq!(
+            highlighted_slices("```rust\n**inside**\n```"),
+            ["```", "```"]
+        );
+        assert_eq!(highlighted_slices("~~~text\n*inside*\n~~~"), ["~~~", "~~~"]);
+        assert!(highlighted_slices("    **indented code**\n").is_empty());
+        assert_eq!(highlighted_slices("`*inline code*`"), ["`", "`"]);
     }
 
     #[test]
