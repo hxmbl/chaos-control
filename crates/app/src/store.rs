@@ -1579,8 +1579,10 @@ impl ChatStore {
     }
 
     /// Shows `open` as the workspace's project: header, picker and channels.
-    /// Every shown channel starts with an empty log (history reloads), and
-    /// #main is selected. Returns #main's app id.
+    /// Project-scoped UI state is replaced atomically: previous channel logs and
+    /// selection are dropped so nothing from the prior project can leak into this one.
+    /// Every shown channel starts with an empty log (history reloads), and #main is
+    /// selected. Returns #main's app id.
     fn show_project(&mut self, open: &OpenProject, folder: &Path, cx: &mut Context<Self>) -> Id {
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let shown_path = |root: Option<&str>| {
@@ -1616,6 +1618,9 @@ impl ChatStore {
                 project_wide: c.id == open.main.id,
             })
             .collect();
+        // Atomic project-context swap for channel state: drop all previous logs and
+        // create fresh empty logs only for the new project's channels.
+        self.logs.clear();
         for c in &self.workspace.channels {
             self.logs.insert(c.id, ChannelLog::default());
         }
@@ -1756,6 +1761,9 @@ impl ChatStore {
     }
 
     /// A switch finished: show the new project.
+    /// Project-scoped attached state is reset atomically with the UI swap so no
+    /// agent/session/message/reaction/setting state from the previous project can
+    /// leak into the new context.
     fn opened(&mut self, open: OpenProject, cx: &mut Context<Self>) {
         let Some(mut attached) = self.core.take() else {
             return;
@@ -1765,13 +1773,21 @@ impl ChatStore {
         attached.seen.clear();
         attached.by_seq.clear();
         attached.receipts.clear();
+        attached.names.clear();
         attached.reactions.clear();
+        attached.agent_statuses.clear();
+        attached.confirm = None;
         attached.ping_answers = None;
         attached.ping_answers_error = None;
+        attached.member_ping_answers.clear();
         attached.member_ping_answers_error = None;
+        attached.nicknames.clear();
         attached.nicknames_error = None;
         // Agents removed from the last project mean nothing in this one.
         attached.former_tokens.clear();
+        // Refresh workspace agent/member views for the new project context.
+        self.workspace.agents = attached.link.agents.iter().map(status_agent).collect();
+        self.workspace.mentions.clear();
         attached.link.open = open;
         self.core = Some(attached);
         self.load_ping_answers(cx);
