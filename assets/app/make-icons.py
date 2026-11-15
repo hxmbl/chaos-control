@@ -97,6 +97,13 @@ def flat_svg():
 '''
 
 
+def mark_svg():
+    """Single-colour in-app mark (icons/chaos-control.svg), Phosphor-style 256 box."""
+    scale = 120.0 / (R + STROKE / 2)  # outer edge 8 px inside the box
+    paths = "".join(f'<path d="{seg_path(a, v, cap, scale, c=128.0)}"/>' for a, v, cap in segments())
+    return f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" fill="currentColor">{paths}</svg>\n'
+
+
 def png_bytes(img, size, quantize=True):
     b = io.BytesIO()
     im = img.resize((size, size), Image.LANCZOS)
@@ -167,6 +174,7 @@ def main():
     img.save(HERE / "app-icon.ico", sizes=[(s, s) for s in (16, 24, 32, 48, 64, 128, 256)])
     write_icns(img, HERE / "AppIcon.icns")
     write_icon_bundle()
+    (HERE.parent / "icons" / "chaos-control.svg").write_text(mark_svg())
 
 
 if __name__ == "__main__":
