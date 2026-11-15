@@ -144,7 +144,7 @@ impl Workspace {
             )
         });
         let pane = cx.new(|cx| PaneHost::new(store.clone(), cx));
-        let composer = cx.new(|cx| Composer::new(store.clone(), window, cx));
+        let composer = cx.new(|cx| Composer::new(store.clone(), window, cx, None));
         let pane_events =
             cx.subscribe_in(&pane, window, |this, _, event, window, cx| match event {
                 PaneEvent::Reply(reply) => this
