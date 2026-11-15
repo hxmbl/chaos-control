@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
 <defs>
 <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-<stop offset="0" stop-color="#2E2E3D"/>
-<stop offset="1" stop-color="#191923"/>
+<stop offset="0" stop-color="#2C2C2C"/>
+<stop offset="1" stop-color="#141414"/>
 </linearGradient>
 <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
 <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.16"/>
@@ -12,5 +12,10 @@
 </defs>
 <rect x="100.0" y="100.0" width="824" height="824" rx="185" fill="url(#bg)"/>
 <rect x="102.0" y="102.0" width="820" height="820" rx="183" fill="none" stroke="url(#rim)" stroke-width="4"/>
-<g transform="translate(256.6 256.6) scale(1.9956)"><path fill="#F5F5F7" fill-rule="evenodd" d="M59.85,226.77A120,120,0,1,0,9.35,145.96A69.60,69.60,0,1,1,59.85,226.77ZM105.15,169.27A43.20,43.20,0,1,0,18.75,169.27A43.20,43.20,0,1,0,105.15,169.27Z"/></g>
+<g transform="translate(512 512) scale(0.74) translate(-512 -512)" fill="none" stroke="#F5F5F7" stroke-width="104" stroke-linecap="round">
+<path d="M 259.08 673.35 A 300 300 0 0 1 673.35 259.08"/>
+<path d="M 772.84 363.81 A 300 300 0 0 1 748.40 696.71"/>
+<path d="M 634.67 785.77 A 300 300 0 0 1 513.39 812.00"/>
+<path d="M 373.02 777.87 A 300 300 0 0 1 363.81 772.84"/>
+</g>
 </svg>
