@@ -1,11 +1,12 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
-use std::{collections::HashMap, ops::Range};
+use std::{collections::HashMap, ops::Range, time::Duration};
 
 use gpui::{
-    Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
-    actions, div, prelude::*,
+    Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent,
+    SharedString, StyledText, Subscription, TextRun, TextStyle, Window, actions, div, linear,
+    prelude::*,
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
@@ -66,6 +67,49 @@ fn sendable(text: &str) -> bool {
 /// Core echoes the posted text trimmed; compare against that.
 fn sent_body(text: &str) -> &str {
     text.trim()
+}
+
+fn working_indicator_text(
+    label: &str,
+    delta: f32,
+    base_style: &TextStyle,
+    base: Hsla,
+    bright: Hsla,
+) -> StyledText {
+    let label: SharedString = label.to_string().into();
+    let chars: Vec<(usize, char)> = label.char_indices().collect();
+    if chars.is_empty() {
+        return StyledText::new(label);
+    }
+    let n = chars.len() as f32;
+    // Sweep center moves across the text (with a bit of lead-in/out).
+    let center = -0.25 + delta * 1.5;
+    let mut runs: Vec<TextRun> = Vec::with_capacity(chars.len());
+    for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
+        let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label.len());
+        let len = next - byte_ix;
+        let p = (i as f32 + 0.5) / n;
+        let d = (p - center).abs();
+        // Soft highlight band with falloff.
+        let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
+        // Gentle global pulse so text smoothly fades in/out overall.
+        let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
+        let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
+        let mut color = base;
+        color.h = base.h + (bright.h - base.h) * mix;
+        color.s = base.s + (bright.s - base.s) * mix;
+        color.l = base.l + (bright.l - base.l) * mix;
+        color.a = (0.45 + 0.55 * mix).clamp(0.0, 1.0);
+        runs.push(TextRun {
+            len,
+            font: base_style.font(),
+            color,
+            background_color: base_style.background_color,
+            underline: base_style.underline,
+            strikethrough: base_style.strikethrough,
+        });
+    }
+    StyledText::new(label).with_runs(runs)
 }
 
 fn echo_matches_in(
@@ -167,7 +211,7 @@ pub struct Composer {
     /// A core send in flight: restored if the send fails.
     pending: Option<(Id, Draft)>,
     mention: Option<MentionState>,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 4],
 }
 
 /// Rows the composer grows to before it scrolls.
@@ -218,6 +262,7 @@ impl Composer {
                 TextInputEvent::Changed => this.refresh_mention(cx),
             }),
             cx.observe(&input, |this, _, cx| this.refresh_mention(cx)),
+            cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
                     let next = store.read(cx).selected();
@@ -502,6 +547,31 @@ impl Composer {
         self.store.read(cx).send_route() == SendRoute::Unwired
     }
 
+    fn working_indicator(&self, cx: &Context<Self>) -> Option<SharedString> {
+        let store = self.store.read(cx);
+        let agents = store.working_agents(store.selected());
+        if agents.is_empty() {
+            return None;
+        }
+        let label = if agents.len() == 1 {
+            let (name, verb) = &agents[0];
+            format!("{} is {verb}…", name)
+        } else {
+            let names = agents
+                .iter()
+                .map(|(name, _)| name.as_ref())
+                .collect::<Vec<_>>();
+            let joined = match names.as_slice() {
+                [] => return None,
+                [a] => (*a).to_string(),
+                [a, b] => format!("{a} and {b}"),
+                [all @ .., last] => format!("{}, and {last}", all.join(", ")),
+            };
+            format!("{joined} are Working…")
+        };
+        Some(label.into())
+    }
+
     fn render_reply(&self, reply: &ReplyRef, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = *cx.theme();
         let who = SharedString::from(author_name(self.store.read(cx).workspace(), reply.author));
@@ -648,22 +718,9 @@ impl Render for Composer {
         let can_send = !unwired && sendable(self.input.read(cx).text());
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
+        let working = self.working_indicator(cx);
 
-        div()
-            .key_context(KEY_CONTEXT)
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::accept_mention_action))
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if !this.suggestions_open() {
-                    return;
-                }
-                let key = event.keystroke.key.as_str();
-                match key {
-                    "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
-                    "down" if this.move_mention_selection(1, cx) => cx.stop_propagation(),
-                    _ => {}
-                }
-            }))
+        let box_el = div()
             .w_full()
             .flex()
             .flex_col()
@@ -728,7 +785,57 @@ impl Render for Composer {
                             .on_click(cx.listener(|this, _, _, cx| this.send(cx)))
                             .child(icon(IconName::ArrowUp, icons::MD, t.surface)),
                     ),
-            )
+            );
+
+        div()
+            .key_context(KEY_CONTEXT)
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::accept_mention_action))
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if !this.suggestions_open() {
+                    return;
+                }
+                let key = event.keystroke.key.as_str();
+                match key {
+                    "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
+                    "down" if this.move_mention_selection(1, cx) => cx.stop_propagation(),
+                    _ => {}
+                }
+            }))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(space::X1_5)
+            .when_some(working, |d, label| {
+                let base_style = window.text_style();
+                let base = t.muted;
+                let bright = t.ink;
+                d.child(
+                    div()
+                        .px(space::X2)
+                        .py(space::X0_5)
+                        .type_style(text::SMALL)
+                        .child(
+                            div().id("working-indicator-shimmer").with_animation(
+                                "working-indicator-shimmer",
+                                Animation::new(Duration::from_millis(1800))
+                                    .repeat()
+                                    .with_easing(linear),
+                                move |el, delta| {
+                                    let text = working_indicator_text(
+                                        label.as_ref(),
+                                        delta,
+                                        &base_style,
+                                        base,
+                                        bright,
+                                    );
+                                    el.child(text)
+                                },
+                            ),
+                        ),
+                )
+            })
+            .child(box_el)
     }
 }
 

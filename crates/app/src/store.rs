@@ -173,6 +173,8 @@ struct Attached {
     names: HashMap<ct::MemberId, Arc<str>>,
     /// Reactions per core message in #main, in the order they were added.
     reactions: HashMap<ct::MessageId, Vec<ct::Reaction>>,
+    /// Latest per-agent status by core channel, for authoritative working state.
+    agent_statuses: HashMap<(ct::MemberId, ct::ChannelId), chaos_core::engine::AgentStatus>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
     /// Each usable harness's models: its cached list (`model_cache`), else
@@ -437,6 +439,45 @@ impl ChatStore {
             read_at: receipt.read_at / 1000,
             behind: len.saturating_sub(read_row + 1),
         })
+    }
+
+    /// Agents actively working in `channel`, as `(display name, verb)` pairs in
+    /// a stable order. Derived from authoritative per-agent/per-channel core
+    /// status (an in-flight turn reported as Active with a "working" presence).
+    pub fn working_agents(&self, channel: Id) -> Vec<(Arc<str>, &'static str)> {
+        let Some(attached) = self.core.as_ref().filter(|a| a.channel == channel) else {
+            return Vec::new();
+        };
+        let main = attached.link.main();
+        let mut out: Vec<(Arc<str>, &'static str)> = attached
+            .agent_statuses
+            .values()
+            .filter(|s| s.channel == main && s.glow == ct::Glow::Active)
+            .filter(|s| {
+                s.presence
+                    .as_deref()
+                    .is_some_and(|p| p == "working" || p.starts_with("working:"))
+            })
+            .filter_map(|s| {
+                let name = attached
+                    .link
+                    .agents
+                    .iter()
+                    .find(|a| a.member == s.agent)
+                    .map(|a| a.name.clone())
+                    .or_else(|| {
+                        self.workspace
+                            .agents
+                            .iter()
+                            .find(|a| a.id == agent_id(s.agent))
+                            .map(|a| a.name.clone())
+                    })?;
+                Some((name, working_verb(s.agent, main)))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out.dedup_by(|a, b| a.0 == b.0);
+        out
     }
 
     /// The reaction chips under the message at `index` of `channel`, in order
@@ -820,6 +861,7 @@ impl ChatStore {
             receipts: HashMap::new(),
             names: HashMap::new(),
             reactions: HashMap::new(),
+            agent_statuses: HashMap::new(),
             confirm,
             models,
             discovering: HashSet::new(),
@@ -1857,6 +1899,11 @@ impl ChatStore {
                 cx.notify();
             }
             CoreEvent::Agent(status) => {
+                if let Some(attached) = self.core.as_mut() {
+                    attached
+                        .agent_statuses
+                        .insert((status.agent, status.channel), status.clone());
+                }
                 let id = agent_id(status.agent);
                 if let Some(agent) = self.workspace.agents.iter_mut().find(|a| a.id == id) {
                     agent.state = match status.glow {
@@ -1865,8 +1912,8 @@ impl ChatStore {
                         ct::Glow::Unresponsive => AgentState::Unresponsive,
                     };
                     agent.presence = status.presence.clone();
-                    cx.notify();
                 }
+                cx.notify();
             }
             CoreEvent::Reaction {
                 channel,
@@ -2039,6 +2086,104 @@ fn agent_id(member: ct::MemberId) -> Id {
 fn core_message_id(id: Id) -> Option<ct::MessageId> {
     id.0.checked_sub(CORE_MESSAGE_BASE)
         .map(|n| ct::MessageId(i64::from(n)))
+}
+
+const WORKING_VERBS: &[&str] = &[
+    "Accomplishing",
+    "Actioning",
+    "Actualizing",
+    "Architecting",
+    "Baking",
+    "Beaming",
+    "Befuddling",
+    "Billowing",
+    "Booping",
+    "Bootstrapping",
+    "Brewing",
+    "Calculating",
+    "Cascading",
+    "Cerebrating",
+    "Churning",
+    "Coalescing",
+    "Cogitating",
+    "Combobulating",
+    "Composing",
+    "Computing",
+    "Concocting",
+    "Considering",
+    "Contemplating",
+    "Cooking",
+    "Crafting",
+    "Creating",
+    "Crystallizing",
+    "Cultivating",
+    "Crunching",
+    "Deciphering",
+    "Deliberating",
+    "Determining",
+    "Doodling",
+    "Elucidating",
+    "Enchanting",
+    "Envisioning",
+    "Fermenting",
+    "Flowing",
+    "Forging",
+    "Forming",
+    "Generating",
+    "Germinating",
+    "Grooving",
+    "Harmonizing",
+    "Hashing",
+    "Hatching",
+    "Ideating",
+    "Imagining",
+    "Incubating",
+    "Inferring",
+    "Manifesting",
+    "Marinating",
+    "Meandering",
+    "Metamorphosing",
+    "Mulling",
+    "Musing",
+    "Noodling",
+    "Orbiting",
+    "Orchestrating",
+    "Percolating",
+    "Philosophising",
+    "Pondering",
+    "Processing",
+    "Puzzling",
+    "Ruminating",
+    "Scheming",
+    "Simmering",
+    "Sketching",
+    "Spinning",
+    "Stewing",
+    "Synthesizing",
+    "Thinking",
+    "Tinkering",
+    "Transmuting",
+    "Vibing",
+    "Weaving",
+    "Whirring",
+    "Whisking",
+    "Working",
+    "Wrangling",
+    "Zesting",
+];
+
+fn working_verb(agent: ct::MemberId, channel: ct::ChannelId) -> &'static str {
+    // Stable per agent+channel so the label doesn't flicker between renders.
+    let mut h: u64 = 1469598103934665603;
+    for b in agent.0.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    for b in channel.0.to_le_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    WORKING_VERBS[(h as usize) % WORKING_VERBS.len()]
 }
 
 /// The log row for the newest message at or before `seq`, if any is loaded.
