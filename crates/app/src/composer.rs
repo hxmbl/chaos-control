@@ -257,6 +257,7 @@ fn filter_slash_commands(
 
 pub struct Composer {
     store: Entity<ChatStore>,
+    #[allow(dead_code)]
     pane: Entity<PaneHost>,
     input: Entity<TextInput>,
     /// The channel the composer is showing a draft for.
@@ -763,7 +764,7 @@ impl Composer {
         }
     }
 
-    fn try_execute_slash_command(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn try_execute_slash_command(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
         let text = self.input.read(cx).text().to_string();
         let trimmed = text.trim_end();
         if !trimmed.starts_with('/') {
@@ -794,41 +795,8 @@ impl Composer {
             name: Arc::from(name.to_string()),
             arguments: args.clone(),
         };
-        self.store.update(cx, |store, _cx| {
-            store.dispatch_slash_command(invocation.clone())
-        });
-
-        // Temporary handling for test commands: open the pane and show details.
-        if matches!(
-            invocation.name.as_ref(),
-            "test" | "test2" | "test3" | "thisisalsoatest"
-        ) {
-            use model::{PaneContent, ReviewItem};
-            let content = PaneContent::Review {
-                title: Arc::from(format!("/{}", invocation.name)),
-                summary: Arc::from("Slash command (test)"),
-                items: vec![
-                    ReviewItem {
-                        title: Arc::from("Command"),
-                        detail: invocation.name.clone(),
-                    },
-                    ReviewItem {
-                        title: Arc::from("Arguments"),
-                        detail: if invocation.arguments.is_empty() {
-                            Arc::from("(none)")
-                        } else {
-                            Arc::from(invocation.arguments.clone())
-                        },
-                    },
-                    ReviewItem {
-                        title: Arc::from("Raw input"),
-                        detail: Arc::from(trimmed.to_string()),
-                    },
-                ],
-            };
-            self.pane
-                .update(cx, |pane, cx| pane.open(content, window, cx));
-        }
+        self.store
+            .update(cx, |store, _cx| store.dispatch_slash_command(invocation));
 
         self.input.update(cx, |input, cx| input.clear(cx));
         self.reply = None;
