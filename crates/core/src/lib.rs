@@ -19,6 +19,7 @@ pub mod acp;
 mod acp_v2;
 pub mod adapter;
 pub mod devin;
+pub mod emoji;
 pub mod engine;
 pub mod fake;
 pub mod harness;

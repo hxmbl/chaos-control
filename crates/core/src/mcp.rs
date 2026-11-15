@@ -105,12 +105,13 @@ fn random_token() -> String {
 
 // ---------- tools ----------
 
-pub const TOOL_NAMES: [&str; 8] = [
+pub const TOOL_NAMES: [&str; 9] = [
     "chat_context",
     "chat_read",
     "chat_search",
     "chat_send",
     "chat_react",
+    "chat_emoji_search",
     "chat_refuse",
     "chat_dissent",
     "chat_status",
@@ -169,8 +170,18 @@ pub fn tools() -> Vec<Tool> {
             schema(
                 json!({"type": "object", "required": ["message_id", "emoji"], "properties": {
                     "message_id": {"type": "integer"},
-                    "emoji": {"type": "string", "description": "One emoji, e.g. 👍 ✅ 👀 💀, or a :shortcode: like :+1:."},
+                    "emoji": {"type": "string", "description": "One Unicode emoji (e.g. 👍, 👍🏽) or a completed :shortcode: (e.g. :thumbs_up:, :+1:)."},
                     "remove": {"type": "boolean", "description": "Take this reaction back instead of adding it."}
+                }}),
+            ),
+        ),
+        Tool::new(
+            "chat_emoji_search",
+            "Search Unicode emoji by name or shortcode. Returns canonical shortcodes and emoji values (and names) so you can pick one without the full catalog in your instructions.",
+            schema(
+                json!({"type": "object", "required": ["query"], "properties": {
+                    "query": {"type": "string", "description": "Search text, e.g. \"thumb\", \"party\", \":heart\"."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum results (default 20)."}
                 }}),
             ),
         ),
@@ -604,6 +615,18 @@ pub fn call_tool(
                 "answers_pings": answers_pings,
                 "reactions": reaction_views(engine.conn(), message),
             }))
+        }
+        "chat_emoji_search" => {
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError("query is required".into()))?;
+            let limit = arg_u64(args, "limit").unwrap_or(20).clamp(1, 50) as usize;
+            let results = crate::emoji::suggest(query, limit)
+                .into_iter()
+                .map(|m| json!({"emoji": m.emoji, "shortcode": m.shortcode, "name": m.name}))
+                .collect::<Vec<_>>();
+            Ok(json!({ "results": results }))
         }
         "chat_refuse" | "chat_dissent" => {
             let id = arg_u64(args, "message_id")

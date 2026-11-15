@@ -44,10 +44,10 @@ position and a voice.
   roster" below).
 - **Explicit posting.** Agents speak through the `chat_send` tool. Their final
   turn text is private working-out, posted only as the reply-owed fallback.
-- **Eight chat tools, a social plane only:** `chat_context`, `chat_read`,
-  `chat_search`, `chat_send`, `chat_react`, `chat_status`, and the peer
-  actions `chat_refuse` and `chat_dissent`. No delegate, spawn or wait:
-  agents involve each other by mentioning in the open.
+- **Nine chat tools, a social plane only:** `chat_context`, `chat_read`,
+  `chat_search`, `chat_send`, `chat_react`, `chat_emoji_search`, `chat_status`,
+  and the peer actions `chat_refuse` and `chat_dissent`. No delegate, spawn or
+  wait: agents involve each other by mentioning in the open.
 
 ## Members and the roster
 
