@@ -1378,7 +1378,28 @@ impl ChatStore {
     /// Slash commands available to the composer. Populated by the application
     /// command registry/dispatcher (STRM-590); empty until wired.
     pub fn slash_command_candidates(&self) -> Vec<SlashCommandCandidate> {
-        Vec::new()
+        vec![
+            SlashCommandCandidate {
+                name: Arc::from("test"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+            SlashCommandCandidate {
+                name: Arc::from("test2"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+            SlashCommandCandidate {
+                name: Arc::from("test3"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+            SlashCommandCandidate {
+                name: Arc::from("thisisalsoatest"),
+                description: Arc::from("Test slash command (temporary)"),
+                argument_hint: Some(Arc::from("[args]")),
+            },
+        ]
     }
 
     /// Hands a slash-command invocation to the application dispatcher.

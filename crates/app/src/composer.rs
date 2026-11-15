@@ -1,7 +1,7 @@
 //! Floating message box. Sends to core in #main; in channels core isn't
 //! wired to yet, sending is off and a note says so.
 
-use std::{collections::HashMap, ops::Range, time::Duration};
+use std::{collections::HashMap, ops::Range, sync::Arc, time::Duration};
 
 use gpui::{
     Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent,
@@ -17,6 +17,7 @@ use ui::{
 };
 
 use crate::mention_highlight::{self, KnownMentions};
+use crate::pane_host::PaneHost;
 use crate::store::{
     ChatStore, MentionCandidate, SendRoute, SlashCommandCandidate, SlashCommandInvocation,
     StoreEvent, UNWIRED_NOTE,
@@ -256,6 +257,7 @@ fn filter_slash_commands(
 
 pub struct Composer {
     store: Entity<ChatStore>,
+    pane: Entity<PaneHost>,
     input: Entity<TextInput>,
     /// The channel the composer is showing a draft for.
     channel: Id,
@@ -277,7 +279,12 @@ fn placeholder(store: &ChatStore) -> String {
 }
 
 impl Composer {
-    pub fn new(store: Entity<ChatStore>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Entity<ChatStore>,
+        pane: Entity<PaneHost>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Enter sends, shift-enter starts a new line, and the field grows with
         // its text (see `TextInput::multiline`).
         let input =
@@ -310,12 +317,12 @@ impl Composer {
         window.focus(&input.focus_handle(cx));
         let channel = store.read(cx).selected();
         let subscriptions = [
-            cx.subscribe(&input, |this, _, event, cx| match event {
+            cx.subscribe_in(&input, window, |this, _, event, window, cx| match event {
                 TextInputEvent::Submit => {
                     if this.suggestions_open() {
-                        this.accept_mention(cx);
+                        this.accept_suggestion(window, cx, true);
                     } else {
-                        this.send(cx);
+                        this.send(window, cx);
                     }
                 }
                 TextInputEvent::Changed => this.refresh_suggestions(cx),
@@ -374,6 +381,7 @@ impl Composer {
         ];
         Self {
             store,
+            pane,
             input,
             channel,
             reply: None,
@@ -602,14 +610,39 @@ impl Composer {
         true
     }
 
-    fn accept_suggestion(&mut self, cx: &mut Context<Self>) -> bool {
+    fn accept_suggestion(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        run_if_single: bool,
+    ) -> bool {
         if self.slash_command.is_some() {
-            return self.accept_slash_command(cx);
+            return self.accept_slash_command(window, cx, run_if_single);
         }
         self.accept_mention(cx)
     }
 
-    fn accept_slash_command(&mut self, cx: &mut Context<Self>) -> bool {
+    fn completed_slash_command_text(state: &SlashCommandState, name: &str) -> (String, usize) {
+        let mut args = state.arguments.clone();
+        if args.is_empty() {
+            args.push(' ');
+        } else if !args.starts_with(char::is_whitespace) {
+            args.insert(0, ' ');
+        }
+        let mut new = String::with_capacity(1 + name.len() + args.len());
+        new.push('/');
+        new.push_str(name);
+        let caret = new.len();
+        new.push_str(&args);
+        (new, caret)
+    }
+
+    fn accept_slash_command(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        run_if_single: bool,
+    ) -> bool {
         let Some(state) = self.slash_command.clone() else {
             return false;
         };
@@ -628,20 +661,38 @@ impl Composer {
             self.refresh_suggestions(cx);
             return false;
         }
-        // Keep arguments after the command name token and dispatch the invocation.
-        let args = state.arguments.clone();
-        let invocation = SlashCommandInvocation {
-            name: candidate.name.clone(),
-            arguments: args.trim_start().to_string(),
-        };
-        self.store
-            .update(cx, |store, _cx| store.dispatch_slash_command(invocation));
-        self.input.update(cx, |input, cx| input.clear(cx));
-        self.reply = None;
-        self.drafts.remove(&self.channel);
+
+        let name = candidate.name.to_string();
+        let multiple = state.matches.len() > 1;
+        let exact = state.query == name;
+        let (new, caret) = Self::completed_slash_command_text(&state, &name);
+
+        // If Enter is pressed again after the command was already completed to
+        // the selected recommendation, run it.
+        if run_if_single && exact {
+            self.input.update(cx, |input, cx| {
+                input.restore_draft_state(SharedString::from(new), caret..caret, false, cx);
+            });
+            self.slash_command = None;
+            self.sync_vertical_nav_suppression(cx);
+            self.refresh_suggestions(cx);
+            self.try_execute_slash_command(window, cx);
+            return true;
+        }
+
+        self.input.update(cx, |input, cx| {
+            input.restore_draft_state(SharedString::from(new), caret..caret, false, cx);
+        });
         self.slash_command = None;
         self.sync_vertical_nav_suppression(cx);
         self.refresh_suggestions(cx);
+
+        // Enter: if there's only one possibility, complete and run in one step.
+        // Tab/click: fill in only. If multiple possibilities, complete now and
+        // a second Enter runs it.
+        if run_if_single && !multiple {
+            self.try_execute_slash_command(window, cx);
+        }
         true
     }
 
@@ -703,15 +754,95 @@ impl Composer {
     fn accept_suggestion_action(
         &mut self,
         _: &AcceptSuggestion,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.accept_suggestion(cx) {
+        // Tab fills in the suggestion; it does not run commands.
+        if !self.accept_suggestion(window, cx, false) {
             cx.propagate();
         }
     }
 
-    fn send(&mut self, cx: &mut Context<Self>) {
+    fn try_execute_slash_command(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let text = self.input.read(cx).text().to_string();
+        let trimmed = text.trim_end();
+        if !trimmed.starts_with('/') {
+            return false;
+        }
+        let ws = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+        let name = &trimmed[1..ws];
+        if name.is_empty() {
+            return false;
+        }
+        let args = if ws < trimmed.len() {
+            trimmed[ws..].trim_start().to_string()
+        } else {
+            String::new()
+        };
+
+        let known = self
+            .store
+            .read(cx)
+            .slash_command_candidates()
+            .into_iter()
+            .any(|c| c.name.as_ref() == name);
+        if !known {
+            return false;
+        }
+
+        let invocation = SlashCommandInvocation {
+            name: Arc::from(name.to_string()),
+            arguments: args.clone(),
+        };
+        self.store.update(cx, |store, _cx| {
+            store.dispatch_slash_command(invocation.clone())
+        });
+
+        // Temporary handling for test commands: open the pane and show details.
+        if matches!(
+            invocation.name.as_ref(),
+            "test" | "test2" | "test3" | "thisisalsoatest"
+        ) {
+            use model::{PaneContent, ReviewItem};
+            let content = PaneContent::Review {
+                title: Arc::from(format!("/{}", invocation.name)),
+                summary: Arc::from("Slash command (test)"),
+                items: vec![
+                    ReviewItem {
+                        title: Arc::from("Command"),
+                        detail: invocation.name.clone(),
+                    },
+                    ReviewItem {
+                        title: Arc::from("Arguments"),
+                        detail: if invocation.arguments.is_empty() {
+                            Arc::from("(none)")
+                        } else {
+                            Arc::from(invocation.arguments.clone())
+                        },
+                    },
+                    ReviewItem {
+                        title: Arc::from("Raw input"),
+                        detail: Arc::from(trimmed.to_string()),
+                    },
+                ],
+            };
+            self.pane
+                .update(cx, |pane, cx| pane.open(content, window, cx));
+        }
+
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.reply = None;
+        self.drafts.remove(&self.channel);
+        self.slash_command = None;
+        self.sync_vertical_nav_suppression(cx);
+        cx.notify();
+        true
+    }
+
+    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.try_execute_slash_command(window, cx) {
+            return;
+        }
         let text = self.input.read(cx).text().clone();
         if !sendable(&text) || self.unwired(cx) {
             return;
@@ -846,11 +977,11 @@ impl Composer {
                     .gap(space::X0_5)
                     .on_mouse_down(
                         gpui::MouseButton::Left,
-                        cx.listener(move |this, _, _, cx| {
+                        cx.listener(move |this, _, window, cx| {
                             if let Some(state) = &mut this.slash_command {
                                 state.selected = idx;
                             }
-                            this.accept_suggestion(cx);
+                            this.accept_suggestion(window, cx, false);
                         }),
                     )
                     .child(
@@ -883,8 +1014,7 @@ impl Composer {
             });
             return Some(
                 div()
-                    .mx(space::X1)
-                    .mb(space::X2)
+                    .w_full()
                     .p(space::X1)
                     .rounded(radius::MD)
                     .bg(t.surface)
@@ -930,11 +1060,11 @@ impl Composer {
                 .gap(space::X0_5)
                 .on_mouse_down(
                     gpui::MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, _, window, cx| {
                         if let Some(state) = &mut this.mention {
                             state.selected = idx;
                         }
-                        this.accept_suggestion(cx);
+                        this.accept_suggestion(window, cx, false);
                     }),
                 )
                 .child(
@@ -967,8 +1097,7 @@ impl Composer {
         });
         Some(
             div()
-                .mx(space::X1)
-                .mb(space::X2)
+                .w_full()
                 .p(space::X1)
                 .rounded(radius::MD)
                 .bg(t.surface)
@@ -1015,7 +1144,6 @@ impl Render for Composer {
                         .child(UNWIRED_NOTE),
                 )
             })
-            .children(self.render_suggestions(cx))
             .when_some(self.reply.clone(), |d, reply| {
                 d.child(self.render_reply(&reply, cx))
             })
@@ -1055,10 +1183,25 @@ impl Render for Composer {
                             // Disabled reads as a muted button, not a missing one.
                             .bg(if can_send { t.ink } else { t.faint })
                             .tooltip(Tooltip::text("Send"))
-                            .on_click(cx.listener(|this, _, _, cx| this.send(cx)))
+                            .on_click(cx.listener(|this, _, window, cx| this.send(window, cx)))
                             .child(icon(IconName::ArrowUp, icons::MD, t.surface)),
                     ),
             );
+
+        let box_wrap = div()
+            .relative()
+            .w_full()
+            .children(self.render_suggestions(cx).map(|el| {
+                div()
+                    .absolute()
+                    .bottom_full()
+                    .left_0()
+                    .right_0()
+                    .mb(space::X1)
+                    .child(el)
+                    .into_any_element()
+            }))
+            .child(box_el);
 
         div()
             .key_context(KEY_CONTEXT)
@@ -1130,7 +1273,7 @@ impl Render for Composer {
                         ),
                 )
             })
-            .child(box_el)
+            .child(box_wrap)
     }
 }
 
