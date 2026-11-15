@@ -375,6 +375,7 @@ impl Composer {
             .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
         self.restore_for(next, cx);
         self.mention = None;
+        self.sync_vertical_nav_suppression(cx);
         self.refresh_mention(cx);
         cx.notify();
     }
@@ -393,9 +394,17 @@ impl Composer {
         self.mention.is_some()
     }
 
+    fn sync_vertical_nav_suppression(&self, cx: &mut Context<Self>) {
+        let open = self.suggestions_open();
+        self.input.update(cx, |input, _| {
+            input.set_suppress_vertical_navigation(open);
+        });
+    }
+
     /// Closes the @-mention popup.
     fn dismiss_suggestions(&mut self, cx: &mut Context<Self>) {
         self.mention = None;
+        self.sync_vertical_nav_suppression(cx);
         cx.notify();
     }
 
@@ -403,6 +412,7 @@ impl Composer {
         let (text, selection, _) = self.input.read(cx).draft_state();
         if selection.start != selection.end {
             if self.mention.take().is_some() {
+                self.sync_vertical_nav_suppression(cx);
                 cx.notify();
             }
             return;
@@ -410,6 +420,7 @@ impl Composer {
         let cursor = selection.end.min(text.len());
         let Some((range, query)) = mention_query(text.as_ref(), cursor) else {
             if self.mention.take().is_some() {
+                self.sync_vertical_nav_suppression(cx);
                 cx.notify();
             }
             return;
@@ -418,6 +429,7 @@ impl Composer {
         let matches = filter_mentions(&candidates, &query);
         if matches.is_empty() {
             if self.mention.take().is_some() {
+                self.sync_vertical_nav_suppression(cx);
                 cx.notify();
             }
             return;
@@ -439,9 +451,11 @@ impl Composer {
             selected,
         };
         if self.mention.as_ref() == Some(&next) {
+            self.sync_vertical_nav_suppression(cx);
             return;
         }
         self.mention = Some(next);
+        self.sync_vertical_nav_suppression(cx);
         cx.notify();
     }
 
@@ -465,6 +479,7 @@ impl Composer {
         };
         let Some(candidate) = state.matches.get(state.selected) else {
             self.mention = None;
+            self.sync_vertical_nav_suppression(cx);
             return false;
         };
         let (text, selection, _reversed) = self.input.read(cx).draft_state();
@@ -496,6 +511,7 @@ impl Composer {
             input.restore_draft_state(SharedString::from(new), caret..caret, false, cx);
         });
         self.mention = None;
+        self.sync_vertical_nav_suppression(cx);
         self.refresh_mention(cx);
         true
     }
@@ -795,8 +811,30 @@ impl Render for Composer {
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::accept_mention_action))
+            .on_action(cx.listener(|this, _: &ui::text_input::Up, _window, cx| {
+                if this.suggestions_open() && this.move_mention_selection(-1, cx) {
+                    cx.stop_propagation();
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ui::text_input::Down, _window, cx| {
+                if this.suggestions_open() && this.move_mention_selection(1, cx) {
+                    cx.stop_propagation();
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 if !this.suggestions_open() {
+                    return;
+                }
+                // Don't steal Shift+Arrow (text selection) or other modified navigation.
+                if event.keystroke.modifiers.shift
+                    || event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.platform
+                {
                     return;
                 }
                 let key = event.keystroke.key.as_str();
