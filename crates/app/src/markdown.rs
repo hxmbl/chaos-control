@@ -1106,6 +1106,7 @@ impl<'a> Renderer<'a> {
 /// Parser-aware: uses pulldown-cmark structure to protect code regions and to
 /// identify actual link/image constructs; applies conservative delimiter dimming
 /// elsewhere to avoid styling ordinary punctuation/identifiers.
+#[allow(dead_code)]
 pub fn markdown_marker_highlights(
     text: &str,
     theme: &ui::Theme,

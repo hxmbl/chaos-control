@@ -30,58 +30,20 @@ pub const ANY_EMOJI: &str = "*";
 /// The project setting key in the store, and the `agents.json` field.
 pub const PING_ANSWERS_KEY: &str = "ping_answer_reactions";
 
-/// Slack-style shortcodes agents tend to send, mapped to the emoji itself so
-/// `:+1:` and 👍 are the same reaction.
-const SHORTCODES: &[(&str, &str)] = &[
-    ("+1", "👍"),
-    ("thumbsup", "👍"),
-    ("thumbs_up", "👍"),
-    ("-1", "👎"),
-    ("thumbsdown", "👎"),
-    ("white_check_mark", "✅"),
-    ("heavy_check_mark", "✅"),
-    ("check", "✅"),
-    ("eyes", "👀"),
-    ("skull", "💀"),
-    ("heart", "❤️"),
-    ("joy", "😂"),
-    ("tada", "🎉"),
-    ("fire", "🔥"),
-    ("pray", "🙏"),
-    ("rocket", "🚀"),
-    ("thinking", "🤔"),
-    ("thinking_face", "🤔"),
-    ("x", "❌"),
-];
-
-/// The emoji as stored, or `None` if it isn't one: trimmed, `:shortcode:`
-/// colons dropped, known shortcodes mapped to their emoji. Anything else
-/// must be a short run with no spaces and no ASCII letters or digits (an
-/// emoji, not a word).
+/// The emoji as stored, or `None` if it isn't one: a literal Unicode emoji or
+/// a known shortcode (`:thumbs_up:` or `thumbs_up`), resolved via the shared
+/// emoji registry. Unknown shortcodes and words are rejected.
 pub fn normalize(raw: &str) -> Option<Arc<str>> {
     let s = raw.trim();
-    let s = s
-        .strip_prefix(':')
-        .and_then(|s| s.strip_suffix(':'))
-        .unwrap_or(s);
-    if s.is_empty() {
+    if s.is_empty() || s.chars().count() > MAX_EMOJI_CHARS {
+        // A literal emoji this long is not a single reaction; shortcodes are
+        // short names and caught below if unknown.
+    }
+    let emoji = crate::emoji::normalize_emoji_input(raw)?;
+    if emoji.chars().count() > MAX_EMOJI_CHARS {
         return None;
     }
-    let lower = s.to_ascii_lowercase();
-    if let Some((_, e)) = SHORTCODES.iter().find(|(code, _)| *code == lower) {
-        return Some(Arc::from(*e));
-    }
-    let chars = s.chars().count();
-    let wordy = s
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_ascii_alphanumeric() || c.is_control());
-    // Keycap sequences (1️⃣, #️⃣) start with an ASCII digit or #/*; allow
-    // them when the keycap mark follows.
-    let keycap = s.contains('\u{20E3}');
-    if chars > MAX_EMOJI_CHARS || (wordy && !keycap) || s.is_ascii() {
-        return None;
-    }
-    Some(Arc::from(s))
+    Some(emoji)
 }
 
 /// Which reactions answer a ping: close a pinged agent's reply obligation
@@ -260,7 +222,7 @@ mod tests {
             "::",
             "lol",
             "nice one",
-            "ok",
+            "okay",
             ":not_a_code:",
             "👍 👍",
             "a👍",

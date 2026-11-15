@@ -474,10 +474,11 @@ impl Engine {
     /// transaction: dedup, rate limit, mentions, hop, obligation satisfaction,
     /// triggers and batching.
     pub fn post(&mut self, now: Millis, req: PostRequest<'_>) -> Result<Posted, PostError> {
-        let body = req.body.trim();
+        let body = crate::emoji::resolve_shortcodes_in_text(req.body.trim());
         if body.is_empty() {
             return Err(PostError::Empty);
         }
+        let body = body.as_ref();
         let author = store::member(self.conn(), req.author)?.ok_or(PostError::NotMember)?;
         let channel = store::channel(self.conn(), req.channel)?.ok_or(PostError::UnknownChannel)?;
         if !store::is_member(self.conn(), req.channel, author.id)? {
