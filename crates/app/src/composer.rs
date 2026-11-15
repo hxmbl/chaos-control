@@ -17,20 +17,23 @@ use ui::{
 };
 
 use crate::mention_highlight::{self, KnownMentions};
-use crate::store::{ChatStore, MentionCandidate, SendRoute, StoreEvent, UNWIRED_NOTE};
+use crate::store::{
+    ChatStore, MentionCandidate, SendRoute, SlashCommandCandidate, SlashCommandInvocation,
+    StoreEvent, UNWIRED_NOTE,
+};
 
-actions!(composer, [Cancel, AcceptMention]);
+actions!(composer, [Cancel, AcceptSuggestion]);
 
 /// Key context of the composer, around its text field.
 pub const KEY_CONTEXT: &str = "Composer";
 
 /// The composer's own keys. Enter and shift-enter are the text field's (see
 /// `ui::TextInput::multiline`); Esc backs out of whatever the composer is in
-/// the middle of, never the typed text. Tab accepts an open @-mention.
+/// the middle of, never the typed text. Tab accepts an open suggestion.
 pub fn bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("escape", Cancel, Some(KEY_CONTEXT)),
-        KeyBinding::new("tab", AcceptMention, Some(KEY_CONTEXT)),
+        KeyBinding::new("tab", AcceptSuggestion, Some(KEY_CONTEXT)),
     ]
 }
 
@@ -158,6 +161,18 @@ struct MentionState {
     selected: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SlashCommandState {
+    /// Byte range covering the leading slash command token/name (`/cmd`).
+    range: Range<usize>,
+    /// Text typed after `/` in the command name (up to cursor), for filtering.
+    query: String,
+    /// Full arguments text after the command token, if any (including leading space).
+    arguments: String,
+    matches: Vec<SlashCommandCandidate>,
+    selected: usize,
+}
+
 fn mention_query(text: &str, cursor: usize) -> Option<(Range<usize>, String)> {
     let cursor = cursor.min(text.len());
     if !text.is_char_boundary(cursor) {
@@ -200,6 +215,45 @@ fn filter_mentions(candidates: &[MentionCandidate], query: &str) -> Vec<MentionC
         .collect()
 }
 
+/// Detects a slash command at the start of the draft when the cursor is within
+/// the command name token. Returns `(range, query, arguments)` where `range` is
+/// the `/name` token span, `query` is the typed name after `/`, and `arguments`
+/// is the remainder of the draft after that token.
+fn slash_command_query(text: &str, cursor: usize) -> Option<(Range<usize>, String, String)> {
+    if !text.starts_with('/') {
+        return None;
+    }
+    let cursor = cursor.min(text.len());
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let ws = text.find(|c: char| c.is_whitespace()).unwrap_or(text.len());
+    // Only suggest while editing the command name token (not arguments).
+    if cursor > ws {
+        return None;
+    }
+    let name = &text[1..ws];
+    if name.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let query_end = cursor.max(1).min(ws);
+    let query = text[1..query_end].to_string();
+    let arguments = text[ws..].to_string();
+    Some((0..ws, query, arguments))
+}
+
+fn filter_slash_commands(
+    candidates: &[SlashCommandCandidate],
+    query: &str,
+) -> Vec<SlashCommandCandidate> {
+    let q = query.to_ascii_lowercase();
+    candidates
+        .iter()
+        .filter(|c| c.name.to_ascii_lowercase().contains(&q))
+        .cloned()
+        .collect()
+}
+
 pub struct Composer {
     store: Entity<ChatStore>,
     input: Entity<TextInput>,
@@ -211,6 +265,7 @@ pub struct Composer {
     /// A core send in flight: restored if the send fails.
     pending: Option<(Id, Draft)>,
     mention: Option<MentionState>,
+    slash_command: Option<SlashCommandState>,
     _subscriptions: [Subscription; 4],
 }
 
@@ -263,9 +318,9 @@ impl Composer {
                         this.send(cx);
                     }
                 }
-                TextInputEvent::Changed => this.refresh_mention(cx),
+                TextInputEvent::Changed => this.refresh_suggestions(cx),
             }),
-            cx.observe(&input, |this, _, cx| this.refresh_mention(cx)),
+            cx.observe(&input, |this, _, cx| this.refresh_suggestions(cx)),
             cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
@@ -325,6 +380,7 @@ impl Composer {
             drafts: HashMap::new(),
             pending: None,
             mention: None,
+            slash_command: None,
             _subscriptions: subscriptions,
         }
     }
@@ -375,8 +431,9 @@ impl Composer {
             .update(cx, |input, cx| input.set_placeholder(placeholder, cx));
         self.restore_for(next, cx);
         self.mention = None;
+        self.slash_command = None;
         self.sync_vertical_nav_suppression(cx);
-        self.refresh_mention(cx);
+        self.refresh_suggestions(cx);
         cx.notify();
     }
 
@@ -388,10 +445,10 @@ impl Composer {
         cx.notify();
     }
 
-    /// Hook for the @-mention popup (STRM-543): true while it is showing,
-    /// so Esc closes it before touching the reply.
+    /// True while a suggestion popup (@-mention or slash command) owns
+    /// keyboard selection.
     fn suggestions_open(&self) -> bool {
-        self.mention.is_some()
+        self.mention.is_some() || self.slash_command.is_some()
     }
 
     fn sync_vertical_nav_suppression(&self, cx: &mut Context<Self>) {
@@ -401,24 +458,86 @@ impl Composer {
         });
     }
 
-    /// Closes the @-mention popup.
+    /// Closes any open suggestion popup.
     fn dismiss_suggestions(&mut self, cx: &mut Context<Self>) {
-        self.mention = None;
-        self.sync_vertical_nav_suppression(cx);
-        cx.notify();
+        if self.mention.take().is_some() || self.slash_command.take().is_some() {
+            self.sync_vertical_nav_suppression(cx);
+            cx.notify();
+        }
     }
 
-    fn refresh_mention(&mut self, cx: &mut Context<Self>) {
+    fn refresh_suggestions(&mut self, cx: &mut Context<Self>) {
         let (text, selection, _) = self.input.read(cx).draft_state();
         if selection.start != selection.end {
-            if self.mention.take().is_some() {
+            let changed = self.mention.take().is_some() || self.slash_command.take().is_some();
+            if changed {
                 self.sync_vertical_nav_suppression(cx);
                 cx.notify();
             }
             return;
         }
         let cursor = selection.end.min(text.len());
-        let Some((range, query)) = mention_query(text.as_ref(), cursor) else {
+        // Slash-command suggestions take precedence when active in the
+        // appropriate input context (start of draft/command name).
+        if self.refresh_slash_command(text.as_ref(), cursor, cx) {
+            return;
+        }
+        self.refresh_mention(text.as_ref(), cursor, cx);
+    }
+
+    /// Updates slash-command suggestion state. Returns true when slash-command
+    /// handling owns suggestion state for this cursor position (including the
+    /// case where a slash command context is active but has no matches).
+    fn refresh_slash_command(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) -> bool {
+        let Some((range, query, arguments)) = slash_command_query(text, cursor) else {
+            if self.slash_command.take().is_some() {
+                self.sync_vertical_nav_suppression(cx);
+                cx.notify();
+            }
+            return false;
+        };
+        let candidates = self.store.read(cx).slash_command_candidates();
+        let matches = filter_slash_commands(&candidates, &query);
+        if matches.is_empty() {
+            let changed = self.slash_command.take().is_some() || self.mention.take().is_some();
+            if changed {
+                self.sync_vertical_nav_suppression(cx);
+                cx.notify();
+            }
+            return true;
+        }
+        if self.mention.take().is_some() {
+            // Slash suggestions take precedence over mention suggestions.
+        }
+        let selected = self
+            .slash_command
+            .as_ref()
+            .filter(|m| m.query == query)
+            .and_then(|m| {
+                m.matches
+                    .get(m.selected)
+                    .and_then(|keep| matches.iter().position(|c| c.name == keep.name))
+            })
+            .unwrap_or(0);
+        let next = SlashCommandState {
+            range,
+            query,
+            arguments,
+            matches,
+            selected,
+        };
+        if self.slash_command.as_ref() == Some(&next) {
+            self.sync_vertical_nav_suppression(cx);
+            return true;
+        }
+        self.slash_command = Some(next);
+        self.sync_vertical_nav_suppression(cx);
+        cx.notify();
+        true
+    }
+
+    fn refresh_mention(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
+        let Some((range, query)) = mention_query(text, cursor) else {
             if self.mention.take().is_some() {
                 self.sync_vertical_nav_suppression(cx);
                 cx.notify();
@@ -459,7 +578,17 @@ impl Composer {
         cx.notify();
     }
 
-    fn move_mention_selection(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+    fn move_suggestion_selection(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        if let Some(state) = &mut self.slash_command {
+            let len = state.matches.len();
+            if len == 0 {
+                return false;
+            }
+            let cur = state.selected as isize;
+            state.selected = (cur + delta).rem_euclid(len as isize) as usize;
+            cx.notify();
+            return true;
+        }
         let Some(state) = &mut self.mention else {
             return false;
         };
@@ -470,6 +599,49 @@ impl Composer {
         let cur = state.selected as isize;
         state.selected = (cur + delta).rem_euclid(len as isize) as usize;
         cx.notify();
+        true
+    }
+
+    fn accept_suggestion(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.slash_command.is_some() {
+            return self.accept_slash_command(cx);
+        }
+        self.accept_mention(cx)
+    }
+
+    fn accept_slash_command(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(state) = self.slash_command.clone() else {
+            return false;
+        };
+        let Some(candidate) = state.matches.get(state.selected) else {
+            self.slash_command = None;
+            self.sync_vertical_nav_suppression(cx);
+            return false;
+        };
+        let (text, selection, _reversed) = self.input.read(cx).draft_state();
+        if selection.start != selection.end {
+            self.refresh_suggestions(cx);
+            return false;
+        }
+        let cursor = selection.end.min(text.len());
+        if cursor > state.range.end || state.range.start != 0 || state.range.end > text.len() {
+            self.refresh_suggestions(cx);
+            return false;
+        }
+        // Keep arguments after the command name token and dispatch the invocation.
+        let args = state.arguments.clone();
+        let invocation = SlashCommandInvocation {
+            name: candidate.name.clone(),
+            arguments: args.trim_start().to_string(),
+        };
+        self.store
+            .update(cx, |store, _cx| store.dispatch_slash_command(invocation));
+        self.input.update(cx, |input, cx| input.clear(cx));
+        self.reply = None;
+        self.drafts.remove(&self.channel);
+        self.slash_command = None;
+        self.sync_vertical_nav_suppression(cx);
+        self.refresh_suggestions(cx);
         true
     }
 
@@ -484,7 +656,7 @@ impl Composer {
         };
         let (text, selection, _reversed) = self.input.read(cx).draft_state();
         if selection.start != selection.end {
-            self.refresh_mention(cx);
+            self.refresh_suggestions(cx);
             return false;
         }
         let cursor = selection.end.min(text.len());
@@ -495,7 +667,7 @@ impl Composer {
             || !text.is_char_boundary(state.range.end)
             || !text.is_char_boundary(cursor)
         {
-            self.refresh_mention(cx);
+            self.refresh_suggestions(cx);
             return false;
         }
         let handle = candidate.handle.to_string();
@@ -512,7 +684,7 @@ impl Composer {
         });
         self.mention = None;
         self.sync_vertical_nav_suppression(cx);
-        self.refresh_mention(cx);
+        self.refresh_suggestions(cx);
         true
     }
 
@@ -528,8 +700,13 @@ impl Composer {
         }
     }
 
-    fn accept_mention_action(&mut self, _: &AcceptMention, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.accept_mention(cx) {
+    fn accept_suggestion_action(
+        &mut self,
+        _: &AcceptSuggestion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.accept_suggestion(cx) {
             cx.propagate();
         }
     }
@@ -646,7 +823,82 @@ impl Composer {
             )
     }
 
-    fn render_mentions(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_suggestions(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if let Some(state) = &self.slash_command {
+            let t = *cx.theme();
+            let hover = t.hover;
+            let rows = state.matches.iter().enumerate().map(|(ix, c)| {
+                let selected = ix == state.selected;
+                let name = format!("/{}", c.name);
+                let hint = c.argument_hint.as_ref().map(|h| h.to_string());
+                let desc = c.description.to_string();
+                let idx = ix;
+                div()
+                    .id(("slash-command", ix))
+                    .px(space::X2)
+                    .py(space::X1_5)
+                    .rounded(radius::MD)
+                    .bg(if selected { t.selected } else { t.surface })
+                    .hover(move |s| s.bg(if selected { t.selected } else { hover }))
+                    .cursor_pointer()
+                    .flex()
+                    .flex_col()
+                    .gap(space::X0_5)
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(move |this, _, _, cx| {
+                            if let Some(state) = &mut this.slash_command {
+                                state.selected = idx;
+                            }
+                            this.accept_suggestion(cx);
+                        }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::X2)
+                            .child(
+                                div()
+                                    .type_style(text::SMALL)
+                                    .font_weight(text::SEMIBOLD)
+                                    .text_color(t.ink)
+                                    .child(name),
+                            )
+                            .when_some(hint, |d, hint| {
+                                d.child(
+                                    div()
+                                        .type_style(text::SMALL)
+                                        .text_color(t.muted)
+                                        .child(hint),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .type_style(text::CAPTION)
+                            .text_color(t.muted)
+                            .child(desc),
+                    )
+            });
+            return Some(
+                div()
+                    .mx(space::X1)
+                    .mb(space::X2)
+                    .p(space::X1)
+                    .rounded(radius::MD)
+                    .bg(t.surface)
+                    .border_1()
+                    .border_color(t.line)
+                    .shadow(t.elevation(Elevation::Overlay))
+                    .flex()
+                    .flex_col()
+                    .gap(space::X0_5)
+                    .children(rows)
+                    .into_any_element(),
+            );
+        }
+
         let state = self.mention.as_ref()?;
         let t = *cx.theme();
         let hover = t.hover;
@@ -682,7 +934,7 @@ impl Composer {
                         if let Some(state) = &mut this.mention {
                             state.selected = idx;
                         }
-                        this.accept_mention(cx);
+                        this.accept_suggestion(cx);
                     }),
                 )
                 .child(
@@ -726,7 +978,8 @@ impl Composer {
                 .flex()
                 .flex_col()
                 .gap(space::X0_5)
-                .children(rows),
+                .children(rows)
+                .into_any_element(),
         )
     }
 }
@@ -762,7 +1015,7 @@ impl Render for Composer {
                         .child(UNWIRED_NOTE),
                 )
             })
-            .children(self.render_mentions(cx))
+            .children(self.render_suggestions(cx))
             .when_some(self.reply.clone(), |d, reply| {
                 d.child(self.render_reply(&reply, cx))
             })
@@ -810,16 +1063,16 @@ impl Render for Composer {
         div()
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::accept_mention_action))
+            .on_action(cx.listener(Self::accept_suggestion_action))
             .on_action(cx.listener(|this, _: &ui::text_input::Up, _window, cx| {
-                if this.suggestions_open() && this.move_mention_selection(-1, cx) {
+                if this.suggestions_open() && this.move_suggestion_selection(-1, cx) {
                     cx.stop_propagation();
                 } else {
                     cx.propagate();
                 }
             }))
             .on_action(cx.listener(|this, _: &ui::text_input::Down, _window, cx| {
-                if this.suggestions_open() && this.move_mention_selection(1, cx) {
+                if this.suggestions_open() && this.move_suggestion_selection(1, cx) {
                     cx.stop_propagation();
                 } else {
                     cx.propagate();
@@ -839,8 +1092,8 @@ impl Render for Composer {
                 }
                 let key = event.keystroke.key.as_str();
                 match key {
-                    "up" if this.move_mention_selection(-1, cx) => cx.stop_propagation(),
-                    "down" if this.move_mention_selection(1, cx) => cx.stop_propagation(),
+                    "up" if this.move_suggestion_selection(-1, cx) => cx.stop_propagation(),
+                    "down" if this.move_suggestion_selection(1, cx) => cx.stop_propagation(),
                     _ => {}
                 }
             }))
@@ -1072,5 +1325,49 @@ mod tests {
         assert_eq!(filter_mentions(&candidates, "CX").len(), 1);
         assert_eq!(filter_mentions(&candidates, "").len(), 2);
         assert!(filter_mentions(&candidates, "zzz").is_empty());
+    }
+
+    #[test]
+    fn slash_command_query_detects_leading_command_context() {
+        assert_eq!(
+            slash_command_query("/di", 3),
+            Some((0..3, "di".to_string(), String::new()))
+        );
+        assert_eq!(
+            slash_command_query("/diff", 5),
+            Some((0..5, "diff".to_string(), String::new()))
+        );
+        assert_eq!(
+            slash_command_query("/diff --staged", 3),
+            Some((0..5, "di".to_string(), " --staged".to_string()))
+        );
+        // Cursor in arguments: no command-name suggestions.
+        assert_eq!(slash_command_query("/diff --staged", 6), None);
+        assert_eq!(slash_command_query("see /diff", 9), None);
+        assert_eq!(slash_command_query("not a command", 3), None);
+        assert_eq!(
+            slash_command_query("/ diff", 1),
+            Some((0..1, String::new(), " diff".to_string()))
+        );
+    }
+
+    #[test]
+    fn slash_command_filter_matches_name_case_insensitively() {
+        let candidates = vec![
+            SlashCommandCandidate {
+                name: "diff".into(),
+                description: "Open diff".into(),
+                argument_hint: None,
+            },
+            SlashCommandCandidate {
+                name: "settings".into(),
+                description: "Open settings".into(),
+                argument_hint: Some("[section]".into()),
+            },
+        ];
+        assert_eq!(filter_slash_commands(&candidates, "di").len(), 1);
+        assert_eq!(filter_slash_commands(&candidates, "ETT").len(), 1);
+        assert_eq!(filter_slash_commands(&candidates, "").len(), 2);
+        assert!(filter_slash_commands(&candidates, "zzz").is_empty());
     }
 }
