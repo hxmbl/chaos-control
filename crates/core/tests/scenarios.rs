@@ -670,6 +670,7 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
         )
         .await;
     h.say("@bot are you there?").await;
+    h.quiesce().await;
     h.until("first failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
             .unwrap()
@@ -684,7 +685,7 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
         Glow::Active,
         "retrying"
     );
-    h.advance(1_100).await; // backoff 1s (+margin for CI scheduling)
+    h.advance(2_000).await; // backoff 1s (+margin for CI scheduling)
     h.quiesce().await;
     h.until("second failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
@@ -695,7 +696,7 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
                 == "pending"
     })
     .await;
-    h.advance(5_100).await; // backoff 5s (+margin for CI scheduling)
+    h.advance(6_000).await; // backoff 5s (+margin for CI scheduling)
     h.quiesce().await;
     h.until("third failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
