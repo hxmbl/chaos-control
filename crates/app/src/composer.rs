@@ -5,14 +5,13 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use chaos_core::emoji::{self, EmojiMatch};
 use gpui::{
-    Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent,
-    SharedString, StyledText, Subscription, Task, TextRun, TextStyle, Window, actions, div, linear,
-    prelude::*, px,
+    Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
+    actions, div, prelude::*, px,
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
@@ -73,159 +72,6 @@ fn sendable(text: &str) -> bool {
 /// Core echoes the posted text trimmed; compare against that.
 fn sent_body(text: &str) -> &str {
     text.trim()
-}
-
-/// Verbs cycled in the working indicator (STRM-662). Decorative only.
-const WORKING_WORDS: &[&str] = &[
-    "working",
-    "pondering",
-    "thinking",
-    "cooking",
-    "brewing",
-    "tinkering",
-    "crafting",
-    "scheming",
-    "mulling",
-    "noodling",
-];
-
-const WORKING_WORD_INTERVAL: Duration = Duration::from_secs(5);
-
-fn working_indicator_parts(
-    agents: &[(std::sync::Arc<str>, &'static str)],
-    word: &str,
-) -> Option<(String, String, String)> {
-    match agents {
-        [] => None,
-        [(name, _)] => Some((format!("{name} is "), word.to_string(), "…".to_string())),
-        [(a, _), (b, _)] => Some((
-            format!("{a} and {b} are "),
-            word.to_string(),
-            "…".to_string(),
-        )),
-        [all @ .., last] => {
-            let names = all
-                .iter()
-                .map(|(n, _)| n.as_ref())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Some((
-                format!("{names}, and {} are ", last.0),
-                word.to_string(),
-                "…".to_string(),
-            ))
-        }
-    }
-}
-
-fn styled_working_text(
-    label: &str,
-    delta: f32,
-    blur: f32,
-    base_style: &TextStyle,
-    base: Hsla,
-    bright: Hsla,
-    shimmer: bool,
-) -> StyledText {
-    let label_s: SharedString = label.to_string().into();
-    let chars: Vec<(usize, char)> = label_s.char_indices().collect();
-    if chars.is_empty() {
-        return StyledText::new(label_s);
-    }
-    let n = chars.len() as f32;
-    let center = -0.25 + delta * 1.5;
-    let mut runs: Vec<TextRun> = Vec::with_capacity(chars.len());
-    for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
-        let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label_s.len());
-        let len = next - byte_ix;
-        let (mix, alpha) = if shimmer {
-            let p = (i as f32 + 0.5) / n;
-            let d = (p - center).abs();
-            let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
-            let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
-            let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
-            let alpha = (0.45 + 0.55 * mix) * (1.0 - blur * 0.35);
-            (mix, alpha.clamp(0.0, 1.0))
-        } else {
-            (0.35, (0.72 * (1.0 - blur * 0.15)).clamp(0.0, 1.0))
-        };
-        let mut color = base;
-        color.h = base.h + (bright.h - base.h) * mix;
-        color.s = base.s + (bright.s - base.s) * mix;
-        color.l = base.l + (bright.l - base.l) * mix;
-        color.a = alpha;
-        runs.push(TextRun {
-            len,
-            font: base_style.font(),
-            color,
-            background_color: base_style.background_color,
-            underline: base_style.underline,
-            strikethrough: base_style.strikethrough,
-        });
-    }
-    StyledText::new(label_s).with_runs(runs)
-}
-
-fn working_indicator_element(
-    agents: &[(std::sync::Arc<str>, &'static str)],
-    word: &str,
-    delta: f32,
-    base_style: &TextStyle,
-    base: Hsla,
-    bright: Hsla,
-) -> impl IntoElement {
-    let Some((prefix, word, suffix)) = working_indicator_parts(agents, word) else {
-        return div().into_any_element();
-    };
-    // STRM-662: blur only the changing word as it transitions.
-    let blur = if delta < 0.14 {
-        1.0 - (delta / 0.14)
-    } else if delta > 0.86 {
-        (delta - 0.86) / 0.14
-    } else {
-        0.0
-    }
-    .clamp(0.0, 1.0);
-
-    let prefix_el = styled_working_text(&prefix, delta, 0.0, base_style, base, bright, false);
-    let suffix_el = styled_working_text(&suffix, delta, 0.0, base_style, base, bright, false);
-    let word_main = styled_working_text(&word, delta, blur, base_style, base, bright, true);
-
-    let word_el: gpui::AnyElement = if blur <= 0.01 {
-        div().child(word_main).into_any_element()
-    } else {
-        let offsets: [(f32, f32, f32); 6] = [
-            (-1.6, 0.0, 0.16),
-            (1.6, 0.0, 0.16),
-            (0.0, -1.2, 0.14),
-            (0.0, 1.2, 0.14),
-            (-1.0, -0.8, 0.10),
-            (1.0, 0.8, 0.10),
-        ];
-        let mut layers = div().relative().child(word_main);
-        for (i, (dx, dy, a)) in offsets.iter().enumerate() {
-            let mut gc = base;
-            gc.a = (a * blur).clamp(0.0, 0.4);
-            let ghost = styled_working_text(&word, delta, blur, base_style, gc, gc, true);
-            layers = layers.child(
-                div()
-                    .id(("working-blur", i))
-                    .absolute()
-                    .top(px(*dy))
-                    .left(px(*dx))
-                    .child(ghost),
-            );
-        }
-        div().child(layers).into_any_element()
-    };
-
-    div()
-        .flex()
-        .items_baseline()
-        .child(prefix_el)
-        .child(word_el)
-        .child(suffix_el)
-        .into_any_element()
 }
 
 fn echo_matches_in(
@@ -576,11 +422,7 @@ pub struct Composer {
     mention_usage: HashMap<String, UsageStat>,
     emoji_usage: HashMap<String, UsageStat>,
     usage_path: Option<PathBuf>,
-    working_word_index: usize,
-    working_word_nonce: u64,
-    working_timer_nonce: u64,
-    _working_timer: Option<Task<()>>,
-    _subscriptions: [Subscription; 4],
+    _subscriptions: [Subscription; 3],
 }
 
 const SUGGESTION_USAGE_SCHEMA_VERSION: u64 = 1;
@@ -770,7 +612,6 @@ impl Composer {
                 TextInputEvent::Changed => this.refresh_suggestions(cx),
             }),
             cx.observe(&input, |this, _, cx| this.refresh_suggestions(cx)),
-            cx.observe(&store, |this, _, cx| this.sync_working_indicator(cx)),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
                     let next = store.read(cx).selected();
@@ -822,7 +663,7 @@ impl Composer {
             }),
         ];
         let (mention_usage, emoji_usage) = load_suggestion_usage(usage_path.as_deref());
-        let mut this = Self {
+        Self {
             store,
             input,
             channel,
@@ -834,14 +675,8 @@ impl Composer {
             mention_usage,
             emoji_usage,
             usage_path,
-            working_word_index: 0,
-            working_word_nonce: 0,
-            working_timer_nonce: 0,
-            _working_timer: None,
             _subscriptions: subscriptions,
-        };
-        this.sync_working_indicator(cx);
-        this
+        }
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -892,7 +727,6 @@ impl Composer {
         self.mention = None;
         self.emoji = None;
         self.refresh_suggestions(cx);
-        self.sync_working_indicator(cx);
         cx.notify();
     }
 
@@ -1224,66 +1058,6 @@ impl Composer {
         self.store.read(cx).send_route() == SendRoute::Unwired
     }
 
-    fn has_working_agents(&self, cx: &Context<Self>) -> bool {
-        let store = self.store.read(cx);
-        !store.working_agents(store.selected()).is_empty()
-    }
-
-    fn sync_working_indicator(&mut self, cx: &mut Context<Self>) {
-        if self.has_working_agents(cx) {
-            if self._working_timer.is_none() {
-                self.working_word_index = 0;
-                self.start_working_timer(cx);
-            }
-            cx.notify();
-        } else {
-            self.working_timer_nonce = self.working_timer_nonce.wrapping_add(1);
-            self.working_word_nonce = self.working_word_nonce.wrapping_add(1);
-            self._working_timer = None;
-            self.working_word_index = 0;
-        }
-    }
-
-    fn start_working_timer(&mut self, cx: &mut Context<Self>) {
-        self.working_timer_nonce = self.working_timer_nonce.wrapping_add(1);
-        let timer_nonce = self.working_timer_nonce;
-        self.working_word_nonce = self.working_word_nonce.wrapping_add(1);
-        self._working_timer = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(WORKING_WORD_INTERVAL).await;
-                let keep = this
-                    .update(cx, |this, cx| {
-                        if this.working_timer_nonce != timer_nonce || !this.has_working_agents(cx) {
-                            return false;
-                        }
-                        this.working_word_index =
-                            (this.working_word_index + 1) % WORKING_WORDS.len();
-                        // Restart animation so the new word blurs in (STRM-662).
-                        this.working_word_nonce = this.working_word_nonce.wrapping_add(1);
-                        cx.notify();
-                        true
-                    })
-                    .unwrap_or(false);
-                if !keep {
-                    break;
-                }
-            }
-        }));
-    }
-
-    fn working_indicator_agents(
-        &self,
-        cx: &Context<Self>,
-    ) -> Option<Vec<(std::sync::Arc<str>, &'static str)>> {
-        let store = self.store.read(cx);
-        let agents = store.working_agents(store.selected());
-        if agents.is_empty() {
-            None
-        } else {
-            Some(agents)
-        }
-    }
-
     fn render_reply(&self, reply: &ReplyRef, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = *cx.theme();
         let who = SharedString::from(author_name(self.store.read(cx).workspace(), reply.author));
@@ -1505,8 +1279,6 @@ impl Render for Composer {
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
 
-        let working = self.working_indicator_agents(cx);
-
         let box_el = div()
             .w_full()
             .flex()
@@ -1573,8 +1345,6 @@ impl Render for Composer {
                     ),
             );
 
-        let base_style = window.text_style();
-        let nonce = self.working_word_nonce;
         div()
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::cancel))
@@ -1594,7 +1364,6 @@ impl Render for Composer {
             .relative()
             .flex()
             .flex_col()
-            .gap(space::X1_5)
             .children(self.render_suggestions(cx).map(|el| {
                 div()
                     .absolute()
@@ -1604,38 +1373,6 @@ impl Render for Composer {
                     .mb(space::X1)
                     .child(el)
             }))
-            .when_some(working, |d, agents| {
-                let base = t.muted;
-                let bright = t.ink;
-                let word_index = self.working_word_index;
-                d.child(
-                    div()
-                        .px(space::X2)
-                        .py(space::X0_5)
-                        .type_style(text::SMALL)
-                        .child(
-                            div()
-                                .id(("working-indicator", nonce as usize))
-                                .with_animation(
-                                    ("working-indicator-shimmer", nonce as usize),
-                                    Animation::new(WORKING_WORD_INTERVAL)
-                                        .repeat()
-                                        .with_easing(linear),
-                                    move |el, delta| {
-                                        let word = WORKING_WORDS[word_index % WORKING_WORDS.len()];
-                                        el.child(working_indicator_element(
-                                            &agents,
-                                            word,
-                                            delta,
-                                            &base_style,
-                                            base,
-                                            bright,
-                                        ))
-                                    },
-                                ),
-                        ),
-                )
-            })
             .child(box_el)
     }
 }
