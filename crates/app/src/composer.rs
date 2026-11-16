@@ -5,13 +5,14 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chaos_core::emoji::{self, EmojiMatch};
 use gpui::{
-    Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
-    actions, div, prelude::*, px,
+    Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent,
+    SharedString, StyledText, Subscription, Task, TextRun, TextStyle, Window, actions, div, linear,
+    prelude::*, px,
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
@@ -72,6 +73,89 @@ fn sendable(text: &str) -> bool {
 /// Core echoes the posted text trimmed; compare against that.
 fn sent_body(text: &str) -> &str {
     text.trim()
+}
+
+/// Verbs cycled in the working indicator (STRM-662). Decorative only.
+const WORKING_WORDS: &[&str] = &[
+    "working",
+    "pondering",
+    "thinking",
+    "cooking",
+    "brewing",
+    "tinkering",
+    "crafting",
+    "scheming",
+    "mulling",
+    "noodling",
+];
+
+const WORKING_WORD_INTERVAL: Duration = Duration::from_secs(5);
+
+fn working_indicator_label(agents: &[(std::sync::Arc<str>, &'static str)], word: &str) -> String {
+    match agents {
+        [] => String::new(),
+        [(name, _)] => format!("{name} is {word}…"),
+        [(a, _), (b, _)] => format!("{a} and {b} are {word}…"),
+        [all @ .., last] => {
+            let names = all
+                .iter()
+                .map(|(n, _)| n.as_ref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{names}, and {} are {word}…", last.0)
+        }
+    }
+}
+
+fn working_indicator_text(
+    label: &str,
+    delta: f32,
+    base_style: &TextStyle,
+    base: Hsla,
+    dim: Hsla,
+    bright: Hsla,
+) -> StyledText {
+    let label: SharedString = label.to_string().into();
+    let chars: Vec<(usize, char)> = label.char_indices().collect();
+    if chars.is_empty() {
+        return StyledText::new(label);
+    }
+    // STRM-662: near the end of each 5s cycle, fade/blur-like transition before the next word.
+    let transition = if delta > 0.84 {
+        ((delta - 0.84) / 0.16).clamp(0.0, 1.0)
+    } else if delta < 0.08 {
+        (1.0 - delta / 0.08).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let n = chars.len() as f32;
+    let center = -0.25 + delta * 1.5;
+    let mut runs: Vec<TextRun> = Vec::with_capacity(chars.len());
+    for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
+        let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label.len());
+        let len = next - byte_ix;
+        let p = (i as f32 + 0.5) / n;
+        let d = (p - center).abs();
+        let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
+        let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
+        let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
+        let target = if transition > 0.55 { dim } else { bright };
+        let mut color = base;
+        color.h = base.h + (target.h - base.h) * mix;
+        color.s = base.s + (target.s - base.s) * mix;
+        color.l = base.l + (target.l - base.l) * mix;
+        let base_alpha = 0.45 + 0.55 * mix;
+        color.a = (base_alpha * (1.0 - transition * 0.75)).clamp(0.0, 1.0);
+        runs.push(TextRun {
+            len,
+            font: base_style.font(),
+            color,
+            background_color: base_style.background_color,
+            underline: base_style.underline,
+            strikethrough: base_style.strikethrough,
+        });
+    }
+    StyledText::new(label).with_runs(runs)
 }
 
 fn echo_matches_in(
@@ -422,7 +506,10 @@ pub struct Composer {
     mention_usage: HashMap<String, UsageStat>,
     emoji_usage: HashMap<String, UsageStat>,
     usage_path: Option<PathBuf>,
-    _subscriptions: [Subscription; 3],
+    working_word_index: usize,
+    working_word_nonce: u64,
+    _working_timer: Option<Task<()>>,
+    _subscriptions: [Subscription; 4],
 }
 
 const SUGGESTION_USAGE_SCHEMA_VERSION: u64 = 1;
@@ -612,6 +699,7 @@ impl Composer {
                 TextInputEvent::Changed => this.refresh_suggestions(cx),
             }),
             cx.observe(&input, |this, _, cx| this.refresh_suggestions(cx)),
+            cx.observe(&store, |this, _, cx| this.sync_working_indicator(cx)),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
                     let next = store.read(cx).selected();
@@ -663,7 +751,7 @@ impl Composer {
             }),
         ];
         let (mention_usage, emoji_usage) = load_suggestion_usage(usage_path.as_deref());
-        Self {
+        let mut this = Self {
             store,
             input,
             channel,
@@ -675,8 +763,13 @@ impl Composer {
             mention_usage,
             emoji_usage,
             usage_path,
+            working_word_index: 0,
+            working_word_nonce: 0,
+            _working_timer: None,
             _subscriptions: subscriptions,
-        }
+        };
+        this.sync_working_indicator(cx);
+        this
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -727,6 +820,7 @@ impl Composer {
         self.mention = None;
         self.emoji = None;
         self.refresh_suggestions(cx);
+        self.sync_working_indicator(cx);
         cx.notify();
     }
 
@@ -1058,6 +1152,58 @@ impl Composer {
         self.store.read(cx).send_route() == SendRoute::Unwired
     }
 
+    fn has_working_agents(&self, cx: &Context<Self>) -> bool {
+        let store = self.store.read(cx);
+        !store.working_agents(store.selected()).is_empty()
+    }
+
+    fn sync_working_indicator(&mut self, cx: &mut Context<Self>) {
+        if self.has_working_agents(cx) {
+            if self._working_timer.is_none() {
+                self.working_word_index = 0;
+                self.start_working_timer(cx);
+            }
+            cx.notify();
+        } else {
+            self._working_timer = None;
+            self.working_word_index = 0;
+        }
+    }
+
+    fn start_working_timer(&mut self, cx: &mut Context<Self>) {
+        self.working_word_nonce = self.working_word_nonce.wrapping_add(1);
+        let nonce = self.working_word_nonce;
+        self._working_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WORKING_WORD_INTERVAL).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if this.working_word_nonce != nonce || !this.has_working_agents(cx) {
+                            return false;
+                        }
+                        this.working_word_index =
+                            (this.working_word_index + 1) % WORKING_WORDS.len();
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn working_indicator_label(&self, cx: &Context<Self>) -> Option<String> {
+        let store = self.store.read(cx);
+        let agents = store.working_agents(store.selected());
+        if agents.is_empty() {
+            return None;
+        }
+        let word = WORKING_WORDS[self.working_word_index % WORKING_WORDS.len()];
+        Some(working_indicator_label(&agents, word))
+    }
+
     fn render_reply(&self, reply: &ReplyRef, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let t = *cx.theme();
         let who = SharedString::from(author_name(self.store.read(cx).workspace(), reply.author));
@@ -1279,6 +1425,8 @@ impl Render for Composer {
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
 
+        let working = self.working_indicator_label(cx);
+
         let box_el = div()
             .w_full()
             .flex()
@@ -1345,6 +1493,8 @@ impl Render for Composer {
                     ),
             );
 
+        let base_style = window.text_style();
+        let nonce = self.working_word_nonce;
         div()
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::cancel))
@@ -1364,6 +1514,7 @@ impl Render for Composer {
             .relative()
             .flex()
             .flex_col()
+            .gap(space::X1_5)
             .children(self.render_suggestions(cx).map(|el| {
                 div()
                     .absolute()
@@ -1373,6 +1524,38 @@ impl Render for Composer {
                     .mb(space::X1)
                     .child(el)
             }))
+            .when_some(working, |d, label| {
+                let base = t.muted;
+                let dim = t.faint;
+                let bright = t.ink;
+                d.child(
+                    div()
+                        .px(space::X2)
+                        .py(space::X0_5)
+                        .type_style(text::SMALL)
+                        .child(
+                            div()
+                                .id(("working-indicator", nonce as usize))
+                                .with_animation(
+                                    ("working-indicator-shimmer", nonce as usize),
+                                    Animation::new(WORKING_WORD_INTERVAL)
+                                        .repeat()
+                                        .with_easing(linear),
+                                    move |el, delta| {
+                                        let text = working_indicator_text(
+                                            &label,
+                                            delta,
+                                            &base_style,
+                                            base,
+                                            dim,
+                                            bright,
+                                        );
+                                        el.child(text)
+                                    },
+                                ),
+                        ),
+                )
+            })
             .child(box_el)
     }
 }
