@@ -17,13 +17,25 @@ const ELSEWHERE: &str = "5f0c9d1a-7b2e-4e8f-a1c3-9d8e7f6a5b4c";
 async fn triggers_for(h: &Harness, agent: MemberId) -> i64 {
     h.core
         .with_engine(move |e, _| {
-            e.conn()
-                .query_row(
-                    "SELECT COUNT(*) FROM triggers WHERE agent_id = ?1",
-                    [agent.0],
-                    |r| r.get(0),
-                )
-                .unwrap()
+            if let Ok(v) = e.conn().query_row(
+                "SELECT COUNT(*) FROM triggers WHERE agent_id = ?1",
+                [agent.0],
+                |r| r.get::<_, i64>(0),
+            ) {
+                return v;
+            }
+            for proj in e.store().projects().unwrap_or_default() {
+                if let Ok(ag) = e.store().project_agents(&proj.id)
+                    && let Ok(v) = ag.query_row(
+                        "SELECT COUNT(*) FROM triggers WHERE agent_id = ?1",
+                        [agent.0],
+                        |r| r.get::<_, i64>(0),
+                    )
+                {
+                    return v;
+                }
+            }
+            panic!("triggers_for failed");
         })
         .await
         .unwrap()

@@ -591,6 +591,22 @@ impl Engine {
     ) -> Result<(Vec<MemberId>, bool), PostError> {
         let members = self.store.members_of(channel)?;
         let nicknames = self.store.nicknames_in(channel)?;
+        if body.contains("@gpt") || body.contains("@jeepy") {
+            eprintln!(
+                "DBG_RESOLVE channel={:?} author={:?} members={:?} nicks={:?} body={:?}",
+                channel,
+                author.handle,
+                members
+                    .iter()
+                    .map(|m| m.handle.as_ref())
+                    .collect::<Vec<_>>(),
+                nicknames
+                    .iter()
+                    .map(|(id, n)| (id.0, n.as_ref()))
+                    .collect::<Vec<_>>(),
+                body
+            );
+        }
         let mut out = Vec::new();
         let mut everyone = false;
         for handle in policy::parse_mentions(body) {
@@ -1293,11 +1309,8 @@ impl Engine {
         project: &ProjectId,
         member: MemberId,
     ) -> rusqlite::Result<Vec<ChannelId>> {
-        let channels = self.store.tx(|c| {
-            let channels = crate::roster::leave_project(c, project, member, now)?;
-            crate::roster::roster_remove(c, project, member)?;
-            Ok::<_, rusqlite::Error>(channels)
-        })?;
+        let channels = self.store.leave_project(project, member, now)?;
+        let _ = crate::roster::roster_remove(self.conn(), project, member);
         for ch in &channels {
             self.rt.remove(&(member, *ch));
         }

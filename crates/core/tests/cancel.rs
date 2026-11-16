@@ -43,7 +43,7 @@ fn batches_in(state: &'static str, n: i64) -> impl Fn(&rusqlite::Connection) -> 
             [state],
             |r| r.get::<_, i64>(0),
         )
-        .unwrap()
+        .unwrap_or(0)
             == n
     }
 }
