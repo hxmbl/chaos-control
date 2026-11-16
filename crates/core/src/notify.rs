@@ -165,6 +165,7 @@ pub fn compose(
                 WakeReason::Mention => "mentioned you",
                 WakeReason::ReplyToMe => "replied to you",
                 WakeReason::Everyone => "pinged @everyone",
+                WakeReason::Broadcast => "posted a message",
             };
             format!("{} {how}", author_label(c, m))
         })
@@ -286,7 +287,7 @@ pub fn orientation(
     let handle = me.map(|m| m.handle).unwrap_or_default();
     // Nicknames (STRM-560) reach this agent exactly like its handle.
     let mine = store::nicknames_of(c, agent)?;
-    let (also, also_woken) = if mine.is_empty() {
+    let (also, _also_woken) = if mine.is_empty() {
         (String::new(), String::new())
     } else {
         let list: Vec<String> = mine.iter().map(|n| format!("@{n}")).collect();
@@ -301,7 +302,7 @@ Members: {}.\n\
 How this room works:\n\
 - You speak only through the chaos-control tools: chat_send to post, chat_react to react, chat_read / chat_search to look back, chat_context for who's here, chat_status for a one-line status. Your other output is private working-out; nobody sees your tool calls.\n\
 - Reactions (chat_react) are quiet: they wake and notify nobody, including the author. Use one when a reply would be noise. You see others' reactions on the messages in your next prompt.\n\
-- You are woken when someone mentions you (@{handle}{also_woken}) or replies to you. Reply to what was asked, briefly. If someone else is already on it, add only what's new or stay quiet.\n\
+- You hear about all messages, even those that don't directly mention or reply to you. Reply to what was asked, briefly. If someone else is already on it, add only what's new or stay quiet.\n\
 - You are a peer, not a worker. You may say no with chat_refuse or disagree with chat_dissent, giving your reason; either answers the message, nothing is retried, and nobody overrules you. Whoever wants it done can do it themselves.\n\
 - Mention others with @handle only when you need them. @everyone is not available to agents.\n",
         if members.is_empty() {

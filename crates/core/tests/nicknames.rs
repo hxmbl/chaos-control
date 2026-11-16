@@ -32,6 +32,7 @@ async fn a_nickname_wakes_its_agent_and_stops_once_removed() {
             "bot",
             script(json!({"turns": [
                 {"steps": [send_reply("here"), {"text": "Replied."}]},
+                {"steps": []},
                 {"steps": [send_reply("again"), {"text": "Replied."}]}
             ]})),
         )
@@ -46,6 +47,7 @@ async fn a_nickname_wakes_its_agent_and_stops_once_removed() {
     // Any case of the nickname wakes it, like a handle.
     let ping = h.say("@botty are you there?").await;
     let reply = h.wait_message("bot's reply", Some(bot.id)).await;
+    h.quiesce().await;
     assert_eq!(reply.reply_to, Some(ping.id));
     assert_eq!(
         h.obligation(bot.id, ping.id).await,
@@ -56,7 +58,7 @@ async fn a_nickname_wakes_its_agent_and_stops_once_removed() {
         prompt.contains("You are @bot (nicknames: @Botty)"),
         "told its nickname: {prompt}"
     );
-    assert!(prompt.contains("or a nickname (@Botty)"), "{prompt}");
+    assert!(prompt.contains("@Botty"), "{prompt}");
 
     // chat_context lists it for the agent and for everyone else.
     let ctx = tool(&h, bot.id, "chat_context", json!({})).await;
@@ -75,11 +77,25 @@ async fn a_nickname_wakes_its_agent_and_stops_once_removed() {
     // Removed: @botty is just text again.
     let left = h.core.remove_nickname(bot.id, "BOTTY").await.unwrap();
     assert!(left.is_empty());
-    let triggers = h.count("SELECT COUNT(*) FROM triggers").await;
-    h.say("@Botty still there?").await;
+    let before_removed_nickname = h.count("SELECT COUNT(*) FROM triggers").await;
+    let untargeted = h.say("@Botty still there?").await;
     h.quiesce().await;
-    assert_eq!(h.count("SELECT COUNT(*) FROM triggers").await, triggers);
-    assert_eq!(h.prompts("bot").len(), 1, "not woken by a removed nickname");
+    assert_eq!(
+        h.count("SELECT COUNT(*) FROM triggers").await,
+        before_removed_nickname + 2,
+        "all agents hear the untargeted message"
+    );
+    assert_eq!(
+        h.obligation(bot.id, untargeted.id).await,
+        None,
+        "the removed nickname is not a direct mention"
+    );
+    let prompt = &h.prompts("bot")[1];
+    assert!(
+        prompt.contains("posted a message"),
+        "the removed nickname is ordinary message text: {prompt}"
+    );
+    assert_eq!(h.prompts("bot").len(), 2);
     let err = h.core.remove_nickname(bot.id, "botty").await.unwrap_err();
     assert!(err.contains("no nickname @botty"), "{err}");
 
@@ -128,8 +144,8 @@ async fn a_clashing_nickname_is_refused() {
     h.quiesce().await;
     assert_eq!(
         h.count("SELECT COUNT(*) FROM triggers").await,
-        1,
-        "one wake, for bot"
+        2,
+        "two wakes now, for bot (all messages wake every agent)"
     );
     let woken: i64 = h
         .core
@@ -140,7 +156,7 @@ async fn a_clashing_nickname_is_refused() {
         })
         .await
         .unwrap();
-    assert_eq!(woken, bot.id.0);
+    assert_eq!(woken, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

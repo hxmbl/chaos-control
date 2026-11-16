@@ -324,6 +324,8 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     assert_eq!(h.core.roster(&project).await.unwrap().len(), 2);
 
     h.say("@fast-one hi").await;
+    // @fast-one is mentioned; @big-two hears the same message as a broadcast
+    // (STRM-536), so both agents run one batch.
     h.until("a settled", |c| {
         c.query_row(
             "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
@@ -331,7 +333,7 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
             |r| r.get::<_, i64>(0),
         )
         .unwrap()
-            == 1
+            == 2
     })
     .await;
 
@@ -346,7 +348,8 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     assert!(agents.contains(&a.member.id) && agents.contains(&b.member.id));
     assert!(!agents.contains(&h.hx.id));
 
-    // A mention of the removed member wakes nobody; the other still answers.
+    // A mention of the removed member wakes nobody; the other still answers
+    // (and hears the broadcast too, as one batch).
     let prompts_before = fake_a.observed.lock().unwrap().prompts.len();
     h.say("@fast-one @big-two both of you").await;
     h.until("b settled", |c| {
@@ -356,7 +359,7 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
             |r| r.get::<_, i64>(0),
         )
         .unwrap()
-            == 2
+            == 3
     })
     .await;
     h.quiesce().await;

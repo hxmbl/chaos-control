@@ -14,6 +14,22 @@ fn agent_messages(msgs: &[Message], agent: MemberId) -> Vec<Message> {
         .collect()
 }
 
+/// Waits until the obligation for (agent, message) is no longer `open`,
+/// however it resolved. Immune to unrelated batches settling nearby.
+async fn obligation_settles(h: &Harness, agent: MemberId, message: MessageId) {
+    let channel = h.main;
+    h.until("obligation settled", move |c| {
+        c.query_row(
+            "SELECT state FROM obligations WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
+            [agent.0, channel.0, message.0],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|s| s != "open")
+        .unwrap_or(false)
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_mention_gets_exactly_one_reply() {
     let mut h = Harness::new().await;
@@ -121,14 +137,14 @@ async fn two_pings_mid_turn_merge_into_one_batch_and_keep_both_obligations() {
     })
     .await;
     let two = h.say("@bot second question").await;
-    let three = h.say_reply("and a third", one.id).await; // reply to a message by... a human; mention below
+    let three = h.say_reply("and a third", one.id).await; // reply to a human message: broadcast wake, no obligation
     let four = h.say("@bot third question").await;
     let main = h.main;
     let bot_id = bot.id;
-    // One pending batch holding both new triggers, each with its obligation.
-    h.until("pending batch with two triggers", move |c| {
+    // One pending batch holding all new mid-turn triggers (two direct mentions + one broadcast).
+    h.until("pending batch with three triggers", move |c| {
         let p = chaos_core::store::pending_batch(c, bot_id, main).unwrap();
-        p.is_some_and(|p| chaos_core::store::batch_triggers(c, p.id).unwrap().len() == 2)
+        p.is_some_and(|p| chaos_core::store::batch_triggers(c, p.id).unwrap().len() == 3)
     })
     .await;
     assert_eq!(
@@ -147,7 +163,7 @@ async fn two_pings_mid_turn_merge_into_one_batch_and_keep_both_obligations() {
     assert_eq!(
         h.obligation(bot.id, three.id).await,
         None,
-        "untargeted: no trigger"
+        "untargeted: broadcast trigger but no obligation"
     );
     h.fake("bot").gates.open("first");
     h.until("both turns settled", |c| {
@@ -165,12 +181,11 @@ async fn two_pings_mid_turn_merge_into_one_batch_and_keep_both_obligations() {
     assert_eq!(
         prompts.len(),
         2,
-        "the two mid-turn pings were delivered as one turn"
+        "the mid-turn messages were delivered as one turn"
     );
-    assert!(
-        prompts[1].contains(&format!("id:{}", two.id))
-            && prompts[1].contains(&format!("id:{}", four.id))
-    );
+    assert!(prompts[1].contains(&format!("id:{}", two.id)));
+    assert!(prompts[1].contains(&format!("id:{}", three.id)));
+    assert!(prompts[1].contains(&format!("id:{}", four.id)));
     assert_eq!(
         h.obligation(bot.id, one.id).await,
         Some(ObligationState::Ignored)
@@ -192,23 +207,22 @@ async fn two_pings_mid_turn_merge_into_one_batch_and_keep_both_obligations() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn final_text_stays_private_when_the_obligation_is_unanswered() {
     let mut h = Harness::new().await;
+    // Agents now hear every message (broadcast). Each agent is added before its
+    // own ping but will also receive broadcasts of later pings, so scripts must
+    // include no-op turns for those follow-up messages.
     let quiet = h
         .agent(
             "quiet",
-            script(json!({"turns": [{"steps": [{"text": "The answer is 42."}]}]})),
+            script(json!({"turns": [
+                {"steps": [{"text": "The answer is 42."}]},
+                {"steps": []},
+                {"steps": []},
+                {"steps": []}
+            ]})),
         )
         .await;
     let ping = h.say("@quiet what is the answer?").await;
-    h.until("quiet settled", |c| {
-        c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            == 1
-    })
-    .await;
+    obligation_settles(&h, quiet.id, ping.id).await;
     assert!(agent_messages(&h.history().await, quiet.id).is_empty());
     assert_eq!(
         h.obligation(quiet.id, ping.id).await,
@@ -219,10 +233,14 @@ async fn final_text_stays_private_when_the_obligation_is_unanswered() {
     let reactor = h
         .agent(
             "reactor",
-            script(json!({"turns": [{"steps": [
-                {"mcp": {"tool": "chat_react", "args": {"message_id": "$TRIGGER", "emoji": "✅"}}},
-                {"text": "Done, reacted."}
-            ]}]})),
+            script(json!({"turns": [
+                {"steps": [
+                    {"mcp": {"tool": "chat_react", "args": {"message_id": "$TRIGGER", "emoji": "✅"}}},
+                    {"text": "Done, reacted."}
+                ]},
+                {"steps": []},
+                {"steps": []}
+            ]})),
         )
         .await;
     let ping2 = h.say("@reactor please ack").await;
@@ -231,16 +249,7 @@ async fn final_text_stays_private_when_the_obligation_is_unanswered() {
         |e| matches!(e, CoreEvent::Reaction { member, .. } if *member == reactor.id),
     )
     .await;
-    h.until("settled", |c| {
-        c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            == 2
-    })
-    .await;
+    obligation_settles(&h, reactor.id, ping2.id).await;
     assert_eq!(
         h.obligation(reactor.id, ping2.id).await,
         Some(ObligationState::Satisfied)
@@ -252,23 +261,17 @@ async fn final_text_stays_private_when_the_obligation_is_unanswered() {
     let eyes = h
         .agent(
             "eyes",
-            script(json!({"turns": [{"steps": [
-                {"mcp": {"tool": "chat_react", "args": {"message_id": "$TRIGGER", "emoji": "👀"}}},
-                {"text": "Here is the actual answer."}
-            ]}]})),
+            script(json!({"turns": [
+                {"steps": [
+                    {"mcp": {"tool": "chat_react", "args": {"message_id": "$TRIGGER", "emoji": "👀"}}},
+                    {"text": "Here is the actual answer."}
+                ]},
+                {"steps": []}
+            ]})),
         )
         .await;
     let ping3 = h.say("@eyes look at this").await;
-    h.until("eyes settled", |c| {
-        c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            == 3
-    })
-    .await;
+    obligation_settles(&h, eyes.id, ping3.id).await;
     assert!(agent_messages(&h.history().await, eyes.id).is_empty());
     assert_eq!(
         h.obligation(eyes.id, ping3.id).await,
@@ -281,16 +284,7 @@ async fn final_text_stays_private_when_the_obligation_is_unanswered() {
         .agent("mute", script(json!({"turns": [{"steps": []}]})))
         .await;
     let ping4 = h.say("@mute hello?").await;
-    h.until("mute settled", |c| {
-        c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            == 4
-    })
-    .await;
+    obligation_settles(&h, mute.id, ping4.id).await;
     assert_eq!(
         h.obligation(mute.id, ping4.id).await,
         Some(ObligationState::Ignored)
@@ -449,8 +443,18 @@ async fn hop_budget_stops_agent_chains_and_a_human_message_resets_it() {
             {"mcp": {"tool": "chat_send", "args": {"body": format!("@{other} your turn"), "client_request_id": "r$N"}}}
         ]}]}))
     };
+    // Agents hear every message: b also gets the initial human @a message as a
+    // broadcast, so it needs a no-op turn before the relay turns begin.
     let a = h.agent("a", relay("b")).await;
-    let _b = h.agent("b", relay("a")).await;
+    let _b = h
+        .agent(
+            "b",
+            script(json!({"turns": [
+                {"steps": []},
+                {"steps": [{"mcp": {"tool": "chat_send", "args": {"body": "@a your turn", "client_request_id": "r$N"}}}]}
+            ]})),
+        )
+        .await;
     h.say("@a kick off").await;
     // a(1) -> b(2) -> a(3) -> b(4): the hop-4 post wakes nobody.
     h.until("chain ended", |c| {
@@ -473,7 +477,11 @@ async fn hop_budget_stops_agent_chains_and_a_human_message_resets_it() {
         .collect();
     assert_eq!(hops, vec![1, 2, 3, 4]);
     assert_eq!(h.prompts("a").len(), 2);
-    assert_eq!(h.prompts("b").len(), 2);
+    assert_eq!(
+        h.prompts("b").len(),
+        3,
+        "initial broadcast + two relay turns"
+    );
     let st = h.core.status(a.id, h.main).await.unwrap();
     assert!(st.presence.unwrap().contains("hop limit"));
 
@@ -482,12 +490,13 @@ async fn hop_budget_stops_agent_chains_and_a_human_message_resets_it() {
     let a = h.agent("a", relay("b")).await;
     let b = h
         .agent("b", script(json!({"turns": [
+            {"steps": []},
             {"steps": [{"mcp": {"tool": "chat_send", "args": {"body": "@a your turn", "client_request_id": "r$N"}}}]},
             {"steps": [{"gate": "late"}, {"mcp": {"tool": "chat_send", "args": {"body": "@a your turn", "client_request_id": "r$N"}}}]}
         ]})))
         .await;
     h.say("@a kick off").await;
-    h.until("b's second turn running", |c| {
+    h.until("b's second relay turn running", |c| {
         c.query_row(
             "SELECT COUNT(*) FROM messages WHERE origin = 'chat_tool'",
             [],
@@ -497,7 +506,7 @@ async fn hop_budget_stops_agent_chains_and_a_human_message_resets_it() {
             == 3
     })
     .await;
-    h.say("nice, keep going").await; // untargeted: wakes nobody, resets hops
+    h.say("nice, keep going").await; // untargeted: now wakes all agents and resets hops
     h.fake("b").gates.open("late");
     h.until("a woken a third time", |c| {
         c.query_row(
@@ -511,7 +520,10 @@ async fn hop_budget_stops_agent_chains_and_a_human_message_resets_it() {
     .await;
     let b_posts = h.by(b.id).await;
     assert_eq!(b_posts[1].hop, 1, "reset by the human message");
-    assert!(h.prompts("a").len() >= 3);
+    assert!(
+        h.prompts("a").len() >= 4,
+        "mention, relay, broadcast, relay"
+    );
     let _ = a;
 }
 
@@ -732,43 +744,41 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn untargeted_message_wakes_nobody() {
+async fn untargeted_messages_wake_agents() {
     let mut h = Harness::new().await;
     let bot = h
         .agent(
             "bot",
-            script(json!({"turns": [{"steps": [{"text": "hi"}]}]})),
+            script(json!({"turns": [{"steps": []}, {"steps": []}, {"steps": []}]})),
         )
         .await;
-    h.say("morning all, CI is green again").await;
-    h.say("mail me at someone@bot.example").await;
-    h.advance(60_000).await;
-    assert!(h.prompts("bot").is_empty());
-    assert_eq!(h.count("SELECT COUNT(*) FROM triggers").await, 0);
-    assert_eq!(h.count("SELECT COUNT(*) FROM batches").await, 0);
-    assert_eq!(
-        h.core.status(bot.id, h.main).await.unwrap().glow,
-        Glow::Sleeping
-    );
-    assert_eq!(h.core.live_tokens(), 0, "no session was started");
-    // When it is woken later, the untargeted messages arrive as context.
+    let m1 = h.say("morning all, CI is green again").await;
+    h.quiesce().await;
+    assert_eq!(h.prompts("bot").len(), 1);
+    assert_eq!(h.obligation(bot.id, m1.id).await, None);
+
+    let m2 = h.say("mail me at someone@bot.example").await;
+    h.quiesce().await;
+    assert_eq!(h.prompts("bot").len(), 2);
+    assert_eq!(h.obligation(bot.id, m2.id).await, None);
+
+    // A direct mention still creates an obligation.
     let ping = h.say("@bot anything new?").await;
-    h.until("settled", |c| {
+    let bot_id = bot.id;
+    let main = h.main;
+    let ping_id = ping.id;
+    h.until("mention settled", move |c| {
         c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
+            "SELECT state FROM obligations WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
+            [bot_id.0, main.0, ping_id.0],
+            |r| r.get::<_, String>(0),
         )
-        .unwrap()
-            == 1
+        .map(|s| s != "open")
+        .unwrap_or(false)
     })
     .await;
-    assert_eq!(
-        h.obligation(bot.id, ping.id).await,
-        Some(ObligationState::Ignored)
-    );
-    assert!(h.by(bot.id).await.is_empty(), "final text stays private");
-    assert!(h.prompts("bot")[0].contains("morning all, CI is green again"));
+    assert_eq!(h.prompts("bot").len(), 3);
+    assert!(h.prompts("bot")[2].contains(&format!("id:{}", ping.id)));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -753,8 +753,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Creates triggers for every agent this message addresses and merges them
-    /// into that agent's single pending batch. Untargeted messages create none.
+    /// Creates triggers for every other agent in the channel and merges them
+    /// into that agent's single pending batch. Untargeted messages create no
+    /// reply obligation.
     fn create_triggers(
         &mut self,
         now: Millis,
@@ -773,6 +774,7 @@ impl Engine {
         };
         let mut woken = Vec::new();
         let mut trip_notice = None;
+        // The author already knows what it posted; every other agent hears it.
         for target in members
             .iter()
             .filter(|m| m.kind == MemberKind::Agent && m.id != author.id)
@@ -784,7 +786,7 @@ impl Engine {
             } else if everyone {
                 WakeReason::Everyone
             } else {
-                continue;
+                WakeReason::Broadcast
             };
             let id = TriggerId {
                 agent: target.id,
