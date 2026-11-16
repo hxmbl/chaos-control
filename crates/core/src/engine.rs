@@ -591,22 +591,7 @@ impl Engine {
     ) -> Result<(Vec<MemberId>, bool), PostError> {
         let members = self.store.members_of(channel)?;
         let nicknames = self.store.nicknames_in(channel)?;
-        if body.contains("@gpt") || body.contains("@jeepy") {
-            eprintln!(
-                "DBG_RESOLVE channel={:?} author={:?} members={:?} nicks={:?} body={:?}",
-                channel,
-                author.handle,
-                members
-                    .iter()
-                    .map(|m| m.handle.as_ref())
-                    .collect::<Vec<_>>(),
-                nicknames
-                    .iter()
-                    .map(|(id, n)| (id.0, n.as_ref()))
-                    .collect::<Vec<_>>(),
-                body
-            );
-        }
+        let _ = (channel, author, &members, &nicknames);
         let mut out = Vec::new();
         let mut everyone = false;
         for handle in policy::parse_mentions(body) {
@@ -871,19 +856,20 @@ impl Engine {
                     Damp::Paused => continue,
                 }
             }
-            {
-                let batch = self
-                    .store
-                    .pending_batch_or_create(target.id, channel, now)
-                    .map_err(|e| PostError::Store(e.to_string()))?;
-                self.store
-                    .insert_trigger(id, reason, message.hop, batch.id, now)
-                    .map_err(|e| PostError::Store(e.to_string()))?;
-                if reason.is_direct() {
-                    self.store
-                        .insert_obligation(id)
-                        .map_err(|e| PostError::Store(e.to_string()))?;
-                }
+            let inserted = self
+                .store
+                .ensure_pending_batch_trigger(
+                    target.id,
+                    channel,
+                    message.id,
+                    reason,
+                    message.hop,
+                    reason.is_direct(),
+                    now,
+                )
+                .map_err(|e| PostError::Store(e.to_string()))?;
+            if !inserted {
+                continue;
             }
             if author.kind == MemberKind::Human {
                 let rt = self.rt.entry((target.id, channel)).or_default();
@@ -984,15 +970,15 @@ impl Engine {
                 .remove_reaction(message, member, &emoji)
                 .map_err(|e| PostError::Store(e.to_string()))?
         };
-        if add && changed && answers.answers(&emoji) {
+        if add && answers.answers(&emoji) {
             let t = TriggerId {
                 agent: member,
                 channel: m.channel,
                 message,
             };
-            let _ = self
-                .store
-                .resolve_obligation(t, ObligationState::Satisfied, None, "react");
+            self.store
+                .resolve_obligation(t, ObligationState::Satisfied, None, "react")
+                .map_err(|e| PostError::Store(e.to_string()))?;
         }
         if changed {
             self.effects

@@ -999,7 +999,8 @@ impl Store {
     ) -> Result<Option<Project>> {
         let p = adopt_import_db(&self.core, id, name, root)?;
         if p.is_some() {
-            let _ = self.ensure_project_open(id);
+            self.ensure_project_open(id)
+                .map_err(store_open_error_to_sqlite)?;
         }
         Ok(p)
     }
@@ -1279,14 +1280,12 @@ impl Store {
                     Some("not_a_project_member".into()),
                 ));
             }
-        }
-        if !is_member_db(
-            self.project_workspace(&project)?,
-            m.channel,
-            m.author.unwrap_or(MemberId(0)),
-        )? && m.author.is_some()
-        {
-            // author must be channel member for normal posts; allow some cases? keep simple: check if provided
+            if !is_member_db(self.project_workspace(&project)?, m.channel, author)? {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                    Some("not_a_channel_member".into()),
+                ));
+            }
         }
         let id = MessageId(self.allocate_id("message")?);
         let msg = insert_message_db(self.project_workspace(&project)?, m, id)?;
@@ -1646,6 +1645,83 @@ impl Store {
             .project_for_channel(id.channel)
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         insert_obligation(self.project_agents(&project)?, id)
+    }
+
+    /// Ensures a pending batch for `(agent, channel)` exists, then inserts the
+    /// trigger (and obligation if requested) atomically within the project's
+    /// agents database. Returns `true` if the trigger was newly inserted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_pending_batch_trigger(
+        &mut self,
+        agent: MemberId,
+        channel: ChannelId,
+        message: MessageId,
+        reason: WakeReason,
+        hop: u8,
+        create_obligation: bool,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        // Fast path: if trigger already exists, nothing to do.
+        let trigger_id = TriggerId {
+            agent,
+            channel,
+            message,
+        };
+        if trigger_exists_db(self.project_agents(&project)?, trigger_id)? {
+            return Ok(false);
+        }
+
+        let mut pending = pending_batch_db(self.project_agents(&project)?, agent, channel)?;
+        if pending.is_none() {
+            let new_id = BatchId(self.allocate_id("batch")?);
+            pending = Some(BatchRow {
+                id: new_id,
+                agent,
+                channel,
+                state: BatchState::Pending,
+                attempts: 0,
+                window_to: None,
+            });
+        }
+        let batch = pending.expect("set above");
+        let ag = self.project_agents(&project)?;
+        let tx = ag.unchecked_transaction()?;
+        // Ensure pending batch row exists (idempotent under unique partial index).
+        if tx
+            .query_row(
+                &format!("SELECT {BATCH_COLS} FROM batches WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'pending'"),
+                params![agent.0, channel.0],
+                batch_from_row,
+            )
+            .optional()?
+            .is_none()
+        {
+            tx.execute(
+                "INSERT INTO batches (id, agent_id, channel_id, state, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)",
+                params![batch.id.0, agent.0, channel.0, now as i64],
+            )?;
+        }
+        let actual_batch_id: i64 = tx.query_row(
+            "SELECT id FROM batches WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'pending'",
+            params![agent.0, channel.0],
+            |r| r.get(0),
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO triggers (agent_id, channel_id, message_id, reason, hop, batch_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![agent.0, channel.0, message.0, reason.as_str(), hop as i64, actual_batch_id, now as i64],
+        )? == 1;
+        if inserted && create_obligation {
+            tx.execute(
+                "INSERT OR IGNORE INTO obligations (agent_id, channel_id, message_id, state) VALUES (?1, ?2, ?3, 'open')",
+                params![agent.0, channel.0, message.0],
+            )?;
+        }
+        tx.commit()?;
+        self.note_batch(project, BatchId(actual_batch_id));
+        Ok(inserted)
     }
     pub fn obligation_state(&self, id: TriggerId) -> Result<Option<ObligationState>> {
         let project = self
@@ -2011,6 +2087,11 @@ fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenErr
             });
         }
         if valid {
+            // Ensure counters are seeded even if a previous attempt crashed before seeding.
+            let legacy_src = Connection::open(&legacy)?;
+            let core = open_db(&core_db, CORE_MIGRATIONS)?;
+            seed_id_counters_from_legacy(&legacy_src, &core)?;
+            drop(core);
             std::fs::rename(&legacy, &backup)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
             return Ok(());
@@ -4658,6 +4739,7 @@ mod tests {
     fn seq_is_per_channel_and_gapless_while_ids_are_global() {
         let (mut s, ch, hx, _) = setup();
         let other = s.ensure_channel(&ch.project, "STRM-1", 0).unwrap();
+        s.join(other.id, &hx, 0, 0).unwrap();
         let a = s.insert_message(&msg(ch.id, hx.id, "a")).unwrap();
         let b = s.insert_message(&msg(other.id, hx.id, "b")).unwrap();
         let c2 = s.insert_message(&msg(ch.id, hx.id, "c")).unwrap();
@@ -5770,6 +5852,9 @@ mod tests {
         assert_ne!(ch1_new.id, ch2_new.id);
 
         // Create new messages across multiple projects.
+        let hx = s.member(MemberId(1)).unwrap().unwrap();
+        s.join(ch1_new.id, &hx, 0, 10_000).unwrap();
+        s.join(ch2_new.id, &hx, 0, 10_001).unwrap();
         let m1 = s
             .insert_message(&msg(ch1_new.id, MemberId(1), "post-migration p1"))
             .unwrap();
