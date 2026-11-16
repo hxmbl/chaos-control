@@ -795,7 +795,6 @@ async fn agents_json_lists_still_win_and_plain_agents_have_no_member_slot() {
     assert_eq!(file, vec!["👍"]);
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn untargeted_messages_wake_agents_without_reply_obligations() {
     let mut h = Harness::new().await;
