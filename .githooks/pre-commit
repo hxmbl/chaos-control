@@ -40,4 +40,10 @@ if [ $EXIT_CODE -ne 0 ]; then
     exit 1
 fi
 
+echo "pre-commit: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-commit: cargo clippy --workspace --all-targets --locked -- -D warnings"
+cargo clippy --workspace --all-targets --locked -- -D warnings
+
 exit 0
