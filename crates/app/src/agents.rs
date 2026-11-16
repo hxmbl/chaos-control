@@ -97,6 +97,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::{
     agents_file,
     project::{self, Confirm, FileState, Known, Plan, Target},
+    recents,
 };
 
 #[derive(Debug, Default, Deserialize)]
@@ -353,12 +354,15 @@ pub struct CoreLink {
     pub core: Core,
     /// The launch folder (the project's root).
     pub folder: PathBuf,
-    pub open: OpenProject,
+    /// The open project, if any. `None` means core is running with no project opened.
+    pub open: Option<OpenProject>,
+    /// Known projects for the picker when no project is open.
+    pub known_projects: Vec<Project>,
     /// An identity question for the user (see `project::decide`), if the
     /// folder's file disagreed with what core remembers.
     pub confirm: Option<Confirm>,
-    /// The human at this keyboard.
-    pub human: MemberId,
+    /// The human at this keyboard in the open project, if any.
+    pub human: Option<MemberId>,
     pub agents: Vec<LinkedAgent>,
     /// The harnesses this run can start, for the model picker.
     pub harnesses: Vec<Harness>,
@@ -377,9 +381,9 @@ pub struct CoreLink {
 }
 
 impl CoreLink {
-    /// Core's channel behind the app's #main.
-    pub fn main(&self) -> ChannelId {
-        self.open.main.id
+    /// Core's channel behind the app's #main, if a project is open.
+    pub fn main(&self) -> Option<ChannelId> {
+        self.open.as_ref().map(|o| o.main.id)
     }
 
     pub fn harness(&self, id: &str) -> Option<&Harness> {
@@ -430,7 +434,29 @@ pub fn parse_brand(name: Option<&str>) -> Brand {
 /// why it did not start otherwise (nothing to run is silent: the app then
 /// runs on sample data alone). The one failure returned is data from a newer
 /// build: the app shows that instead of sample data.
+///
+/// Marks the last-active recents entry unavailable if its recorded path is
+/// missing. This only stops that entry from being auto-restored; it must never
+/// stop the launch folder from opening.
+pub(crate) fn mark_unavailable_last_active(rec: &mut recents::RecentsFile, data_dir: &Path) {
+    let Some(active) = rec.last_active().cloned() else {
+        return;
+    };
+    if active.unavailable {
+        return;
+    }
+    if let Some(p) = active.path.as_deref()
+        && !std::path::Path::new(p).exists()
+    {
+        rec.mark_unavailable(&active.id);
+        let _ = recents::save(data_dir, rec);
+    }
+}
+
 pub fn start() -> Result<Option<CoreLink>, StartError> {
+    let data = data_dir();
+    let mut rec = recents::load(&data);
+    mark_unavailable_last_active(&mut rec, &data);
     let path = agents_file();
     let config = match std::fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str::<AgentsConfig>(&text) {
@@ -455,7 +481,8 @@ pub fn start() -> Result<Option<CoreLink>, StartError> {
     if !had_file && found.is_empty() {
         return Ok(None);
     }
-    match start_with(config, found, path) {
+    let folder = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
+    match start_with_in(config, found, path, data, folder) {
         Ok(link) => Ok(Some(link)),
         Err(e @ StartError::NewerData(_)) => Err(e),
         Err(e) => {
@@ -537,10 +564,12 @@ fn split_installed(
     (specs, dormant)
 }
 
-pub fn start_with(
+pub(crate) fn start_with_in(
     config: AgentsConfig,
     harnesses: Vec<Harness>,
     agents_path: PathBuf,
+    data: PathBuf,
+    folder: PathBuf,
 ) -> Result<CoreLink, StartError> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -548,7 +577,6 @@ pub fn start_with(
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?;
-    let data = data_dir();
     let bridge = std::env::current_exe().ok().map(|command| BridgeCommand {
         command,
         args: vec!["mcp-bridge".into()],
@@ -559,7 +587,6 @@ pub fn start_with(
         default_cwd: std::env::current_dir().unwrap_or_else(|_| data.clone()),
         ..HostConfig::default()
     };
-    let folder = std::env::current_dir().map_err(|e| format!("no working directory: {e}"))?;
     let model_cache_dir = model_cache::dir(&data);
     let cached_models: HashMap<&'static str, CachedModels> = harnesses
         .iter()
@@ -578,124 +605,173 @@ pub fn start_with(
     } = config;
     // Started on its own so a refusal keeps its type (see `start`).
     let (core, events) = runtime.block_on(Core::start(host, Arc::new(SystemClock)))?;
-    let (core, events, open, confirm, human, agents, dormant) = runtime.block_on(async {
-        let plan = plan_for(&core, &folder).await?;
-        let project = apply_plan(&core, &folder, &plan.open, plan.write_file).await?;
-        let main = core.channel(&project.id, "main").await?.id;
-        let human = core
-            .human(&human_config.handle, &human_config.name, main)
-            .await?
-            .id;
-        let mut agents = Vec::new();
-        // The original shape: plain ACP agents, not on the roster.
-        for a in plain_agents {
-            let ping_answers = a.ping_answers().unwrap_or_else(|e| {
-                eprintln!("chaos-control: ignoring ping_answer_reactions for {e}");
-                None
-            });
-            let name = a.name.clone().unwrap_or_else(|| a.handle.clone());
-            let transport = SpawnTransport {
-                command: a.command,
-                args: a.args,
-                env: a.env.into_iter().collect(),
-                record: a.record,
-            };
-            let adapter = AcpAdapter::new(Arc::new(transport))
-                .prefer_v2(a.acp_v2)
-                .chat_tools(a.chat_tools.preference());
-            let member = core
-                .add_agent(
-                    AgentSpec {
-                        handle: a.handle.clone(),
-                        name: name.clone(),
-                        adapter: Arc::new(adapter),
-                        cwd: a.cwd,
-                        ping_answers,
-                    },
-                    main,
-                )
-                .await?;
-            agents.push(LinkedAgent {
-                member: member.id,
-                handle: member.handle.clone(),
-                name: Arc::from(name),
-                brand: parse_brand(a.brand.as_deref()),
-                harness: None,
-                harness_id: None,
-                model: None,
-                removable: false,
-            });
-        }
-        // Model members: agents.json's `members`, else (first start) a
-        // seeded roster, or the one core kept from before, written to the
-        // file so it is the source from now on.
-        let roster: Vec<MemberConfig> = match file_members {
-            Some(list) => dedupe(list),
-            None => {
-                let list: Vec<MemberConfig> = if core.seed_roster_once(&project.id).await? {
-                    harnesses.iter().map(seed_entry).collect()
-                } else {
-                    core.roster(&project.id)
-                        .await?
-                        .into_iter()
-                        .map(|m| MemberConfig {
-                            harness: m.harness.to_string(),
-                            model: m.model.as_deref().map(str::to_string),
-                            name: Some(m.model_name.to_string()),
-                            cwd: None,
-                        })
-                        .collect()
-                };
-                let entries: Vec<agents_file::Entry> = list
-                    .iter()
-                    .map(|m| {
-                        agents_file::Entry::new(&m.harness, m.model.as_deref(), &entry_name(m))
-                    })
-                    .collect();
-                if let Err(e) = agents_file::set_members(&agents_path, &entries) {
-                    eprintln!(
-                        "chaos-control: could not write the members to {}: {e}",
-                        agents_path.display()
-                    );
+    let (core, events, open, known_projects, confirm, human, agents, dormant) =
+        runtime.block_on(async {
+            async fn open_cwd(
+                core: &Core,
+                folder: &Path,
+                harnesses: &[Harness],
+                agents_path: &Path,
+                human_config: &HumanConfig,
+                file_members: &Option<Vec<MemberConfig>>,
+                plain_agents: Vec<AgentConfig>,
+            ) -> Result<
+                (
+                    Option<OpenProject>,
+                    Option<Confirm>,
+                    Option<MemberId>,
+                    Vec<LinkedAgent>,
+                    Vec<DormantMember>,
+                ),
+                String,
+            > {
+                let plan = plan_for(core, folder).await?;
+                let project = apply_plan(core, folder, &plan.open, plan.write_file).await?;
+                let main = core.channel(&project.id, "main").await?.id;
+                let human = core
+                    .human(&human_config.handle, &human_config.name, main)
+                    .await?
+                    .id;
+                let mut agents = Vec::new();
+                // The original shape: plain ACP agents, not on the roster.
+                for a in plain_agents {
+                    let ping_answers = a.ping_answers().unwrap_or_else(|e| {
+                        eprintln!("chaos-control: ignoring ping_answer_reactions for {e}");
+                        None
+                    });
+                    let name = a.name.clone().unwrap_or_else(|| a.handle.clone());
+                    let transport = SpawnTransport {
+                        command: a.command,
+                        args: a.args,
+                        env: a.env.into_iter().collect(),
+                        record: a.record,
+                    };
+                    let adapter = AcpAdapter::new(Arc::new(transport))
+                        .prefer_v2(a.acp_v2)
+                        .chat_tools(a.chat_tools.preference());
+                    let member = core
+                        .add_agent(
+                            AgentSpec {
+                                handle: a.handle.clone(),
+                                name: name.clone(),
+                                adapter: Arc::new(adapter),
+                                cwd: a.cwd,
+                                ping_answers,
+                            },
+                            main,
+                        )
+                        .await?;
+                    agents.push(LinkedAgent {
+                        member: member.id,
+                        handle: member.handle.clone(),
+                        name: Arc::from(name),
+                        brand: parse_brand(a.brand.as_deref()),
+                        harness: None,
+                        harness_id: None,
+                        model: None,
+                        removable: false,
+                    });
                 }
-                dedupe(list)
-            }
-        };
-        let (specs, dormant) = split_installed(&harnesses, &roster);
-        let mut linked: Vec<(Arc<str>, Option<Arc<str>>)> = Vec::new();
-        for spec in specs {
-            match core.add_model_member(spec, main).await {
-                Ok(m) => {
-                    linked.push((m.harness.clone(), m.model.clone()));
-                    if !agents.iter().any(|a: &LinkedAgent| a.member == m.member.id) {
-                        agents.push(LinkedAgent::from_member(&m));
+                // Model members: agents.json's `members`, else (first start) a
+                // seeded roster, or the one core kept from before, written to the
+                // file so it is the source from now on.
+                let roster: Vec<MemberConfig> = match file_members.clone() {
+                    Some(list) => dedupe(list),
+                    None => {
+                        let list: Vec<MemberConfig> = if core.seed_roster_once(&project.id).await? {
+                            harnesses.iter().map(seed_entry).collect()
+                        } else {
+                            core.roster(&project.id)
+                                .await?
+                                .into_iter()
+                                .map(|m| MemberConfig {
+                                    harness: m.harness.to_string(),
+                                    model: m.model.as_deref().map(str::to_string),
+                                    name: Some(m.model_name.to_string()),
+                                    cwd: None,
+                                })
+                                .collect()
+                        };
+                        let entries: Vec<agents_file::Entry> = list
+                            .iter()
+                            .map(|m| {
+                                agents_file::Entry::new(
+                                    &m.harness,
+                                    m.model.as_deref(),
+                                    &entry_name(m),
+                                )
+                            })
+                            .collect();
+                        if let Err(e) = agents_file::set_members(agents_path, &entries) {
+                            eprintln!(
+                                "chaos-control: could not write the members to {}: {e}",
+                                agents_path.display()
+                            );
+                        }
+                        dedupe(list)
+                    }
+                };
+                let (specs, dormant) = split_installed(harnesses, &roster);
+                let mut linked: Vec<(Arc<str>, Option<Arc<str>>)> = Vec::new();
+                for spec in specs {
+                    match core.add_model_member(spec, main).await {
+                        Ok(m) => {
+                            linked.push((m.harness.clone(), m.model.clone()));
+                            if !agents.iter().any(|a: &LinkedAgent| a.member == m.member.id) {
+                                agents.push(LinkedAgent::from_member(&m));
+                            }
+                        }
+                        Err(e) => eprintln!("chaos-control: could not add a member: {e}"),
                     }
                 }
-                Err(e) => eprintln!("chaos-control: could not add a member: {e}"),
+                // Whatever else core still has on this project's roster (removed in
+                // another project, a harness no longer installed) leaves the room.
+                // Its messages stay.
+                for m in core.roster(&project.id).await? {
+                    if !linked
+                        .iter()
+                        .any(|(h, model)| *h == m.harness && *model == m.model)
+                        && let Err(e) = core.remove_member(&project.id, m.member.id).await
+                    {
+                        eprintln!(
+                            "chaos-control: could not take {} off the roster: {e}",
+                            m.model_name
+                        );
+                    }
+                }
+                let open = describe(core, project).await?;
+                Ok((Some(open), plan.confirm, Some(human), agents, dormant))
             }
-        }
-        // Whatever else core still has on this project's roster (removed in
-        // another project, a harness no longer installed) leaves the room.
-        // Its messages stay.
-        for m in core.roster(&project.id).await? {
-            if !linked
-                .iter()
-                .any(|(h, model)| *h == m.harness && *model == m.model)
-                && let Err(e) = core.remove_member(&project.id, m.member.id).await
+
+            match open_cwd(
+                &core,
+                &folder,
+                &harnesses,
+                &agents_path,
+                &human_config,
+                &file_members,
+                plain_agents,
+            )
+            .await
             {
-                eprintln!(
-                    "chaos-control: could not take {} off the roster: {e}",
-                    m.model_name
-                );
+                Ok((open, confirm, human, agents, dormant)) => {
+                    let known = core.projects().await.unwrap_or_default();
+                    Ok::<_, String>((core, events, open, known, confirm, human, agents, dormant))
+                }
+                Err(e) => {
+                    eprintln!("chaos-control: could not open launch folder: {e}");
+                    let known = core.projects().await.unwrap_or_default();
+                    let roster: Vec<MemberConfig> = file_members.map(dedupe).unwrap_or_default();
+                    let (_specs, dormant) = split_installed(&harnesses, &roster);
+                    Ok((core, events, None, known, None, None, Vec::new(), dormant))
+                }
             }
-        }
-        let open = describe(&core, project).await?;
-        Ok::<_, String>((core, events, open, plan.confirm, human, agents, dormant))
-    })?;
+        })?;
     Ok(CoreLink {
         core,
         folder,
         open,
+        known_projects,
         confirm,
         human,
         agents,
@@ -1008,5 +1084,81 @@ mod tests {
         } else {
             assert!(data_dir().ends_with("chaos-control") || data_dir().ends_with("Chaos Control"));
         }
+    }
+
+    fn temp_data(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("cc-agents-start-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn startup_missing_last_active_does_not_block_launch_folder() {
+        let data = temp_data("missing-launch");
+        let launch = temp_data("launch-folder");
+        let mut rec = crate::recents::RecentsFile::default();
+        rec.upsert_opened(
+            "p1",
+            "Missing",
+            Some("/path/that/does/not/exist/cc"),
+            Some("main"),
+        );
+        crate::recents::save(&data, &rec).unwrap();
+
+        mark_unavailable_last_active(&mut rec, &data);
+        let saved = crate::recents::load(&data);
+        assert!(saved.last_active().expect("kept").unavailable);
+
+        let agents_path = data.join("agents.json");
+        let link = start_with_in(
+            AgentsConfig::default(),
+            Vec::new(),
+            agents_path.clone(),
+            data.clone(),
+            launch.clone(),
+        )
+        .expect("core should start and open launch folder");
+        assert!(link.open.is_some(), "launch folder must open");
+        let opened_root = link
+            .open
+            .as_ref()
+            .and_then(|o| o.project.root_path.as_deref())
+            .expect("opened project root");
+        assert_eq!(
+            std::path::Path::new(opened_root),
+            std::fs::canonicalize(&launch)
+                .unwrap_or(launch.clone())
+                .as_path()
+        );
+        assert!(
+            !link.known_projects.is_empty(),
+            "project list should be available"
+        );
+        drop(link);
+
+        // Next launch does the same.
+        let mut rec2 = crate::recents::load(&data);
+        mark_unavailable_last_active(&mut rec2, &data);
+        let link2 = start_with_in(
+            AgentsConfig::default(),
+            Vec::new(),
+            agents_path,
+            data.clone(),
+            launch.clone(),
+        )
+        .expect("core should start and open launch folder again");
+        assert!(link2.open.is_some(), "next launch opens launch folder");
+        let saved2 = crate::recents::load(&data);
+        assert!(
+            saved2
+                .last_active()
+                .is_some_and(|p| p.unavailable && p.id == "p1")
+        );
+        drop(link2);
+
+        let _ = std::fs::remove_dir_all(data);
+        let _ = std::fs::remove_dir_all(launch);
     }
 }

@@ -27,6 +27,8 @@ use crate::{
     agents::{self, CoreLink, DormantMember, LinkedAgent, OpenProject},
     agents_file,
     project::{self, Confirm, Question, Target},
+    project_context::{ProjectContext, ProjectLifecycle},
+    recents,
 };
 
 /// How long after a failed probe (signed out, timed out) a harness is left
@@ -136,10 +138,13 @@ pub struct ChatStore {
     logs: HashMap<Id, ChannelLog>,
     selected: Id,
     next_message_id: u32,
-    /// Monotonic generation for the active project context. Incremented on each
-    /// successful attach/open/switch so async results can be dropped if stale.
+    /// Authoritative active project context (app/runtime boundary).
+    project_context: ProjectContext,
+    /// Compatibility mirror of `project_context.generation`.
     project_generation: u64,
     core: Option<Attached>,
+    /// Core runtime running with no project opened.
+    no_project_core: Option<CoreLink>,
 }
 
 /// One emoji under a message: how many put it there and who.
@@ -377,16 +382,23 @@ impl ChatStore {
     /// generation before being applied to avoid stale cross-project writes.
     #[allow(dead_code)]
     pub fn project_generation(&self) -> u64 {
-        self.project_generation
+        self.project_context.generation
+    }
+
+    /// Authoritative active project context.
+    #[allow(dead_code)]
+    pub fn project_context(&self) -> &ProjectContext {
+        &self.project_context
     }
 
     fn bump_project_generation(&mut self) -> u64 {
-        self.project_generation = self.project_generation.saturating_add(1);
-        self.project_generation
+        let generation = self.project_context.bump();
+        self.project_generation = generation;
+        generation
     }
 
     fn is_current_generation(&self, generation: u64) -> bool {
-        self.project_generation == generation
+        self.project_context.is_current(generation)
     }
 
     pub fn new(workspace: Workspace) -> Self {
@@ -401,8 +413,10 @@ impl ChatStore {
             logs,
             selected,
             next_message_id: 1_000_000,
+            project_context: ProjectContext::new(),
             project_generation: 0,
             core: None,
+            no_project_core: None,
         }
     }
 
@@ -429,6 +443,53 @@ impl ChatStore {
         self.logs.get(&channel)
     }
 
+    fn restore_last_selected_channel(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let data_dir = crate::agents::data_dir();
+        let state = recents::load(&data_dir);
+        if state.last_active_project_id.as_deref() != Some(project_id) {
+            return;
+        }
+        let Some(name) = state.last_active_channel.as_deref() else {
+            return;
+        };
+        if let Some(id) = self
+            .workspace
+            .channels
+            .iter()
+            .find(|c| c.name.as_ref() == name)
+            .map(|c| c.id)
+            && self.selected != id
+        {
+            self.selected = id;
+            if let Some(c) = self.workspace.channels.iter_mut().find(|c| c.id == id) {
+                c.unread = false;
+            }
+            cx.emit(StoreEvent::Selected);
+        }
+    }
+
+    fn persist_recents(&self, selected_channel_name: Option<&str>) {
+        let Some(attached) = &self.core else { return };
+        let Some(open) = &attached.link.open else {
+            return;
+        };
+        let data_dir = crate::agents::data_dir();
+        let mut state = recents::load(&data_dir);
+        let project = &open.project;
+        let path = project.root_path.as_deref();
+        state.upsert_opened(
+            &project.id.to_string(),
+            &project.name,
+            path,
+            selected_channel_name.or_else(|| {
+                self.workspace
+                    .channel(self.selected)
+                    .map(|c| c.name.as_ref())
+            }),
+        );
+        let _ = recents::save(&data_dir, &state);
+    }
+
     pub fn select(&mut self, channel: Id, cx: &mut Context<Self>) {
         if self.selected != channel && self.workspace.channel(channel).is_some() {
             self.selected = channel;
@@ -438,6 +499,7 @@ impl ChatStore {
             cx.emit(StoreEvent::Selected);
             cx.notify();
             self.mark_main_read(cx);
+            self.persist_recents(None);
         }
     }
 
@@ -492,7 +554,9 @@ impl ChatStore {
         let Some(attached) = self.core.as_ref().filter(|a| a.channel == channel) else {
             return Vec::new();
         };
-        let main = attached.link.main();
+        let Some(main) = attached.link.main() else {
+            return Vec::new();
+        };
         let mut out: Vec<(Arc<str>, &'static str)> = attached
             .agent_statuses
             .values()
@@ -545,7 +609,7 @@ impl ChatStore {
             .into_iter()
             .map(|g| ReactionChip {
                 count: g.members.len(),
-                mine: g.members.contains(&attached.link.human),
+                mine: attached.link.human.is_some_and(|h| g.members.contains(&h)),
                 names: g.members.iter().map(|m| self.reactor_name(*m)).collect(),
                 emoji: g.emoji,
             })
@@ -585,7 +649,9 @@ impl ChatStore {
         else {
             return;
         };
-        let human = attached.link.human;
+        let Some(human) = attached.link.human else {
+            return;
+        };
         let mine = attached
             .reactions
             .get(&id)
@@ -625,7 +691,9 @@ impl ChatStore {
         }) else {
             return;
         };
-        let human = attached.link.human;
+        let Some(human) = attached.link.human else {
+            return;
+        };
         let mine = attached
             .reactions
             .get(&id)
@@ -649,7 +717,7 @@ impl ChatStore {
         let Some(attached) = self.core.as_ref() else {
             return Arc::from("Someone");
         };
-        if member == attached.link.human {
+        if attached.link.human == Some(member) {
             return Arc::from("You");
         }
         attached
@@ -673,7 +741,9 @@ impl ChatStore {
             return;
         }
         let core = attached.link.core.clone();
-        let (human, main) = (attached.link.human, attached.link.main());
+        let (Some(human), Some(main)) = (attached.link.human, attached.link.main()) else {
+            return;
+        };
         cx.spawn(async move |_, _| {
             if let Err(e) = core.mark_read(human, main, None).await {
                 eprintln!("chaos-control: could not record a read receipt: {e}");
@@ -745,7 +815,9 @@ impl ChatStore {
             && attached.channel == self.selected
         {
             let core = attached.link.core.clone();
-            let (author, channel) = (attached.link.human, attached.link.main());
+            let (Some(author), Some(channel)) = (attached.link.human, attached.link.main()) else {
+                return;
+            };
             let reply = reply_to.and_then(|r| core_message_id(r.message));
             let body = body.to_string();
             let app_channel = self.selected;
@@ -785,8 +857,43 @@ impl ChatStore {
     /// Puts core behind the launch project: its channels replace the sample
     /// ones (each project has its own #main), the picker lists core's
     /// projects, its agents join Agent Status, #main's history loads and its
-    /// events flow in from here on.
+    /// events flow in from here on. If no project is open, core runs without
+    /// an active project attached.
     pub fn attach_core(&mut self, mut link: CoreLink, cx: &mut Context<Self>) {
+        if link.open.is_none() {
+            // Core running with no project opened: keep project list visible.
+            self.workspace.agents.clear();
+            self.workspace.mentions.clear();
+            self.workspace.channels.clear();
+            self.logs.clear();
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+            let shown_path = |root: Option<&str>| {
+                root.map(|r| Arc::from(project::display_path(Path::new(r), home.as_deref())))
+            };
+            self.workspace.project = model::Project {
+                id: Id(0),
+                name: Arc::from(""),
+                emoji: Arc::from(""),
+                path: None,
+            };
+            self.workspace.projects = link
+                .known_projects
+                .iter()
+                .map(|q| ProjectEntry {
+                    name: q.name.clone(),
+                    path: shown_path(q.root_path.as_deref()),
+                    current: false,
+                })
+                .collect();
+            self.project_context = crate::project_context::ProjectContext::new();
+            self.project_context.lifecycle = ProjectLifecycle::Closed;
+            self.project_generation = self.project_context.generation;
+            self.core = None;
+            self.no_project_core = Some(link);
+            cx.emit(StoreEvent::Selected);
+            cx.notify();
+            return;
+        }
         // Agent Status is the project's members now, not the sample cast
         // (and the sample mentions name sample agents).
         self.workspace.agents = link.agents.iter().map(status_agent).collect();
@@ -821,12 +928,16 @@ impl ChatStore {
                 (h.preset.id, entry)
             })
             .collect();
-        let channel = self.show_project(&link.open, &link.folder, cx);
+        let open = link.open.as_ref().expect("open project");
+        let channel = self.show_project(open, &link.folder, cx);
         let confirm = link.confirm.take();
         let mut events = link.events.take();
         let core = link.core.clone();
-        let main = link.main();
+        let main = link.main().expect("open project main");
         let generation = self.bump_project_generation();
+        self.project_context.identity = Some(open.project.id.clone());
+        self.project_context.location.path = Some(project::root_key(&link.folder));
+        self.project_context.lifecycle = ProjectLifecycle::Open;
         let task = cx.spawn(async move |this, cx| {
             // Who was ever an agent, before the history that needs it.
             if let Ok(ids) = core.agent_members().await {
@@ -893,7 +1004,7 @@ impl ChatStore {
                     }
                     if let Some(a) = &mut store.core
                         && a.generation == generation
-                        && a.link.main() == main
+                        && a.link.main() == Some(main)
                     {
                         a.names = members.into_iter().map(|m| (m.id, m.name)).collect();
                     }
@@ -946,6 +1057,7 @@ impl ChatStore {
                 }
             }
         });
+        self.no_project_core = None;
         self.core = Some(Attached {
             link,
             generation,
@@ -976,6 +1088,14 @@ impl ChatStore {
         self.load_ping_answers(cx);
         self.load_nicknames(cx);
         self.load_former_project_agents(cx);
+        let project_id = self
+            .core
+            .as_ref()
+            .and_then(|a| a.link.open.as_ref().map(|o| o.project.id.to_string()));
+        if let Some(id) = project_id {
+            self.restore_last_selected_channel(&id, cx);
+            self.persist_recents(None);
+        }
         cx.notify();
     }
 
@@ -1150,7 +1270,9 @@ impl ChatStore {
             return;
         };
         let core = attached.link.core.clone();
-        let main = attached.link.main();
+        let Some(main) = attached.link.main() else {
+            return;
+        };
         let path = attached.link.agents_path.clone();
         let entry = agents_file::Entry::new(harness, model.as_deref(), &name);
         cx.spawn(async move |this, cx| {
@@ -1187,11 +1309,12 @@ impl ChatStore {
 
     /// Reads the open project's ping-answer list from core.
     fn load_ping_answers(&mut self, cx: &mut Context<Self>) {
-        let Some((generation, project)) = self
-            .core
-            .as_ref()
-            .map(|a| (a.generation, a.link.open.project.id.clone()))
-        else {
+        let Some((generation, project)) = self.core.as_ref().and_then(|a| {
+            a.link
+                .open
+                .as_ref()
+                .map(|o| (a.generation, o.project.id.clone()))
+        }) else {
             return;
         };
         self.load_ping_answers_for(generation, project, cx);
@@ -1223,25 +1346,43 @@ impl ChatStore {
                 }
             }
             this.update(cx, |store, cx| {
-                if !store.is_current_generation(generation) {
-                    return;
-                }
-                let Some(a) = &mut store.core else {
-                    return;
-                };
-                if a.generation != generation || a.link.open.project.id != project {
-                    return;
-                }
-                match result {
-                    Ok(list) => a.ping_answers = list,
-                    Err(e) => a.ping_answers_error = Some(Arc::from(e)),
-                }
-                a.member_ping_answers = own;
-                cx.notify();
+                store.apply_loaded_ping_answers_result(generation, &project, result, own, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Applies a ping-answers load result only if it still belongs to the
+    /// current project/generation (real async-apply path).
+    fn apply_loaded_ping_answers_result(
+        &mut self,
+        generation: u64,
+        project: &ct::ProjectId,
+        result: Result<Option<Vec<String>>, String>,
+        own: HashMap<ct::MemberId, Vec<String>>,
+        cx: &mut impl EventSink,
+    ) {
+        if !self.is_current_generation(generation) {
+            return;
+        }
+        let Some(a) = &mut self.core else {
+            return;
+        };
+        if a.generation != generation
+            || a.link
+                .open
+                .as_ref()
+                .is_none_or(|o| &o.project.id != project)
+        {
+            return;
+        }
+        match result {
+            Ok(list) => a.ping_answers = list,
+            Err(e) => a.ping_answers_error = Some(Arc::from(e)),
+        }
+        a.member_ping_answers = own;
+        cx.notify();
     }
 
     fn linked(&mut self, linked: LinkedAgent, cx: &mut Context<Self>) {
@@ -1304,7 +1445,9 @@ impl ChatStore {
         }
         self.workspace.agents.retain(|a| a.id != id);
         let core = attached.link.core.clone();
-        let project = attached.link.open.project.id.clone();
+        let Some(project) = attached.link.open.as_ref().map(|o| o.project.id.clone()) else {
+            return;
+        };
         cx.notify();
         cx.spawn(async move |this, cx| {
             if let Err(e) = core.remove_member(&project, member).await {
@@ -1319,11 +1462,12 @@ impl ChatStore {
 
     /// Reads every linked agent's nicknames from core.
     fn load_nicknames(&mut self, cx: &mut Context<Self>) {
-        let Some((generation, project)) = self
-            .core
-            .as_ref()
-            .map(|a| (a.generation, a.link.open.project.id.clone()))
-        else {
+        let Some((generation, project)) = self.core.as_ref().and_then(|a| {
+            a.link
+                .open
+                .as_ref()
+                .map(|o| (a.generation, o.project.id.clone()))
+        }) else {
             return;
         };
         self.load_nicknames_for(generation, project, cx);
@@ -1356,7 +1500,9 @@ impl ChatStore {
                 let Some(a) = &mut store.core else {
                     return;
                 };
-                if a.generation != generation || a.link.open.project.id != project {
+                if a.generation != generation
+                    || a.link.open.as_ref().is_none_or(|o| o.project.id != project)
+                {
                     return;
                 }
                 a.nicknames = all;
@@ -1384,11 +1530,12 @@ impl ChatStore {
 
     /// Reads the open project's removed agents' `@tokens` from core.
     fn load_former_project_agents(&mut self, cx: &mut Context<Self>) {
-        let Some((generation, project)) = self
-            .core
-            .as_ref()
-            .map(|a| (a.generation, a.link.open.project.id.clone()))
-        else {
+        let Some((generation, project)) = self.core.as_ref().and_then(|a| {
+            a.link
+                .open
+                .as_ref()
+                .map(|o| (a.generation, o.project.id.clone()))
+        }) else {
             return;
         };
         self.load_former_project_agents_for(generation, project, cx);
@@ -1415,7 +1562,9 @@ impl ChatStore {
                 let Some(a) = &mut store.core else {
                     return;
                 };
-                if a.generation != generation || a.link.open.project.id != project {
+                if a.generation != generation
+                    || a.link.open.as_ref().is_none_or(|o| o.project.id != project)
+                {
                     return;
                 }
                 // Keep any removed this session that core's answer predates.
@@ -1675,6 +1824,9 @@ impl ChatStore {
         let Some(attached) = &mut self.core else {
             return false;
         };
+        let Some(project) = attached.link.open.as_ref().map(|o| o.project.id.clone()) else {
+            return false;
+        };
         let entries = match parse_ping_answers_input(text) {
             PingAnswersInput::Nothing => return false,
             PingAnswersInput::Reset => None,
@@ -1682,7 +1834,6 @@ impl ChatStore {
         };
         let reset = entries.is_none();
         let core = attached.link.core.clone();
-        let project = attached.link.open.project.id.clone();
         cx.spawn(async move |this, cx| {
             let result = core.set_ping_answer_reactions(project, entries).await;
             this.update(cx, |store, cx| {
@@ -1820,10 +1971,13 @@ impl ChatStore {
         let Some(attached) = &self.core else {
             return;
         };
+        self.project_context.lifecycle = ProjectLifecycle::Switching;
         let link = &attached.link;
         let core = link.core.clone();
         let folder = link.folder.clone();
-        let members = std::iter::once(link.human)
+        let members = link
+            .human
+            .into_iter()
             .chain(link.agents.iter().map(|a| a.member))
             .collect();
         cx.spawn(async move |this, cx| {
@@ -1866,7 +2020,10 @@ impl ChatStore {
                     }
                     if store.core.as_ref().is_none_or(|a| {
                         a.generation != generation
-                            || a.link.open.project.id.to_string() != project_id
+                            || a.link
+                                .open
+                                .as_ref()
+                                .is_none_or(|o| o.project.id.to_string() != project_id)
                     }) {
                         return;
                     }
@@ -1883,7 +2040,10 @@ impl ChatStore {
                         }
                         if store.core.as_ref().is_none_or(|a| {
                             a.generation != generation
-                                || a.link.open.project.id.to_string() != project_id
+                                || a.link
+                                    .open
+                                    .as_ref()
+                                    .is_none_or(|o| o.project.id.to_string() != project_id)
                         }) {
                             return;
                         }
@@ -1899,7 +2059,10 @@ impl ChatStore {
                     }
                     if store.core.as_ref().is_none_or(|a| {
                         a.generation != generation
-                            || a.link.open.project.id.to_string() != project_id
+                            || a.link
+                                .open
+                                .as_ref()
+                                .is_none_or(|o| o.project.id.to_string() != project_id)
                     }) {
                         return;
                     }
@@ -1917,8 +2080,11 @@ impl ChatStore {
                     if let Some(a) = &mut store.core {
                         // Only apply if this is still the active project's context.
                         if a.generation == generation
-                            && a.link.open.project.id.to_string() == project_id
-                            && a.link.main() == main
+                            && a.link
+                                .open
+                                .as_ref()
+                                .is_some_and(|o| o.project.id.to_string() == project_id)
+                            && a.link.main() == Some(main)
                         {
                             a.names = members.into_iter().map(|m| (m.id, m.name)).collect();
                         }
@@ -1946,6 +2112,9 @@ impl ChatStore {
         };
         let generation = self.bump_project_generation();
         let folder = attached.link.folder.clone();
+        self.project_context.identity = Some(open.project.id.clone());
+        self.project_context.location.path = Some(project::root_key(&folder));
+        self.project_context.lifecycle = ProjectLifecycle::Open;
         attached.generation = generation;
         attached.channel = self.show_project(&open, &folder, cx);
         attached.seen.clear();
@@ -1968,11 +2137,13 @@ impl ChatStore {
         self.workspace.mentions.clear();
         let main = open.main.id;
         let project_id = open.project.id.clone();
-        attached.link.open = open;
+        attached.link.open = Some(open);
         self.core = Some(attached);
         self.load_ping_answers_for(generation, project_id.clone(), cx);
         self.load_nicknames_for(generation, project_id.clone(), cx);
         self.load_former_project_agents_for(generation, project_id.clone(), cx);
+        self.restore_last_selected_channel(&project_id.to_string(), cx);
+        self.persist_recents(None);
         (generation, main, project_id.to_string())
     }
 
@@ -2009,8 +2180,12 @@ impl ChatStore {
         let Some(attached_ref) = &self.core else {
             return;
         };
-        let main = attached_ref.link.main();
-        let human = attached_ref.link.human;
+        let Some(main) = attached_ref.link.main() else {
+            return;
+        };
+        let Some(human) = attached_ref.link.human else {
+            return;
+        };
         let app_channel = attached_ref.channel;
         let agents: Vec<ct::MemberId> = attached_ref.link.agents.iter().map(|a| a.member).collect();
         let agent_ids_snapshot = attached_ref.agent_ids.clone();
@@ -2199,7 +2374,7 @@ impl ChatStore {
         let mut rows = Vec::new();
         let mut fresh: HashMap<ct::MessageId, Vec<ct::Reaction>> = HashMap::new();
         for r in reactions {
-            if r.channel == attached.link.main() {
+            if attached.link.main() == Some(r.channel) {
                 fresh.entry(r.message).or_default().push(r);
             }
         }
@@ -3199,5 +3374,41 @@ mod apply_core_event_tests {
         );
         let m = store.log(app_channel).unwrap().get(0).unwrap();
         assert_eq!(m.author, Author::System);
+    }
+
+    #[test]
+    fn delayed_async_result_from_a_is_dropped_once_b_is_active() {
+        use std::collections::HashMap as StdHashMap;
+
+        let app_channel = Id(10);
+        let mut store = store_with_main(app_channel);
+
+        // Async work started under A captures A's generation/project.
+        let gen_a = store.bump_project_generation();
+        let project_a = ct::ProjectId::parse("0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59").unwrap();
+        store.project_context.identity = Some(project_a.clone());
+        store.project_context.lifecycle = crate::project_context::ProjectLifecycle::Open;
+
+        // B becomes active before A's result is delivered.
+        let gen_b = store.bump_project_generation();
+        let project_b = ct::ProjectId::parse("5f0c9d1a-7b2e-4e8f-a1c3-9d8e7f6a5b4c").unwrap();
+        store.project_context.identity = Some(project_b.clone());
+        assert!(store.is_current_generation(gen_b));
+        assert!(!store.is_current_generation(gen_a));
+
+        // Deliver A's result through the real ChatStore guarded apply path
+        // (called by the async loader). Dropped at the generation check:
+        // removing that guard would let stale work proceed past it.
+        let mut sink = Sink::default();
+        store.apply_loaded_ping_answers_result(
+            gen_a,
+            &project_a,
+            Ok(Some(vec!["✅".to_string()])),
+            StdHashMap::new(),
+            &mut sink,
+        );
+        assert_eq!(sink.notifies, 0, "stale A result dropped before apply");
+        assert!(sink.events.is_empty());
+        assert!(store.core.is_none(), "no stale core mutation");
     }
 }

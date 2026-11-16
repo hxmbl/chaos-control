@@ -13,6 +13,8 @@ mod pane_host;
 mod panels;
 mod profile;
 mod project;
+mod project_context;
+mod recents;
 mod refused;
 mod right_sidebar;
 mod search;
