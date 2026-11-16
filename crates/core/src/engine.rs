@@ -298,6 +298,14 @@ impl Engine {
         self.store.conn()
     }
 
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
+    }
+
     pub fn take_effects(&mut self) -> Vec<Effect> {
         std::mem::take(&mut self.effects)
     }
@@ -683,13 +691,16 @@ impl Engine {
         if author.kind == MemberKind::Human {
             return Ok(0);
         }
-        let c = self.conn();
-        let last_human = store::last_human_seq(c, channel)?;
+        let project = self.store.project_for_channel(channel).ok_or(PostError::UnknownChannel)?;
+        let ws = self.store.project_workspace(&project).map_err(|e| PostError::Store(e.to_string()))?;
+        let last_human = store::last_human_seq(ws, channel).map_err(|e| PostError::Store(e.to_string()))?;
         let base = match cause {
             Some(b) => {
+                let bproj = self.store.project_for_batch(b).ok_or(PostError::UnknownChannel)?;
+                let ag = self.store.project_agents(&bproj).map_err(|e| PostError::Store(e.to_string()))?;
                 let mut base = 0u8;
-                for t in store::batch_triggers(c, b)? {
-                    if let Some(m) = store::message(c, t.id.message)?
+                for t in store::batch_triggers(ag, b).map_err(|e| PostError::Store(e.to_string()))? {
+                    if let Some(m) = store::message(ws, t.id.message).map_err(|e| PostError::Store(e.to_string()))?
                         && m.seq > last_human
                     {
                         base = base.max(t.hop);
@@ -697,7 +708,7 @@ impl Engine {
                 }
                 base
             }
-            None => store::last_agent_message_after(c, channel, last_human)?
+            None => store::last_agent_message_after(ws, channel, last_human).map_err(|e| PostError::Store(e.to_string()))?
                 .map(|m| m.hop)
                 .unwrap_or(0),
         };
@@ -723,27 +734,22 @@ impl Engine {
                 channel,
                 message: r,
             };
-            if store::obligation_state(self.conn(), t)? == Some(ObligationState::Open) {
+            if self.store.obligation_state(t).map_err(|e| PostError::Store(e.to_string()))? == Some(ObligationState::Open) {
                 target = Some(t);
             }
         } else if let Some(b) = cause {
-            let open = store::open_obligations(self.conn(), b)?;
+            let open = self.store.open_obligations(b).map_err(|e| PostError::Store(e.to_string()))?;
             if open.len() == 1 {
                 target = Some(open[0]);
             }
         }
         if let Some(t) = target {
-            // A refusal is an answer like any other: it closes the obligation
-            // (as `refused`), so there is no fallback and no retry.
             let (state, kind) = match message.origin {
                 Origin::Refusal => (ObligationState::Refused, "refusal"),
                 Origin::Dissent => (ObligationState::Satisfied, "dissent"),
                 _ => (ObligationState::Satisfied, "send"),
             };
-            self.store.tx::<_, PostError>(|c| {
-                store::resolve_obligation(c, t, state, Some(message.id), kind)?;
-                Ok(())
-            })?;
+            self.store.resolve_obligation(t, state, Some(message.id), kind).map_err(|e| PostError::Store(e.to_string()))?;
         }
         if cause.is_some() {
             let rt = self.rt.entry((agent.id, channel)).or_default();
@@ -766,14 +772,13 @@ impl Engine {
             return Ok(());
         }
         let channel = message.channel;
-        let members = self.store.members_of(channel)?;
+        let members = self.store.members_of(channel).map_err(|e| PostError::Store(e.to_string()))?;
         let reply_parent_author = match message.reply_to {
-            Some(r) => self.store.message(r)?.and_then(|m| m.author),
+            Some(r) => self.store.message(r).map_err(|e| PostError::Store(e.to_string()))?.and_then(|m| m.author),
             None => None,
         };
         let mut woken = Vec::new();
         let mut trip_notice = None;
-        // The author already knows what it posted; every other agent hears it.
         for target in members
             .iter()
             .filter(|m| m.kind == MemberKind::Agent && m.id != author.id)
@@ -792,8 +797,8 @@ impl Engine {
                 channel,
                 message: message.id,
             };
-            if store::trigger_exists(self.conn(), id)? {
-                continue; // same message, same agent: already woken once
+            if self.store.trigger_exists(id).map_err(|e| PostError::Store(e.to_string()))? {
+                continue;
             }
             if author.kind == MemberKind::Agent {
                 if message.hop > self.policy.max_hops {
@@ -820,16 +825,14 @@ impl Engine {
                     Damp::Paused => continue,
                 }
             }
-            self.store.tx::<_, PostError>(|c| {
-                let batch = store::pending_batch_or_create(c, target.id, channel, now)?;
-                store::insert_trigger(c, id, reason, message.hop, batch.id, now)?;
+            {
+                let batch = self.store.pending_batch_or_create(target.id, channel, now).map_err(|e| PostError::Store(e.to_string()))?;
+                self.store.insert_trigger(id, reason, message.hop, batch.id, now).map_err(|e| PostError::Store(e.to_string()))?;
                 if reason.is_direct() {
-                    store::insert_obligation(c, id)?;
+                    self.store.insert_obligation(id).map_err(|e| PostError::Store(e.to_string()))?;
                 }
-                Ok(())
-            })?;
+            }
             if author.kind == MemberKind::Human {
-                // A human ping is a fresh start for an agent that went red.
                 let rt = self.rt.entry((target.id, channel)).or_default();
                 if rt.failures >= self.policy.max_failures || rt.red.is_some() {
                     rt.failures = 0;
@@ -1160,32 +1163,21 @@ impl Engine {
             return Ok(());
         };
         // Everything in it already answered (e.g. by a reply sent mid-turn)?
-        let triggers = store::batch_triggers(self.conn(), pending.id)?;
+        let triggers = self.store.batch_triggers(pending.id).map_err(|e| PostError::Store(e.to_string()))?;
         let needs_delivery = triggers.iter().any(|t| {
             !t.reason.is_direct()
-                || store::obligation_state(self.conn(), t.id).ok().flatten()
+                || self.store.obligation_state(t.id).ok().flatten()
                     == Some(ObligationState::Open)
         });
         if !needs_delivery {
-            self.store.tx::<_, PostError>(|c| {
-                store::set_batch_state(
-                    c,
-                    pending.id,
-                    BatchState::Settled,
-                    now,
-                    Some("answered before delivery"),
-                )?;
-                Ok(())
-            })?;
+            self.store.set_batch_state(pending.id, BatchState::Settled, now, Some("answered before delivery")).map_err(|e| PostError::Store(e.to_string()))?;
             return Ok(());
         }
-        let window_to = self.store.head_seq(channel)?;
-        let attempt = self
-            .store
-            .tx(|c| store::dispatch_batch(c, pending.id, window_to))?;
+        let window_to = self.store.head_seq(channel).map_err(|e| PostError::Store(e.to_string()))?;
+        let attempt = self.store.dispatch_batch(pending.id, window_to).map_err(|e| PostError::Store(e.to_string()))?;
         let answers = self.ping_answers(agent, channel);
-        let prompt = notify::compose(self.conn(), agent, channel, pending.id, window_to, &answers)?;
-        let orientation = notify::orientation(self.conn(), agent, channel)?;
+        let prompt = notify::compose(&self.store, agent, channel, pending.id, window_to, &answers).map_err(|e| PostError::Store(e.to_string()))?;
+        let orientation = notify::orientation(&self.store, agent, channel).map_err(|e| PostError::Store(e.to_string()))?;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.retry_at = None;
         rt.sent_in_turn.clear();

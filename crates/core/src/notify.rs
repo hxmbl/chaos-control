@@ -13,9 +13,7 @@
 
 use std::fmt::Write as _;
 
-use rusqlite::Connection;
-
-use crate::{reaction, store, types::*};
+use crate::{reaction, store::Store, types::*};
 
 pub const MAX_CONTEXT_MESSAGES: usize = 20;
 pub const MAX_CONTEXT_CHARS: usize = 6_000;
@@ -25,8 +23,8 @@ pub const MAX_REACTORS_SHOWN: usize = 3;
 /// Reactions on messages outside the prompt, listed at most.
 pub const MAX_OTHER_REACTIONS: usize = 10;
 
-fn author_label(c: &Connection, m: &Message) -> String {
-    match m.author.and_then(|a| store::member(c, a).ok().flatten()) {
+fn author_label(store: &Store, m: &Message) -> String {
+    match m.author.and_then(|a| store.member(a).ok().flatten()) {
         Some(who) => format!("{} (@{}, {})", who.name, who.handle, who.kind.as_str()),
         None => "system".into(),
     }
@@ -40,16 +38,17 @@ fn clip(body: &str, max: usize) -> (String, bool) {
     }
 }
 
-fn handle(c: &Connection, member: MemberId) -> String {
-    store::member(c, member)
+fn handle(store: &Store, member: MemberId) -> String {
+    store
+        .member(member)
         .ok()
         .flatten()
         .map_or_else(|| "?".to_string(), |m| format!("@{}", m.handle))
 }
 
 /// ` [👍 @hx @claude · 💀 @claude]`, or nothing when there are none.
-fn reactions_suffix(c: &Connection, message: MessageId) -> String {
-    let all = store::reactions_on(c, message).unwrap_or_default();
+fn reactions_suffix(store: &Store, message: MessageId) -> String {
+    let all = store.reactions_on(message).unwrap_or_default();
     if all.is_empty() {
         return String::new();
     }
@@ -60,7 +59,7 @@ fn reactions_suffix(c: &Connection, message: MessageId) -> String {
                 .members
                 .iter()
                 .take(MAX_REACTORS_SHOWN)
-                .map(|m| handle(c, *m))
+                .map(|m| handle(store, *m))
                 .collect();
             if g.members.len() > MAX_REACTORS_SHOWN {
                 who.push(format!("+{}", g.members.len() - MAX_REACTORS_SHOWN));
@@ -71,7 +70,7 @@ fn reactions_suffix(c: &Connection, message: MessageId) -> String {
     format!(" [{}]", groups.join(" · "))
 }
 
-fn line(c: &Connection, m: &Message, max: usize) -> String {
+fn line(store: &Store, m: &Message, max: usize) -> String {
     let (body, cut) = clip(&m.body, max);
     let reply = m.reply_to.map(|r| format!(" ↩ id:{r}")).unwrap_or_default();
     let cut = if cut {
@@ -90,31 +89,32 @@ fn line(c: &Connection, m: &Message, max: usize) -> String {
         m.id,
         reply,
         stance,
-        author_label(c, m),
+        author_label(store, m),
         body,
         cut,
-        reactions_suffix(c, m.id)
+        reactions_suffix(store, m.id)
     )
 }
 
 /// The turn prompt for one batch. `answers` is which reactions answer a ping
 /// for this agent (named in the "you owe a reply" line).
 pub fn compose(
-    c: &Connection,
+    store: &Store,
     agent: MemberId,
     channel: ChannelId,
     batch: BatchId,
     window_to: Seq,
     answers: &reaction::PingAnswers,
 ) -> rusqlite::Result<String> {
-    let ch = store::channel(c, channel)?
+    let ch = store
+        .channel(channel)?
         .map(|c| c.name)
         .unwrap_or_default();
-    let cursor = store::cursor(c, agent, channel)?;
-    let triggers = store::batch_triggers(c, batch)?;
+    let cursor = store.cursor(agent, channel)?;
+    let triggers = store.batch_triggers(batch)?;
     let mut trigger_msgs = Vec::new();
     for t in &triggers {
-        if let Some(m) = store::message(c, t.id.message)? {
+        if let Some(m) = store.message(t.id.message)? {
             trigger_msgs.push((t.clone(), m));
         }
     }
@@ -132,12 +132,12 @@ pub fn compose(
         push(m.clone(), &mut picked, &mut chars);
     }
     for (_, m) in &trigger_msgs {
-        if let Some(p) = m.reply_to.and_then(|r| store::message(c, r).ok().flatten()) {
+        if let Some(p) = m.reply_to.and_then(|r| store.message(r).ok().flatten()) {
             push(p, &mut picked, &mut chars);
         }
     }
     let unread_from = cursor.read_through;
-    let unread = store::messages_between(c, channel, unread_from, window_to, 10_000)?;
+    let unread = store.messages_between(channel, unread_from, window_to, 10_000)?;
     let unread_total = unread.len();
     // Unread that mention this agent first, then the rest, newest first.
     let (mine, rest): (Vec<_>, Vec<_>) = unread
@@ -167,7 +167,7 @@ pub fn compose(
                 WakeReason::Everyone => "pinged @everyone",
                 WakeReason::Broadcast => "posted a message",
             };
-            format!("{} {how}", author_label(c, m))
+            format!("{} {how}", author_label(store, m))
         })
         .collect();
     let _ = writeln!(out, "[chaos-control] #{ch} · {}", who.join("; "));
@@ -190,25 +190,25 @@ pub fn compose(
         } else {
             MAX_BODY_CHARS
         };
-        let _ = writeln!(out, "{}", line(c, m, max));
+        let _ = writeln!(out, "{}", line(store, m, max));
     }
-    // Reactions since the agent last read, on messages not shown above (those
-    // carry theirs on their own line). Others' reactions only.
+    // Reactions since the agent last read, on messages not shown above.
     if let Some(since) = cursor.read_at {
         let shown: Vec<MessageId> = picked.iter().map(|m| m.id).collect();
-        let others: Vec<String> = store::reactions_since(c, channel, since, 200)?
+        let others: Vec<String> = store
+            .reactions_since(channel, since, 200)?
             .into_iter()
             .filter(|r| r.member != agent && !shown.contains(&r.message))
             .take(MAX_OTHER_REACTIONS)
             .map(|r| {
-                let target = store::message(c, r.message).ok().flatten();
+                let target = store.message(r.message).ok().flatten();
                 let whose = match target.as_ref().and_then(|t| t.author) {
                     Some(a) if a == agent => " (yours)",
                     _ => "",
                 };
-                let at =
-                    target.map_or_else(|| format!("id:{}", r.message), |t| format!("#{}", t.seq));
-                format!("{} {} on {at}{whose}", r.emoji, handle(c, r.member))
+                let at = target
+                    .map_or_else(|| format!("id:{}", r.message), |t| format!("#{}", t.seq));
+                format!("{} {} on {at}{whose}", r.emoji, handle(store, r.member))
             })
             .collect();
         if !others.is_empty() {
@@ -219,7 +219,7 @@ pub fn compose(
         .iter()
         .filter(|(t, _)| {
             t.reason.is_direct()
-                && store::obligation_state(c, t.id).ok().flatten() == Some(ObligationState::Open)
+                && store.obligation_state(t.id).ok().flatten() == Some(ObligationState::Open)
         })
         .map(|(_, m)| format!("id:{} (#{})", m.id, m.seq))
         .collect();
@@ -251,15 +251,13 @@ pub fn compose(
 
 /// Room norms, sent once at the start of a session.
 pub fn orientation(
-    c: &Connection,
+    store: &Store,
     agent: MemberId,
     channel: ChannelId,
 ) -> rusqlite::Result<String> {
-    let me = store::member(c, agent)?;
-    let ch = store::channel(c, channel)?
-        .map(|c| c.name)
-        .unwrap_or_default();
-    let nicknames = store::nicknames_in(c, channel)?;
+    let me = store.member(agent)?;
+    let ch = store.channel(channel)?.map(|c| c.name).unwrap_or_default();
+    let nicknames = store.nicknames_in(channel)?;
     let aka = |id: MemberId| -> Vec<String> {
         nicknames
             .iter()
@@ -267,7 +265,8 @@ pub fn orientation(
             .map(|(_, n)| format!("@{n}"))
             .collect()
     };
-    let members: Vec<String> = store::members_of(c, channel)?
+    let members: Vec<String> = store
+        .members_of(channel)?
         .into_iter()
         .filter(|m| m.id != agent)
         .map(|m| {
@@ -285,16 +284,12 @@ pub fn orientation(
         })
         .collect();
     let handle = me.map(|m| m.handle).unwrap_or_default();
-    // Nicknames (STRM-560) reach this agent exactly like its handle.
-    let mine = store::nicknames_of(c, agent)?;
-    let (also, _also_woken) = if mine.is_empty() {
-        (String::new(), String::new())
+    let mine = store.nicknames_of(agent)?;
+    let also = if mine.is_empty() {
+        String::new()
     } else {
         let list: Vec<String> = mine.iter().map(|n| format!("@{n}")).collect();
-        (
-            format!(" (nicknames: {})", list.join(", ")),
-            format!(" or a nickname ({})", list.join(", ")),
-        )
+        format!(" (nicknames: {})", list.join(", "))
     };
     Ok(format!(
         "You are @{handle}{also} in #{ch} on Chaos Control, a group chat where humans and agents work things out together. \

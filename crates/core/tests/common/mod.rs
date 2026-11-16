@@ -199,14 +199,23 @@ impl Harness {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         loop {
             let p = pred.clone();
-            if self
+            let ok = self
                 .core
-                .with_engine(move |e, _| p(e.conn()))
+                .with_engine(move |e, _| {
+                    if p(e.conn()) { return true; }
+                    for proj in e.store().projects().unwrap_or_default() {
+                        if let Ok(ws) = e.store().project_workspace(&proj.id) {
+                            if p(ws) { return true; }
+                        }
+                        if let Ok(ag) = e.store().project_agents(&proj.id) {
+                            if p(ag) { return true; }
+                        }
+                    }
+                    false
+                })
                 .await
-                .unwrap()
-            {
-                return;
-            }
+                .unwrap();
+            if ok { return; }
             if tokio::time::Instant::now() > deadline {
                 panic!("timed out waiting until {what}");
             }
@@ -242,8 +251,10 @@ impl Harness {
         let main = self.main;
         self.core
             .with_engine(move |e, _| {
+                let project = e.store().project_for_channel(main).unwrap();
+                let ag = e.store().project_agents(&project).unwrap();
                 store::obligation_state(
-                    e.conn(),
+                    ag,
                     TriggerId {
                         agent,
                         channel: main,
@@ -258,7 +269,25 @@ impl Harness {
 
     pub async fn count(&self, sql: &'static str) -> i64 {
         self.core
-            .with_engine(move |e, _| e.conn().query_row(sql, [], |r| r.get(0)).unwrap())
+            .with_engine(move |e, _| {
+                // Try core DB first, then project DBs (batches/messages/channels live in project DBs).
+                if let Ok(v) = e.conn().query_row(sql, [], |r| r.get::<_, i64>(0)) {
+                    return v;
+                }
+                for proj in e.store().projects().unwrap_or_default() {
+                    if let Ok(ws) = e.store().project_workspace(&proj.id) {
+                        if let Ok(v) = ws.query_row(sql, [], |r| r.get::<_, i64>(0)) {
+                            return v;
+                        }
+                    }
+                    if let Ok(ag) = e.store().project_agents(&proj.id) {
+                        if let Ok(v) = ag.query_row(sql, [], |r| r.get::<_, i64>(0)) {
+                            return v;
+                        }
+                    }
+                }
+                panic!("count query failed: {sql}");
+            })
             .await
             .unwrap()
     }

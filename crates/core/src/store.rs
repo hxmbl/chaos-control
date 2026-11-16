@@ -681,20 +681,20 @@ impl Store {
 
     /// A private in-memory split store (tests). Backed by a temporary directory.
     pub fn open_in_memory() -> std::result::Result<Self, OpenError> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "chaos-control-store-{}-{}",
+            "chaos-control-store-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
+                .as_nanos(),
+            n
         ));
         std::fs::create_dir_all(&dir)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let mut store = Self::open(&dir)?;
-        // Remember temp dir so it can be cleaned up? Store owns path; tests
-        // drop it. Best-effort cleanup on drop is tricky without Drop impl
-        // changing semantics; leave for OS temp cleanup in tests.
         store.data_dir = dir;
         Ok(store)
     }
@@ -1385,18 +1385,13 @@ impl Store {
     pub fn reactions_since(
         &self,
         channel: ChannelId,
-        after_message: Seq,
+        since: Millis,
         limit: usize,
     ) -> Result<Vec<Reaction>> {
         let project = self
             .project_for_channel(channel)
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-        reactions_since(
-            self.project_workspace(&project)?,
-            channel,
-            after_message,
-            limit,
-        )
+        reactions_since(self.project_workspace(&project)?, channel, since, limit)
     }
     pub fn reactions_after_seq(
         &self,
@@ -1462,6 +1457,12 @@ impl Store {
             .project_for_batch(id)
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         requeue_batch(self.project_agents(&project)?, id)
+    }
+    pub fn trigger_exists(&self, id: TriggerId) -> Result<bool> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        trigger_exists(self.project_agents(&project)?, id)
     }
     pub fn insert_trigger(
         &self,
