@@ -150,20 +150,16 @@ async fn two_pings_mid_turn_merge_into_one_batch_and_keep_both_obligations() {
         "untargeted: no trigger"
     );
     h.fake("bot").gates.open("first");
-    let first = h
-        .wait_message("fallback to the first ping", Some(bot.id))
-        .await;
-    assert_eq!(first.reply_to, Some(one.id));
-    assert_eq!(first.origin, Origin::Fallback);
-    let second = h
-        .wait_message("fallback to the merged batch", Some(bot.id))
-        .await;
-    assert_eq!(second.origin, Origin::Fallback);
-    assert_eq!(
-        second.reply_to,
-        Some(four.id),
-        "one fallback, to the newest open trigger"
-    );
+    h.until("both turns settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 2
+    })
+    .await;
     h.quiesce().await;
     let prompts = h.prompts("bot");
     assert_eq!(
@@ -176,18 +172,25 @@ async fn two_pings_mid_turn_merge_into_one_batch_and_keep_both_obligations() {
             && prompts[1].contains(&format!("id:{}", four.id))
     );
     assert_eq!(
+        h.obligation(bot.id, one.id).await,
+        Some(ObligationState::Ignored)
+    );
+    assert_eq!(
         h.obligation(bot.id, two.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Ignored)
     );
     assert_eq!(
         h.obligation(bot.id, four.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Ignored)
     );
-    assert_eq!(agent_messages(&h.history().await, bot.id).len(), 2);
+    assert!(
+        agent_messages(&h.history().await, bot.id).is_empty(),
+        "no automatic fallback replies"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fallback_reply_only_when_the_obligation_is_unmet() {
+async fn final_text_stays_private_when_the_obligation_is_unanswered() {
     let mut h = Harness::new().await;
     let quiet = h
         .agent(
@@ -196,16 +199,23 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
         )
         .await;
     let ping = h.say("@quiet what is the answer?").await;
-    let m = h.wait_message("fallback", Some(quiet.id)).await;
-    assert_eq!(m.origin, Origin::Fallback);
-    assert_eq!(m.reply_to, Some(ping.id));
-    assert_eq!(&*m.body, "The answer is 42.");
+    h.until("quiet settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
+    assert!(agent_messages(&h.history().await, quiet.id).is_empty());
     assert_eq!(
         h.obligation(quiet.id, ping.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Ignored)
     );
 
-    // A reaction that answers it: no fallback.
+    // A reaction that answers it: no automatic reply.
     let reactor = h
         .agent(
             "reactor",
@@ -237,7 +247,8 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
     );
     assert!(agent_messages(&h.history().await, reactor.id).is_empty());
 
-    // An "on it" reaction does not answer: the fallback still posts.
+    // An "on it" reaction holds the obligation during the turn; final text
+    // remains private and the turn is treated as handled.
     let eyes = h
         .agent(
             "eyes",
@@ -248,8 +259,21 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
         )
         .await;
     let ping3 = h.say("@eyes look at this").await;
-    let m = h.wait_message("fallback after 👀", Some(eyes.id)).await;
-    assert_eq!(m.reply_to, Some(ping3.id));
+    h.until("eyes settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 3
+    })
+    .await;
+    assert!(agent_messages(&h.history().await, eyes.id).is_empty());
+    assert_eq!(
+        h.obligation(eyes.id, ping3.id).await,
+        Some(ObligationState::Satisfied)
+    );
 
     // Turn ends with no text and no reply: the agent ignored it, which is
     // legitimate. Nothing posted, nothing owed, never retried.
@@ -283,10 +307,10 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fallback_never_duplicates_an_explicit_send() {
+async fn final_text_never_duplicates_an_explicit_send() {
     let mut h = Harness::new().await;
     // No reply_to, but it is the only open obligation: the send answers it.
-    // The final text repeats the sent text.
+    // The final text repeats the sent text and must stay private.
     let bot = h
         .agent("bot", script(json!({"turns": [
             {"steps": [
@@ -328,7 +352,7 @@ async fn fallback_never_duplicates_an_explicit_send() {
     assert_eq!(
         mine.len(),
         2,
-        "no fallback after either explicit send: {mine:#?}"
+        "no extra automatic message after either explicit send: {mine:#?}"
     );
     assert!(mine.iter().all(|m| m.origin == Origin::ChatTool));
     assert_eq!(
@@ -338,11 +362,6 @@ async fn fallback_never_duplicates_an_explicit_send() {
     assert_eq!(
         h.obligation(bot.id, p2.id).await,
         Some(ObligationState::Satisfied)
-    );
-    assert_eq!(
-        h.count("SELECT COUNT(*) FROM messages WHERE origin = 'fallback'")
-            .await,
-        0
     );
 }
 
@@ -533,22 +552,34 @@ async fn slow_v1_turn_is_never_retried_after_acceptance() {
     assert_eq!(h.prompts("bot").len(), 1);
     assert_eq!(h.count("SELECT attempts FROM batches").await, 1);
     h.fake("bot").gates.open("done");
-    let reply = h.wait_message("reply", Some(bot.id)).await;
-    assert_eq!(reply.reply_to, Some(ping.id));
-    assert_eq!(&*reply.body, "All 4,000 tests pass.");
+    h.until("settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
     h.quiesce().await;
+    assert!(h.by(bot.id).await.is_empty(), "final text stays private");
+    assert_eq!(
+        h.obligation(bot.id, ping.id).await,
+        Some(ObligationState::Ignored)
+    );
     assert_eq!(h.prompts("bot").len(), 1);
 
     // Slow *before* acceptance (no update at all yet) is not a failure either:
     // it is never retried while the request is outstanding.
     let mut h = Harness::new().await;
-    let _slow = h
+    let slow = h
         .agent(
             "slow",
             script(json!({"turns": [{"steps": [{"gate": "go"}, {"text": "ok"}]}]})),
         )
         .await;
-    h.say("@slow hi").await;
+    let ping = h.say("@slow hi").await;
     h.until("dispatched", |c| {
         c.query_row(
             "SELECT COUNT(*) FROM batches WHERE state = 'dispatched'",
@@ -564,7 +595,21 @@ async fn slow_v1_turn_is_never_retried_after_acceptance() {
     }
     assert_eq!(h.prompts("slow").len(), 1);
     h.fake("slow").gates.open("go");
-    h.wait_message("reply", Some(_slow.id)).await;
+    h.until("slow settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
+    assert_eq!(
+        h.obligation(slow.id, ping.id).await,
+        Some(ObligationState::Ignored)
+    );
+    assert!(h.by(slow.id).await.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -582,9 +627,21 @@ async fn permission_request_is_auto_allowed() {
         )
         .await;
     let ping = h.say("@bot clean the build dir").await;
-    let reply = h.wait_message("fallback", Some(bot.id)).await;
-    assert_eq!(reply.reply_to, Some(ping.id));
-    assert_eq!(&*reply.body, "Deleted build/.");
+    h.until("settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
+    assert_eq!(
+        h.obligation(bot.id, ping.id).await,
+        Some(ObligationState::Ignored)
+    );
+    assert!(h.by(bot.id).await.is_empty(), "final text stays private");
     let outcomes = h
         .fake("bot")
         .observed
@@ -613,6 +670,7 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
         )
         .await;
     h.say("@bot are you there?").await;
+    h.quiesce().await;
     h.until("first failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
             .unwrap()
@@ -627,7 +685,7 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
         Glow::Active,
         "retrying"
     );
-    h.advance(1_100).await; // backoff 1s (+margin for CI scheduling)
+    h.advance(2_000).await; // backoff 1s (+margin for CI scheduling)
     h.quiesce().await;
     h.until("second failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
@@ -638,7 +696,7 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
                 == "pending"
     })
     .await;
-    h.advance(5_100).await; // backoff 5s (+margin for CI scheduling)
+    h.advance(6_000).await; // backoff 5s (+margin for CI scheduling)
     h.quiesce().await;
     h.until("third failure", |c| {
         c.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
@@ -694,8 +752,22 @@ async fn untargeted_message_wakes_nobody() {
     );
     assert_eq!(h.core.live_tokens(), 0, "no session was started");
     // When it is woken later, the untargeted messages arrive as context.
-    h.say("@bot anything new?").await;
-    h.wait_message("reply", Some(bot.id)).await;
+    let ping = h.say("@bot anything new?").await;
+    h.until("settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
+    assert_eq!(
+        h.obligation(bot.id, ping.id).await,
+        Some(ObligationState::Ignored)
+    );
+    assert!(h.by(bot.id).await.is_empty(), "final text stays private");
     assert!(h.prompts("bot")[0].contains("morning all, CI is green again"));
 }
 

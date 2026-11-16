@@ -248,13 +248,9 @@ async fn a_cancel_does_not_leak_into_the_next_turn() {
         Some(ObligationState::Satisfied)
     );
 
-    // Once idle, a later ping also completes, with a fallback reply: the
-    // cancel left no state behind in the adapter, the session or the fake.
+    // Once idle, a later ping also completes. Final text is private, so the
+    // obligation is left ignored with no automatic reply posted.
     let third = h.say("@bot and now?").await;
-    let fallback = h.wait_message("third turn's fallback", Some(bot.id)).await;
-    assert_eq!(fallback.origin, Origin::Fallback);
-    assert_eq!(fallback.reply_to, Some(third.id));
-    assert_eq!(&*fallback.body, "third: all green");
     h.until("three turns settled", batches_in("settled", 3))
         .await;
     assert_eq!(
@@ -267,7 +263,14 @@ async fn a_cancel_does_not_leak_into_the_next_turn() {
     );
     assert_eq!(
         h.obligation(bot.id, third.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Ignored)
+    );
+    assert!(
+        h.by(bot.id)
+            .await
+            .iter()
+            .all(|m| m.reply_to != Some(third.id)),
+        "no automatic fallback reply for the third ping"
     );
     assert_eq!(cancels(&h, "bot"), 1);
     assert_eq!(h.prompts("bot").len(), 3);

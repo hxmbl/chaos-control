@@ -102,8 +102,8 @@ async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
     );
 
     // 💀 is recorded but doesn't answer: the obligation stays open during the
-    // turn and the usual turn-end rules apply. With final text, that text is
-    // the fallback reply; with none, the ping was ignored.
+    // turn and the usual turn-end rules apply. Final text is private, so with
+    // no explicit reply the ping is ignored; with no text it is ignored too.
     let skull = h
         .agent(
             "skull",
@@ -114,9 +114,9 @@ async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
     settled(&mut h, 2).await;
     assert_eq!(
         h.obligation(skull.id, ping2.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Ignored)
     );
-    assert_eq!(h.by(skull.id).await.len(), 1, "the final text was posted");
+    assert!(h.by(skull.id).await.is_empty(), "final text stays private");
     assert_eq!(
         h.count("SELECT COUNT(*) FROM reactions WHERE emoji = '💀'")
             .await,
@@ -284,7 +284,9 @@ async fn a_wildcard_lets_any_emoji_but_eyes_answer() {
 async fn eyes_always_keeps_the_obligation_open_during_the_turn() {
     let mut h = Harness::new().await;
     // Even when every emoji answers (project "*" and the agent's own "*"),
-    // 👀 leaves the reply owed: the final text is still posted as the reply.
+    // 👀 leaves the reply owed during the turn. Final text stays private, so
+    // the obligation is ignored when the turn completes without an explicit
+    // reply.
     h.core
         .set_ping_answer_reactions(project_id(), Some(vec!["*".into()]))
         .await
@@ -297,13 +299,12 @@ async fn eyes_always_keeps_the_obligation_open_during_the_turn() {
         )
         .await;
     let ping = h.say("@eyes can you look").await;
-    let reply = h.wait_message("eyes' fallback", Some(eyes.id)).await;
     settled(&mut h, 1).await;
-    assert_eq!(&*reply.body, "Looking now.");
     assert_eq!(
         h.obligation(eyes.id, ping.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Satisfied)
     );
+    assert!(h.by(eyes.id).await.is_empty(), "final text stays private");
     let other = h.say("another").await;
     let r = tool(
         &h,
