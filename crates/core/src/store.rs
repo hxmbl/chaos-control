@@ -2072,10 +2072,10 @@ fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenErr
     };
     // If core.db exists but legacy still exists, prefer completing a verified split layout
     // (e.g. crash after migration but before backup rename) over destructive retry.
-    // Require an explicit completion marker to avoid accepting empty-but-valid DBs.
+    // Require an explicit, valid completion marker to avoid accepting empty-but-valid DBs.
     if core_db.exists() && legacy.exists() {
         let marker = split_migration_marker(data_dir);
-        let mut valid = marker.exists();
+        let mut valid = is_valid_split_migration_marker(data_dir);
         if valid
             && let Ok(core) = open_db(&core_db, CORE_MIGRATIONS)
             && let Ok(projects) = core_project_ids(&core)
@@ -2115,8 +2115,7 @@ fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenErr
         let _ws = open_db(&dir.join("workspace.db"), WORKSPACE_MIGRATIONS)?;
         let _ag = open_db(&dir.join("agents.db"), AGENTS_MIGRATIONS)?;
     }
-    std::fs::write(split_migration_marker(data_dir), b"1")
-        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    write_split_migration_marker_atomic(data_dir)?;
     if legacy.exists() {
         std::fs::rename(&legacy, &backup)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
@@ -2360,8 +2359,37 @@ fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), Ope
     Ok(())
 }
 
+const SPLIT_MIGRATION_MARKER_CONTENT: &[u8] = b"v1\n";
+
 fn split_migration_marker(data_dir: &Path) -> PathBuf {
     data_dir.join("core.split-migration-complete")
+}
+
+fn is_valid_split_migration_marker(data_dir: &Path) -> bool {
+    let marker = split_migration_marker(data_dir);
+    match std::fs::read(&marker) {
+        Ok(bytes) => bytes == SPLIT_MIGRATION_MARKER_CONTENT,
+        Err(_) => false,
+    }
+}
+
+fn write_split_migration_marker_atomic(data_dir: &Path) -> std::result::Result<(), OpenError> {
+    use std::io::Write;
+    let marker = split_migration_marker(data_dir);
+    let tmp = data_dir.join("core.split-migration-complete.tmp");
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    f.write_all(SPLIT_MIGRATION_MARKER_CONTENT)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    f.sync_all()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    drop(f);
+    std::fs::rename(&tmp, &marker)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    if let Ok(dir) = std::fs::File::open(data_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 fn table_exists(c: &Connection, name: &str) -> Result<bool> {
@@ -6087,6 +6115,123 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))
             .unwrap();
         assert_eq!(batches, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_recovery_retries_partial_split_with_empty_id_tables_and_copied_core_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-partial-empty-ids-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+
+        // Legacy DB: project/member metadata exists, but channel/message/batch ID tables are empty.
+        {
+            let conn = Connection::open(&legacy).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            super::run_migrations(&conn, LEGACY_MIGRATIONS, 0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', '/tmp/alpha', 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+        }
+
+        // Interrupted/partial state: copied core metadata, schema-valid empty project DBs, no valid marker.
+        let plant_partial = |dir: &std::path::Path| {
+            let core = super::open_db(&dir.join("core.db"), CORE_MIGRATIONS).unwrap();
+            core.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', '/tmp/alpha', 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+            drop(core);
+            let pdir = dir.join("Projects").join(P1);
+            std::fs::create_dir_all(&pdir).unwrap();
+            let _ws = super::open_db(&pdir.join("workspace.db"), WORKSPACE_MIGRATIONS).unwrap();
+            let _ag = super::open_db(&pdir.join("agents.db"), AGENTS_MIGRATIONS).unwrap();
+        };
+
+        // Case A: missing marker.
+        plant_partial(&dir);
+        assert!(!super::split_migration_marker(&dir).exists());
+        let mut s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "legacy must not be discarded without a valid marker"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+        assert_eq!(s.projects().unwrap().len(), 1);
+        assert!(s.is_project_member(&pid(P1), MemberId(1)).unwrap());
+        assert_eq!(s.allocate_id("channel").unwrap(), 1);
+        assert_eq!(s.allocate_id("message").unwrap(), 1);
+        assert_eq!(s.allocate_id("batch").unwrap(), 1);
+        drop(s);
+
+        // Reset for case B: recreate legacy and plant partial state with an empty (invalid) marker.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&legacy).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            super::run_migrations(&conn, LEGACY_MIGRATIONS, 0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', '/tmp/alpha', 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+        }
+        plant_partial(&dir);
+        std::fs::write(super::split_migration_marker(&dir), b"").unwrap();
+        let s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "empty marker must never certify completion; legacy must be migrated"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+        assert_eq!(s.projects().unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
