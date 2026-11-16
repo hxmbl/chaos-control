@@ -6001,4 +6001,93 @@ mod tests {
         assert_eq!(s.allocate_id("batch").unwrap(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn migration_recovery_retries_markerless_partial_split_with_empty_project_dbs() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-partial-markerless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+
+        // Interrupted/partial state: core.db copied with project metadata, per-project DBs exist
+        // with schema but no copied data (including missing project_settings), and no marker.
+        {
+            let core = super::open_db(&dir.join("core.db"), CORE_MIGRATIONS).unwrap();
+            core.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1,'Alpha','/tmp/a',1,0)",
+                params![P1],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1,'Beta','/tmp/b',2,0)",
+                params![P2],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1,'human','hx','Hx'), (2,'agent','claude','Claude')",
+                [],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1,1,1),(?1,2,1),(?2,1,2),(?2,2,2)",
+                params![P1, P2],
+            )
+            .unwrap();
+            drop(core);
+
+            for p in [P1, P2] {
+                let pdir = dir.join("Projects").join(p);
+                std::fs::create_dir_all(&pdir).unwrap();
+                let _ws = super::open_db(&pdir.join("workspace.db"), WORKSPACE_MIGRATIONS).unwrap();
+                let _ag = super::open_db(&pdir.join("agents.db"), AGENTS_MIGRATIONS).unwrap();
+            }
+            assert!(!super::split_migration_marker(&dir).exists());
+        }
+        assert!(legacy.exists());
+
+        let s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "legacy must be migrated, not accepted as complete"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+
+        // Data copied from legacy, including project_settings that were missing in partial state.
+        let ws1 = s.project_workspace(&pid(P1)).unwrap();
+        let setting: Option<String> = ws1
+            .query_row(
+                "SELECT value FROM project_settings WHERE project_id=?1 AND key='k'",
+                params![P1],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(setting.as_deref(), Some("v"));
+        let msg_ids: Vec<i64> = {
+            let mut st = ws1.prepare("SELECT id FROM messages ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(msg_ids, vec![100, 101]);
+        let batches: i64 = s
+            .project_agents(&pid(P1))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(batches, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
