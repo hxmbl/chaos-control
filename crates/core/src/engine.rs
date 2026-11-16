@@ -1155,7 +1155,7 @@ impl Engine {
             runtime,
             created_at: now,
         };
-        self.store.tx(|c| store::insert_stance(c, &stance))?;
+        self.store.insert_stance(&stance).map_err(|e| PostError::Store(e.to_string()))?;
         if req.kind == StanceKind::Refusal && !posted.deduped {
             let target_seq = self.store.message(req.target)?.map(|m| m.seq);
             // Agents only (humans have no runtime state or presence).
