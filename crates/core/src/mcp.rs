@@ -39,7 +39,7 @@ use serde_json::{Value, json};
 
 use crate::{
     engine::{Engine, PostError, PostRequest, StanceRequest},
-    reaction, store,
+    reaction,
     types::*,
 };
 
@@ -238,10 +238,73 @@ impl From<rusqlite::Error> for ToolError {
     }
 }
 
-fn message_view(c: &rusqlite::Connection, m: &Message) -> Value {
+fn arg_u64(args: &Value, key: &str) -> Option<u64> {
+    args.get(key).and_then(Value::as_u64)
+}
+
+/// The project the session's channel belongs to. Every name an agent passes
+/// resolves inside it, so a channel in another project doesn't exist as far as
+/// the agent can tell.
+fn scope_project(engine: &Engine, scope: Scope) -> Result<ProjectId, ToolError> {
+    engine
+        .store()
+        .project_for_channel(scope.channel)
+        .ok_or_else(|| ToolError("not_found: no such channel".into()))
+}
+
+fn channel_arg(engine: &Engine, scope: Scope, args: &Value) -> Result<ChannelId, ToolError> {
+    match args.get("channel").and_then(Value::as_str) {
+        None => Ok(scope.channel),
+        Some(name) => {
+            let project = scope_project(engine, scope)?;
+            let ch = engine
+                .store()
+                .channel_in_project(&project, name)?
+                .ok_or_else(|| ToolError("not_found: no such channel".into()))?;
+            if engine.store().is_member(ch.id, scope.agent)? {
+                Ok(ch.id)
+            } else {
+                Err(ToolError("not_found: no such channel".into()))
+            }
+        }
+    }
+}
+
+/// Read receipts in `channel` for everyone but `me` (humans only if
+/// `humans_only`).
+fn receipt_views(
+    engine: &Engine,
+    channel: ChannelId,
+    me: MemberId,
+    humans_only: bool,
+) -> Result<Vec<Value>, ToolError> {
+    let mut out = Vec::new();
+    for r in engine.store().receipts(channel)? {
+        if r.member == me {
+            continue;
+        }
+        let Some(m) = engine.store().member(r.member)? else {
+            continue;
+        };
+        if humans_only && m.kind != MemberKind::Human {
+            continue;
+        }
+        out.push(json!({
+            "handle": m.handle,
+            "name": m.name,
+            "kind": m.kind.as_str(),
+            "read_through": r.read_through,
+            "read_at": r.read_at,
+            "summary": format!("{} read up to #{}", m.name, r.read_through),
+        }));
+    }
+    Ok(out)
+}
+
+fn message_view(engine: &Engine, m: &Message) -> Value {
     let author = m
         .author
-        .and_then(|a| store::member(c, a).ok().flatten())
+        .and_then(|a| engine.store().member(a).ok().flatten())
         .map(|a| json!({"handle": a.handle, "name": a.name, "kind": a.kind.as_str()}))
         .unwrap_or(json!({"handle": "system", "kind": "system"}));
     let (body, truncated) = if m.body.chars().count() > 4_000 {
@@ -257,11 +320,11 @@ fn message_view(c: &rusqlite::Connection, m: &Message) -> Value {
         v["reply_to"] = json!(r);
     }
     if matches!(m.origin, Origin::Refusal | Origin::Dissent)
-        && let Ok(Some(st)) = store::stance(c, m.id)
+        && let Ok(Some(st)) = engine.store().stance(m.id)
     {
-        v["stance"] = stance_view(c, &st);
+        v["stance"] = stance_view(engine, &st);
     }
-    let reactions = reaction_views(c, m.id);
+    let reactions = reaction_views(engine, m.id);
     if !reactions.is_empty() {
         v["reactions"] = json!(reactions);
     }
@@ -271,10 +334,8 @@ fn message_view(c: &rusqlite::Connection, m: &Message) -> Value {
     v
 }
 
-/// Reactions on one message, grouped by emoji in order of first use, e.g.
-/// `[{"emoji": "👍", "count": 2, "by": ["hx", "claude"]}]`.
-fn reaction_views(c: &rusqlite::Connection, message: MessageId) -> Vec<Value> {
-    let Ok(all) = store::reactions_on(c, message) else {
+fn reaction_views(engine: &Engine, message: MessageId) -> Vec<Value> {
+    let Ok(all) = engine.store().reactions_on(message) else {
         return Vec::new();
     };
     reaction::group(&all)
@@ -283,7 +344,7 @@ fn reaction_views(c: &rusqlite::Connection, message: MessageId) -> Vec<Value> {
             let by: Vec<Arc<str>> = g
                 .members
                 .iter()
-                .filter_map(|m| store::member(c, *m).ok().flatten())
+                .filter_map(|m| engine.store().member(*m).ok().flatten())
                 .map(|m| m.handle)
                 .collect();
             json!({"emoji": g.emoji, "count": g.members.len(), "by": by})
@@ -291,12 +352,14 @@ fn reaction_views(c: &rusqlite::Connection, message: MessageId) -> Vec<Value> {
         .collect()
 }
 
-/// A recent reaction for `chat_context`, e.g. `{"emoji": "💀", "by": "hx",
-/// "message_id": 12, "target_seq": 4, "at": ..., "summary": "Hx reacted 💀
-/// to #4"}`.
-fn recent_reaction_view(c: &rusqlite::Connection, r: &Reaction) -> Value {
-    let by = store::member(c, r.member).ok().flatten();
-    let seq = store::message(c, r.message).ok().flatten().map(|m| m.seq);
+fn recent_reaction_view(engine: &Engine, r: &Reaction) -> Value {
+    let by = engine.store().member(r.member).ok().flatten();
+    let seq = engine
+        .store()
+        .message(r.message)
+        .ok()
+        .flatten()
+        .map(|m| m.seq);
     let name = by
         .as_ref()
         .map_or("someone".to_string(), |m| m.name.to_string());
@@ -311,12 +374,9 @@ fn recent_reaction_view(c: &rusqlite::Connection, r: &Reaction) -> Value {
     })
 }
 
-/// A recorded refusal or dissent, e.g. `{"kind": "refusal", "by": {...},
-/// "target": 12, "reason": "...", "model": "...", "summary": "Claude refused
-/// #4"}`.
-fn stance_view(c: &rusqlite::Connection, st: &Stance) -> Value {
-    let by = store::member(c, st.member).ok().flatten();
-    let target = store::message(c, st.target).ok().flatten();
+fn stance_view(engine: &Engine, st: &Stance) -> Value {
+    let by = engine.store().member(st.member).ok().flatten();
+    let target = engine.store().message(st.target).ok().flatten();
     let name = by
         .as_ref()
         .map_or("someone".to_string(), |m| m.name.to_string());
@@ -349,67 +409,6 @@ fn stance_view(c: &rusqlite::Connection, st: &Stance) -> Value {
     v
 }
 
-fn arg_u64(args: &Value, key: &str) -> Option<u64> {
-    args.get(key).and_then(Value::as_u64)
-}
-
-/// The project the session's channel belongs to. Every name an agent passes
-/// resolves inside it, so a channel in another project doesn't exist as far as
-/// the agent can tell.
-fn scope_project(engine: &Engine, scope: Scope) -> Result<ProjectId, ToolError> {
-    Ok(store::channel(engine.conn(), scope.channel)?
-        .ok_or_else(|| ToolError("not_found: no such channel".into()))?
-        .project)
-}
-
-fn channel_arg(engine: &Engine, scope: Scope, args: &Value) -> Result<ChannelId, ToolError> {
-    match args.get("channel").and_then(Value::as_str) {
-        None => Ok(scope.channel),
-        Some(name) => {
-            let project = scope_project(engine, scope)?;
-            let ch = store::channel_in_project(engine.conn(), &project, name)?
-                .ok_or_else(|| ToolError("not_found: no such channel".into()))?;
-            if store::is_member(engine.conn(), ch.id, scope.agent)? {
-                Ok(ch.id)
-            } else {
-                Err(ToolError("not_found: no such channel".into()))
-            }
-        }
-    }
-}
-
-/// Read receipts in `channel` for everyone but `me` (humans only if
-/// `humans_only`), e.g. `{"handle": "hx", ..., "read_through": 42,
-/// "summary": "Hx read up to #42"}`. `read_at` is Unix milliseconds.
-fn receipt_views(
-    c: &rusqlite::Connection,
-    channel: ChannelId,
-    me: MemberId,
-    humans_only: bool,
-) -> Result<Vec<Value>, ToolError> {
-    let mut out = Vec::new();
-    for r in store::receipts(c, channel)? {
-        if r.member == me {
-            continue;
-        }
-        let Some(m) = store::member(c, r.member)? else {
-            continue;
-        };
-        if humans_only && m.kind != MemberKind::Human {
-            continue;
-        }
-        out.push(json!({
-            "handle": m.handle,
-            "name": m.name,
-            "kind": m.kind.as_str(),
-            "read_through": r.read_through,
-            "read_at": r.read_at,
-            "summary": format!("{} read up to #{}", m.name, r.read_through),
-        }));
-    }
-    Ok(out)
-}
-
 /// Runs one tool for `scope`. Pure over the engine, so it is testable without
 /// HTTP; the server below is a thin shell around it.
 pub fn call_tool(
@@ -421,14 +420,17 @@ pub fn call_tool(
 ) -> Result<Value, ToolError> {
     match name {
         "chat_context" => {
-            let c = engine.conn();
-            let me =
-                store::member(c, scope.agent)?.ok_or_else(|| ToolError("unknown agent".into()))?;
-            let ch = store::channel(c, scope.channel)?
+            let me = engine
+                .store()
+                .member(scope.agent)?
+                .ok_or_else(|| ToolError("unknown agent".into()))?;
+            let ch = engine
+                .store()
+                .channel(scope.channel)?
                 .ok_or_else(|| ToolError("not_found: no such channel".into()))?;
-            let cursor = store::cursor(c, scope.agent, scope.channel)?;
-            let head = store::head_seq(c, scope.channel)?;
-            let nicknames = store::nicknames_in(c, scope.channel)?;
+            let cursor = engine.store().cursor(scope.agent, scope.channel)?;
+            let head = engine.store().head_seq(scope.channel)?;
+            let nicknames = engine.store().nicknames_in(scope.channel)?;
             let aka = |id: MemberId| -> Vec<Arc<str>> {
                 nicknames
                     .iter()
@@ -436,7 +438,9 @@ pub fn call_tool(
                     .map(|(_, n)| n.clone())
                     .collect()
             };
-            let members: Vec<Value> = store::members_of(c, scope.channel)?
+            let members: Vec<Value> = engine
+                .store()
+                .members_of(scope.channel)?
                 .into_iter()
                 .map(|m| {
                     let mut v =
@@ -453,63 +457,61 @@ pub fn call_tool(
                 })
                 .collect();
             Ok(json!({
-                "me": {"handle": me.handle, "name": me.name, "nicknames": store::nicknames_of(c, scope.agent)?},
+                "me": {"handle": me.handle, "name": me.name, "nicknames": engine.store().nicknames_of(scope.agent)?},
                 "channel": {"name": ch.name, "head_seq": head},
-                "project": store::project(c, &ch.project)?.map(|p| json!({"name": p.name})),
+                "project": engine.store().project(&ch.project)?.map(|p| json!({"name": p.name})),
                 "members": members,
                 "cursor": {"delivered_through": cursor.delivered_through, "read_through": cursor.read_through},
-                "read_receipts": receipt_views(c, scope.channel, scope.agent, false)?,
-                "stances": store::recent_stances(c, scope.channel, 10)?
-                    .iter()
-                    .map(|st| stance_view(c, st))
-                    .collect::<Vec<_>>(),
+                "read_receipts": receipt_views(engine, scope.channel, scope.agent, false)?,
+                "stances": engine.store().recent_stances(scope.channel, 10)?
+                    .iter().map(|st| stance_view(engine, st)).collect::<Vec<_>>(),
                 "ping_answer_reactions": engine.ping_answers(scope.agent, scope.channel).to_list(),
-                "recent_reactions": store::recent_reactions(c, scope.channel, 10)?
-                    .iter()
-                    .map(|r| recent_reaction_view(c, r))
-                    .collect::<Vec<_>>(),
+                "recent_reactions": engine.store().recent_reactions(scope.channel, 10)?
+                    .iter().map(|r| recent_reaction_view(engine, r)).collect::<Vec<_>>(),
                 "norms": "Speak with chat_send (reply_to the message you answer). React (chat_react) when no words are needed; reactions wake nobody. You may say no (chat_refuse) or disagree (chat_dissent) with your reason; both are fine and nobody overrules them. Mention people only when you need them; no @everyone.",
             }))
         }
         "chat_read" => {
             let channel = channel_arg(engine, scope, args)?;
             let limit = arg_u64(args, "limit").unwrap_or(20).clamp(1, 50) as usize;
-            let c = engine.conn();
-            let head = store::head_seq(c, channel)?;
-            let cursor = store::cursor(c, scope.agent, channel)?;
+            let head = engine.store().head_seq(channel)?;
+            let cursor = engine.store().cursor(scope.agent, channel)?;
             let (messages, forward) = if let Some(around) = arg_u64(args, "around") {
-                let m = store::message(c, MessageId(around as i64))?
+                let m = engine
+                    .store()
+                    .message(MessageId(around as i64))?
                     .filter(|m| m.channel == channel)
                     .ok_or_else(|| ToolError("not_found: no such message".into()))?;
                 let half = limit / 2;
-                let mut v = store::messages_before(c, channel, m.seq, half)?;
-                v.extend(store::messages_between(
-                    c,
+                let mut v = engine.store().messages_before(channel, m.seq, half)?;
+                v.extend(engine.store().messages_between(
                     channel,
-                    m.seq - 1,
+                    m.seq.saturating_sub(1),
                     head,
-                    limit - v.len(),
+                    limit.saturating_sub(v.len()),
                 )?);
                 (v, false)
             } else if let Some(before) = arg_u64(args, "before_seq") {
                 let after = arg_u64(args, "after_seq").unwrap_or(0);
-                let mut v = store::messages_before(c, channel, before, limit)?;
+                let mut v = engine.store().messages_before(channel, before, limit)?;
                 v.retain(|m| m.seq > after);
                 (v, false)
             } else {
                 let after = arg_u64(args, "after_seq").unwrap_or(cursor.read_through);
                 (
-                    store::messages_between(c, channel, after, head, limit)?,
+                    engine
+                        .store()
+                        .messages_between(channel, after, head, limit)?,
                     true,
                 )
             };
             let last = messages.last().map(|m| m.seq);
-            let views: Vec<Value> = messages.iter().map(|m| message_view(c, m)).collect();
+            let views: Vec<Value> = messages.iter().map(|m| message_view(engine, m)).collect();
             let has_more = forward && last.is_some_and(|s| s < head);
             if forward && let Some(seq) = last {
                 engine.advance_read(now, scope.agent, channel, seq);
             }
-            let read_by = receipt_views(engine.conn(), channel, scope.agent, true)?;
+            let read_by = receipt_views(engine, channel, scope.agent, true)?;
             let mut out = json!({
                 "messages": views,
                 "has_more": has_more,
@@ -532,18 +534,26 @@ pub fn call_tool(
                 vec![channel_arg(engine, scope, args)?]
             } else {
                 let project = scope_project(engine, scope)?;
-                store::channels_of(engine.conn(), scope.agent, &project)?
+                // search all channels in project visible to scope's project context; membership-filtered best effort
+                engine
+                    .store()
+                    .channels_in_project(&project)?
                     .into_iter()
+                    .filter(|c| engine.store().is_member(c.id, scope.agent).unwrap_or(false))
                     .map(|c| c.id)
                     .collect()
             };
-            let c = engine.conn();
-            let hits = store::search(c, &channels, query, limit)?;
+            let hits = engine.store().search_messages(&channels, query, limit)?;
             let hits: Vec<Value> = hits
                 .iter()
                 .map(|m| {
-                    let ch = store::channel(c, m.channel).ok().flatten().map(|c| c.name);
-                    json!({"channel": ch, "message": message_view(c, m)})
+                    let ch = engine
+                        .store()
+                        .channel(m.channel)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.name);
+                    json!({"channel": ch, "message": message_view(engine, m)})
                 })
                 .collect();
             Ok(json!({"hits": hits}))
@@ -589,31 +599,28 @@ pub fn call_tool(
                 .filter(|e| !e.trim().is_empty())
                 .ok_or_else(|| ToolError("emoji is required".into()))?;
             let remove = args.get("remove").and_then(Value::as_bool).unwrap_or(false);
-            // Only messages in this session's project: an id from another
-            // project reads as unknown, like a channel name would.
             let project = scope_project(engine, scope)?;
-            let in_scope = store::message(engine.conn(), MessageId(id as i64))?
-                .and_then(|m| store::channel(engine.conn(), m.channel).ok().flatten())
+            let in_scope = engine
+                .store()
+                .message(MessageId(id as i64))?
+                .and_then(|m| engine.store().channel(m.channel).ok().flatten())
                 .is_some_and(|ch| ch.project == project);
             if !in_scope {
                 return Err(PostError::UnknownMessage.into());
             }
             let message = MessageId(id as i64);
             let done = engine.react(now, scope.agent, message, emoji, !remove)?;
-            let target = store::message(engine.conn(), message)?;
             let answers_pings = !remove
-                && target.is_some_and(|m| {
-                    engine
-                        .ping_answers(scope.agent, m.channel)
-                        .answers(&done.emoji)
-                });
+                && engine
+                    .ping_answers(scope.agent, message_channel(engine, message)?)
+                    .answers(&done.emoji);
             Ok(json!({
                 "ok": true,
                 "emoji": done.emoji,
                 "removed": remove,
                 "changed": done.changed,
                 "answers_pings": answers_pings,
-                "reactions": reaction_views(engine.conn(), message),
+                "reactions": reaction_views(engine, message),
             }))
         }
         "chat_emoji_search" => {
@@ -676,6 +683,14 @@ pub fn call_tool(
         }
         other => Err(ToolError(format!("unknown tool {other}"))),
     }
+}
+
+fn message_channel(engine: &Engine, message: MessageId) -> Result<ChannelId, ToolError> {
+    Ok(engine
+        .store()
+        .message(message)?
+        .ok_or(PostError::UnknownMessage)?
+        .channel)
 }
 
 // ---------- HTTP server ----------

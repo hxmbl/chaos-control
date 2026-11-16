@@ -691,31 +691,21 @@ impl Engine {
         if author.kind == MemberKind::Human {
             return Ok(0);
         }
-        let project = self
+        let last_human = self
             .store
-            .project_for_channel(channel)
-            .ok_or(PostError::UnknownChannel)?;
-        let ws = self
-            .store
-            .project_workspace(&project)
+            .last_human_seq(channel)
             .map_err(|e| PostError::Store(e.to_string()))?;
-        let last_human =
-            store::last_human_seq(ws, channel).map_err(|e| PostError::Store(e.to_string()))?;
         let base = match cause {
             Some(b) => {
-                let bproj = self
-                    .store
-                    .project_for_batch(b)
-                    .ok_or(PostError::UnknownChannel)?;
-                let ag = self
-                    .store
-                    .project_agents(&bproj)
-                    .map_err(|e| PostError::Store(e.to_string()))?;
                 let mut base = 0u8;
-                for t in
-                    store::batch_triggers(ag, b).map_err(|e| PostError::Store(e.to_string()))?
+                for t in self
+                    .store
+                    .batch_triggers(b)
+                    .map_err(|e| PostError::Store(e.to_string()))?
                 {
-                    if let Some(m) = store::message(ws, t.id.message)
+                    if let Some(m) = self
+                        .store
+                        .message(t.id.message)
                         .map_err(|e| PostError::Store(e.to_string()))?
                         && m.seq > last_human
                     {
@@ -724,7 +714,9 @@ impl Engine {
                 }
                 base
             }
-            None => store::last_agent_message_after(ws, channel, last_human)
+            None => self
+                .store
+                .last_agent_message_after(channel, last_human)
                 .map_err(|e| PostError::Store(e.to_string()))?
                 .map(|m| m.hop)
                 .unwrap_or(0),
@@ -919,23 +911,21 @@ impl Engine {
         channel: ChannelId,
         text: &str,
     ) -> Result<Message, PostError> {
-        let m = self.store.tx::<_, PostError>(|c| {
-            Ok(store::insert_message(
-                c,
-                &NewMessage {
-                    channel,
-                    author: None,
-                    origin: Origin::System,
-                    body: text,
-                    reply_to: None,
-                    mentions: &[],
-                    hop: 0,
-                    cause_batch: None,
-                    client_request_id: None,
-                    sent_at: now,
-                },
-            )?)
-        })?;
+        let m = self
+            .store
+            .insert_message(&NewMessage {
+                channel,
+                author: None,
+                origin: Origin::System,
+                body: text,
+                reply_to: None,
+                mentions: &[],
+                hop: 0,
+                cause_batch: None,
+                client_request_id: None,
+                sent_at: now,
+            })
+            .map_err(|e| PostError::Store(e.to_string()))?;
         self.effects
             .push(Effect::Event(Box::new(CoreEvent::Message(m.clone()))));
         Ok(m)
@@ -969,22 +959,25 @@ impl Engine {
             return Err(PostError::UnknownMessage);
         }
         let answers = self.ping_answers(member, m.channel);
-        let changed = self.store.tx::<_, PostError>(|c| {
-            let changed = if add {
-                store::add_reaction(c, message, m.channel, member, &emoji, now)?
-            } else {
-                store::remove_reaction(c, message, member, &emoji)?
+        let changed = if add {
+            self.store
+                .add_reaction(message, m.channel, member, &emoji, now)
+                .map_err(|e| PostError::Store(e.to_string()))?
+        } else {
+            self.store
+                .remove_reaction(message, member, &emoji)
+                .map_err(|e| PostError::Store(e.to_string()))?
+        };
+        if add && changed && answers.answers(&emoji) {
+            let t = TriggerId {
+                agent: member,
+                channel: m.channel,
+                message,
             };
-            if add && answers.answers(&emoji) {
-                let t = TriggerId {
-                    agent: member,
-                    channel: m.channel,
-                    message,
-                };
-                store::resolve_obligation(c, t, ObligationState::Satisfied, None, "react")?;
-            }
-            Ok(changed)
-        })?;
+            let _ = self
+                .store
+                .resolve_obligation(t, ObligationState::Satisfied, None, "react");
+        }
         if changed {
             self.effects
                 .push(Effect::Event(Box::new(CoreEvent::Reaction {
@@ -1265,9 +1258,9 @@ impl Engine {
         channel: ChannelId,
         info: &SessionInfo,
     ) {
-        let _ = self.store.tx(|c| {
-            store::record_session(c, agent, channel, &info.protocol, &info.native_ref, now)
-        });
+        let _ = self
+            .store
+            .record_session(agent, channel, &info.protocol, &info.native_ref, now);
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.phase = Phase::Open;
         rt.idle_since = Some(now);
@@ -1384,18 +1377,21 @@ impl Engine {
     }
 
     fn accepted(&mut self, now: Millis, agent: MemberId, channel: ChannelId, turn: BatchId) {
-        let Ok(Some(b)) = store::batch(self.conn(), turn) else {
+        let Ok(Some(b)) = self.store.batch(turn) else {
             return;
         };
         if b.agent != agent || b.channel != channel || b.state != BatchState::Dispatched {
             return;
         }
         let window_to = b.window_to.unwrap_or(0);
-        let read = self.store.tx(|c| {
-            store::set_batch_state(c, turn, BatchState::Accepted, now, None)?;
-            store::advance_delivered(c, agent, channel, window_to, now)
-        });
-        if read.unwrap_or(false) {
+        let _ = self
+            .store
+            .set_batch_state(turn, BatchState::Accepted, now, None);
+        let read = self
+            .store
+            .advance_delivered(agent, channel, window_to, now)
+            .unwrap_or(false);
+        if read {
             self.publish_receipt(agent, channel);
         }
         let rt = self.rt.entry((agent, channel)).or_default();
@@ -1413,13 +1409,13 @@ impl Engine {
         kind: AgentErrorKind,
         error: &str,
     ) {
-        let Ok(Some(b)) = store::batch(self.conn(), turn) else {
+        let Ok(Some(b)) = self.store.batch(turn) else {
             return;
         };
         if b.state != BatchState::Dispatched {
             return; // accepted turns are never retried
         }
-        let _ = self.store.tx(|c| store::requeue_batch(c, turn));
+        let _ = self.store.requeue_batch(turn);
         let max = self.policy.max_failures;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.failures += 1;
@@ -1448,18 +1444,22 @@ impl Engine {
         err: &AgentError,
     ) {
         let error: &str = &err.message;
-        let Ok(Some(b)) = store::batch(self.conn(), turn) else {
+        let Ok(Some(b)) = self.store.batch(turn) else {
             return;
         };
         if !matches!(b.state, BatchState::Accepted | BatchState::Dispatched) {
             return;
         }
-        let _ = self.store.tx(|c| {
-            for t in store::open_obligations(c, turn)? {
-                store::resolve_obligation(c, t, ObligationState::Unmet, None, "turn_failed")?;
+        if let Ok(open) = self.store.open_obligations(turn) {
+            for t in open {
+                let _ =
+                    self.store
+                        .resolve_obligation(t, ObligationState::Unmet, None, "turn_failed");
             }
-            store::set_batch_state(c, turn, BatchState::Failed, now, Some(error))
-        });
+        }
+        let _ = self
+            .store
+            .set_batch_state(turn, BatchState::Failed, now, Some(error));
         let handle = self
             .store
             .member(agent)
@@ -1496,7 +1496,7 @@ impl Engine {
     /// Handles of the humans whose messages woke this batch.
     pub fn woken_by(&self, batch: BatchId) -> Vec<String> {
         let mut out = Vec::new();
-        for t in store::batch_triggers(self.conn(), batch).unwrap_or_default() {
+        for t in self.store.batch_triggers(batch).unwrap_or_default() {
             if let Ok(Some(m)) = self.store.message(t.id.message)
                 && let Some(a) = m.author
                 && let Ok(Some(who)) = self.store.member(a)
@@ -1524,43 +1524,45 @@ impl Engine {
         outcome: &TurnOutcome,
         final_text: &str,
     ) -> Result<(), PostError> {
-        let Some(b) = store::batch(self.conn(), turn)? else {
+        let Some(b) = self
+            .store
+            .batch(turn)
+            .map_err(|e| PostError::Store(e.to_string()))?
+        else {
             return Ok(());
         };
         if b.agent != agent || b.channel != channel || b.state != BatchState::Accepted {
             return Ok(());
         }
-        let open = store::open_obligations(self.conn(), turn)?;
+        let open = self
+            .store
+            .open_obligations(turn)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let _ = final_text;
         let _ = std::mem::take(&mut self.rt.entry((agent, channel)).or_default().sent_in_turn);
         let outcome_label = format!("{outcome:?}");
         if !open.is_empty() {
-            // A completed turn with nothing to say is the agent choosing to let
-            // the ping go: `ignored`, which is fine. Anything else (cancelled,
-            // refused, cut short) is `unmet`. A trigger the agent put 👀 on
-            // (an answering emoji closed it when it was added; this also
-            // catches one the config made answering since) was handled, not
-            // ignored. Any other reaction doesn't count: still `ignored`.
             let completed = *outcome == TurnOutcome::Completed;
             let answers = self.ping_answers(agent, channel);
             let mut ignored_any = false;
-            self.store.tx::<_, PostError>(|c| {
-                for t in &open {
-                    let (state, kind) = if !completed {
-                        (ObligationState::Unmet, "no_reply")
-                    } else if store::reactions_by(c, t.message, agent)?
-                        .iter()
-                        .any(|e| reaction::HOLDS_OBLIGATION.contains(&&**e) || answers.answers(e))
-                    {
+            for t in &open {
+                let (state, kind) = if !completed {
+                    (ObligationState::Unmet, "no_reply")
+                } else {
+                    let reacted = self.store.reactions_on(t.message).unwrap_or_default();
+                    if reacted.iter().filter(|r| r.member == agent).any(|r| {
+                        reaction::HOLDS_OBLIGATION.contains(&&*r.emoji) || answers.answers(&r.emoji)
+                    }) {
                         (ObligationState::Satisfied, "react")
                     } else {
                         ignored_any = true;
                         (ObligationState::Ignored, "ignored")
-                    };
-                    store::resolve_obligation(c, *t, state, None, kind)?;
-                }
-                Ok(())
-            })?;
+                    }
+                };
+                self.store
+                    .resolve_obligation(*t, state, None, kind)
+                    .map_err(|e| PostError::Store(e.to_string()))?;
+            }
             let rt = self.rt.entry((agent, channel)).or_default();
             if !completed {
                 rt.note = Some(Arc::from("turn ended without a reply"));
@@ -1568,10 +1570,9 @@ impl Engine {
                 rt.note = Some(Arc::from("read it and let it go"));
             }
         }
-        self.store.tx::<_, PostError>(|c| {
-            store::set_batch_state(c, turn, BatchState::Settled, now, Some(&outcome_label))?;
-            Ok(())
-        })?;
+        self.store
+            .set_batch_state(turn, BatchState::Settled, now, Some(&outcome_label))
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.activity = None;
         rt.status = None;
@@ -1647,7 +1648,7 @@ impl Engine {
 
     /// Read receipts in `channel` (see [`Receipt`]).
     pub fn receipts(&self, channel: ChannelId) -> rusqlite::Result<Vec<Receipt>> {
-        store::receipts(self.conn(), channel)
+        self.store.receipts(channel)
     }
 
     fn publish_receipt(&mut self, member: MemberId, channel: ChannelId) {

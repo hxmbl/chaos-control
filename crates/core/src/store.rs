@@ -1054,6 +1054,85 @@ impl Store {
         };
         channels_in_project_db(ws, project)
     }
+
+    pub fn channels_of(&self, member: MemberId, project: &ProjectId) -> Result<Vec<Channel>> {
+        let Ok(ws) = self.project_workspace(project) else {
+            return Ok(vec![]);
+        };
+        channels_of_db(ws, member, project)
+    }
+
+    pub fn search_messages(
+        &self,
+        channels: &[ChannelId],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let mut out = Vec::new();
+        let pattern = format!(
+            "%{}%",
+            query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        for ch in channels {
+            let Some(project) = self.project_for_channel(*ch) else {
+                continue;
+            };
+            let ws = self.project_workspace(&project)?;
+            out.extend(search_in_channel_db(ws, *ch, &pattern, limit)?);
+        }
+        out.sort_by(|a, b| b.sent_at.cmp(&a.sent_at).then(b.id.cmp(&a.id)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    pub fn last_human_seq(&self, channel: ChannelId) -> Result<Seq> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(0);
+        };
+        let ws = self.project_workspace(&project)?;
+        let mut stmt = ws.prepare(
+            "SELECT seq, author_id FROM messages WHERE channel_id = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([channel.0], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+        })?;
+        for row in rows {
+            let (seq, author) = row?;
+            let Some(author) = author else {
+                continue;
+            };
+            if let Some(m) = member_db(&self.core, MemberId(author))?
+                && m.kind == MemberKind::Human
+            {
+                return Ok(seq as Seq);
+            }
+        }
+        Ok(0)
+    }
+
+    pub fn last_agent_message_after(
+        &self,
+        channel: ChannelId,
+        after_seq: Seq,
+    ) -> Result<Option<Message>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(None);
+        };
+        let ws = self.project_workspace(&project)?;
+        query_messages_db(
+            ws,
+            &format!(
+                "SELECT {MESSAGE_COLS} FROM messages
+                 WHERE channel_id = ?1 AND seq > ?2 AND origin IN ('chat_tool', 'fallback')
+                 ORDER BY seq DESC LIMIT 1"
+            ),
+            params![channel.0, after_seq as i64],
+        )
+        .map(|mut v| v.pop())
+    }
     pub fn rename_channel(&self, id: ChannelId, name: &str) -> Result<bool> {
         let Some(project) = self.project_for_channel(id) else {
             return Ok(false);
@@ -1208,6 +1287,12 @@ impl Store {
         };
         in_flight_batch_db(self.project_agents(&project)?, agent, channel)
     }
+    pub fn batch(&self, id: BatchId) -> Result<Option<BatchRow>> {
+        let Some(project) = self.project_for_batch(id) else {
+            return Ok(None);
+        };
+        batch_db(self.project_agents(&project)?, id)
+    }
     pub fn pending_batch(&self, agent: MemberId, channel: ChannelId) -> Result<Option<BatchRow>> {
         let Some(project) = self.project_for_channel(channel) else {
             return Ok(None);
@@ -1251,6 +1336,26 @@ impl Store {
     }
     pub fn remove_nickname(&self, member: MemberId, nickname: &str) -> Result<bool> {
         remove_nickname_db(&self.core, member, nickname)
+    }
+    pub fn record_session(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+        protocol: &str,
+        native_ref: &str,
+        now: Millis,
+    ) -> Result<()> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        };
+        record_session(
+            self.project_agents(&project)?,
+            agent,
+            channel,
+            protocol,
+            native_ref,
+            now,
+        )
     }
     pub fn project_setting(&self, project: &ProjectId, key: &str) -> Result<Option<String>> {
         let Ok(ws) = self.project_workspace(project) else {
@@ -1543,6 +1648,13 @@ impl Store {
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         resolve_obligation(self.project_agents(&project)?, id, state, resolved_by, kind)
     }
+    pub fn receipts(&self, channel: ChannelId) -> Result<Vec<Receipt>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(vec![]);
+        };
+        receipts(self.project_workspace(&project)?, channel)
+    }
+
     pub fn former_project_agent_mention_tokens(
         &self,
         project: &ProjectId,
@@ -3606,6 +3718,36 @@ pub fn search(
     out.sort_by(|a, b| b.sent_at.cmp(&a.sent_at).then(b.id.cmp(&a.id)));
     out.truncate(limit);
     Ok(out)
+}
+
+fn search_in_channel_db(
+    ws: &Connection,
+    channel: ChannelId,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<Message>> {
+    query_messages_db(
+        ws,
+        &format!(
+            "SELECT {MESSAGE_COLS} FROM messages
+             WHERE channel_id = ?1 AND body LIKE ?2 ESCAPE '\\'
+             ORDER BY seq DESC LIMIT ?3"
+        ),
+        params![channel.0, pattern, limit as i64],
+    )
+}
+
+fn channels_of_db(ws: &Connection, member: MemberId, project: &ProjectId) -> Result<Vec<Channel>> {
+    let mut stmt = ws.prepare(&format!(
+        "SELECT {CHANNEL_COLS} FROM channels c
+         JOIN memberships m ON m.channel_id = c.id
+         WHERE c.project_id = ?1 AND m.member_id = ?2
+         ORDER BY c.name"
+    ))?;
+    let rows = stmt
+        .query_map(params![project.as_str(), member.0], channel_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Seq of the newest human-authored message in the channel (0 if none).

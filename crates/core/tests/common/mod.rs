@@ -202,17 +202,21 @@ impl Harness {
             let ok = self
                 .core
                 .with_engine(move |e, _| {
-                    if p(e.conn()) {
+                    let try_p = |c: &rusqlite::Connection| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p(c)))
+                            .unwrap_or(false)
+                    };
+                    if try_p(e.conn()) {
                         return true;
                     }
                     for proj in e.store().projects().unwrap_or_default() {
                         if let Ok(ws) = e.store().project_workspace(&proj.id)
-                            && p(ws)
+                            && try_p(ws)
                         {
                             return true;
                         }
                         if let Ok(ag) = e.store().project_agents(&proj.id)
-                            && p(ag)
+                            && try_p(ag)
                         {
                             return true;
                         }
