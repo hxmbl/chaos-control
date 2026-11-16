@@ -147,8 +147,6 @@ impl std::error::Error for OpenError {
 /// They stay so existing local databases keep their schema version; nothing
 /// reads or writes them. The split migration reads from this layout but does
 /// not recreate dead tables in the new files.
-#[cfg(test)]
-const MIGRATIONS: &[&str] = LEGACY_MIGRATIONS;
 const LEGACY_MIGRATIONS: &[&str] = &[
     r#"
 CREATE TABLE channels (
@@ -663,16 +661,16 @@ impl Store {
     }
 
     pub fn open_path(path: &Path) -> std::result::Result<Self, OpenError> {
-        if path.file_name().and_then(|n| n.to_str()) == Some("core.sqlite") {
-            if let Some(dir) = path.parent() {
-                return Self::open(dir);
-            }
+        if path.file_name().and_then(|n| n.to_str()) == Some("core.sqlite")
+            && let Some(dir) = path.parent()
+        {
+            return Self::open(dir);
         }
         // Treat as data dir or core.db path
-        if path.file_name().and_then(|n| n.to_str()) == Some("core.db") {
-            if let Some(dir) = path.parent() {
-                return Self::open(dir);
-            }
+        if path.file_name().and_then(|n| n.to_str()) == Some("core.db")
+            && let Some(dir) = path.parent()
+        {
+            return Self::open(dir);
         }
         Self::open(path)
     }
@@ -747,7 +745,6 @@ impl Store {
         ws: &Connection,
         ag: &Connection,
     ) -> Result<()> {
-        let project = project;
         let mut stmt = ws.prepare("SELECT id FROM channels")?;
         let rows = stmt.query_map([], |r| Ok(ChannelId(r.get(0)?)))?;
         for r in rows {
@@ -2420,6 +2417,7 @@ fn set_batch_state_db(
     };
     Ok(())
 }
+#[allow(dead_code)]
 fn dispatch_batch_db(ag: &Connection, id: BatchId, window_to: Seq) -> Result<u32> {
     ag.execute("UPDATE batches SET state = 'dispatched', attempts = attempts + 1, window_to = ?2 WHERE id = ?1 AND state = 'pending'", params![id.0, window_to as i64])?;
     ag.query_row("SELECT attempts FROM batches WHERE id = ?1", [id.0], |r| {
@@ -2443,6 +2441,7 @@ fn requeue_batch_db(ag: &Connection, id: BatchId) -> Result<()> {
     ag.execute("UPDATE batches SET state = 'pending' WHERE id = ?1", [id.0])?;
     Ok(())
 }
+#[allow(dead_code)]
 fn insert_trigger_db(
     ag: &Connection,
     id: TriggerId,
@@ -2453,6 +2452,7 @@ fn insert_trigger_db(
 ) -> Result<bool> {
     Ok(ag.execute("INSERT OR IGNORE INTO triggers (agent_id, channel_id, message_id, reason, hop, batch_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![id.agent.0, id.channel.0, id.message.0, reason.as_str(), hop as i64, batch.0, now as i64])? == 1)
 }
+#[allow(dead_code)]
 fn trigger_exists_db(ag: &Connection, id: TriggerId) -> Result<bool> {
     ag.query_row(
         "SELECT 1 FROM triggers WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
@@ -2462,6 +2462,7 @@ fn trigger_exists_db(ag: &Connection, id: TriggerId) -> Result<bool> {
     .optional()
     .map(|o| o.is_some())
 }
+#[allow(dead_code)]
 fn batch_triggers_db(ag: &Connection, batch: BatchId) -> Result<Vec<TriggerRow>> {
     let mut stmt = ag.prepare_cached("SELECT agent_id, channel_id, message_id, reason, hop, batch_id FROM triggers WHERE batch_id = ?1 ORDER BY message_id")?;
     stmt.query_map([batch.0], |r| {
@@ -2478,9 +2479,11 @@ fn batch_triggers_db(ag: &Connection, batch: BatchId) -> Result<Vec<TriggerRow>>
     })?
     .collect()
 }
+#[allow(dead_code)]
 fn insert_obligation_db(ag: &Connection, id: TriggerId) -> Result<bool> {
     Ok(ag.execute("INSERT OR IGNORE INTO obligations (agent_id, channel_id, message_id, state) VALUES (?1, ?2, ?3, 'open')", params![id.agent.0, id.channel.0, id.message.0])? == 1)
 }
+#[allow(dead_code)]
 fn obligation_state_db(ag: &Connection, id: TriggerId) -> Result<Option<ObligationState>> {
     ag.query_row(
         "SELECT state FROM obligations WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
@@ -2510,6 +2513,7 @@ fn resolve_obligation_db(
 ) -> Result<bool> {
     Ok(ag.execute("UPDATE obligations SET state = ?4, resolved_by = ?5, resolved_kind = ?6 WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3 AND state = 'open'", params![id.agent.0, id.channel.0, id.message.0, state.as_str(), by.map(|m| m.0), kind])? == 1)
 }
+#[allow(dead_code)]
 fn record_session_db(
     ag: &Connection,
     agent: MemberId,
@@ -5161,7 +5165,7 @@ mod tests {
         }
         // untouched
         let after = std::fs::read(&ws_path).unwrap();
-        assert_eq!(before.len() == after.len() || before != after, true); // file still exists; check version unchanged
+        assert!(before.len() == after.len() || before != after); // file still exists; check version unchanged
         let c = Connection::open(&ws_path).unwrap();
         let v: i64 = c
             .query_row("PRAGMA user_version", [], |r| r.get(0))
