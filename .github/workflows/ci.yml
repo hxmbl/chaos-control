@@ -26,17 +26,21 @@ jobs:
           fetch-depth: 0
 
       - name: Install latest Minesweep
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
 
-          release="$(curl -fsSL https://api.github.com/repos/hxmbl/minesweep/releases/latest)"
+          auth=(-H "Authorization: Bearer $GH_TOKEN")
+
+          release="$(curl -fsSL "${auth[@]}" https://api.github.com/repos/hxmbl/minesweep/releases/latest)"
           tag="$(jq -er '.tag_name' <<< "$release")"
           asset="$(jq -er 'first(.assets[] | select(.name | test("_Linux_x86_64\\.tar\\.gz$"))) | .name' <<< "$release")"
 
           base="https://github.com/hxmbl/minesweep/releases/download/$tag"
 
-          curl -fsSL "$base/$asset" -o "$RUNNER_TEMP/$asset"
-          curl -fsSL "$base/checksums.txt" -o "$RUNNER_TEMP/checksums.txt"
+          curl -fsSL "${auth[@]}" "$base/$asset" -o "$RUNNER_TEMP/$asset"
+          curl -fsSL "${auth[@]}" "$base/checksums.txt" -o "$RUNNER_TEMP/checksums.txt"
 
           cd "$RUNNER_TEMP"
           awk -v asset="$asset" '$NF == asset { print; found=1 } END { if (!found) exit 1 }' \
