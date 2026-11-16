@@ -219,9 +219,7 @@ impl Core {
     ) -> Result<(Core, mpsc::UnboundedReceiver<CoreEvent>), StartError> {
         let store = match &config.db {
             Some(path) => {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
+                let _ = std::fs::create_dir_all(path);
                 Store::open(path)
             }
             None => Store::open_in_memory(),
