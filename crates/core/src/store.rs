@@ -2070,79 +2070,43 @@ fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenErr
     } else {
         return Ok(()); // fresh install
     };
-    // If core.db exists but legacy still exists, prefer completing a valid split layout
+    // If core.db exists but legacy still exists, prefer completing a verified split layout
     // (e.g. crash after migration but before backup rename) over destructive retry.
+    // Require an explicit completion marker to avoid accepting empty-but-valid DBs.
     if core_db.exists() && legacy.exists() {
-        let mut valid = false;
-        if let Ok(core) = open_db(&core_db, CORE_MIGRATIONS)
+        let marker = split_migration_marker(data_dir);
+        let mut valid = marker.exists();
+        if valid
+            && let Ok(core) = open_db(&core_db, CORE_MIGRATIONS)
             && let Ok(projects) = core_project_ids(&core)
-            && projects.iter().all(|p| {
+        {
+            valid = projects.iter().all(|p| {
                 let dir = data_dir.join("Projects").join(p.as_str());
                 open_db(&dir.join("workspace.db"), WORKSPACE_MIGRATIONS).is_ok()
                     && open_db(&dir.join("agents.db"), AGENTS_MIGRATIONS).is_ok()
-            })
-        {
-            // Reject "empty-but-valid" split DBs that would discard legacy data:
-            // only accept completion when id_counters are already seeded above legacy maxima.
-            if let Ok(legacy_src) = Connection::open(&legacy) {
-                let max_channel: i64 = legacy_src
-                    .query_row("SELECT COALESCE(MAX(id), 0) FROM channels", [], |r| {
-                        r.get(0)
-                    })
-                    .unwrap_or(i64::MAX);
-                let max_message: i64 = legacy_src
-                    .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| {
-                        r.get(0)
-                    })
-                    .unwrap_or(i64::MAX);
-                let max_batch: i64 = legacy_src
-                    .query_row("SELECT COALESCE(MAX(id), 0) FROM batches", [], |r| r.get(0))
-                    .unwrap_or(i64::MAX);
-                if max_channel != i64::MAX && max_message != i64::MAX && max_batch != i64::MAX {
-                    let c_ok = core
-                        .query_row(
-                            "SELECT next_id FROM id_counters WHERE name = 'channel'",
-                            [],
-                            |r| r.get::<_, i64>(0),
-                        )
-                        .map(|n| n > max_channel)
-                        .unwrap_or(false);
-                    let m_ok = core
-                        .query_row(
-                            "SELECT next_id FROM id_counters WHERE name = 'message'",
-                            [],
-                            |r| r.get::<_, i64>(0),
-                        )
-                        .map(|n| n > max_message)
-                        .unwrap_or(false);
-                    let b_ok = core
-                        .query_row(
-                            "SELECT next_id FROM id_counters WHERE name = 'batch'",
-                            [],
-                            |r| r.get::<_, i64>(0),
-                        )
-                        .map(|n| n > max_batch)
-                        .unwrap_or(false);
-                    valid = c_ok && m_ok && b_ok;
+            });
+            if valid {
+                // Best-effort: ensure counters are seeded (idempotent) before finalizing.
+                if let Ok(legacy_src) = Connection::open(&legacy) {
+                    let _ = seed_id_counters_from_legacy(&legacy_src, &core);
                 }
             }
+        } else {
+            valid = false;
         }
         if valid {
-            // Ensure counters are seeded even if a previous attempt crashed before seeding.
-            let legacy_src = Connection::open(&legacy)?;
-            let core = open_db(&core_db, CORE_MIGRATIONS)?;
-            seed_id_counters_from_legacy(&legacy_src, &core)?;
-            drop(core);
             std::fs::rename(&legacy, &backup)
                 .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let _ = std::fs::remove_file(marker);
             return Ok(());
         }
         let _ = std::fs::remove_file(&core_db);
+        let _ = std::fs::remove_file(marker);
         let projects_dir = data_dir.join("Projects");
         let _ = std::fs::remove_dir_all(&projects_dir);
     }
     migrate_legacy(&source, data_dir)?;
-    // Verify by opening all DBs, then rename original to backup.
+    // Verify by opening all DBs, then mark complete and rename original to backup.
     let _core = open_db(&core_db, CORE_MIGRATIONS)?;
     // verify project dbs
     let projects = core_project_ids(&_core)?;
@@ -2151,10 +2115,13 @@ fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenErr
         let _ws = open_db(&dir.join("workspace.db"), WORKSPACE_MIGRATIONS)?;
         let _ag = open_db(&dir.join("agents.db"), AGENTS_MIGRATIONS)?;
     }
+    std::fs::write(split_migration_marker(data_dir), b"1")
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     if legacy.exists() {
         std::fs::rename(&legacy, &backup)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
     }
+    let _ = std::fs::remove_file(split_migration_marker(data_dir));
     Ok(())
 }
 
@@ -2391,6 +2358,10 @@ fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), Ope
     // Seed id_counters from legacy max IDs to avoid collisions on new inserts (F5).
     seed_id_counters_from_legacy(&legacy, &core)?;
     Ok(())
+}
+
+fn split_migration_marker(data_dir: &Path) -> PathBuf {
+    data_dir.join("core.split-migration-complete")
 }
 
 fn table_exists(c: &Connection, name: &str) -> Result<bool> {
@@ -5965,6 +5936,69 @@ mod tests {
         assert!(s.channel(ChannelId(10)).unwrap().is_some());
         assert!(s.batch(BatchId(500)).unwrap().is_some());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_recovery_does_not_accept_empty_split_without_marker_when_legacy_id_tables_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-empty-ids-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+
+        // Legacy DB: has project/member data but no channels/messages/batches (ID maxima are 0).
+        {
+            let conn = Connection::open(&legacy).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            super::run_migrations(&conn, LEGACY_MIGRATIONS, 0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', NULL, 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+        }
+
+        // Plant an empty-but-valid split layout with default counters and no completion marker.
+        {
+            let core = super::open_db(&dir.join("core.db"), CORE_MIGRATIONS).unwrap();
+            // intentionally no projects copied into split core
+            drop(core);
+            // no Projects/* DBs, no completion marker
+        }
+
+        let mut s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "legacy must be migrated and renamed, not discarded as already-complete"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+        assert_eq!(s.projects().unwrap().len(), 1);
+        assert_eq!(s.project(&pid(P1)).unwrap().unwrap().name.as_ref(), "Alpha");
+        assert!(s.is_project_member(&pid(P1), MemberId(1)).unwrap());
+
+        // Counters remain valid for future allocations even when legacy ID tables were empty.
+        assert_eq!(s.allocate_id("channel").unwrap(), 1);
+        assert_eq!(s.allocate_id("message").unwrap(), 1);
+        assert_eq!(s.allocate_id("batch").unwrap(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
