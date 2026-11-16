@@ -107,45 +107,36 @@ fn working_indicator_label(agents: &[(std::sync::Arc<str>, &'static str)], word:
     }
 }
 
-fn working_indicator_text(
+fn styled_working_text(
     label: &str,
     delta: f32,
+    blur: f32,
     base_style: &TextStyle,
     base: Hsla,
-    dim: Hsla,
     bright: Hsla,
 ) -> StyledText {
-    let label: SharedString = label.to_string().into();
-    let chars: Vec<(usize, char)> = label.char_indices().collect();
+    let label_s: SharedString = label.to_string().into();
+    let chars: Vec<(usize, char)> = label_s.char_indices().collect();
     if chars.is_empty() {
-        return StyledText::new(label);
+        return StyledText::new(label_s);
     }
-    // STRM-662: near the end of each 5s cycle, fade/blur-like transition before the next word.
-    let transition = if delta > 0.84 {
-        ((delta - 0.84) / 0.16).clamp(0.0, 1.0)
-    } else if delta < 0.08 {
-        (1.0 - delta / 0.08).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
     let n = chars.len() as f32;
     let center = -0.25 + delta * 1.5;
     let mut runs: Vec<TextRun> = Vec::with_capacity(chars.len());
     for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
-        let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label.len());
+        let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label_s.len());
         let len = next - byte_ix;
         let p = (i as f32 + 0.5) / n;
         let d = (p - center).abs();
         let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
         let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
         let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
-        let target = if transition > 0.55 { dim } else { bright };
         let mut color = base;
-        color.h = base.h + (target.h - base.h) * mix;
-        color.s = base.s + (target.s - base.s) * mix;
-        color.l = base.l + (target.l - base.l) * mix;
-        let base_alpha = 0.45 + 0.55 * mix;
-        color.a = (base_alpha * (1.0 - transition * 0.75)).clamp(0.0, 1.0);
+        color.h = base.h + (bright.h - base.h) * mix;
+        color.s = base.s + (bright.s - base.s) * mix;
+        color.l = base.l + (bright.l - base.l) * mix;
+        let alpha = (0.45 + 0.55 * mix) * (1.0 - blur * 0.35);
+        color.a = alpha.clamp(0.0, 1.0);
         runs.push(TextRun {
             len,
             font: base_style.font(),
@@ -155,7 +146,57 @@ fn working_indicator_text(
             strikethrough: base_style.strikethrough,
         });
     }
-    StyledText::new(label).with_runs(runs)
+    StyledText::new(label_s).with_runs(runs)
+}
+
+fn working_indicator_element(
+    label: &str,
+    delta: f32,
+    base_style: &TextStyle,
+    base: Hsla,
+    bright: Hsla,
+) -> impl IntoElement {
+    // STRM-662: blur the word as it changes (blur-in at start of cycle, blur-out at end).
+    let blur = if delta < 0.14 {
+        1.0 - (delta / 0.14)
+    } else if delta > 0.86 {
+        (delta - 0.86) / 0.14
+    } else {
+        0.0
+    }
+    .clamp(0.0, 1.0);
+
+    let main = styled_working_text(label, delta, blur, base_style, base, bright);
+    if blur <= 0.01 {
+        return div().child(main).into_any_element();
+    }
+
+    let offsets: [(f32, f32, f32); 6] = [
+        (-1.6, 0.0, 0.16),
+        (1.6, 0.0, 0.16),
+        (0.0, -1.2, 0.14),
+        (0.0, 1.2, 0.14),
+        (-1.0, -0.8, 0.10),
+        (1.0, 0.8, 0.10),
+    ];
+    let mut ghost_colors = base;
+    ghost_colors.a = (base.a.max(0.55)) * blur;
+    let mut layers = div().relative().child(main);
+    for (i, (dx, dy, a)) in offsets.iter().enumerate() {
+        let mut gc = ghost_colors;
+        gc.a = (a * blur).clamp(0.0, 0.4);
+        // approximate blur with faint offset copies of the same label
+        let ghost = styled_working_text(label, delta, blur, base_style, gc, gc);
+        layers = layers.child(
+            div()
+                .id(("working-blur", i))
+                .absolute()
+                .top(px(*dy))
+                .left(px(*dx))
+                .child(ghost),
+        );
+    }
+    div().child(layers).into_any_element()
 }
 
 fn echo_matches_in(
@@ -508,6 +549,7 @@ pub struct Composer {
     usage_path: Option<PathBuf>,
     working_word_index: usize,
     working_word_nonce: u64,
+    working_timer_nonce: u64,
     _working_timer: Option<Task<()>>,
     _subscriptions: [Subscription; 4],
 }
@@ -765,6 +807,7 @@ impl Composer {
             usage_path,
             working_word_index: 0,
             working_word_nonce: 0,
+            working_timer_nonce: 0,
             _working_timer: None,
             _subscriptions: subscriptions,
         };
@@ -1165,24 +1208,29 @@ impl Composer {
             }
             cx.notify();
         } else {
+            self.working_timer_nonce = self.working_timer_nonce.wrapping_add(1);
+            self.working_word_nonce = self.working_word_nonce.wrapping_add(1);
             self._working_timer = None;
             self.working_word_index = 0;
         }
     }
 
     fn start_working_timer(&mut self, cx: &mut Context<Self>) {
+        self.working_timer_nonce = self.working_timer_nonce.wrapping_add(1);
+        let timer_nonce = self.working_timer_nonce;
         self.working_word_nonce = self.working_word_nonce.wrapping_add(1);
-        let nonce = self.working_word_nonce;
         self._working_timer = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(WORKING_WORD_INTERVAL).await;
                 let keep = this
                     .update(cx, |this, cx| {
-                        if this.working_word_nonce != nonce || !this.has_working_agents(cx) {
+                        if this.working_timer_nonce != timer_nonce || !this.has_working_agents(cx) {
                             return false;
                         }
                         this.working_word_index =
                             (this.working_word_index + 1) % WORKING_WORDS.len();
+                        // Restart animation so the new word blurs in (STRM-662).
+                        this.working_word_nonce = this.working_word_nonce.wrapping_add(1);
                         cx.notify();
                         true
                     })
@@ -1526,7 +1574,6 @@ impl Render for Composer {
             }))
             .when_some(working, |d, label| {
                 let base = t.muted;
-                let dim = t.faint;
                 let bright = t.ink;
                 d.child(
                     div()
@@ -1542,15 +1589,13 @@ impl Render for Composer {
                                         .repeat()
                                         .with_easing(linear),
                                     move |el, delta| {
-                                        let text = working_indicator_text(
+                                        el.child(working_indicator_element(
                                             &label,
                                             delta,
                                             &base_style,
                                             base,
-                                            dim,
                                             bright,
-                                        );
-                                        el.child(text)
+                                        ))
                                     },
                                 ),
                         ),
