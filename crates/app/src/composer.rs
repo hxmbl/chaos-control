@@ -5,13 +5,14 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use chaos_core::emoji::{self, EmojiMatch};
 use gpui::{
-    Context, Entity, Focusable, KeyBinding, KeyDownEvent, SharedString, Subscription, Window,
-    actions, div, prelude::*, px,
+    Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent,
+    SharedString, StyledText, Subscription, TextRun, TextStyle, Window, actions, div, linear,
+    prelude::*, px,
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
@@ -72,6 +73,62 @@ fn sendable(text: &str) -> bool {
 /// Core echoes the posted text trimmed; compare against that.
 fn sent_body(text: &str) -> &str {
     text.trim()
+}
+
+fn working_indicator_label(agents: &[(std::sync::Arc<str>, &'static str)]) -> Option<String> {
+    match agents {
+        [] => None,
+        [(name, verb)] => Some(format!("{name} is {verb}…")),
+        [(a, _), (b, _)] => Some(format!("{a} and {b} are working…")),
+        [all @ .., last] => {
+            let names = all
+                .iter()
+                .map(|(n, _)| n.as_ref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Some(format!("{names}, and {} are working…", last.0))
+        }
+    }
+}
+
+fn working_indicator_text(
+    label: &str,
+    delta: f32,
+    base_style: &TextStyle,
+    base: Hsla,
+    bright: Hsla,
+) -> StyledText {
+    let label_s: SharedString = label.to_string().into();
+    let chars: Vec<(usize, char)> = label_s.char_indices().collect();
+    if chars.is_empty() {
+        return StyledText::new(label_s);
+    }
+    let n = chars.len() as f32;
+    let center = -0.25 + delta * 1.5;
+    let mut runs: Vec<TextRun> = Vec::with_capacity(chars.len());
+    for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
+        let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label_s.len());
+        let len = next - byte_ix;
+        let p = (i as f32 + 0.5) / n;
+        let d = (p - center).abs();
+        let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
+        let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
+        let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
+        let mut color = base;
+        color.h = base.h + (bright.h - base.h) * mix;
+        color.s = base.s + (bright.s - base.s) * mix;
+        color.l = base.l + (bright.l - base.l) * mix;
+        color.a = (0.45 + 0.55 * mix).clamp(0.0, 1.0);
+        runs.push(TextRun {
+            len,
+            font: base_style.font(),
+            color,
+            background_color: base_style.background_color,
+            underline: base_style.underline,
+            strikethrough: base_style.strikethrough,
+        });
+    }
+    StyledText::new(label_s).with_runs(runs)
 }
 
 fn echo_matches_in(
@@ -422,7 +479,7 @@ pub struct Composer {
     mention_usage: HashMap<String, UsageStat>,
     emoji_usage: HashMap<String, UsageStat>,
     usage_path: Option<PathBuf>,
-    _subscriptions: [Subscription; 3],
+    _subscriptions: [Subscription; 4],
 }
 
 const SUGGESTION_USAGE_SCHEMA_VERSION: u64 = 1;
@@ -612,6 +669,7 @@ impl Composer {
                 TextInputEvent::Changed => this.refresh_suggestions(cx),
             }),
             cx.observe(&input, |this, _, cx| this.refresh_suggestions(cx)),
+            cx.observe(&store, |_, _, cx| cx.notify()),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
                     let next = store.read(cx).selected();
@@ -1279,6 +1337,11 @@ impl Render for Composer {
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
 
+        let working = {
+            let store = self.store.read(cx);
+            working_indicator_label(&store.working_agents(store.selected()))
+        };
+
         let box_el = div()
             .w_full()
             .flex()
@@ -1345,6 +1408,7 @@ impl Render for Composer {
                     ),
             );
 
+        let base_style = window.text_style();
         div()
             .key_context(KEY_CONTEXT)
             .on_action(cx.listener(Self::cancel))
@@ -1364,6 +1428,7 @@ impl Render for Composer {
             .relative()
             .flex()
             .flex_col()
+            .gap(space::X1_5)
             .children(self.render_suggestions(cx).map(|el| {
                 div()
                     .absolute()
@@ -1373,6 +1438,31 @@ impl Render for Composer {
                     .mb(space::X1)
                     .child(el)
             }))
+            .when_some(working, |d, label| {
+                let base = t.muted;
+                let bright = t.ink;
+                d.child(
+                    div()
+                        .px(space::X2)
+                        .py(space::X0_5)
+                        .type_style(text::SMALL)
+                        .child(div().id("working-indicator").with_animation(
+                            "working-indicator-shimmer",
+                            Animation::new(Duration::from_millis(1800))
+                                .repeat()
+                                .with_easing(linear),
+                            move |el, delta| {
+                                el.child(working_indicator_text(
+                                    &label,
+                                    delta,
+                                    &base_style,
+                                    base,
+                                    bright,
+                                ))
+                            },
+                        )),
+                )
+            })
             .child(box_el)
     }
 }
