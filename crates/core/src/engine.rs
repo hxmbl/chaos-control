@@ -1101,16 +1101,11 @@ impl Engine {
         let value = parsed
             .as_ref()
             .map(|p| serde_json::to_string(&p.to_list()).expect("strings serialise"));
-        if store::project(self.conn(), project)?.is_none() {
+        if self.store.project(project)?.is_none() {
             return Err(SettingError::UnknownProject);
         }
-        store::set_project_setting(
-            self.conn(),
-            project,
-            reaction::PING_ANSWERS_KEY,
-            value.as_deref(),
-            now,
-        )?;
+        self.store
+            .set_project_setting(project, reaction::PING_ANSWERS_KEY, value.as_deref(), now)?;
         Ok(parsed.unwrap_or_default())
     }
 

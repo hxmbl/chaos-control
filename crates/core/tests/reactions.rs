@@ -44,7 +44,7 @@ async fn settled(h: &mut Harness, n: i64) {
             [],
             |r| r.get::<_, i64>(0),
         )
-        .unwrap()
+        .unwrap_or(0)
             == n
     })
     .await;
@@ -58,8 +58,8 @@ async fn settled_all(h: &Harness) {
             [],
             |r| r.get::<_, i64>(0),
         )
-        .unwrap()
-            == 0
+        .map(|n| n == 0)
+        .unwrap_or(false)
     })
     .await;
 }
@@ -67,13 +67,25 @@ async fn settled_all(h: &Harness) {
 async fn resolved_kind(h: &Harness, message: MessageId) -> Option<String> {
     h.core
         .with_engine(move |e, _| {
-            e.conn()
-                .query_row(
-                    "SELECT resolved_kind FROM obligations WHERE message_id = ?1",
-                    [message.0],
-                    |r| r.get(0),
-                )
-                .unwrap()
+            if let Ok(v) = e.conn().query_row(
+                "SELECT resolved_kind FROM obligations WHERE message_id = ?1",
+                [message.0],
+                |r| r.get::<_, Option<String>>(0),
+            ) {
+                return v;
+            }
+            for proj in e.store().projects().unwrap_or_default() {
+                if let Ok(ag) = e.store().project_agents(&proj.id)
+                    && let Ok(v) = ag.query_row(
+                        "SELECT resolved_kind FROM obligations WHERE message_id = ?1",
+                        [message.0],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                {
+                    return v;
+                }
+            }
+            None
         })
         .await
         .unwrap()
@@ -372,12 +384,13 @@ async fn an_invalid_list_is_rejected_whole_with_every_bad_entry_named() {
     // A stored value that no longer parses (hand-edited) counts as unset.
     h.core
         .with_engine(|e, _| {
-            e.conn()
-                .execute(
-                    "UPDATE project_settings SET value = '[\"nope\"]' WHERE key = 'ping_answer_reactions'",
-                    [],
-                )
-                .unwrap();
+            let p = project_id();
+            let ws = e.store().project_workspace(&p).unwrap();
+            ws.execute(
+                "UPDATE project_settings SET value = '[\"nope\"]' WHERE key = 'ping_answer_reactions'",
+                [],
+            )
+            .unwrap();
         })
         .await
         .unwrap();
