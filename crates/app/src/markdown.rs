@@ -646,7 +646,8 @@ impl<'a> Renderer<'a> {
                         style: s,
                     });
                 }
-                Event::SoftBreak => self.push_text(" "),
+                // Chat, not a document: a single newline from an agent is a line break.
+                Event::SoftBreak => self.push_text("\n"),
                 Event::HardBreak => self.push_text("\n"),
                 Event::Rule => {
                     self.flush_paragraph();
