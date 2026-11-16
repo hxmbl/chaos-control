@@ -970,16 +970,6 @@ impl Engine {
                 .remove_reaction(message, member, &emoji)
                 .map_err(|e| PostError::Store(e.to_string()))?
         };
-        if add && answers.answers(&emoji) {
-            let t = TriggerId {
-                agent: member,
-                channel: m.channel,
-                message,
-            };
-            self.store
-                .resolve_obligation(t, ObligationState::Satisfied, None, "react")
-                .map_err(|e| PostError::Store(e.to_string()))?;
-        }
         if changed {
             self.effects
                 .push(Effect::Event(Box::new(CoreEvent::Reaction {
@@ -989,6 +979,16 @@ impl Engine {
                     emoji: emoji.clone(),
                     added: add,
                 })));
+        }
+        if add && answers.answers(&emoji) {
+            let t = TriggerId {
+                agent: member,
+                channel: m.channel,
+                message,
+            };
+            self.store
+                .resolve_obligation(t, ObligationState::Satisfied, None, "react")
+                .map_err(|e| PostError::Store(e.to_string()))?;
         }
         Ok(Reacted { emoji, changed })
     }

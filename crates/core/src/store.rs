@@ -1414,11 +1414,12 @@ impl Store {
         let channels: Vec<ChannelId> = stmt
             .query_map([member.0], |r| Ok(ChannelId(r.get(0)?)))?
             .collect::<Result<_>>()?;
-        if let Ok(ag) = self.project_agents(project) {
-            for ch in &channels {
-                ag.execute("UPDATE obligations SET state = 'unmet', resolved_kind = 'member_removed' WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'open'", params![member.0, ch.0])?;
-                ag.execute("UPDATE batches SET state = 'failed', outcome = 'member removed', settled_at = ?3 WHERE agent_id = ?1 AND channel_id = ?2 AND state IN ('pending', 'dispatched', 'accepted')", params![member.0, ch.0, now as i64])?;
-            }
+        let ag = self
+            .project_agents(project)
+            .map_err(|_| cannot_inspect_project_storage(project))?;
+        for ch in &channels {
+            ag.execute("UPDATE obligations SET state = 'unmet', resolved_kind = 'member_removed' WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'open'", params![member.0, ch.0])?;
+            ag.execute("UPDATE batches SET state = 'failed', outcome = 'member removed', settled_at = ?3 WHERE agent_id = ?1 AND channel_id = ?2 AND state IN ('pending', 'dispatched', 'accepted')", params![member.0, ch.0, now as i64])?;
         }
         for ch in &channels {
             ws.execute(
@@ -2432,19 +2433,16 @@ fn copy_project_join(
 }
 
 fn seed_id_counters_from_legacy(legacy: &Connection, core: &Connection) -> Result<()> {
-    let max_channel: i64 = legacy
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM channels", [], |r| {
+    let max_channel: i64 =
+        legacy.query_row("SELECT COALESCE(MAX(id), 0) FROM channels", [], |r| {
             r.get(0)
-        })
-        .unwrap_or(0);
-    let max_message: i64 = legacy
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| {
+        })?;
+    let max_message: i64 =
+        legacy.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| {
             r.get(0)
-        })
-        .unwrap_or(0);
-    let max_batch: i64 = legacy
-        .query_row("SELECT COALESCE(MAX(id), 0) FROM batches", [], |r| r.get(0))
-        .unwrap_or(0);
+        })?;
+    let max_batch: i64 =
+        legacy.query_row("SELECT COALESCE(MAX(id), 0) FROM batches", [], |r| r.get(0))?;
     core.execute(
         "UPDATE id_counters SET next_id = ?2 WHERE name = ?1 AND next_id <= ?2",
         params!["channel", max_channel + 1],
