@@ -1450,15 +1450,8 @@ impl Engine {
 
     /// Turn end: resolve every still-open obligation of the batch.
     ///
-    /// - Completed with final text: post it **once**, as a fallback reply to the
-    ///   newest open trigger, and mark every open obligation of the batch
-    ///   `fallback` by that one message. If the agent already posted exactly
-    ///   that text this turn, nothing is posted and they count as satisfied.
-    /// - Completed with no text, or any other outcome: `unmet`.
-    ///
-    /// Obligations already satisfied by a send or reaction are untouched (the
-    /// fallback only ever looks at `open` rows, inside one transaction), so a
-    /// fallback can never duplicate a reply that was already sent.
+    /// Final turn text is private. Only explicit chat actions can resolve an
+    /// obligation; an unanswered ping is ignored on a completed turn.
     fn settle(
         &mut self,
         now: Millis,
@@ -1475,66 +1468,10 @@ impl Engine {
             return Ok(());
         }
         let open = store::open_obligations(self.conn(), turn)?;
-        let text = final_text.trim();
-        let sent = std::mem::take(&mut self.rt.entry((agent, channel)).or_default().sent_in_turn);
-        let mut fallback_message = None;
+        let _ = final_text;
+        let _ = std::mem::take(&mut self.rt.entry((agent, channel)).or_default().sent_in_turn);
         let outcome_label = format!("{outcome:?}");
-        if !open.is_empty() && *outcome == TurnOutcome::Completed && !text.is_empty() {
-            if let Some((echo, _)) = sent.iter().find(|(_, body)| body.trim() == text) {
-                let echo = *echo;
-                self.store.tx::<_, PostError>(|c| {
-                    for t in &open {
-                        store::resolve_obligation(
-                            c,
-                            *t,
-                            ObligationState::Satisfied,
-                            Some(echo),
-                            "send_echo",
-                        )?;
-                    }
-                    Ok(())
-                })?;
-            } else {
-                let author = store::member(self.conn(), agent)?.ok_or(PostError::NotMember)?;
-                let target = *open.last().expect("non-empty");
-                let mut notes = Vec::new();
-                let (mentions, _) = self.resolve_mentions(channel, &author, text, &mut notes)?;
-                let hop = self.hop_for(&author, channel, Some(turn))?;
-                let m = self.store.tx::<_, PostError>(|c| {
-                    // Re-check inside the transaction: only still-open rows count.
-                    let still_open = store::open_obligations(c, turn)?;
-                    if still_open.is_empty() {
-                        return Ok(None);
-                    }
-                    let m = store::insert_message(
-                        c,
-                        &NewMessage {
-                            channel,
-                            author: Some(agent),
-                            origin: Origin::Fallback,
-                            body: text,
-                            reply_to: Some(target.message),
-                            mentions: &mentions,
-                            hop,
-                            cause_batch: Some(turn),
-                            client_request_id: None,
-                            sent_at: now,
-                        },
-                    )?;
-                    for t in still_open {
-                        store::resolve_obligation(
-                            c,
-                            t,
-                            ObligationState::Fallback,
-                            Some(m.id),
-                            "fallback",
-                        )?;
-                    }
-                    Ok(Some(m))
-                })?;
-                fallback_message = m.map(|m| (m, author));
-            }
-        } else if !open.is_empty() {
+        if !open.is_empty() {
             // A completed turn with nothing to say is the agent choosing to let
             // the ping go: `ignored`, which is fine. Anything else (cancelled,
             // refused, cut short) is `unmet`. A trigger the agent put 👀 on
@@ -1576,11 +1513,6 @@ impl Engine {
         rt.activity = None;
         rt.status = None;
         rt.idle_since = Some(now);
-        if let Some((m, author)) = fallback_message {
-            self.effects
-                .push(Effect::Event(Box::new(CoreEvent::Message(m.clone()))));
-            self.create_triggers(now, &m, &author, false)?;
-        }
         Ok(())
     }
 

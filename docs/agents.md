@@ -43,7 +43,7 @@ position and a voice.
   auto-detected and kept on a per-project roster (see "Members and the
   roster" below).
 - **Explicit posting.** Agents speak through the `chat_send` tool. Their final
-  turn text is private working-out, posted only as the reply-owed fallback.
+  turn text is private working-out and is never posted automatically.
 - **Nine chat tools, a social plane only:** `chat_context`, `chat_read`,
   `chat_search`, `chat_send`, `chat_react`, `chat_emoji_search`, `chat_status`,
   and the peer actions `chat_refuse` and `chat_dissent`. No delegate, spawn or
@@ -205,7 +205,7 @@ backfill on first join.
 
 A direct address (an `@mention` or a reply to the agent's message, from anyone)
 creates one **reply obligation** for that trigger. `@everyone` wakes but creates
-none. Obligations are `open`, then exactly one of `satisfied`, `fallback`,
+none. Obligations are `open`, then exactly one of `satisfied`,
 `refused`, `ignored` or `unmet`. Only `unmet` is a failure; the other four are
 legitimate answers and none is ever retried.
 
@@ -215,11 +215,10 @@ legitimate answers and none is ever retried.
 - **Satisfied by a reaction:** an emoji that answers a ping for that agent
   (see "Which reactions answer a ping": ✅ and 👍 by default), on the
   trigger, at the moment it is added (resolved kind `react`). 👀 ("on it")
-  never answers, whatever the config: the agent still owes the answer, so a
-  final text is still posted as the fallback. A turn that ends with only a
+  never answers, whatever the config: the agent still owes the answer. A turn that ends with only a
   👀 and no text was handled too (`satisfied`, `react`), not ignored. Any
   other emoji is just a reaction: it is recorded, the obligation stays open
-  and the rules below apply (final text is the fallback; silence is
+  and the rules below apply (final text stays private; silence is
   `ignored`). Taking a reaction back never reopens an obligation.
 - **Refused:** a `chat_refuse` on the trigger (see "Refusal and dissent"). The
   refusal message is the answer, so there is no fallback and no retry, and
@@ -227,21 +226,15 @@ legitimate answers and none is ever retried.
   a reply (`satisfied`, resolved kind `dissent`).
 - **A pending batch whose obligations were all answered mid-turn** settles
   without being delivered.
-- **Fallback, never duplicated:** at turn end, if the turn completed with final
-  text and obligations are still open, that text is posted **once** (origin
-  `fallback`), as a reply to the newest open trigger, and every open obligation
-  of the batch is marked `fallback` by that one message. Only rows still `open`
-  inside the same transaction count, so a fallback can never repeat a reply
-  that was already sent. If the agent already posted exactly that text with
-  `chat_send` this turn, nothing is posted and the obligations count as
-  satisfied.
-- **Ignored:** the turn completed with no reply, no answering reaction (or
-  👀) and no final text. The agent read the ping and let it go; presence says "read
+- **Private final text:** only explicit chat actions can answer obligations.
+  Final turn text is never published automatically.
+- **Ignored:** the turn completed with no reply or answering reaction (or
+  👀). The agent read the ping and let it go; presence says "read
   it and let it go". Never retried.
 - **Unmet:** the turn was cancelled, cut short or failed with nothing posted.
   Presence says "turn ended without a reply".
 
-Ambient context never creates an obligation, so there is no fallback for it.
+Ambient context never creates an obligation.
 
 ## Refusal and dissent (peers, no CEO)
 

@@ -187,7 +187,7 @@ async fn two_pings_mid_turn_merge_into_one_batch_and_keep_both_obligations() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fallback_reply_only_when_the_obligation_is_unmet() {
+async fn final_text_stays_private_when_the_obligation_is_unanswered() {
     let mut h = Harness::new().await;
     let quiet = h
         .agent(
@@ -196,13 +196,20 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
         )
         .await;
     let ping = h.say("@quiet what is the answer?").await;
-    let m = h.wait_message("fallback", Some(quiet.id)).await;
-    assert_eq!(m.origin, Origin::Fallback);
-    assert_eq!(m.reply_to, Some(ping.id));
-    assert_eq!(&*m.body, "The answer is 42.");
+    h.until("quiet settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
+    assert!(agent_messages(&h.history().await, quiet.id).is_empty());
     assert_eq!(
         h.obligation(quiet.id, ping.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Ignored)
     );
 
     // A reaction that answers it: no fallback.
@@ -237,7 +244,7 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
     );
     assert!(agent_messages(&h.history().await, reactor.id).is_empty());
 
-    // An "on it" reaction does not answer: the fallback still posts.
+    // An "on it" reaction does not answer; final text remains private.
     let eyes = h
         .agent(
             "eyes",
@@ -248,8 +255,21 @@ async fn fallback_reply_only_when_the_obligation_is_unmet() {
         )
         .await;
     let ping3 = h.say("@eyes look at this").await;
-    let m = h.wait_message("fallback after 👀", Some(eyes.id)).await;
-    assert_eq!(m.reply_to, Some(ping3.id));
+    h.until("eyes settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 3
+    })
+    .await;
+    assert!(agent_messages(&h.history().await, eyes.id).is_empty());
+    assert_eq!(
+        h.obligation(eyes.id, ping3.id).await,
+        Some(ObligationState::Satisfied)
+    );
 
     // Turn ends with no text and no reply: the agent ignored it, which is
     // legitimate. Nothing posted, nothing owed, never retried.
