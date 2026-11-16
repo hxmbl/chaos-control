@@ -129,7 +129,24 @@ async fn run(seed: u64) {
 impl Harness {
     async fn count_param(&self, sql: &'static str, p: i64) -> i64 {
         self.core
-            .with_engine(move |e, _| e.conn().query_row(sql, [p], |r| r.get(0)).unwrap())
+            .with_engine(move |e, _| {
+                if let Ok(v) = e.conn().query_row(sql, [p], |r| r.get::<_, i64>(0)) {
+                    return v;
+                }
+                for proj in e.store().projects().unwrap_or_default() {
+                    if let Ok(ws) = e.store().project_workspace(&proj.id)
+                        && let Ok(v) = ws.query_row(sql, [p], |r| r.get::<_, i64>(0))
+                    {
+                        return v;
+                    }
+                    if let Ok(ag) = e.store().project_agents(&proj.id)
+                        && let Ok(v) = ag.query_row(sql, [p], |r| r.get::<_, i64>(0))
+                    {
+                        return v;
+                    }
+                }
+                panic!("count_param query failed: {sql}");
+            })
             .await
             .unwrap()
     }
