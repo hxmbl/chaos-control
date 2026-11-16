@@ -784,7 +784,8 @@ impl Engine {
             } else if everyone {
                 WakeReason::Everyone
             } else {
-                continue;
+                // Untargeted messages create no obligation, but agents still hear about them.
+                WakeReason::Everyone
             };
             let id = TriggerId {
                 agent: target.id,
@@ -1155,9 +1156,7 @@ impl Engine {
         // Everything in it already answered (e.g. by a reply sent mid-turn)?
         let triggers = store::batch_triggers(self.conn(), pending.id)?;
         let needs_delivery = triggers.iter().any(|t| {
-            !t.reason.is_direct()
-                || store::obligation_state(self.conn(), t.id).ok().flatten()
-                    == Some(ObligationState::Open)
+            store::obligation_state(self.conn(), t.id).ok().flatten() == Some(ObligationState::Open)
         });
         if !needs_delivery {
             self.store.tx::<_, PostError>(|c| {
