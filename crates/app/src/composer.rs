@@ -91,18 +91,29 @@ const WORKING_WORDS: &[&str] = &[
 
 const WORKING_WORD_INTERVAL: Duration = Duration::from_secs(5);
 
-fn working_indicator_label(agents: &[(std::sync::Arc<str>, &'static str)], word: &str) -> String {
+fn working_indicator_parts(
+    agents: &[(std::sync::Arc<str>, &'static str)],
+    word: &str,
+) -> Option<(String, String, String)> {
     match agents {
-        [] => String::new(),
-        [(name, _)] => format!("{name} is {word}…"),
-        [(a, _), (b, _)] => format!("{a} and {b} are {word}…"),
+        [] => None,
+        [(name, _)] => Some((format!("{name} is "), word.to_string(), "…".to_string())),
+        [(a, _), (b, _)] => Some((
+            format!("{a} and {b} are "),
+            word.to_string(),
+            "…".to_string(),
+        )),
         [all @ .., last] => {
             let names = all
                 .iter()
                 .map(|(n, _)| n.as_ref())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("{names}, and {} are {word}…", last.0)
+            Some((
+                format!("{names}, and {} are ", last.0),
+                word.to_string(),
+                "…".to_string(),
+            ))
         }
     }
 }
@@ -114,6 +125,7 @@ fn styled_working_text(
     base_style: &TextStyle,
     base: Hsla,
     bright: Hsla,
+    shimmer: bool,
 ) -> StyledText {
     let label_s: SharedString = label.to_string().into();
     let chars: Vec<(usize, char)> = label_s.char_indices().collect();
@@ -126,17 +138,22 @@ fn styled_working_text(
     for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
         let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label_s.len());
         let len = next - byte_ix;
-        let p = (i as f32 + 0.5) / n;
-        let d = (p - center).abs();
-        let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
-        let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
-        let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
+        let (mix, alpha) = if shimmer {
+            let p = (i as f32 + 0.5) / n;
+            let d = (p - center).abs();
+            let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
+            let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
+            let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
+            let alpha = (0.45 + 0.55 * mix) * (1.0 - blur * 0.35);
+            (mix, alpha.clamp(0.0, 1.0))
+        } else {
+            (0.35, (0.72 * (1.0 - blur * 0.15)).clamp(0.0, 1.0))
+        };
         let mut color = base;
         color.h = base.h + (bright.h - base.h) * mix;
         color.s = base.s + (bright.s - base.s) * mix;
         color.l = base.l + (bright.l - base.l) * mix;
-        let alpha = (0.45 + 0.55 * mix) * (1.0 - blur * 0.35);
-        color.a = alpha.clamp(0.0, 1.0);
+        color.a = alpha;
         runs.push(TextRun {
             len,
             font: base_style.font(),
@@ -150,13 +167,17 @@ fn styled_working_text(
 }
 
 fn working_indicator_element(
-    label: &str,
+    agents: &[(std::sync::Arc<str>, &'static str)],
+    word: &str,
     delta: f32,
     base_style: &TextStyle,
     base: Hsla,
     bright: Hsla,
 ) -> impl IntoElement {
-    // STRM-662: blur the word as it changes (blur-in at start of cycle, blur-out at end).
+    let Some((prefix, word, suffix)) = working_indicator_parts(agents, word) else {
+        return div().into_any_element();
+    };
+    // STRM-662: blur only the changing word as it transitions.
     let blur = if delta < 0.14 {
         1.0 - (delta / 0.14)
     } else if delta > 0.86 {
@@ -166,37 +187,45 @@ fn working_indicator_element(
     }
     .clamp(0.0, 1.0);
 
-    let main = styled_working_text(label, delta, blur, base_style, base, bright);
-    if blur <= 0.01 {
-        return div().child(main).into_any_element();
-    }
+    let prefix_el = styled_working_text(&prefix, delta, 0.0, base_style, base, bright, false);
+    let suffix_el = styled_working_text(&suffix, delta, 0.0, base_style, base, bright, false);
+    let word_main = styled_working_text(&word, delta, blur, base_style, base, bright, true);
 
-    let offsets: [(f32, f32, f32); 6] = [
-        (-1.6, 0.0, 0.16),
-        (1.6, 0.0, 0.16),
-        (0.0, -1.2, 0.14),
-        (0.0, 1.2, 0.14),
-        (-1.0, -0.8, 0.10),
-        (1.0, 0.8, 0.10),
-    ];
-    let mut ghost_colors = base;
-    ghost_colors.a = (base.a.max(0.55)) * blur;
-    let mut layers = div().relative().child(main);
-    for (i, (dx, dy, a)) in offsets.iter().enumerate() {
-        let mut gc = ghost_colors;
-        gc.a = (a * blur).clamp(0.0, 0.4);
-        // approximate blur with faint offset copies of the same label
-        let ghost = styled_working_text(label, delta, blur, base_style, gc, gc);
-        layers = layers.child(
-            div()
-                .id(("working-blur", i))
-                .absolute()
-                .top(px(*dy))
-                .left(px(*dx))
-                .child(ghost),
-        );
-    }
-    div().child(layers).into_any_element()
+    let word_el: gpui::AnyElement = if blur <= 0.01 {
+        div().child(word_main).into_any_element()
+    } else {
+        let offsets: [(f32, f32, f32); 6] = [
+            (-1.6, 0.0, 0.16),
+            (1.6, 0.0, 0.16),
+            (0.0, -1.2, 0.14),
+            (0.0, 1.2, 0.14),
+            (-1.0, -0.8, 0.10),
+            (1.0, 0.8, 0.10),
+        ];
+        let mut layers = div().relative().child(word_main);
+        for (i, (dx, dy, a)) in offsets.iter().enumerate() {
+            let mut gc = base;
+            gc.a = (a * blur).clamp(0.0, 0.4);
+            let ghost = styled_working_text(&word, delta, blur, base_style, gc, gc, true);
+            layers = layers.child(
+                div()
+                    .id(("working-blur", i))
+                    .absolute()
+                    .top(px(*dy))
+                    .left(px(*dx))
+                    .child(ghost),
+            );
+        }
+        div().child(layers).into_any_element()
+    };
+
+    div()
+        .flex()
+        .items_baseline()
+        .child(prefix_el)
+        .child(word_el)
+        .child(suffix_el)
+        .into_any_element()
 }
 
 fn echo_matches_in(
@@ -1242,14 +1271,17 @@ impl Composer {
         }));
     }
 
-    fn working_indicator_label(&self, cx: &Context<Self>) -> Option<String> {
+    fn working_indicator_agents(
+        &self,
+        cx: &Context<Self>,
+    ) -> Option<Vec<(std::sync::Arc<str>, &'static str)>> {
         let store = self.store.read(cx);
         let agents = store.working_agents(store.selected());
         if agents.is_empty() {
-            return None;
+            None
+        } else {
+            Some(agents)
         }
-        let word = WORKING_WORDS[self.working_word_index % WORKING_WORDS.len()];
-        Some(working_indicator_label(&agents, word))
     }
 
     fn render_reply(&self, reply: &ReplyRef, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -1473,7 +1505,7 @@ impl Render for Composer {
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
 
-        let working = self.working_indicator_label(cx);
+        let working = self.working_indicator_agents(cx);
 
         let box_el = div()
             .w_full()
@@ -1572,9 +1604,10 @@ impl Render for Composer {
                     .mb(space::X1)
                     .child(el)
             }))
-            .when_some(working, |d, label| {
+            .when_some(working, |d, agents| {
                 let base = t.muted;
                 let bright = t.ink;
+                let word_index = self.working_word_index;
                 d.child(
                     div()
                         .px(space::X2)
@@ -1589,8 +1622,10 @@ impl Render for Composer {
                                         .repeat()
                                         .with_easing(linear),
                                     move |el, delta| {
+                                        let word = WORKING_WORDS[word_index % WORKING_WORDS.len()];
                                         el.child(working_indicator_element(
-                                            &label,
+                                            &agents,
+                                            word,
                                             delta,
                                             &base_style,
                                             base,
