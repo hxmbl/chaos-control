@@ -361,11 +361,13 @@ impl Core {
     /// Whether anything was ever said in `id`'s channels.
     pub async fn project_has_messages(&self, id: ProjectId) -> Result<bool, String> {
         self.with_engine(move |e, _| {
-            let Ok(ws) = e.store().project_workspace(&id) else { return Ok(false); };
+            let Ok(ws) = e.store().project_workspace(&id) else {
+                return Ok(false);
+            };
             ws.query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |r| r.get(0))
         })
-            .await?
-            .map_err(|e| e.to_string())
+        .await?
+        .map_err(|e| e.to_string())
     }
 
     /// Deletes `id` if it has no folder, no messages and isn't the unclaimed
@@ -445,7 +447,9 @@ impl Core {
         let (handle, name) = (handle.to_string(), name.to_string());
         self.with_engine(move |e, now| {
             let m = e.ensure_member(MemberKind::Human, &handle, &name)?;
-            let ch = e.store().channel(channel)?
+            let ch = e
+                .store()
+                .channel(channel)?
                 .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             e.join_project(&ch.project, m.id, now)?;
             e.join(channel, &m, now)?;
@@ -489,11 +493,14 @@ impl Core {
         );
         let mm = self
             .with_engine(move |e, now| {
-                let project = e.store().channel(channel)?
+                let project = e
+                    .store()
+                    .channel(channel)?
                     .ok_or(rusqlite::Error::QueryReturnedNoRows)?
                     .project;
                 let core = e.conn();
-                let mm = crate::roster::ensure_model_member(core, &harness, model.as_deref(), &name)?;
+                let mm =
+                    crate::roster::ensure_model_member(core, &harness, model.as_deref(), &name)?;
                 crate::roster::roster_add(core, &project, mm.member.id, now)?;
                 Ok::<_, rusqlite::Error>(mm)
             })
@@ -646,11 +653,9 @@ impl Core {
         project: &ProjectId,
     ) -> Result<Vec<(MemberId, Arc<str>)>, String> {
         let project = project.clone();
-        self.with_engine(move |e, _| {
-            e.store().former_project_agent_mention_tokens(&project)
-        })
-        .await?
-        .map_err(|e| e.to_string())
+        self.with_engine(move |e, _| e.store().former_project_agent_mention_tokens(&project))
+            .await?
+            .map_err(|e| e.to_string())
     }
 
     pub async fn post(
@@ -795,11 +800,9 @@ impl Core {
         channel: ChannelId,
         after_seq: Seq,
     ) -> Result<Vec<Reaction>, String> {
-        self.with_engine(move |e, _| {
-            e.store().reactions_after_seq(channel, after_seq)
-        })
-        .await?
-        .map_err(|e| e.to_string())
+        self.with_engine(move |e, _| e.store().reactions_after_seq(channel, after_seq))
+            .await?
+            .map_err(|e| e.to_string())
     }
 
     /// A human refuses or dissents from `target` (agents use the chat tools).
@@ -834,10 +837,8 @@ impl Core {
 
     /// The stance a message states, if any (for drawing it).
     pub async fn stance_of(&self, message: MessageId) -> Result<Option<Stance>, String> {
-        self.with_engine(move |e, _| {
-            e.store().stance(message).map_err(|e| e.to_string())
-        })
-        .await?
+        self.with_engine(move |e, _| e.store().stance(message).map_err(|e| e.to_string()))
+            .await?
     }
 
     pub async fn history(&self, channel: ChannelId, limit: usize) -> Result<Vec<Message>, String> {
@@ -1058,7 +1059,10 @@ impl Actor {
             .engine
             .ensure_member(MemberKind::Agent, &spec.handle, &spec.name)
             .map_err(|e| e.to_string())?;
-        let project = self.engine.store().channel(channel)
+        let project = self
+            .engine
+            .store()
+            .channel(channel)
             .map_err(|e| e.to_string())?
             .ok_or("no such channel")?
             .project;

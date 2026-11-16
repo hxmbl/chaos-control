@@ -106,10 +106,7 @@ pub fn compose(
     window_to: Seq,
     answers: &reaction::PingAnswers,
 ) -> rusqlite::Result<String> {
-    let ch = store
-        .channel(channel)?
-        .map(|c| c.name)
-        .unwrap_or_default();
+    let ch = store.channel(channel)?.map(|c| c.name).unwrap_or_default();
     let cursor = store.cursor(agent, channel)?;
     let triggers = store.batch_triggers(batch)?;
     let mut trigger_msgs = Vec::new();
@@ -206,8 +203,8 @@ pub fn compose(
                     Some(a) if a == agent => " (yours)",
                     _ => "",
                 };
-                let at = target
-                    .map_or_else(|| format!("id:{}", r.message), |t| format!("#{}", t.seq));
+                let at =
+                    target.map_or_else(|| format!("id:{}", r.message), |t| format!("#{}", t.seq));
                 format!("{} {} on {at}{whose}", r.emoji, handle(store, r.member))
             })
             .collect();
@@ -250,11 +247,7 @@ pub fn compose(
 }
 
 /// Room norms, sent once at the start of a session.
-pub fn orientation(
-    store: &Store,
-    agent: MemberId,
-    channel: ChannelId,
-) -> rusqlite::Result<String> {
+pub fn orientation(store: &Store, agent: MemberId, channel: ChannelId) -> rusqlite::Result<String> {
     let me = store.member(agent)?;
     let ch = store.channel(channel)?.map(|c| c.name).unwrap_or_default();
     let nicknames = store.nicknames_in(channel)?;

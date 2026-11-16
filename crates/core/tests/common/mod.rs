@@ -202,20 +202,28 @@ impl Harness {
             let ok = self
                 .core
                 .with_engine(move |e, _| {
-                    if p(e.conn()) { return true; }
+                    if p(e.conn()) {
+                        return true;
+                    }
                     for proj in e.store().projects().unwrap_or_default() {
-                        if let Ok(ws) = e.store().project_workspace(&proj.id) {
-                            if p(ws) { return true; }
+                        if let Ok(ws) = e.store().project_workspace(&proj.id)
+                            && p(ws)
+                        {
+                            return true;
                         }
-                        if let Ok(ag) = e.store().project_agents(&proj.id) {
-                            if p(ag) { return true; }
+                        if let Ok(ag) = e.store().project_agents(&proj.id)
+                            && p(ag)
+                        {
+                            return true;
                         }
                     }
                     false
                 })
                 .await
                 .unwrap();
-            if ok { return; }
+            if ok {
+                return;
+            }
             if tokio::time::Instant::now() > deadline {
                 panic!("timed out waiting until {what}");
             }
@@ -275,15 +283,15 @@ impl Harness {
                     return v;
                 }
                 for proj in e.store().projects().unwrap_or_default() {
-                    if let Ok(ws) = e.store().project_workspace(&proj.id) {
-                        if let Ok(v) = ws.query_row(sql, [], |r| r.get::<_, i64>(0)) {
-                            return v;
-                        }
+                    if let Ok(ws) = e.store().project_workspace(&proj.id)
+                        && let Ok(v) = ws.query_row(sql, [], |r| r.get::<_, i64>(0))
+                    {
+                        return v;
                     }
-                    if let Ok(ag) = e.store().project_agents(&proj.id) {
-                        if let Ok(v) = ag.query_row(sql, [], |r| r.get::<_, i64>(0)) {
-                            return v;
-                        }
+                    if let Ok(ag) = e.store().project_agents(&proj.id)
+                        && let Ok(v) = ag.query_row(sql, [], |r| r.get::<_, i64>(0))
+                    {
+                        return v;
                     }
                 }
                 panic!("count query failed: {sql}");

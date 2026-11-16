@@ -691,16 +691,32 @@ impl Engine {
         if author.kind == MemberKind::Human {
             return Ok(0);
         }
-        let project = self.store.project_for_channel(channel).ok_or(PostError::UnknownChannel)?;
-        let ws = self.store.project_workspace(&project).map_err(|e| PostError::Store(e.to_string()))?;
-        let last_human = store::last_human_seq(ws, channel).map_err(|e| PostError::Store(e.to_string()))?;
+        let project = self
+            .store
+            .project_for_channel(channel)
+            .ok_or(PostError::UnknownChannel)?;
+        let ws = self
+            .store
+            .project_workspace(&project)
+            .map_err(|e| PostError::Store(e.to_string()))?;
+        let last_human =
+            store::last_human_seq(ws, channel).map_err(|e| PostError::Store(e.to_string()))?;
         let base = match cause {
             Some(b) => {
-                let bproj = self.store.project_for_batch(b).ok_or(PostError::UnknownChannel)?;
-                let ag = self.store.project_agents(&bproj).map_err(|e| PostError::Store(e.to_string()))?;
+                let bproj = self
+                    .store
+                    .project_for_batch(b)
+                    .ok_or(PostError::UnknownChannel)?;
+                let ag = self
+                    .store
+                    .project_agents(&bproj)
+                    .map_err(|e| PostError::Store(e.to_string()))?;
                 let mut base = 0u8;
-                for t in store::batch_triggers(ag, b).map_err(|e| PostError::Store(e.to_string()))? {
-                    if let Some(m) = store::message(ws, t.id.message).map_err(|e| PostError::Store(e.to_string()))?
+                for t in
+                    store::batch_triggers(ag, b).map_err(|e| PostError::Store(e.to_string()))?
+                {
+                    if let Some(m) = store::message(ws, t.id.message)
+                        .map_err(|e| PostError::Store(e.to_string()))?
                         && m.seq > last_human
                     {
                         base = base.max(t.hop);
@@ -708,7 +724,8 @@ impl Engine {
                 }
                 base
             }
-            None => store::last_agent_message_after(ws, channel, last_human).map_err(|e| PostError::Store(e.to_string()))?
+            None => store::last_agent_message_after(ws, channel, last_human)
+                .map_err(|e| PostError::Store(e.to_string()))?
                 .map(|m| m.hop)
                 .unwrap_or(0),
         };
@@ -734,11 +751,19 @@ impl Engine {
                 channel,
                 message: r,
             };
-            if self.store.obligation_state(t).map_err(|e| PostError::Store(e.to_string()))? == Some(ObligationState::Open) {
+            if self
+                .store
+                .obligation_state(t)
+                .map_err(|e| PostError::Store(e.to_string()))?
+                == Some(ObligationState::Open)
+            {
                 target = Some(t);
             }
         } else if let Some(b) = cause {
-            let open = self.store.open_obligations(b).map_err(|e| PostError::Store(e.to_string()))?;
+            let open = self
+                .store
+                .open_obligations(b)
+                .map_err(|e| PostError::Store(e.to_string()))?;
             if open.len() == 1 {
                 target = Some(open[0]);
             }
@@ -749,7 +774,9 @@ impl Engine {
                 Origin::Dissent => (ObligationState::Satisfied, "dissent"),
                 _ => (ObligationState::Satisfied, "send"),
             };
-            self.store.resolve_obligation(t, state, Some(message.id), kind).map_err(|e| PostError::Store(e.to_string()))?;
+            self.store
+                .resolve_obligation(t, state, Some(message.id), kind)
+                .map_err(|e| PostError::Store(e.to_string()))?;
         }
         if cause.is_some() {
             let rt = self.rt.entry((agent.id, channel)).or_default();
@@ -772,9 +799,16 @@ impl Engine {
             return Ok(());
         }
         let channel = message.channel;
-        let members = self.store.members_of(channel).map_err(|e| PostError::Store(e.to_string()))?;
+        let members = self
+            .store
+            .members_of(channel)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let reply_parent_author = match message.reply_to {
-            Some(r) => self.store.message(r).map_err(|e| PostError::Store(e.to_string()))?.and_then(|m| m.author),
+            Some(r) => self
+                .store
+                .message(r)
+                .map_err(|e| PostError::Store(e.to_string()))?
+                .and_then(|m| m.author),
             None => None,
         };
         let mut woken = Vec::new();
@@ -797,7 +831,11 @@ impl Engine {
                 channel,
                 message: message.id,
             };
-            if self.store.trigger_exists(id).map_err(|e| PostError::Store(e.to_string()))? {
+            if self
+                .store
+                .trigger_exists(id)
+                .map_err(|e| PostError::Store(e.to_string()))?
+            {
                 continue;
             }
             if author.kind == MemberKind::Agent {
@@ -826,10 +864,17 @@ impl Engine {
                 }
             }
             {
-                let batch = self.store.pending_batch_or_create(target.id, channel, now).map_err(|e| PostError::Store(e.to_string()))?;
-                self.store.insert_trigger(id, reason, message.hop, batch.id, now).map_err(|e| PostError::Store(e.to_string()))?;
+                let batch = self
+                    .store
+                    .pending_batch_or_create(target.id, channel, now)
+                    .map_err(|e| PostError::Store(e.to_string()))?;
+                self.store
+                    .insert_trigger(id, reason, message.hop, batch.id, now)
+                    .map_err(|e| PostError::Store(e.to_string()))?;
                 if reason.is_direct() {
-                    self.store.insert_obligation(id).map_err(|e| PostError::Store(e.to_string()))?;
+                    self.store
+                        .insert_obligation(id)
+                        .map_err(|e| PostError::Store(e.to_string()))?;
                 }
             }
             if author.kind == MemberKind::Human {
@@ -1163,21 +1208,38 @@ impl Engine {
             return Ok(());
         };
         // Everything in it already answered (e.g. by a reply sent mid-turn)?
-        let triggers = self.store.batch_triggers(pending.id).map_err(|e| PostError::Store(e.to_string()))?;
+        let triggers = self
+            .store
+            .batch_triggers(pending.id)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let needs_delivery = triggers.iter().any(|t| {
             !t.reason.is_direct()
-                || self.store.obligation_state(t.id).ok().flatten()
-                    == Some(ObligationState::Open)
+                || self.store.obligation_state(t.id).ok().flatten() == Some(ObligationState::Open)
         });
         if !needs_delivery {
-            self.store.set_batch_state(pending.id, BatchState::Settled, now, Some("answered before delivery")).map_err(|e| PostError::Store(e.to_string()))?;
+            self.store
+                .set_batch_state(
+                    pending.id,
+                    BatchState::Settled,
+                    now,
+                    Some("answered before delivery"),
+                )
+                .map_err(|e| PostError::Store(e.to_string()))?;
             return Ok(());
         }
-        let window_to = self.store.head_seq(channel).map_err(|e| PostError::Store(e.to_string()))?;
-        let attempt = self.store.dispatch_batch(pending.id, window_to).map_err(|e| PostError::Store(e.to_string()))?;
+        let window_to = self
+            .store
+            .head_seq(channel)
+            .map_err(|e| PostError::Store(e.to_string()))?;
+        let attempt = self
+            .store
+            .dispatch_batch(pending.id, window_to)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let answers = self.ping_answers(agent, channel);
-        let prompt = notify::compose(&self.store, agent, channel, pending.id, window_to, &answers).map_err(|e| PostError::Store(e.to_string()))?;
-        let orientation = notify::orientation(&self.store, agent, channel).map_err(|e| PostError::Store(e.to_string()))?;
+        let prompt = notify::compose(&self.store, agent, channel, pending.id, window_to, &answers)
+            .map_err(|e| PostError::Store(e.to_string()))?;
+        let orientation = notify::orientation(&self.store, agent, channel)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.retry_at = None;
         rt.sent_in_turn.clear();

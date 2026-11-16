@@ -1119,6 +1119,24 @@ impl Store {
         };
         cursor_db(self.project_workspace(&project)?, agent, channel)
     }
+    pub fn messages_between(
+        &self,
+        channel: ChannelId,
+        after: Seq,
+        through: Seq,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(vec![]);
+        };
+        messages_between(
+            self.project_workspace(&project)?,
+            channel,
+            after,
+            through,
+            limit,
+        )
+    }
     pub fn messages_before(
         &self,
         channel: ChannelId,
@@ -1445,6 +1463,18 @@ impl Store {
             .project_for_channel(channel)
             .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
         recent_stances(self.project_workspace(&project)?, channel, limit)
+    }
+    pub fn set_batch_state(
+        &self,
+        id: BatchId,
+        state: BatchState,
+        now: Millis,
+        outcome: Option<&str>,
+    ) -> Result<()> {
+        let project = self
+            .project_for_batch(id)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        set_batch_state(self.project_agents(&project)?, id, state, now, outcome)
     }
     pub fn dispatch_batch(&self, id: BatchId, window_to: Seq) -> Result<u32> {
         let project = self
