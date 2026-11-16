@@ -6154,6 +6154,11 @@ mod tests {
                 params![P1],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO project_settings (project_id, key, value, updated_at) VALUES (?1, 'k', 'v', 5)",
+                params![P1],
+            )
+            .unwrap();
         }
 
         // Interrupted/partial state: copied core metadata, schema-valid empty project DBs, no valid marker.
@@ -6193,6 +6198,18 @@ mod tests {
         assert!(!super::split_migration_marker(&dir).exists());
         assert_eq!(s.projects().unwrap().len(), 1);
         assert!(s.is_project_member(&pid(P1), MemberId(1)).unwrap());
+        let setting: Option<String> = s
+            .project_workspace(&pid(P1))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM project_settings WHERE project_id=?1 AND key='k'",
+                params![P1],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(setting.as_deref(), Some("v"));
         assert_eq!(s.allocate_id("channel").unwrap(), 1);
         assert_eq!(s.allocate_id("message").unwrap(), 1);
         assert_eq!(s.allocate_id("batch").unwrap(), 1);
@@ -6221,6 +6238,11 @@ mod tests {
                 params![P1],
             )
             .unwrap();
+            conn.execute(
+                "INSERT INTO project_settings (project_id, key, value, updated_at) VALUES (?1, 'k', 'v', 5)",
+                params![P1],
+            )
+            .unwrap();
         }
         plant_partial(&dir);
         std::fs::write(super::split_migration_marker(&dir), b"").unwrap();
@@ -6232,6 +6254,18 @@ mod tests {
         assert!(dir.join("core.sqlite.pre-split").exists());
         assert!(!super::split_migration_marker(&dir).exists());
         assert_eq!(s.projects().unwrap().len(), 1);
+        let setting: Option<String> = s
+            .project_workspace(&pid(P1))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM project_settings WHERE project_id=?1 AND key='k'",
+                params![P1],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(setting.as_deref(), Some("v"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
