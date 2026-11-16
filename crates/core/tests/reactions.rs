@@ -50,6 +50,20 @@ async fn settled(h: &mut Harness, n: i64) {
     .await;
 }
 
+/// Every batch has finished; robust when several settle between polls.
+async fn settled_all(h: &Harness) {
+    h.until("all batches settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state != 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 0
+    })
+    .await;
+}
+
 async fn resolved_kind(h: &Harness, message: MessageId) -> Option<String> {
     h.core
         .with_engine(move |e, _| {
@@ -81,7 +95,7 @@ async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
         |e| matches!(e, CoreEvent::Reaction { member, added: true, .. } if *member == check.id),
     )
     .await;
-    settled(&mut h, 1).await;
+    settled_all(&h).await;
     assert_eq!(
         h.obligation(check.id, ping.id).await,
         Some(ObligationState::Satisfied)
@@ -111,7 +125,7 @@ async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
         )
         .await;
     let ping2 = h.say("@skull I broke CI again").await;
-    settled(&mut h, 2).await;
+    settled_all(&h).await;
     assert_eq!(
         h.obligation(skull.id, ping2.id).await,
         Some(ObligationState::Ignored)
@@ -130,7 +144,7 @@ async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
         )
         .await;
     let ping3 = h.say("@quiet I broke it again").await;
-    settled(&mut h, 3).await;
+    settled_all(&h).await;
     assert_eq!(
         h.obligation(quiet.id, ping3.id).await,
         Some(ObligationState::Ignored)
@@ -145,7 +159,7 @@ async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
         )
         .await;
     let ping4 = h.say("@eyes can you look").await;
-    settled(&mut h, 4).await;
+    settled_all(&h).await;
     assert_eq!(
         h.obligation(eyes.id, ping4.id).await,
         Some(ObligationState::Satisfied)
@@ -157,20 +171,27 @@ async fn by_default_check_and_thumbs_up_answer_a_ping_and_other_emoji_dont() {
         .agent("mute", script(json!({"turns": [{"steps": []}]})))
         .await;
     let ping5 = h.say("@mute hello?").await;
-    settled(&mut h, 5).await;
+    settled_all(&h).await;
     assert_eq!(
         h.obligation(mute.id, ping5.id).await,
         Some(ObligationState::Ignored)
     );
 
-    // Taking the reaction back later doesn't reopen anything.
+    // Taking the reaction back later doesn't reopen anything and wakes
+    // nobody: no new prompt for @check, whose other prompts are the
+    // broadcast hearings (STRM-536) of the messages above.
+    let prompts_before_remove = h.prompts("check").len();
     h.core.react(check.id, ping.id, "✅", false).await.unwrap();
     assert_eq!(
         h.obligation(check.id, ping.id).await,
         Some(ObligationState::Satisfied)
     );
     h.advance(10 * 60 * 1000).await;
-    assert_eq!(h.prompts("check").len(), 1, "never retried");
+    assert_eq!(
+        h.prompts("check").len(),
+        prompts_before_remove,
+        "never retried"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -380,7 +401,7 @@ async fn a_reaction_wakes_nobody_not_even_the_author() {
         .await;
     h.say("@poster ship it").await;
     let shipped = h.wait_message("poster's reply", Some(poster.id)).await;
-    settled(&mut h, 1).await;
+    settled_all(&h).await; // @poster's mention wake and @other's broadcast
     h.quiesce().await;
     let batches = h.count("SELECT COUNT(*) FROM batches").await;
     let triggers = h.count("SELECT COUNT(*) FROM triggers").await;
@@ -399,7 +420,7 @@ async fn a_reaction_wakes_nobody_not_even_the_author() {
         .post(poster.id, h.main, "thanks @other", None)
         .await
         .unwrap();
-    settled(&mut h, 2).await; // @other's own wake from the mention
+    settled_all(&h).await; // @other's own wake from the mention
     let after_mention_batches = h.count("SELECT COUNT(*) FROM batches").await;
     let after_mention_triggers = h.count("SELECT COUNT(*) FROM triggers").await;
     h.core.react(h.hx.id, mention.id, "👍", true).await.unwrap();
@@ -418,7 +439,11 @@ async fn a_reaction_wakes_nobody_not_even_the_author() {
         "no trigger for any reaction"
     );
     assert_eq!(h.prompts("poster").len(), 1, "the author is not woken");
-    assert_eq!(h.prompts("other").len(), 1, "only the mention woke @other");
+    assert_eq!(
+        h.prompts("other").len(),
+        3,
+        "two broadcasts (the ping and poster's reply) and the mention reached @other; reactions woke nobody"
+    );
     let st = h.core.status(poster.id, h.main).await.unwrap();
     assert_ne!(st.glow, Glow::Unresponsive);
     // The UI still hears about each one.
@@ -608,36 +633,48 @@ async fn prompts_show_reactions_compactly() {
     let bot = h
         .agent(
             "bot",
-            script(json!({"turns": [{"steps": [send_reply("On it.")]}, {"steps": []}]})),
+            script(json!({"turns": [
+                {"steps": []},
+                {"steps": [send_reply("On it.")]},
+                {"steps": []}
+            ]})),
         )
         .await;
+    // The untargeted note is heard as a broadcast (STRM-536, turn 1, silent);
+    // the reaction lands before the mention, whose prompt shows the note as
+    // the reply parent, carrying its reaction on the line.
     let note = h.say("the flaky test is back").await;
     h.core.react(h.hx.id, note.id, "💀", true).await.unwrap();
-    let ping = h.say("@bot can you look").await;
-    let prompts = h.wait_prompts("bot", 1).await;
+    let ping = h.say_reply("@bot can you look", note.id).await;
+    let prompts = h.wait_prompts("bot", 2).await;
     assert!(
-        prompts[0].contains("the flaky test is back [💀 @hx]"),
+        prompts[1].contains("the flaky test is back [💀 @hx]"),
         "reactions ride on the message line: {}",
-        prompts[0]
+        prompts[1]
     );
     assert!(
-        prompts[0].contains("react with chat_react"),
+        prompts[1].contains("react with chat_react"),
         "the owed line mentions reacting: {}",
-        prompts[0]
+        prompts[1]
     );
     let reply = h.wait_message("reply", Some(bot.id)).await;
-    settled(&mut h, 1).await;
+    settled_all(&h).await;
 
     // After the turn: a reaction on the ping (already read) and one on the
     // bot's own reply. Neither wakes it; the next prompt carries both.
     h.advance(1_000).await;
+    let prompts_before_react = h.prompts("bot").len();
     h.core.react(h.hx.id, ping.id, "👍", true).await.unwrap();
     h.core.react(h.hx.id, reply.id, "🎉", true).await.unwrap();
     h.advance(1_000).await;
-    assert_eq!(h.prompts("bot").len(), 1, "reactions don't wake");
+    assert_eq!(
+        h.prompts("bot").len(),
+        prompts_before_react,
+        "reactions don't wake"
+    );
     h.say("@bot thanks").await;
-    let prompts = h.wait_prompts("bot", 2).await;
-    let p = &prompts[1];
+    let prompts = h.wait_prompts("bot", 3).await;
+    let p = &prompts[2];
     assert!(
         p.contains(&format!(
             "Reactions since you last read: 👍 @hx on #{}",

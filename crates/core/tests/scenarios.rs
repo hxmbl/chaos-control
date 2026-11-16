@@ -14,6 +14,22 @@ fn agent_messages(msgs: &[Message], agent: MemberId) -> Vec<Message> {
         .collect()
 }
 
+/// Waits until the obligation for (agent, message) is no longer `open`,
+/// however it resolved. Immune to unrelated batches settling nearby.
+async fn obligation_settles(h: &Harness, agent: MemberId, message: MessageId) {
+    let channel = h.main;
+    h.until("obligation settled", move |c| {
+        c.query_row(
+            "SELECT state FROM obligations WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
+            [agent.0, channel.0, message.0],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|s| s != "open")
+        .unwrap_or(false)
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_mention_gets_exactly_one_reply() {
     let mut h = Harness::new().await;
@@ -199,16 +215,7 @@ async fn final_text_stays_private_when_the_obligation_is_unanswered() {
         )
         .await;
     let ping = h.say("@quiet what is the answer?").await;
-    h.until("quiet settled", |c| {
-        c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            == 1
-    })
-    .await;
+    obligation_settles(&h, quiet.id, ping.id).await;
     assert!(agent_messages(&h.history().await, quiet.id).is_empty());
     assert_eq!(
         h.obligation(quiet.id, ping.id).await,
@@ -231,16 +238,7 @@ async fn final_text_stays_private_when_the_obligation_is_unanswered() {
         |e| matches!(e, CoreEvent::Reaction { member, .. } if *member == reactor.id),
     )
     .await;
-    h.until("settled", |c| {
-        c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            == 2
-    })
-    .await;
+    obligation_settles(&h, reactor.id, ping2.id).await;
     assert_eq!(
         h.obligation(reactor.id, ping2.id).await,
         Some(ObligationState::Satisfied)
@@ -259,16 +257,7 @@ async fn final_text_stays_private_when_the_obligation_is_unanswered() {
         )
         .await;
     let ping3 = h.say("@eyes look at this").await;
-    h.until("eyes settled", |c| {
-        c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .unwrap()
-            == 3
-    })
-    .await;
+    obligation_settles(&h, eyes.id, ping3.id).await;
     assert!(agent_messages(&h.history().await, eyes.id).is_empty());
     assert_eq!(
         h.obligation(eyes.id, ping3.id).await,
