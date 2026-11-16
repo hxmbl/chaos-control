@@ -108,9 +108,10 @@ async fn v2_agent_is_negotiated_and_replies_through_the_chat_tools() {
 /// Keyed upserts: chunks and an `agent_message` snapshot of the same message
 /// are one message (the snapshot replaces, never appends); a tool call's
 /// `completed` upsert arriving after the next message has started neither
-/// clears that message nor counts as a new tool call.
+/// clears that message nor counts as a new tool call. Final turn text is kept
+/// private unless the agent explicitly posts it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_fallback_text_follows_keyed_message_and_tool_call_upserts() {
+async fn v2_final_text_stays_private_across_keyed_message_and_tool_call_upserts() {
     let mut h = Harness::new().await;
     let bot = h
         .agent(
@@ -140,17 +141,15 @@ async fn v2_fallback_text_follows_keyed_message_and_tool_call_upserts() {
     );
     h.fake("bot").gates.open("look");
 
-    let reply = h.wait_message("fallback", Some(bot.id)).await;
-    assert_eq!(reply.origin, Origin::Fallback);
-    assert_eq!(reply.reply_to, Some(ping.id));
-    assert_eq!(
-        &*reply.body, "The flake is a timezone bug. Fix in #12.",
-        "the text since the tool call, with the snapshot replacing its chunks"
-    );
     h.until("batch settled", batches_in("settled", 1)).await;
+    h.quiesce().await;
     assert_eq!(
         h.obligation(bot.id, ping.id).await,
-        Some(ObligationState::Fallback)
+        Some(ObligationState::Ignored)
+    );
+    assert!(
+        h.by(bot.id).await.is_empty(),
+        "final text is not auto-posted"
     );
 }
 
@@ -169,9 +168,12 @@ async fn v2_permission_request_is_auto_allowed() {
         )
         .await;
     let ping = h.say("@bot clean the build dir").await;
-    let reply = h.wait_message("fallback", Some(bot.id)).await;
-    assert_eq!(reply.reply_to, Some(ping.id));
-    assert_eq!(&*reply.body, "Deleted build/.");
+    h.until("batch settled", batches_in("settled", 1)).await;
+    assert_eq!(
+        h.obligation(bot.id, ping.id).await,
+        Some(ObligationState::Ignored)
+    );
+    assert!(h.by(bot.id).await.is_empty(), "final text stays private");
     let outcomes = h
         .fake("bot")
         .observed
@@ -222,11 +224,16 @@ async fn v2_interrupt_ends_the_turn_cancelled_and_unmet() {
     );
     assert!(h.by(bot.id).await.is_empty(), "no reply, no fallback");
 
-    // The next turn on the same v2 session runs normally.
+    // The next turn on the same v2 session runs normally; final text remains
+    // private and the obligation is ignored.
     let second = h.say("@bot and now?").await;
-    let fallback = h.wait_message("second fallback", Some(bot.id)).await;
-    assert_eq!(fallback.reply_to, Some(second.id));
-    assert_eq!(&*fallback.body, "second: all green");
+    h.until("both turns settled", batches_in("settled", 2))
+        .await;
+    assert_eq!(
+        h.obligation(bot.id, second.id).await,
+        Some(ObligationState::Ignored)
+    );
+    assert!(h.by(bot.id).await.is_empty(), "no automatic fallback reply");
     assert_eq!(h.fake("bot").observed.lock().unwrap().sessions.len(), 1);
 }
 

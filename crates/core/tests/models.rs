@@ -3,7 +3,7 @@
 
 mod common;
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use chaos_core::{
     acp::{AcpAdapter, FnTransport},
@@ -49,20 +49,6 @@ async fn add(
         .unwrap()
 }
 
-/// Polls `f` (real time, bounded) until it returns `Some`.
-async fn eventually<T>(what: &str, mut f: impl AsyncFnMut() -> Option<T>) -> T {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    loop {
-        if let Some(v) = f().await {
-            return v;
-        }
-        if tokio::time::Instant::now() > deadline {
-            panic!("timed out waiting for {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-}
-
 fn models_script() -> serde_json::Value {
     json!({
         "models": [["fast-1", "Fast One"], ["big-2", "Big Two"]],
@@ -85,9 +71,22 @@ async fn acp_member_runs_its_model_through_the_session_model_option() {
     )
     .await;
     assert_eq!(&*m.member.handle, "big-two");
-    h.say("@big-two hello").await;
-    h.wait_message("the fallback reply", Some(m.member.id))
-        .await;
+    let ping = h.say("@big-two hello").await;
+    h.until("turn settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
+    assert_eq!(
+        h.obligation(m.member.id, ping.id).await,
+        Some(chaos_core::types::ObligationState::Ignored)
+    );
+    assert!(h.by(m.member.id).await.is_empty());
     let o = fake.observed.lock().unwrap().clone();
     assert_eq!(
         o.config_sets,
@@ -123,24 +122,50 @@ async fn a_model_the_harness_does_not_offer_runs_the_default_and_says_so() {
     )
     .await;
     h.say("@gone-nine hello").await;
-    h.wait_message("the reply", Some(m.member.id)).await;
-    assert!(fake.observed.lock().unwrap().config_sets.is_empty());
-    let presence = eventually("a model note", async || {
-        let s = h.core.status(m.member.id, h.main).await.ok()?;
-        s.presence.filter(|p| p.contains("gone-9"))
+    let note = h
+        .wait_for("model note", |e| {
+            matches!(e, CoreEvent::Agent(s) if s.agent == m.member.id && s.presence.as_deref().is_some_and(|p| p.contains("running its default")))
+        })
+        .await;
+    let CoreEvent::Agent(note) = note else {
+        unreachable!()
+    };
+    assert!(
+        note.presence
+            .as_deref()
+            .is_some_and(|p| p.contains("gone-9") && p.contains("running its default")),
+        "{note:?}"
+    );
+    h.until("turn settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
     })
     .await;
-    assert!(presence.contains("running its default"), "{presence}");
+    assert!(fake.observed.lock().unwrap().config_sets.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_default_model_member_sets_nothing() {
-    let mut h = Harness::new().await;
+    let h = Harness::new().await;
     let fake = FakeAgent::new(script(models_script()));
     let m = add(&h, "fx", None, "fx default", acp_adapter(&fake, None)).await;
     assert_eq!(&*m.member.handle, "fx");
     h.say("@fx hello").await;
-    h.wait_message("the reply", Some(m.member.id)).await;
+    h.until("turn settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
     assert!(fake.observed.lock().unwrap().config_sets.is_empty());
 }
 
@@ -172,7 +197,7 @@ async fn acp_discovery_opens_and_closes_a_throwaway_session_without_chat_tools()
 /// Devin's trusted workspaces before model discovery and before a session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn devin_folders_are_trusted_before_discovery_and_sessions() {
-    let mut h = Harness::new().await;
+    let h = Harness::new().await;
     let root = std::env::temp_dir().join(format!("chaos-devin-trust-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let (probe_dir, work_dir) = (root.join("probe"), root.join("work"));
@@ -226,7 +251,16 @@ async fn devin_folders_are_trusted_before_discovery_and_sessions() {
         .await
         .unwrap();
     h.say(&format!("@{} hello", m.member.handle)).await;
-    h.wait_message("the reply", Some(m.member.id)).await;
+    h.until("turn settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
     assert_eq!(trusted(), vec![canon(&probe_dir), canon(&work_dir)]);
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -250,7 +284,7 @@ async fn discovery_of_a_signed_out_harness_is_an_error_and_caches_nothing() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
-    let mut h = Harness::new().await;
+    let h = Harness::new().await;
     let fake_a = FakeAgent::new(script(models_script()));
     let fake_b = FakeAgent::new(script(models_script()));
     let a = add(
@@ -290,7 +324,16 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     assert_eq!(h.core.roster(&project).await.unwrap().len(), 2);
 
     h.say("@fast-one hi").await;
-    h.wait_message("a's reply", Some(a.member.id)).await;
+    h.until("a settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 1
+    })
+    .await;
 
     h.core.remove_member(&project, a.member.id).await.unwrap();
     let roster = h.core.roster(&project).await.unwrap();
@@ -299,7 +342,6 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     assert!(!members.iter().any(|m| m.id == a.member.id));
     // Its history stays, and core still knows it was an agent (the app
     // labels those messages "Previous agent").
-    assert_eq!(h.by(a.member.id).await.len(), 1);
     let agents = h.core.agent_members().await.unwrap();
     assert!(agents.contains(&a.member.id) && agents.contains(&b.member.id));
     assert!(!agents.contains(&h.hx.id));
@@ -307,7 +349,16 @@ async fn one_harness_hosts_two_members_and_removing_one_leaves_the_other() {
     // A mention of the removed member wakes nobody; the other still answers.
     let prompts_before = fake_a.observed.lock().unwrap().prompts.len();
     h.say("@fast-one @big-two both of you").await;
-    h.wait_message("b's reply", Some(b.member.id)).await;
+    h.until("b settled", |c| {
+        c.query_row(
+            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+            == 2
+    })
+    .await;
     h.quiesce().await;
     assert_eq!(
         fake_a.observed.lock().unwrap().prompts.len(),

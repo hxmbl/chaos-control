@@ -109,22 +109,6 @@ async fn run(seed: u64) {
             Some(ObligationState::Open),
             "seed {seed}: obligation left open"
         );
-        if state == Some(ObligationState::Fallback) {
-            // Answered by the batch's single fallback message, which replies to
-            // the newest open trigger of that batch (maybe this one).
-            let by = h
-                .count_param(
-                    "SELECT COALESCE(resolved_by, 0) FROM obligations WHERE message_id = ?1",
-                    ping.0,
-                )
-                .await;
-            let fallback = history
-                .iter()
-                .find(|m| m.id.0 == by)
-                .expect("resolving message exists");
-            assert_eq!(fallback.origin, Origin::Fallback, "seed {seed}");
-            assert_eq!(fallback.author, Some(bot.id), "seed {seed}");
-        }
     }
     // One delivery per batch, never a re-send after acceptance.
     let batches = h
