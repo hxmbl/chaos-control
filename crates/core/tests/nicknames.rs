@@ -150,12 +150,18 @@ async fn a_clashing_nickname_is_refused() {
     let woken: i64 = h
         .core
         .with_engine(move |e, _| {
-            if let Ok(v) = e.conn().query_row("SELECT agent_id FROM triggers", [], |r| r.get::<_, i64>(0)) {
+            if let Ok(v) = e
+                .conn()
+                .query_row("SELECT agent_id FROM triggers", [], |r| r.get::<_, i64>(0))
+            {
                 return v;
             }
             for proj in e.store().projects().unwrap_or_default() {
                 if let Ok(ag) = e.store().project_agents(&proj.id)
-                    && let Ok(v) = ag.query_row("SELECT agent_id FROM triggers ORDER BY agent_id", [], |r| r.get::<_, i64>(0))
+                    && let Ok(v) =
+                        ag.query_row("SELECT agent_id FROM triggers ORDER BY agent_id", [], |r| {
+                            r.get::<_, i64>(0)
+                        })
                 {
                     return v;
                 }

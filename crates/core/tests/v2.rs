@@ -43,7 +43,9 @@ async fn outcomes(h: &Harness) -> Vec<(String, Option<String>)> {
             for proj in e.store().projects().unwrap_or_default() {
                 if let Ok(ag) = e.store().project_agents(&proj.id)
                     && let Ok(mut st) = ag.prepare("SELECT state, outcome FROM batches ORDER BY id")
-                    && let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)))
+                    && let Ok(rows) = st.query_map([], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                    })
                 {
                     let v: Vec<_> = rows.map(Result::unwrap).collect();
                     if !v.is_empty() || e.store().projects().unwrap_or_default().len() == 1 {

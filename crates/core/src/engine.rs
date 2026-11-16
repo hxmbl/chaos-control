@@ -1104,8 +1104,12 @@ impl Engine {
         if self.store.project(project)?.is_none() {
             return Err(SettingError::UnknownProject);
         }
-        self.store
-            .set_project_setting(project, reaction::PING_ANSWERS_KEY, value.as_deref(), now)?;
+        self.store.set_project_setting(
+            project,
+            reaction::PING_ANSWERS_KEY,
+            value.as_deref(),
+            now,
+        )?;
         Ok(parsed.unwrap_or_default())
     }
 
@@ -1155,7 +1159,9 @@ impl Engine {
             runtime,
             created_at: now,
         };
-        self.store.insert_stance(&stance).map_err(|e| PostError::Store(e.to_string()))?;
+        self.store
+            .insert_stance(&stance)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         if req.kind == StanceKind::Refusal && !posted.deduped {
             let target_seq = self.store.message(req.target)?.map(|m| m.seq);
             // Agents only (humans have no runtime state or presence).

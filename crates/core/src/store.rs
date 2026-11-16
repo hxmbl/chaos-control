@@ -137,6 +137,34 @@ impl std::error::Error for OpenError {
     }
 }
 
+fn store_open_error_to_sqlite(e: OpenError) -> rusqlite::Error {
+    match e {
+        OpenError::Sqlite(e) => e,
+        OpenError::NewerSchema { path, found, known } => {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                "newer schema at {} (found {}, known {})",
+                path.display(),
+                found,
+                known
+            ))))
+        }
+        OpenError::Project {
+            project,
+            path,
+            source,
+        } => rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+            "project {project:?} storage {}: {source}",
+            path.display()
+        )))),
+    }
+}
+
+fn cannot_inspect_project_storage(project: &ProjectId) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        "cannot inspect project storage for {project:?}"
+    ))))
+}
+
 /// Legacy ordered migrations for the old single `core.sqlite` file.
 /// `PRAGMA user_version` records how many have run; add new ones at the end,
 /// never edit old ones.
@@ -915,8 +943,10 @@ impl Store {
     }
 
     /// Allocates a globally unique ID from core.db counters (channel/message/batch).
-    pub fn allocate_id(&self, name: &str) -> Result<i64> {
-        let tx = self.core.unchecked_transaction()?;
+    pub fn allocate_id(&mut self, name: &str) -> Result<i64> {
+        let tx = self
+            .core
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let id: i64 = tx.query_row(
             "SELECT next_id FROM id_counters WHERE name = ?1",
             [name],
@@ -957,10 +987,8 @@ impl Store {
         now: Millis,
     ) -> Result<Project> {
         let p = ensure_project_row(&self.core, id, name, root, now)?;
-        self.ensure_project_open(id).map_err(|e| match e {
-            OpenError::Sqlite(e) => e,
-            _ => rusqlite::Error::InvalidQuery,
-        })?;
+        self.ensure_project_open(id)
+            .map_err(store_open_error_to_sqlite)?;
         Ok(p)
     }
     pub fn adopt_import(
@@ -976,24 +1004,21 @@ impl Store {
         Ok(p)
     }
     pub fn forget_empty_project(&mut self, id: &ProjectId) -> Result<Option<Vec<ChannelId>>> {
-        // if project has DBs, check messages in workspace db
-        let has_messages = if let Ok(ws) = self.project_workspace(id) {
-            project_has_messages_db(ws)?
-        } else {
-            false
-        };
+        // Fail closed: we must be able to inspect project storage to prove it empty.
+        // If the project DBs cannot be opened/read, do not delete core metadata.
+        self.ensure_project_open(id)
+            .map_err(store_open_error_to_sqlite)?;
+        let ws = self
+            .project_workspace(id)
+            .map_err(|_| cannot_inspect_project_storage(id))?;
+        let has_messages = project_has_messages_db(ws)?;
         if has_messages {
             return Ok(None);
         }
-        // gather channels from workspace if open
-        let channels = if let Ok(ws) = self.project_workspace(id) {
-            channels_in_project_db(ws, id)?
-                .into_iter()
-                .map(|c| c.id)
-                .collect()
-        } else {
-            vec![]
-        };
+        let channels = channels_in_project_db(ws, id)?
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>();
         let gone = forget_empty_project_core(&self.core, id, &channels)?;
         if gone.is_some() {
             self.projects.remove(id);
@@ -1020,10 +1045,8 @@ impl Store {
         name: &str,
         now: Millis,
     ) -> Result<Channel> {
-        self.ensure_project_open(project).map_err(|e| match e {
-            OpenError::Sqlite(e) => e,
-            _ => rusqlite::Error::InvalidQuery,
-        })?;
+        self.ensure_project_open(project)
+            .map_err(store_open_error_to_sqlite)?;
         if self.project(project)?.is_none() {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
@@ -1846,7 +1869,7 @@ CREATE TABLE memberships (
     PRIMARY KEY (channel_id, member_id)
 );
 CREATE TABLE messages (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    id                 INTEGER PRIMARY KEY,
     channel_id         INTEGER NOT NULL REFERENCES channels(id),
     seq                INTEGER NOT NULL,
     author_id          INTEGER,
@@ -1912,7 +1935,7 @@ CREATE TABLE project_settings (
 
 const AGENTS_MIGRATIONS: &[&str] = &[r#"
 CREATE TABLE batches (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    id           INTEGER PRIMARY KEY,
     agent_id     INTEGER NOT NULL,
     channel_id   INTEGER NOT NULL,
     state        TEXT NOT NULL CHECK (state IN ('pending', 'dispatched', 'accepted', 'settled', 'failed')),
@@ -1974,8 +1997,24 @@ fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenErr
     } else {
         return Ok(()); // fresh install
     };
-    // If core.db exists but legacy still exists, we may have partial migration; remove partial outputs and redo safely from legacy.
+    // If core.db exists but legacy still exists, prefer completing a valid split layout
+    // (e.g. crash after migration but before backup rename) over destructive retry.
     if core_db.exists() && legacy.exists() {
+        let mut valid = false;
+        if let Ok(core) = open_db(&core_db, CORE_MIGRATIONS)
+            && let Ok(projects) = core_project_ids(&core)
+        {
+            valid = projects.into_iter().all(|p| {
+                let dir = data_dir.join("Projects").join(p.as_str());
+                open_db(&dir.join("workspace.db"), WORKSPACE_MIGRATIONS).is_ok()
+                    && open_db(&dir.join("agents.db"), AGENTS_MIGRATIONS).is_ok()
+            });
+        }
+        if valid {
+            std::fs::rename(&legacy, &backup)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            return Ok(());
+        }
         let _ = std::fs::remove_file(&core_db);
         let projects_dir = data_dir.join("Projects");
         let _ = std::fs::remove_dir_all(&projects_dir);
@@ -2169,8 +2208,6 @@ fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), Ope
                     4,
                 )?;
             }
-            reset_sqlite_sequence(&ws, "channels")?;
-            reset_sqlite_sequence(&ws, "messages")?;
             Ok(())
         })();
         match wres {
@@ -2217,7 +2254,6 @@ fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), Ope
                 &pid,
                 5,
             )?;
-            reset_sqlite_sequence(&ag, "batches")?;
             Ok(())
         })();
         match ares {
@@ -2230,6 +2266,8 @@ fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), Ope
             }
         }
     }
+    // Seed id_counters from legacy max IDs to avoid collisions on new inserts (F5).
+    seed_id_counters_from_legacy(&legacy, &core)?;
     Ok(())
 }
 
@@ -2309,6 +2347,35 @@ fn copy_project_join(
         }
         ins.execute(rusqlite::params_from_iter(params_vec))?;
     }
+    Ok(())
+}
+
+fn seed_id_counters_from_legacy(legacy: &Connection, core: &Connection) -> Result<()> {
+    let max_channel: i64 = legacy
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM channels", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    let max_message: i64 = legacy
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| {
+            r.get(0)
+        })
+        .unwrap_or(0);
+    let max_batch: i64 = legacy
+        .query_row("SELECT COALESCE(MAX(id), 0) FROM batches", [], |r| r.get(0))
+        .unwrap_or(0);
+    core.execute(
+        "UPDATE id_counters SET next_id = ?2 WHERE name = ?1 AND next_id <= ?2",
+        params!["channel", max_channel + 1],
+    )?;
+    core.execute(
+        "UPDATE id_counters SET next_id = ?2 WHERE name = ?1 AND next_id <= ?2",
+        params!["message", max_message + 1],
+    )?;
+    core.execute(
+        "UPDATE id_counters SET next_id = ?2 WHERE name = ?1 AND next_id <= ?2",
+        params!["batch", max_batch + 1],
+    )?;
     Ok(())
 }
 
@@ -5649,6 +5716,132 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 9999);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn required_migrated_legacy_preserves_ids_and_supports_new_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-mig-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+
+        let mut s = Store::open(&dir).unwrap();
+
+        // Existing IDs/data preserved after migration.
+        assert!(s.project(&pid(P1)).unwrap().is_some());
+        assert!(s.project(&pid(P2)).unwrap().is_some());
+        let ws1 = s.project_workspace(&pid(P1)).unwrap();
+        let old_msg_ids: Vec<i64> = {
+            let mut st = ws1.prepare("SELECT id FROM messages ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(old_msg_ids, vec![100, 101]);
+        let ws2 = s.project_workspace(&pid(P2)).unwrap();
+        let old_msg2: i64 = ws2
+            .query_row("SELECT id FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_msg2, 200);
+
+        // Create new channels across multiple projects.
+        let ch1_new = s.ensure_channel(&pid(P1), "new-p1", 10_000).unwrap();
+        let ch2_new = s.ensure_channel(&pid(P2), "new-p2", 10_001).unwrap();
+        assert!(
+            ch1_new.id.0 > 20,
+            "new channel id must be above legacy max (20), got {}",
+            ch1_new.id.0
+        );
+        assert!(
+            ch2_new.id.0 > 20,
+            "new channel id must be above legacy max (20), got {}",
+            ch2_new.id.0
+        );
+        assert_ne!(ch1_new.id, ch2_new.id);
+
+        // Create new messages across multiple projects.
+        let m1 = s
+            .insert_message(&msg(ch1_new.id, MemberId(1), "post-migration p1"))
+            .unwrap();
+        let m2 = s
+            .insert_message(&msg(ch2_new.id, MemberId(1), "post-migration p2"))
+            .unwrap();
+        assert!(
+            m1.id.0 > 200,
+            "new message id must be above legacy max (200), got {}",
+            m1.id.0
+        );
+        assert!(
+            m2.id.0 > 200,
+            "new message id must be above legacy max (200), got {}",
+            m2.id.0
+        );
+        assert_ne!(m1.id, m2.id);
+        assert_eq!(
+            s.message(m1.id).unwrap().unwrap().body.as_ref(),
+            "post-migration p1"
+        );
+        assert_eq!(
+            s.message(m2.id).unwrap().unwrap().body.as_ref(),
+            "post-migration p2"
+        );
+
+        // Create new agent batches across multiple projects/channels.
+        let b1 = s
+            .pending_batch_or_create(MemberId(2), ch1_new.id, 10_002)
+            .unwrap();
+        let b2 = s
+            .pending_batch_or_create(MemberId(2), ch2_new.id, 10_003)
+            .unwrap();
+        assert!(
+            b1.id.0 > 500,
+            "new batch id must be above legacy max (500), got {}",
+            b1.id.0
+        );
+        assert!(
+            b2.id.0 > 500,
+            "new batch id must be above legacy max (500), got {}",
+            b2.id.0
+        );
+        assert_ne!(b1.id, b2.id);
+
+        // Global uniqueness across entity kinds not required, but IDs within counters must not collide.
+        let mut channel_ids = vec![
+            ChannelId(10).0,
+            ChannelId(11).0,
+            ChannelId(20).0,
+            ch1_new.id.0,
+            ch2_new.id.0,
+        ];
+        channel_ids.sort_unstable();
+        channel_ids.dedup();
+        assert_eq!(channel_ids.len(), 5);
+        let mut message_ids = vec![100i64, 101, 200, m1.id.0, m2.id.0];
+        message_ids.sort_unstable();
+        message_ids.dedup();
+        assert_eq!(message_ids.len(), 5);
+        let mut batch_ids = vec![500i64, b1.id.0, b2.id.0];
+        batch_ids.sort_unstable();
+        batch_ids.dedup();
+        assert_eq!(batch_ids.len(), 3);
+
+        // Existing data still accessible.
+        assert!(s.message(MessageId(100)).unwrap().is_some());
+        assert!(s.message(MessageId(101)).unwrap().is_some());
+        assert!(s.message(MessageId(200)).unwrap().is_some());
+        assert!(s.channel(ChannelId(10)).unwrap().is_some());
+        assert!(s.batch(BatchId(500)).unwrap().is_some());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
