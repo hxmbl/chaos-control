@@ -5,7 +5,7 @@
 
 mod common;
 
-use chaos_core::{mcp, store, types::*};
+use chaos_core::{mcp, types::*};
 use common::*;
 use serde_json::{Value, json};
 
@@ -35,7 +35,7 @@ async fn settled(h: &mut Harness, n: i64) {
             [],
             |r| r.get::<_, i64>(0),
         )
-        .unwrap()
+        .unwrap_or(0)
             == n
     })
     .await;
@@ -95,13 +95,25 @@ async fn refusal_answers_the_ping_with_no_fallback_and_no_retry() {
     let resolved: (i64, String) = h
         .core
         .with_engine(move |e, _| {
-            e.conn()
-                .query_row(
-                    "SELECT resolved_by, resolved_kind FROM obligations WHERE message_id = ?1",
-                    [ping.id.0],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .unwrap()
+            if let Ok(v) = e.conn().query_row(
+                "SELECT resolved_by, resolved_kind FROM obligations WHERE message_id = ?1",
+                [ping.id.0],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            ) {
+                return v;
+            }
+            for proj in e.store().projects().unwrap_or_default() {
+                if let Ok(ag) = e.store().project_agents(&proj.id)
+                    && let Ok(v) = ag.query_row(
+                        "SELECT resolved_by, resolved_kind FROM obligations WHERE message_id = ?1",
+                        [ping.id.0],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                    )
+                {
+                    return v;
+                }
+            }
+            panic!("no obligation");
         })
         .await
         .unwrap();
@@ -237,8 +249,10 @@ async fn a_refusal_needs_a_reason_and_a_target_in_this_channel() {
             )
             .err()
             .map(|e| e.0);
-            let stances = store::recent_stances(e.conn(), scope.channel, 10)
-                .unwrap()
+            let stances = e
+                .store()
+                .recent_stances(scope.channel, 10)
+                .unwrap_or_default()
                 .len();
             (no_reason, no_target, stances)
         })

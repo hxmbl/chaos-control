@@ -219,9 +219,7 @@ impl Core {
     ) -> Result<(Core, mpsc::UnboundedReceiver<CoreEvent>), StartError> {
         let store = match &config.db {
             Some(path) => {
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
+                let _ = std::fs::create_dir_all(path);
                 Store::open(path)
             }
             None => Store::open_in_memory(),
@@ -362,9 +360,14 @@ impl Core {
 
     /// Whether anything was ever said in `id`'s channels.
     pub async fn project_has_messages(&self, id: ProjectId) -> Result<bool, String> {
-        self.with_engine(move |e, _| crate::store::project_has_messages(e.conn(), &id))
-            .await?
-            .map_err(|e| e.to_string())
+        self.with_engine(move |e, _| {
+            let Ok(ws) = e.store().project_workspace(&id) else {
+                return Ok(false);
+            };
+            ws.query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |r| r.get(0))
+        })
+        .await?
+        .map_err(|e| e.to_string())
     }
 
     /// Deletes `id` if it has no folder, no messages and isn't the unclaimed
@@ -396,7 +399,7 @@ impl Core {
     /// A project's channels, in `::N` order.
     pub async fn channels(&self, project: &ProjectId) -> Result<Vec<Channel>, String> {
         let project = project.clone();
-        self.with_engine(move |e, _| crate::store::channels_in_project(e.conn(), &project))
+        self.with_engine(move |e, _| e.store().channels_in_project(&project))
             .await?
             .map_err(|e| e.to_string())
     }
@@ -404,7 +407,7 @@ impl Core {
     /// Renames a channel. Its id, `::N` and history stay.
     pub async fn rename_channel(&self, channel: ChannelId, name: &str) -> Result<(), String> {
         let name = name.to_string();
-        self.with_engine(move |e, _| crate::store::rename_channel(e.conn(), channel, &name))
+        self.with_engine(move |e, _| e.store().rename_channel(channel, &name))
             .await?
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -444,7 +447,9 @@ impl Core {
         let (handle, name) = (handle.to_string(), name.to_string());
         self.with_engine(move |e, now| {
             let m = e.ensure_member(MemberKind::Human, &handle, &name)?;
-            let ch = crate::store::channel(e.conn(), channel)?
+            let ch = e
+                .store()
+                .channel(channel)?
                 .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
             e.join_project(&ch.project, m.id, now)?;
             e.join(channel, &m, now)?;
@@ -488,15 +493,16 @@ impl Core {
         );
         let mm = self
             .with_engine(move |e, now| {
-                let project = crate::store::channel(e.conn(), channel)?
+                let project = e
+                    .store()
+                    .channel(channel)?
                     .ok_or(rusqlite::Error::QueryReturnedNoRows)?
                     .project;
-                e.store_tx(|c| {
-                    let mm =
-                        crate::roster::ensure_model_member(c, &harness, model.as_deref(), &name)?;
-                    crate::roster::roster_add(c, &project, mm.member.id, now)?;
-                    Ok::<_, rusqlite::Error>(mm)
-                })
+                let core = e.conn();
+                let mm =
+                    crate::roster::ensure_model_member(core, &harness, model.as_deref(), &name)?;
+                crate::roster::roster_add(core, &project, mm.member.id, now)?;
+                Ok::<_, rusqlite::Error>(mm)
             })
             .await?
             .map_err(|e| e.to_string())?;
@@ -647,11 +653,9 @@ impl Core {
         project: &ProjectId,
     ) -> Result<Vec<(MemberId, Arc<str>)>, String> {
         let project = project.clone();
-        self.with_engine(move |e, _| {
-            crate::store::former_project_agent_mention_tokens(e.conn(), &project)
-        })
-        .await?
-        .map_err(|e| e.to_string())
+        self.with_engine(move |e, _| e.store().former_project_agent_mention_tokens(&project))
+            .await?
+            .map_err(|e| e.to_string())
     }
 
     pub async fn post(
@@ -796,11 +800,9 @@ impl Core {
         channel: ChannelId,
         after_seq: Seq,
     ) -> Result<Vec<Reaction>, String> {
-        self.with_engine(move |e, _| {
-            crate::store::reactions_after_seq(e.conn(), channel, after_seq)
-        })
-        .await?
-        .map_err(|e| e.to_string())
+        self.with_engine(move |e, _| e.store().reactions_after_seq(channel, after_seq))
+            .await?
+            .map_err(|e| e.to_string())
     }
 
     /// A human refuses or dissents from `target` (agents use the chat tools).
@@ -835,10 +837,8 @@ impl Core {
 
     /// The stance a message states, if any (for drawing it).
     pub async fn stance_of(&self, message: MessageId) -> Result<Option<Stance>, String> {
-        self.with_engine(move |e, _| {
-            crate::store::stance(e.conn(), message).map_err(|e| e.to_string())
-        })
-        .await?
+        self.with_engine(move |e, _| e.store().stance(message).map_err(|e| e.to_string()))
+            .await?
     }
 
     pub async fn history(&self, channel: ChannelId, limit: usize) -> Result<Vec<Message>, String> {
@@ -869,7 +869,7 @@ impl Core {
     }
 
     pub async fn members(&self, channel: ChannelId) -> Result<Vec<Member>, String> {
-        self.with_engine(move |e, _| crate::store::members_of(e.conn(), channel))
+        self.with_engine(move |e, _| e.store().members_of(channel))
             .await?
             .map_err(|e| e.to_string())
     }
@@ -1059,7 +1059,10 @@ impl Actor {
             .engine
             .ensure_member(MemberKind::Agent, &spec.handle, &spec.name)
             .map_err(|e| e.to_string())?;
-        let project = crate::store::channel(self.engine.conn(), channel)
+        let project = self
+            .engine
+            .store()
+            .channel(channel)
             .map_err(|e| e.to_string())?
             .ok_or("no such channel")?
             .project;

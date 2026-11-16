@@ -252,11 +252,24 @@ async fn claude_agent_acp_selects_v2_and_a_signed_out_turn_goes_red() {
     );
     let (state, attempts): (String, i64) = core
         .with_engine(|e, _| {
-            e.conn()
+            if let Ok(v) = e
+                .conn()
                 .query_row("SELECT state, attempts FROM batches", [], |r| {
-                    Ok((r.get(0)?, r.get(1)?))
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
                 })
-                .unwrap()
+            {
+                return v;
+            }
+            for proj in e.store().projects().unwrap_or_default() {
+                if let Ok(ag) = e.store().project_agents(&proj.id)
+                    && let Ok(v) = ag.query_row("SELECT state, attempts FROM batches", [], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                    })
+                {
+                    return v;
+                }
+            }
+            panic!("no batches");
         })
         .await
         .unwrap();
@@ -315,9 +328,21 @@ async fn codex_acp_auth_required_turns_the_agent_red() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let attempts: i64 = core
         .with_engine(|e, _| {
-            e.conn()
-                .query_row("SELECT attempts FROM batches", [], |r| r.get(0))
-                .unwrap()
+            if let Ok(v) = e
+                .conn()
+                .query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
+            {
+                return v;
+            }
+            for proj in e.store().projects().unwrap_or_default() {
+                if let Ok(ag) = e.store().project_agents(&proj.id)
+                    && let Ok(v) =
+                        ag.query_row("SELECT attempts FROM batches", [], |r| r.get::<_, i64>(0))
+                {
+                    return v;
+                }
+            }
+            panic!("no batches");
         })
         .await
         .unwrap();

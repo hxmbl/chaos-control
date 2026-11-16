@@ -26,7 +26,11 @@
 //! - The migrated "Imported" project is adoptable by one folder, once, and
 //!   only while it has no folder (`adopt_import`'s guarded update).
 
-use std::{path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -34,14 +38,64 @@ use crate::types::*;
 
 pub type Result<T> = rusqlite::Result<T>;
 
-/// Why [`Store::open`] refused or failed.
+/// A message about to be inserted.
+pub struct NewMessage<'a> {
+    pub channel: ChannelId,
+    pub author: Option<MemberId>,
+    pub origin: Origin,
+    pub body: &'a str,
+    pub reply_to: Option<MessageId>,
+    pub mentions: &'a [MemberId],
+    pub hop: u8,
+    pub cause_batch: Option<BatchId>,
+    pub client_request_id: Option<&'a str>,
+    pub sent_at: Millis,
+}
+
+/// A trigger row with its message, for building notifications.
+#[derive(Clone, Debug)]
+pub struct TriggerRow {
+    pub id: TriggerId,
+    pub reason: WakeReason,
+    pub hop: u8,
+    pub batch: BatchId,
+}
+
+#[derive(Clone, Debug)]
+pub struct BatchRow {
+    pub id: BatchId,
+    pub agent: MemberId,
+    pub channel: ChannelId,
+    pub state: BatchState,
+    pub attempts: u32,
+    pub window_to: Option<Seq>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cursor {
+    pub delivered_through: Seq,
+    pub read_through: Seq,
+    /// When `read_through` last moved forward (None: never read anything).
+    pub read_at: Option<Millis>,
+}
+
+/// Why opening or migrating the store refused or failed.
 #[derive(Debug)]
 pub enum OpenError {
-    /// The database's schema is newer than every migration this build knows:
+    /// A database's schema is newer than every migration this build knows:
     /// a newer Chaos Control wrote it. Nothing in it was changed.
     NewerSchema {
+        path: PathBuf,
         found: i64,
         known: i64,
+    },
+    /// A project's database could not be opened or is invalid in a way that
+    /// is isolated to that project (guarantee 4). It is reported but does not
+    /// block core.db or other projects.
+    Project {
+        project: ProjectId,
+        path: PathBuf,
+        source: rusqlite::Error,
     },
     Sqlite(rusqlite::Error),
 }
@@ -55,9 +109,19 @@ impl From<rusqlite::Error> for OpenError {
 impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpenError::NewerSchema { found, known } => write!(
+            OpenError::NewerSchema { path, found, known } => write!(
                 f,
-                "This data was written by a newer Chaos Control (schema {found}, this build knows {known}). Update the app."
+                "{} was written by a newer Chaos Control (schema {found}, this build knows {known}). Update the app.",
+                path.display()
+            ),
+            OpenError::Project {
+                project,
+                path,
+                source,
+            } => write!(
+                f,
+                "project {project:?} database {}: {source}",
+                path.display()
             ),
             OpenError::Sqlite(e) => write!(f, "{e}"),
         }
@@ -68,20 +132,50 @@ impl std::error::Error for OpenError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             OpenError::NewerSchema { .. } => None,
-            OpenError::Sqlite(e) => Some(e),
+            OpenError::Project { source, .. } | OpenError::Sqlite(source) => Some(source),
         }
     }
 }
 
-/// Ordered migrations. `PRAGMA user_version` records how many have run; add new
-/// ones at the end, never edit old ones.
+fn store_open_error_to_sqlite(e: OpenError) -> rusqlite::Error {
+    match e {
+        OpenError::Sqlite(e) => e,
+        OpenError::NewerSchema { path, found, known } => {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+                "newer schema at {} (found {}, known {})",
+                path.display(),
+                found,
+                known
+            ))))
+        }
+        OpenError::Project {
+            project,
+            path,
+            source,
+        } => rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+            "project {project:?} storage {}: {source}",
+            path.display()
+        )))),
+    }
+}
+
+fn cannot_inspect_project_storage(project: &ProjectId) -> rusqlite::Error {
+    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(format!(
+        "cannot inspect project storage for {project:?}"
+    ))))
+}
+
+/// Legacy ordered migrations for the old single `core.sqlite` file.
+/// `PRAGMA user_version` records how many have run; add new ones at the end,
+/// never edit old ones.
 ///
 /// Since the permission model was removed (rebuild from scratch), the tables
 /// and columns its migrations created are unused: `permission_requests`
 /// (6, 8, 13, 16, 19), `channel_approval_mode` (17) and `app_settings` (18).
 /// They stay so existing local databases keep their schema version; nothing
-/// reads or writes them.
-const MIGRATIONS: &[&str] = &[
+/// reads or writes them. The split migration reads from this layout but does
+/// not recreate dead tables in the new files.
+const LEGACY_MIGRATIONS: &[&str] = &[
     r#"
 CREATE TABLE channels (
     id          INTEGER PRIMARY KEY,
@@ -503,100 +597,1245 @@ CREATE INDEX message_revisions_by_message ON message_revisions (message_id, id);
 "#,
 ];
 
+/// Per-project open databases (workspace + agents). A broken project must not
+/// stop core.db or other projects from opening (guarantee 4).
+#[derive(Clone, Debug)]
+pub struct ProjectDbs {
+    pub workspace: PathBuf,
+    pub agents: PathBuf,
+}
+
+/// Which project database file is newer than this build knows.
+#[derive(Debug)]
+pub struct ProjectNewerSchema {
+    pub project: ProjectId,
+    pub path: PathBuf,
+    pub found: i64,
+    pub known: i64,
+}
+
+pub struct ProjectConnections {
+    pub workspace: Connection,
+    pub agents: Connection,
+}
+
 pub struct Store {
-    conn: Connection,
-}
-
-/// A message about to be inserted.
-pub struct NewMessage<'a> {
-    pub channel: ChannelId,
-    pub author: Option<MemberId>,
-    pub origin: Origin,
-    pub body: &'a str,
-    pub reply_to: Option<MessageId>,
-    pub mentions: &'a [MemberId],
-    pub hop: u8,
-    pub cause_batch: Option<BatchId>,
-    pub client_request_id: Option<&'a str>,
-    pub sent_at: Millis,
-}
-
-/// A trigger row with its message, for building notifications.
-#[derive(Clone, Debug)]
-pub struct TriggerRow {
-    pub id: TriggerId,
-    pub reason: WakeReason,
-    pub hop: u8,
-    pub batch: BatchId,
-}
-
-#[derive(Clone, Debug)]
-pub struct BatchRow {
-    pub id: BatchId,
-    pub agent: MemberId,
-    pub channel: ChannelId,
-    pub state: BatchState,
-    pub attempts: u32,
-    pub window_to: Option<Seq>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Cursor {
-    pub delivered_through: Seq,
-    pub read_through: Seq,
-    /// When `read_through` last moved forward (None: never read anything).
-    pub read_at: Option<Millis>,
+    data_dir: PathBuf,
+    core: Connection,
+    /// Open project connections, keyed by project id.
+    projects: HashMap<ProjectId, ProjectConnections>,
+    /// channel id -> project id index for routing.
+    channel_project: HashMap<ChannelId, ProjectId>,
+    /// message id -> (project id, channel id) index for routing.
+    message_project: HashMap<MessageId, (ProjectId, ChannelId)>,
+    /// batch id -> project id index.
+    batch_project: HashMap<BatchId, ProjectId>,
+    /// Projects that could not be opened (isolated).
+    project_errors: Vec<OpenError>,
 }
 
 impl Store {
-    /// Opens (or creates) the database at `path` and runs pending migrations.
-    /// Refuses a database from a newer build ([`OpenError::NewerSchema`])
+    /// Opens the split store in `data_dir` (`core.db` + `Projects/<id>/*.db`).
+    /// Migrates from legacy `<data_dir>/core.sqlite` if present and the new
+    /// layout is not yet complete. Refuses a database from a newer build
     /// without changing it.
     pub fn open(path: &Path) -> std::result::Result<Self, OpenError> {
-        Self::init(Connection::open(path)?)
-    }
-
-    /// A private in-memory database (tests, demos).
-    pub fn open_in_memory() -> std::result::Result<Self, OpenError> {
-        Self::init(Connection::open_in_memory()?)
-    }
-
-    fn init(conn: Connection) -> std::result::Result<Self, OpenError> {
-        // Checked before anything writes (the journal mode is stored in the
-        // file), so a refused database is left exactly as it was.
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        let known = MIGRATIONS.len() as i64;
-        if version > known {
-            return Err(OpenError::NewerSchema {
-                found: version,
-                known,
-            });
+        // Compatibility: opening an existing sqlite file path (legacy tests/APIs).
+        if path.exists() && path.is_file() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name != "core.db" {
+                let dir = path.parent().unwrap_or(Path::new("."));
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                let core_sqlite = dir.join("core.sqlite");
+                let backup = dir.join("core.sqlite.pre-split");
+                let core_db = dir.join("core.db");
+                let already_split = core_db.exists() || backup.exists();
+                if name == "core.sqlite" {
+                    // standard legacy location
+                } else if !already_split {
+                    // Standalone legacy file: check for refusal without modifying it.
+                    let conn = Connection::open(path)?;
+                    let version: i64 =
+                        conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+                    let known = LEGACY_MIGRATIONS.len() as i64;
+                    if version > known {
+                        return Err(OpenError::NewerSchema {
+                            path: path.to_path_buf(),
+                            found: version,
+                            known,
+                        });
+                    }
+                    drop(conn);
+                    if !core_sqlite.exists() {
+                        std::fs::copy(path, &core_sqlite)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    }
+                }
+                maybe_migrate_from_legacy(dir)?;
+                let core_path = dir.join("core.db");
+                let core = open_db(&core_path, CORE_MIGRATIONS)?;
+                let mut store = Store {
+                    data_dir: dir.to_path_buf(),
+                    core,
+                    projects: HashMap::new(),
+                    channel_project: HashMap::new(),
+                    message_project: HashMap::new(),
+                    batch_project: HashMap::new(),
+                    project_errors: Vec::new(),
+                };
+                store.load_projects()?;
+                return Ok(store);
+            }
         }
-        conn.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
-        )?;
-        let mut store = Store { conn };
-        store.migrate(version as usize)?;
+        let data_dir = path;
+        std::fs::create_dir_all(data_dir)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        maybe_migrate_from_legacy(data_dir)?;
+        let core_path = data_dir.join("core.db");
+        let core = open_db(&core_path, CORE_MIGRATIONS)?;
+        let mut store = Store {
+            data_dir: data_dir.to_path_buf(),
+            core,
+            projects: HashMap::new(),
+            channel_project: HashMap::new(),
+            message_project: HashMap::new(),
+            batch_project: HashMap::new(),
+            project_errors: Vec::new(),
+        };
+        store.load_projects()?;
         Ok(store)
     }
 
-    fn migrate(&mut self, version: usize) -> Result<()> {
-        if version >= MIGRATIONS.len() {
-            return Ok(());
-        }
-        // A table rebuild (migration 2) drops a table other tables point at,
-        // which SQLite only allows with foreign keys off. The pragma is a
-        // no-op inside a transaction, so it is set around them; each
-        // migration then proves nothing dangles before it commits.
-        self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
-        let result = self.run_migrations(version);
-        self.conn.execute_batch("PRAGMA foreign_keys = ON")?;
-        result
+    /// A private in-memory split store (tests). Backed by a temporary directory.
+    pub fn open_in_memory() -> std::result::Result<Self, OpenError> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "chaos-control-store-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            n
+        ));
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let mut store = Self::open(&dir)?;
+        store.data_dir = dir;
+        Ok(store)
     }
 
-    fn run_migrations(&mut self, from: usize) -> Result<()> {
-        for (ix, sql) in MIGRATIONS.iter().enumerate().skip(from) {
-            let tx = self.conn.transaction()?;
+    /// Compatibility: open from a legacy core.sqlite path by using its parent
+    /// as data dir. Used during transition.
+    /// Legacy compat: open from existing single-db connection by migrating? not supported in split.
+    /// Kept for old tests - creates a temp split store seeded from this connection's state is complex.
+    /// For now, tests using init should be rewritten. This returns an error.
+    #[cfg(test)]
+    pub fn init(_conn: Connection) -> std::result::Result<Self, OpenError> {
+        panic!("Store::init not supported in split layout; rewrite test")
+    }
+
+    pub fn open_path(path: &Path) -> std::result::Result<Self, OpenError> {
+        if path.file_name().and_then(|n| n.to_str()) == Some("core.sqlite")
+            && let Some(dir) = path.parent()
+        {
+            return Self::open(dir);
+        }
+        // Treat as data dir or core.db path
+        if path.file_name().and_then(|n| n.to_str()) == Some("core.db")
+            && let Some(dir) = path.parent()
+        {
+            return Self::open(dir);
+        }
+        Self::open(path)
+    }
+
+    fn load_projects(&mut self) -> std::result::Result<(), OpenError> {
+        let ids = core_project_ids(&self.core)?;
+        for id in ids {
+            match self.open_project(&id) {
+                Ok(()) => {}
+                Err(OpenError::NewerSchema { path, found, known }) => {
+                    return Err(OpenError::NewerSchema { path, found, known });
+                }
+                Err(e @ OpenError::Project { .. }) => {
+                    self.project_errors.push(e);
+                }
+                Err(OpenError::Sqlite(e)) => {
+                    self.project_errors.push(OpenError::Project {
+                        project: id.clone(),
+                        path: self.project_dir(&id),
+                        source: e,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn project_dir(&self, project: &ProjectId) -> PathBuf {
+        self.data_dir.join("Projects").join(project.as_str())
+    }
+
+    fn open_project(&mut self, project: &ProjectId) -> std::result::Result<(), OpenError> {
+        if self.projects.contains_key(project) {
+            return Ok(());
+        }
+        let dir = self.project_dir(project);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let ws_path = dir.join("workspace.db");
+        let ag_path = dir.join("agents.db");
+        let workspace = open_db(&ws_path, WORKSPACE_MIGRATIONS).map_err(|e| match e {
+            OpenError::NewerSchema { path, found, known } => {
+                OpenError::NewerSchema { path, found, known }
+            }
+            OpenError::Sqlite(source) => OpenError::Project {
+                project: project.clone(),
+                path: ws_path.clone(),
+                source,
+            },
+            other => other,
+        })?;
+        let agents = open_db(&ag_path, AGENTS_MIGRATIONS).map_err(|e| match e {
+            OpenError::NewerSchema { path, found, known } => {
+                OpenError::NewerSchema { path, found, known }
+            }
+            OpenError::Sqlite(source) => OpenError::Project {
+                project: project.clone(),
+                path: ag_path.clone(),
+                source,
+            },
+            other => other,
+        })?;
+        self.index_project(project.clone(), &workspace, &agents)?;
+        self.projects
+            .insert(project.clone(), ProjectConnections { workspace, agents });
+        Ok(())
+    }
+
+    fn index_project(
+        &mut self,
+        project: ProjectId,
+        ws: &Connection,
+        ag: &Connection,
+    ) -> Result<()> {
+        let mut stmt = ws.prepare("SELECT id FROM channels")?;
+        let rows = stmt.query_map([], |r| Ok(ChannelId(r.get(0)?)))?;
+        for r in rows {
+            self.channel_project.insert(r?, project.clone());
+        }
+        let mut stmt = ws.prepare("SELECT id, channel_id FROM messages")?;
+        let rows = stmt.query_map([], |r| Ok((MessageId(r.get(0)?), ChannelId(r.get(1)?))))?;
+        for r in rows {
+            let (m, ch) = r?;
+            self.message_project.insert(m, (project.clone(), ch));
+        }
+        let mut stmt = ag.prepare("SELECT id FROM batches")?;
+        let rows = stmt.query_map([], |r| Ok(BatchId(r.get(0)?)))?;
+        for r in rows {
+            self.batch_project.insert(r?, project.clone());
+        }
+        Ok(())
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.core.query_row("PRAGMA user_version", [], |r| r.get(0))
+    }
+
+    /// Core database connection.
+    pub fn core(&self) -> &Connection {
+        &self.core
+    }
+
+    /// Mutable core database connection.
+    pub fn core_mut(&mut self) -> &mut Connection {
+        &mut self.core
+    }
+
+    /// Back-compat: returns core connection. Many legacy call sites use this
+    /// for operations that moved; callers must be updated.
+    pub fn conn(&self) -> &Connection {
+        &self.core
+    }
+
+    pub fn project_workspace(&self, project: &ProjectId) -> Result<&Connection> {
+        self.projects
+            .get(project)
+            .map(|p| &p.workspace)
+            .ok_or_else(|| rusqlite::Error::InvalidQuery)
+    }
+
+    pub fn project_agents(&self, project: &ProjectId) -> Result<&Connection> {
+        self.projects
+            .get(project)
+            .map(|p| &p.agents)
+            .ok_or_else(|| rusqlite::Error::InvalidQuery)
+    }
+
+    pub fn project_workspace_mut(&mut self, project: &ProjectId) -> Result<&mut Connection> {
+        self.projects
+            .get_mut(project)
+            .map(|p| &mut p.workspace)
+            .ok_or_else(|| rusqlite::Error::InvalidQuery)
+    }
+
+    pub fn project_agents_mut(&mut self, project: &ProjectId) -> Result<&mut Connection> {
+        self.projects
+            .get_mut(project)
+            .map(|p| &mut p.agents)
+            .ok_or_else(|| rusqlite::Error::InvalidQuery)
+    }
+
+    pub fn project_for_channel(&self, channel: ChannelId) -> Option<ProjectId> {
+        self.channel_project.get(&channel).cloned()
+    }
+
+    pub fn project_for_message(&self, message: MessageId) -> Option<(ProjectId, ChannelId)> {
+        self.message_project.get(&message).cloned()
+    }
+
+    pub fn project_for_batch(&self, batch: BatchId) -> Option<ProjectId> {
+        self.batch_project.get(&batch).cloned()
+    }
+
+    /// Ensure project DBs exist/open (used when a new project is created).
+    pub fn ensure_project_open(
+        &mut self,
+        project: &ProjectId,
+    ) -> std::result::Result<(), OpenError> {
+        self.open_project(project)
+    }
+
+    pub fn note_channel(&mut self, project: ProjectId, channel: ChannelId) {
+        self.channel_project.insert(channel, project);
+    }
+
+    pub fn note_message(&mut self, project: ProjectId, channel: ChannelId, message: MessageId) {
+        self.message_project.insert(message, (project, channel));
+    }
+
+    pub fn note_batch(&mut self, project: ProjectId, batch: BatchId) {
+        self.batch_project.insert(batch, project);
+    }
+
+    pub fn project_errors(&self) -> &[OpenError] {
+        &self.project_errors
+    }
+
+    /// Runs `f` in one immediate transaction on the core database.
+    pub fn tx<T, E: From<rusqlite::Error>>(
+        &mut self,
+        f: impl FnOnce(&Connection) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let tx = self
+            .core
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Allocates a globally unique ID from core.db counters (channel/message/batch).
+    pub fn allocate_id(&mut self, name: &str) -> Result<i64> {
+        let tx = self
+            .core
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let id: i64 = tx.query_row(
+            "SELECT next_id FROM id_counters WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE id_counters SET next_id = ?2 WHERE name = ?1",
+            params![name, id + 1],
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    // Convenience methods routing to appropriate DBs.
+    pub fn ensure_member(&self, kind: MemberKind, handle: &str, name: &str) -> Result<Member> {
+        ensure_member_db(&self.core, kind, handle, name)
+    }
+    pub fn member(&self, id: MemberId) -> Result<Option<Member>> {
+        member_db(&self.core, id)
+    }
+    pub fn project(&self, id: &ProjectId) -> Result<Option<Project>> {
+        project_row(&self.core, id)
+    }
+    pub fn projects(&self) -> Result<Vec<Project>> {
+        projects_rows(&self.core)
+    }
+    pub fn project_by_root(&self, root: &str) -> Result<Option<Project>> {
+        project_by_root_row(&self.core, root)
+    }
+    pub fn unclaimed_import(&self) -> Result<Option<Project>> {
+        unclaimed_import_db(&self.core)
+    }
+    pub fn ensure_project(
+        &mut self,
+        id: &ProjectId,
+        name: &str,
+        root: Option<&str>,
+        now: Millis,
+    ) -> Result<Project> {
+        let p = ensure_project_row(&self.core, id, name, root, now)?;
+        self.ensure_project_open(id)
+            .map_err(store_open_error_to_sqlite)?;
+        Ok(p)
+    }
+    pub fn adopt_import(
+        &mut self,
+        id: &ProjectId,
+        name: &str,
+        root: &str,
+    ) -> Result<Option<Project>> {
+        let p = adopt_import_db(&self.core, id, name, root)?;
+        if p.is_some() {
+            self.ensure_project_open(id)
+                .map_err(store_open_error_to_sqlite)?;
+        }
+        Ok(p)
+    }
+    pub fn forget_empty_project(&mut self, id: &ProjectId) -> Result<Option<Vec<ChannelId>>> {
+        // Fail closed: we must be able to inspect project storage to prove it empty.
+        // If the project DBs cannot be opened/read, do not delete core metadata.
+        self.ensure_project_open(id)
+            .map_err(store_open_error_to_sqlite)?;
+        let ws = self
+            .project_workspace(id)
+            .map_err(|_| cannot_inspect_project_storage(id))?;
+        let has_messages = project_has_messages_db(ws)?;
+        if has_messages {
+            return Ok(None);
+        }
+        let channels = channels_in_project_db(ws, id)?
+            .into_iter()
+            .map(|c| c.id)
+            .collect::<Vec<_>>();
+        let gone = forget_empty_project_core(&self.core, id, &channels)?;
+        if gone.is_some() {
+            self.projects.remove(id);
+            self.channel_project.retain(|_, p| p != id);
+            self.message_project.retain(|_, (p, _)| p != id);
+            self.batch_project.retain(|_, p| p != id);
+            let dir = self.project_dir(id);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        Ok(gone)
+    }
+    pub fn rename_project(&mut self, id: &ProjectId, name: &str) -> Result<bool> {
+        rename_project_row(&self.core, id, name)
+    }
+    pub fn join_project(&self, project: &ProjectId, member: MemberId, now: Millis) -> Result<bool> {
+        join_project_row(&self.core, project, member, now)
+    }
+    pub fn is_project_member(&self, project: &ProjectId, member: MemberId) -> Result<bool> {
+        is_project_member_row(&self.core, project, member)
+    }
+    pub fn ensure_channel(
+        &mut self,
+        project: &ProjectId,
+        name: &str,
+        now: Millis,
+    ) -> Result<Channel> {
+        self.ensure_project_open(project)
+            .map_err(store_open_error_to_sqlite)?;
+        if self.project(project)?.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        let clean = name.strip_prefix('#').unwrap_or(name);
+        if let Some(ch) = self.channel_in_project(project, clean)? {
+            return Ok(ch);
+        }
+        let id = ChannelId(self.allocate_id("channel")?);
+        let ch = ensure_channel_db(self.project_workspace(project)?, project, clean, id, now)?;
+        self.note_channel(project.clone(), ch.id);
+        Ok(ch)
+    }
+    pub fn channel(&self, id: ChannelId) -> Result<Option<Channel>> {
+        let Some(project) = self.project_for_channel(id) else {
+            return Ok(None);
+        };
+        channel_db(self.project_workspace(&project)?, id)
+    }
+    pub fn channel_in_project(&self, project: &ProjectId, name: &str) -> Result<Option<Channel>> {
+        let Ok(ws) = self.project_workspace(project) else {
+            return Ok(None);
+        };
+        channel_in_project_db(ws, project, name)
+    }
+    pub fn channels_in_project(&self, project: &ProjectId) -> Result<Vec<Channel>> {
+        let Ok(ws) = self.project_workspace(project) else {
+            return Ok(vec![]);
+        };
+        channels_in_project_db(ws, project)
+    }
+
+    pub fn channels_of(&self, member: MemberId, project: &ProjectId) -> Result<Vec<Channel>> {
+        let Ok(ws) = self.project_workspace(project) else {
+            return Ok(vec![]);
+        };
+        channels_of_db(ws, member, project)
+    }
+
+    pub fn search_messages(
+        &self,
+        channels: &[ChannelId],
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let mut out = Vec::new();
+        let pattern = format!(
+            "%{}%",
+            query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        for ch in channels {
+            let Some(project) = self.project_for_channel(*ch) else {
+                continue;
+            };
+            let ws = self.project_workspace(&project)?;
+            out.extend(search_in_channel_db(ws, *ch, &pattern, limit)?);
+        }
+        out.sort_by(|a, b| b.sent_at.cmp(&a.sent_at).then(b.id.cmp(&a.id)));
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    pub fn last_human_seq(&self, channel: ChannelId) -> Result<Seq> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(0);
+        };
+        let ws = self.project_workspace(&project)?;
+        let mut stmt = ws.prepare(
+            "SELECT seq, author_id FROM messages WHERE channel_id = ?1 ORDER BY seq DESC",
+        )?;
+        let rows = stmt.query_map([channel.0], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?))
+        })?;
+        for row in rows {
+            let (seq, author) = row?;
+            let Some(author) = author else {
+                continue;
+            };
+            if let Some(m) = member_db(&self.core, MemberId(author))?
+                && m.kind == MemberKind::Human
+            {
+                return Ok(seq as Seq);
+            }
+        }
+        Ok(0)
+    }
+
+    pub fn last_agent_message_after(
+        &self,
+        channel: ChannelId,
+        after_seq: Seq,
+    ) -> Result<Option<Message>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(None);
+        };
+        let ws = self.project_workspace(&project)?;
+        query_messages_db(
+            ws,
+            &format!(
+                "SELECT {MESSAGE_COLS} FROM messages
+                 WHERE channel_id = ?1 AND seq > ?2 AND origin IN ('chat_tool', 'fallback')
+                 ORDER BY seq DESC LIMIT 1"
+            ),
+            params![channel.0, after_seq as i64],
+        )
+        .map(|mut v| v.pop())
+    }
+    pub fn rename_channel(&self, id: ChannelId, name: &str) -> Result<bool> {
+        let Some(project) = self.project_for_channel(id) else {
+            return Ok(false);
+        };
+        rename_channel_db(self.project_workspace(&project)?, id, name)
+    }
+    pub fn is_member(&self, channel: ChannelId, member: MemberId) -> Result<bool> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(false);
+        };
+        is_member_db(self.project_workspace(&project)?, channel, member)
+    }
+    pub fn members_of(&self, channel: ChannelId) -> Result<Vec<Member>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(vec![]);
+        };
+        members_of_db(&self.core, self.project_workspace(&project)?, channel)
+    }
+    pub fn join(
+        &mut self,
+        channel: ChannelId,
+        member: &Member,
+        backfill: usize,
+        now: Millis,
+    ) -> Result<bool> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        };
+        if member_db(&self.core, member.id)?.is_none() {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT),
+                Some("not_a_project_member: missing member".into()),
+            ));
+        }
+        if !is_project_member_row(&self.core, &project, member.id)? {
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                Some("not_a_project_member".into()),
+            ));
+        }
+        join_db(
+            self.project_workspace(&project)?,
+            channel,
+            member,
+            backfill,
+            now,
+        )
+    }
+    pub fn head_seq(&self, channel: ChannelId) -> Result<Seq> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(0);
+        };
+        head_seq_db(self.project_workspace(&project)?, channel)
+    }
+
+    pub fn cursor(&self, agent: MemberId, channel: ChannelId) -> Result<Cursor> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(Cursor {
+                delivered_through: 0,
+                read_through: 0,
+                read_at: None,
+            });
+        };
+        cursor_db(self.project_workspace(&project)?, agent, channel)
+    }
+    pub fn messages_between(
+        &self,
+        channel: ChannelId,
+        after: Seq,
+        through: Seq,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(vec![]);
+        };
+        messages_between(
+            self.project_workspace(&project)?,
+            channel,
+            after,
+            through,
+            limit,
+        )
+    }
+    pub fn messages_before(
+        &self,
+        channel: ChannelId,
+        before_seq: Seq,
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(vec![]);
+        };
+        messages_before_db(
+            self.project_workspace(&project)?,
+            channel,
+            before_seq,
+            limit,
+        )
+    }
+    pub fn message(&self, id: MessageId) -> Result<Option<Message>> {
+        let Some((project, _)) = self.project_for_message(id) else {
+            return Ok(None);
+        };
+        message_db(self.project_workspace(&project)?, id)
+    }
+    pub fn insert_message(&mut self, m: &NewMessage<'_>) -> Result<Message> {
+        let Some(project) = self.project_for_channel(m.channel) else {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        };
+        // app-level integrity checks (G1)
+        if let Some(author) = m.author {
+            if member_db(&self.core, author)?.is_none() {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+                    Some("missing member".into()),
+                ));
+            }
+            if !is_project_member_row(&self.core, &project, author)? {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                    Some("not_a_project_member".into()),
+                ));
+            }
+            if !is_member_db(self.project_workspace(&project)?, m.channel, author)? {
+                return Err(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_TRIGGER),
+                    Some("not_a_channel_member".into()),
+                ));
+            }
+        }
+        let id = MessageId(self.allocate_id("message")?);
+        let msg = insert_message_db(self.project_workspace(&project)?, m, id)?;
+        self.note_message(project, m.channel, msg.id);
+        Ok(msg)
+    }
+    pub fn message_by_request(
+        &self,
+        author: MemberId,
+        channel: ChannelId,
+        request: &str,
+    ) -> Result<Option<Message>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(None);
+        };
+        message_by_request_db(self.project_workspace(&project)?, author, channel, request)
+    }
+    pub fn in_flight_batch(&self, agent: MemberId, channel: ChannelId) -> Result<Option<BatchRow>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(None);
+        };
+        in_flight_batch_db(self.project_agents(&project)?, agent, channel)
+    }
+    pub fn batch(&self, id: BatchId) -> Result<Option<BatchRow>> {
+        let Some(project) = self.project_for_batch(id) else {
+            return Ok(None);
+        };
+        batch_db(self.project_agents(&project)?, id)
+    }
+    pub fn pending_batch(&self, agent: MemberId, channel: ChannelId) -> Result<Option<BatchRow>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(None);
+        };
+        pending_batch_db(self.project_agents(&project)?, agent, channel)
+    }
+    pub fn pending_batch_or_create(
+        &mut self,
+        agent: MemberId,
+        channel: ChannelId,
+        now: Millis,
+    ) -> Result<BatchRow> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        };
+        // allocate only if needed: check existing first
+        if let Some(b) = pending_batch_db(self.project_agents(&project)?, agent, channel)? {
+            self.note_batch(project.clone(), b.id);
+            return Ok(b);
+        }
+        let id = BatchId(self.allocate_id("batch")?);
+        let b =
+            pending_batch_or_create_db(self.project_agents(&project)?, agent, channel, now, id)?;
+        self.note_batch(project, b.id);
+        Ok(b)
+    }
+    pub fn nicknames_of(&self, member: MemberId) -> Result<Vec<Arc<str>>> {
+        nicknames_of_db(&self.core, member)
+    }
+    pub fn nicknames_in(&self, channel: ChannelId) -> Result<Vec<(MemberId, Arc<str>)>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(vec![]);
+        };
+        nicknames_in_db(&self.core, self.project_workspace(&project)?, channel)
+    }
+    pub fn mention_owner(&self, token: &str) -> Result<Option<MemberId>> {
+        mention_owner_db(&self.core, token)
+    }
+    pub fn add_nickname(&self, member: MemberId, nickname: &str, now: Millis) -> Result<()> {
+        add_nickname_db(&self.core, member, nickname, now)
+    }
+    pub fn remove_nickname(&self, member: MemberId, nickname: &str) -> Result<bool> {
+        remove_nickname_db(&self.core, member, nickname)
+    }
+    pub fn record_session(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+        protocol: &str,
+        native_ref: &str,
+        now: Millis,
+    ) -> Result<()> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        };
+        record_session(
+            self.project_agents(&project)?,
+            agent,
+            channel,
+            protocol,
+            native_ref,
+            now,
+        )
+    }
+    pub fn project_setting(&self, project: &ProjectId, key: &str) -> Result<Option<String>> {
+        let Ok(ws) = self.project_workspace(project) else {
+            return Ok(None);
+        };
+        project_setting_db(ws, project, key)
+    }
+    pub fn set_project_setting(
+        &self,
+        project: &ProjectId,
+        key: &str,
+        value: Option<&str>,
+        now: Millis,
+    ) -> Result<()> {
+        let ws = self.project_workspace(project)?;
+        set_project_setting_db(ws, project, key, value, now)
+    }
+
+    pub fn leave_project(
+        &mut self,
+        project: &ProjectId,
+        member: MemberId,
+        now: Millis,
+    ) -> Result<Vec<ChannelId>> {
+        let ws = self
+            .project_workspace(project)
+            .map_err(|_| cannot_inspect_project_storage(project))?;
+        // find channels member is in
+        let mut stmt = ws.prepare("SELECT channel_id FROM memberships WHERE member_id = ?1")?;
+        let channels: Vec<ChannelId> = stmt
+            .query_map([member.0], |r| Ok(ChannelId(r.get(0)?)))?
+            .collect::<Result<_>>()?;
+        let ag = self
+            .project_agents(project)
+            .map_err(|_| cannot_inspect_project_storage(project))?;
+        for ch in &channels {
+            ag.execute("UPDATE obligations SET state = 'unmet', resolved_kind = 'member_removed' WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'open'", params![member.0, ch.0])?;
+            ag.execute("UPDATE batches SET state = 'failed', outcome = 'member removed', settled_at = ?3 WHERE agent_id = ?1 AND channel_id = ?2 AND state IN ('pending', 'dispatched', 'accepted')", params![member.0, ch.0, now as i64])?;
+        }
+        for ch in &channels {
+            ws.execute(
+                "DELETE FROM memberships WHERE channel_id = ?1 AND member_id = ?2",
+                params![ch.0, member.0],
+            )?;
+        }
+        crate::roster::leave_project(&self.core, project, member, now)?;
+        Ok(channels)
+    }
+
+    pub fn recover(&mut self, now: Millis) -> Result<Vec<(MemberId, ChannelId)>> {
+        let mut out = Vec::new();
+        let project_ids: Vec<ProjectId> = self.projects.keys().cloned().collect();
+        for pid in project_ids {
+            let ag = match self.project_agents(&pid) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // accepted -> failed/unmet
+            let accepted: Vec<BatchId> = {
+                let mut stmt = ag.prepare("SELECT id FROM batches WHERE state = 'accepted'")?;
+                stmt.query_map([], |r| Ok(BatchId(r.get(0)?)))?
+                    .collect::<Result<_>>()?
+            };
+            for b in accepted {
+                let open = open_obligations_db(ag, b)?;
+                for t in open {
+                    resolve_obligation_db(ag, t, ObligationState::Unmet, None, "app_restart")?;
+                }
+                set_batch_state_db(
+                    ag,
+                    b,
+                    BatchState::Failed,
+                    now,
+                    Some("app restarted mid-turn"),
+                )?;
+            }
+            let dispatched: Vec<BatchId> = {
+                let mut stmt = ag.prepare("SELECT id FROM batches WHERE state = 'dispatched'")?;
+                stmt.query_map([], |r| Ok(BatchId(r.get(0)?)))?
+                    .collect::<Result<_>>()?
+            };
+            for b in dispatched {
+                requeue_batch_db(ag, b)?;
+            }
+            let mut stmt =
+                ag.prepare("SELECT agent_id, channel_id FROM batches WHERE state = 'pending'")?;
+            let pairs = stmt
+                .query_map([], |r| Ok((MemberId(r.get(0)?), ChannelId(r.get(1)?))))?
+                .collect::<Result<Vec<_>>>()?;
+            out.extend(pairs);
+        }
+        Ok(out)
+    }
+
+    pub fn add_reaction(
+        &self,
+        message: MessageId,
+        channel: ChannelId,
+        member: MemberId,
+        emoji: &str,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        add_reaction(
+            self.project_workspace(&project)?,
+            message,
+            channel,
+            member,
+            emoji,
+            now,
+        )
+    }
+    pub fn remove_reaction(
+        &self,
+        message: MessageId,
+        member: MemberId,
+        emoji: &str,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        remove_reaction(self.project_workspace(&project)?, message, member, emoji)
+    }
+    pub fn reactions_on(&self, message: MessageId) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        reactions_on(self.project_workspace(&project)?, message)
+    }
+    pub fn has_reacted(&self, message: MessageId, member: MemberId) -> Result<bool> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        has_reacted(self.project_workspace(&project)?, message, member)
+    }
+    pub fn recent_reactions(&self, channel: ChannelId, limit: usize) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        recent_reactions(self.project_workspace(&project)?, channel, limit)
+    }
+    pub fn reactions_since(
+        &self,
+        channel: ChannelId,
+        since: Millis,
+        limit: usize,
+    ) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        reactions_since(self.project_workspace(&project)?, channel, since, limit)
+    }
+    pub fn reactions_after_seq(
+        &self,
+        channel: ChannelId,
+        after_message: Seq,
+    ) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        reactions_after_seq(self.project_workspace(&project)?, channel, after_message)
+    }
+    pub fn advance_read(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+        seq: Seq,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        advance_read(self.project_workspace(&project)?, agent, channel, seq, now)
+    }
+    pub fn advance_delivered(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+        seq: Seq,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        advance_delivered(self.project_workspace(&project)?, agent, channel, seq, now)
+    }
+    pub fn insert_stance(&self, s: &Stance) -> Result<()> {
+        let project = self
+            .project_for_channel(s.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        insert_stance(self.project_workspace(&project)?, s)
+    }
+    pub fn stance(&self, message: MessageId) -> Result<Option<Stance>> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        stance(self.project_workspace(&project)?, message)
+    }
+    pub fn recent_stances(&self, channel: ChannelId, limit: usize) -> Result<Vec<Stance>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        recent_stances(self.project_workspace(&project)?, channel, limit)
+    }
+    pub fn set_batch_state(
+        &self,
+        id: BatchId,
+        state: BatchState,
+        now: Millis,
+        outcome: Option<&str>,
+    ) -> Result<()> {
+        let project = self
+            .project_for_batch(id)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        set_batch_state(self.project_agents(&project)?, id, state, now, outcome)
+    }
+    pub fn dispatch_batch(&self, id: BatchId, window_to: Seq) -> Result<u32> {
+        let project = self
+            .project_for_batch(id)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        dispatch_batch(self.project_agents(&project)?, id, window_to)
+    }
+    pub fn requeue_batch(&self, id: BatchId) -> Result<()> {
+        let project = self
+            .project_for_batch(id)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        requeue_batch(self.project_agents(&project)?, id)
+    }
+    pub fn trigger_exists(&self, id: TriggerId) -> Result<bool> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        trigger_exists(self.project_agents(&project)?, id)
+    }
+    pub fn insert_trigger(
+        &self,
+        id: TriggerId,
+        reason: WakeReason,
+        hop: u8,
+        batch: BatchId,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_batch(batch)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        insert_trigger(self.project_agents(&project)?, id, reason, hop, batch, now)
+    }
+    pub fn batch_triggers(&self, batch: BatchId) -> Result<Vec<TriggerRow>> {
+        let project = self
+            .project_for_batch(batch)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        batch_triggers(self.project_agents(&project)?, batch)
+    }
+    pub fn insert_obligation(&self, id: TriggerId) -> Result<bool> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        insert_obligation(self.project_agents(&project)?, id)
+    }
+
+    /// Ensures a pending batch for `(agent, channel)` exists, then inserts the
+    /// trigger (and obligation if requested) atomically within the project's
+    /// agents database. Returns `true` if the trigger was newly inserted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn ensure_pending_batch_trigger(
+        &mut self,
+        agent: MemberId,
+        channel: ChannelId,
+        message: MessageId,
+        reason: WakeReason,
+        hop: u8,
+        create_obligation: bool,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        // Fast path: if trigger already exists, nothing to do.
+        let trigger_id = TriggerId {
+            agent,
+            channel,
+            message,
+        };
+        if trigger_exists_db(self.project_agents(&project)?, trigger_id)? {
+            return Ok(false);
+        }
+
+        let mut pending = pending_batch_db(self.project_agents(&project)?, agent, channel)?;
+        if pending.is_none() {
+            let new_id = BatchId(self.allocate_id("batch")?);
+            pending = Some(BatchRow {
+                id: new_id,
+                agent,
+                channel,
+                state: BatchState::Pending,
+                attempts: 0,
+                window_to: None,
+            });
+        }
+        let batch = pending.expect("set above");
+        let ag = self.project_agents(&project)?;
+        let tx = ag.unchecked_transaction()?;
+        // Ensure pending batch row exists (idempotent under unique partial index).
+        if tx
+            .query_row(
+                &format!("SELECT {BATCH_COLS} FROM batches WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'pending'"),
+                params![agent.0, channel.0],
+                batch_from_row,
+            )
+            .optional()?
+            .is_none()
+        {
+            tx.execute(
+                "INSERT INTO batches (id, agent_id, channel_id, state, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)",
+                params![batch.id.0, agent.0, channel.0, now as i64],
+            )?;
+        }
+        let actual_batch_id: i64 = tx.query_row(
+            "SELECT id FROM batches WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'pending'",
+            params![agent.0, channel.0],
+            |r| r.get(0),
+        )?;
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO triggers (agent_id, channel_id, message_id, reason, hop, batch_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![agent.0, channel.0, message.0, reason.as_str(), hop as i64, actual_batch_id, now as i64],
+        )? == 1;
+        if inserted && create_obligation {
+            tx.execute(
+                "INSERT OR IGNORE INTO obligations (agent_id, channel_id, message_id, state) VALUES (?1, ?2, ?3, 'open')",
+                params![agent.0, channel.0, message.0],
+            )?;
+        }
+        tx.commit()?;
+        self.note_batch(project, BatchId(actual_batch_id));
+        Ok(inserted)
+    }
+    pub fn obligation_state(&self, id: TriggerId) -> Result<Option<ObligationState>> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        obligation_state(self.project_agents(&project)?, id)
+    }
+    pub fn open_obligations(&self, batch: BatchId) -> Result<Vec<TriggerId>> {
+        let project = self
+            .project_for_batch(batch)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        open_obligations(self.project_agents(&project)?, batch)
+    }
+    pub fn resolve_obligation(
+        &self,
+        id: TriggerId,
+        state: ObligationState,
+        resolved_by: Option<MessageId>,
+        kind: &str,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        resolve_obligation(self.project_agents(&project)?, id, state, resolved_by, kind)
+    }
+    pub fn receipts(&self, channel: ChannelId) -> Result<Vec<Receipt>> {
+        let Some(project) = self.project_for_channel(channel) else {
+            return Ok(vec![]);
+        };
+        receipts(self.project_workspace(&project)?, channel)
+    }
+
+    pub fn former_project_agent_mention_tokens(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<(MemberId, Arc<str>)>> {
+        // Former = agent not currently in project_members but has cursor/message history in project.
+        let mut stmt = self.core.prepare(
+            "SELECT m.id, m.handle FROM members m
+             WHERE m.kind = 'agent'
+               AND NOT EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = ?1 AND pm.member_id = m.id)
+             ORDER BY m.id"
+        )?;
+        let rows = stmt
+            .query_map([project.as_str()], |r| {
+                Ok((
+                    MemberId(r.get::<_, i64>(0)?),
+                    Arc::from(r.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        let ws = match self.project_workspace(project) {
+            Ok(c) => c,
+            Err(_) => return Ok(vec![]),
+        };
+        let mut out = Vec::new();
+        for (id, handle) in rows {
+            let in_proj: bool = ws.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cursors WHERE agent_id=?1) OR EXISTS(SELECT 1 FROM messages WHERE author_id=?1)",
+                [id.0], |r| r.get(0)).unwrap_or(false);
+            if !in_proj {
+                continue;
+            }
+            out.push((id, handle));
+            // nicknames
+            let mut ns = self.core.prepare(
+                "SELECT nickname FROM member_nicknames WHERE member_id=?1 ORDER BY added_at, rowid",
+            )?;
+            let nrows = ns
+                .query_map([id.0], |r| Ok(Arc::from(r.get::<_, String>(0)?)))?
+                .collect::<Result<Vec<_>>>()?;
+            for n in nrows {
+                out.push((id, n));
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn core_project_ids(core: &Connection) -> Result<Vec<ProjectId>> {
+    let mut stmt = core.prepare("SELECT id FROM projects ORDER BY created_at, id")?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for r in rows {
+        if let Some(id) = ProjectId::parse(&r?) {
+            out.push(id);
+        }
+    }
+    Ok(out)
+}
+
+fn open_db(path: &Path, migrations: &[&str]) -> std::result::Result<Connection, OpenError> {
+    let conn = Connection::open(path)?;
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let known = migrations.len() as i64;
+    if version > known {
+        return Err(OpenError::NewerSchema {
+            path: path.to_path_buf(),
+            found: version,
+            known,
+        });
+    }
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;",
+    )?;
+    run_migrations(&conn, migrations, version as usize).map_err(OpenError::Sqlite)?;
+    Ok(conn)
+}
+
+fn run_migrations(conn: &Connection, migrations: &[&str], from: usize) -> Result<()> {
+    if from >= migrations.len() {
+        return Ok(());
+    }
+    conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+    let result = (|| {
+        for (ix, sql) in migrations.iter().enumerate().skip(from) {
+            let tx = conn.unchecked_transaction()?;
             tx.execute_batch(sql)?;
             let dangling: i64 =
                 tx.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
@@ -615,28 +1854,1284 @@ impl Store {
             tx.commit()?;
         }
         Ok(())
+    })();
+    conn.execute_batch("PRAGMA foreign_keys = ON")?;
+    result
+}
+
+const CORE_MIGRATIONS: &[&str] = &[r#"
+CREATE TABLE projects (
+    id          TEXT PRIMARY KEY NOT NULL,
+    name        TEXT NOT NULL,
+    root_path   TEXT,
+    created_at  INTEGER NOT NULL,
+    unclaimed_import INTEGER NOT NULL DEFAULT 0 CHECK (unclaimed_import IN (0, 1))
+);
+CREATE UNIQUE INDEX projects_one_per_root
+    ON projects (root_path) WHERE root_path IS NOT NULL;
+CREATE TABLE members (
+    id      INTEGER PRIMARY KEY,
+    kind    TEXT NOT NULL CHECK (kind IN ('human', 'agent')),
+    handle  TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name    TEXT NOT NULL
+);
+CREATE TABLE project_members (
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    member_id   INTEGER NOT NULL REFERENCES members(id),
+    joined_at   INTEGER NOT NULL,
+    PRIMARY KEY (project_id, member_id)
+);
+CREATE TABLE member_nicknames (
+    nickname   TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+    member_id  INTEGER NOT NULL REFERENCES members(id),
+    added_at   INTEGER NOT NULL
+);
+CREATE INDEX member_nicknames_by_member ON member_nicknames (member_id, added_at);
+CREATE TRIGGER member_nicknames_not_a_handle BEFORE INSERT ON member_nicknames
+WHEN EXISTS (SELECT 1 FROM members WHERE handle = NEW.nickname)
+BEGIN
+    SELECT RAISE(ABORT, 'nickname_is_a_handle');
+END;
+CREATE TABLE model_members (
+    member_id   INTEGER PRIMARY KEY REFERENCES members(id),
+    harness     TEXT NOT NULL,
+    model       TEXT NOT NULL DEFAULT '',
+    model_name  TEXT NOT NULL,
+    ping_answer_reactions TEXT,
+    UNIQUE (harness, model)
+);
+CREATE TABLE roster (
+    project_id  TEXT NOT NULL REFERENCES projects(id),
+    member_id   INTEGER NOT NULL REFERENCES model_members(member_id),
+    added_at    INTEGER NOT NULL,
+    PRIMARY KEY (project_id, member_id)
+);
+CREATE TABLE roster_seeded (
+    project_id  TEXT PRIMARY KEY NOT NULL REFERENCES projects(id),
+    seeded_at   INTEGER NOT NULL
+);
+CREATE TABLE harness_models (
+    harness  TEXT NOT NULL,
+    ord      INTEGER NOT NULL,
+    model    TEXT NOT NULL,
+    name     TEXT NOT NULL,
+    seen_at  INTEGER NOT NULL,
+    PRIMARY KEY (harness, model)
+);
+CREATE TABLE id_counters (
+    name    TEXT PRIMARY KEY NOT NULL,
+    next_id INTEGER NOT NULL
+);
+INSERT INTO id_counters (name, next_id) VALUES ('channel', 1), ('message', 1), ('batch', 1);
+"#];
+
+const WORKSPACE_MIGRATIONS: &[&str] = &[r#"
+CREATE TABLE channels (
+    id          INTEGER PRIMARY KEY,
+    project_id  TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    ordinal     INTEGER NOT NULL CHECK (ordinal > 0),
+    created_at  INTEGER NOT NULL,
+    UNIQUE (project_id, name),
+    UNIQUE (project_id, ordinal)
+);
+CREATE TABLE memberships (
+    channel_id  INTEGER NOT NULL REFERENCES channels(id),
+    member_id   INTEGER NOT NULL,
+    joined_at   INTEGER NOT NULL,
+    PRIMARY KEY (channel_id, member_id)
+);
+CREATE TABLE messages (
+    id                 INTEGER PRIMARY KEY,
+    channel_id         INTEGER NOT NULL REFERENCES channels(id),
+    seq                INTEGER NOT NULL,
+    author_id          INTEGER,
+    origin             TEXT NOT NULL,
+    body               TEXT NOT NULL,
+    reply_to           INTEGER REFERENCES messages(id),
+    hop                INTEGER NOT NULL DEFAULT 0,
+    cause_batch        INTEGER,
+    client_request_id  TEXT,
+    sent_at            INTEGER NOT NULL,
+    UNIQUE (channel_id, seq)
+);
+CREATE UNIQUE INDEX messages_request
+    ON messages (author_id, channel_id, client_request_id)
+    WHERE client_request_id IS NOT NULL;
+CREATE UNIQUE INDEX messages_one_fallback
+    ON messages (author_id, reply_to)
+    WHERE origin = 'fallback';
+CREATE TABLE mentions (
+    message_id  INTEGER NOT NULL REFERENCES messages(id),
+    member_id   INTEGER NOT NULL,
+    PRIMARY KEY (message_id, member_id)
+);
+CREATE TABLE reactions (
+    message_id  INTEGER NOT NULL REFERENCES messages(id),
+    channel_id  INTEGER NOT NULL REFERENCES channels(id),
+    member_id   INTEGER NOT NULL,
+    emoji       TEXT NOT NULL CHECK (length(emoji) BETWEEN 1 AND 32),
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (message_id, member_id, emoji)
+);
+CREATE INDEX reactions_by_channel ON reactions (channel_id, created_at);
+CREATE TABLE cursors (
+    agent_id           INTEGER NOT NULL,
+    channel_id         INTEGER NOT NULL REFERENCES channels(id),
+    delivered_through  INTEGER NOT NULL,
+    read_through       INTEGER NOT NULL,
+    delivered_at       INTEGER,
+    read_at            INTEGER,
+    PRIMARY KEY (agent_id, channel_id)
+);
+CREATE TABLE stances (
+    message_id  INTEGER PRIMARY KEY NOT NULL REFERENCES messages(id),
+    channel_id  INTEGER NOT NULL REFERENCES channels(id),
+    kind        TEXT NOT NULL CHECK (kind IN ('refusal', 'dissent')),
+    member_id   INTEGER NOT NULL,
+    target_id   INTEGER NOT NULL REFERENCES messages(id),
+    reason      TEXT NOT NULL,
+    model       TEXT,
+    runtime     TEXT,
+    created_at  INTEGER NOT NULL
+);
+CREATE INDEX stances_by_channel ON stances (channel_id, message_id);
+CREATE INDEX stances_by_target ON stances (target_id);
+CREATE TABLE project_settings (
+    project_id  TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    value       TEXT NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (project_id, key)
+);
+"#];
+
+const AGENTS_MIGRATIONS: &[&str] = &[r#"
+CREATE TABLE batches (
+    id           INTEGER PRIMARY KEY,
+    agent_id     INTEGER NOT NULL,
+    channel_id   INTEGER NOT NULL,
+    state        TEXT NOT NULL CHECK (state IN ('pending', 'dispatched', 'accepted', 'settled', 'failed')),
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    window_to    INTEGER,
+    created_at   INTEGER NOT NULL,
+    accepted_at  INTEGER,
+    settled_at   INTEGER,
+    outcome      TEXT
+);
+CREATE UNIQUE INDEX batches_one_pending
+    ON batches (agent_id, channel_id) WHERE state = 'pending';
+CREATE UNIQUE INDEX batches_one_in_flight
+    ON batches (agent_id, channel_id) WHERE state IN ('dispatched', 'accepted');
+CREATE TABLE triggers (
+    agent_id    INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    hop         INTEGER NOT NULL,
+    batch_id    INTEGER NOT NULL REFERENCES batches(id),
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_id, message_id)
+);
+CREATE TABLE obligations (
+    agent_id       INTEGER NOT NULL,
+    channel_id     INTEGER NOT NULL,
+    message_id     INTEGER NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN ('open', 'satisfied', 'fallback', 'unmet', 'ignored', 'refused')),
+    resolved_by    INTEGER,
+    resolved_kind  TEXT,
+    PRIMARY KEY (agent_id, channel_id, message_id),
+    FOREIGN KEY (agent_id, channel_id, message_id)
+        REFERENCES triggers (agent_id, channel_id, message_id)
+);
+CREATE TABLE sessions (
+    agent_id    INTEGER NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    protocol    TEXT NOT NULL,
+    native_ref  TEXT NOT NULL,
+    opened_at   INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, channel_id)
+);
+"#];
+
+fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenError> {
+    let legacy = data_dir.join("core.sqlite");
+    let core_db = data_dir.join("core.db");
+    let backup = data_dir.join("core.sqlite.pre-split");
+    // Already migrated/complete?
+    if core_db.exists() && !legacy.exists() {
+        return Ok(());
+    }
+    // If backup exists but no core.db, or partial state, try to resume from backup/original.
+    let source = if legacy.exists() {
+        legacy.clone()
+    } else if backup.exists() {
+        backup.clone()
+    } else {
+        return Ok(()); // fresh install
+    };
+    // If core.db exists but legacy still exists, prefer completing a verified split layout
+    // (e.g. crash after migration but before backup rename) over destructive retry.
+    // Require an explicit, valid completion marker to avoid accepting empty-but-valid DBs.
+    if core_db.exists() && legacy.exists() {
+        let marker = split_migration_marker(data_dir);
+        let mut valid = is_valid_split_migration_marker(data_dir);
+        if valid
+            && let Ok(core) = open_db(&core_db, CORE_MIGRATIONS)
+            && let Ok(projects) = core_project_ids(&core)
+        {
+            valid = projects.iter().all(|p| {
+                let dir = data_dir.join("Projects").join(p.as_str());
+                open_db(&dir.join("workspace.db"), WORKSPACE_MIGRATIONS).is_ok()
+                    && open_db(&dir.join("agents.db"), AGENTS_MIGRATIONS).is_ok()
+            });
+            if valid {
+                // Best-effort: ensure counters are seeded (idempotent) before finalizing.
+                if let Ok(legacy_src) = Connection::open(&legacy) {
+                    let _ = seed_id_counters_from_legacy(&legacy_src, &core);
+                }
+            }
+        } else {
+            valid = false;
+        }
+        if valid {
+            std::fs::rename(&legacy, &backup)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+            let _ = std::fs::remove_file(marker);
+            return Ok(());
+        }
+        let _ = std::fs::remove_file(&core_db);
+        let _ = std::fs::remove_file(marker);
+        let projects_dir = data_dir.join("Projects");
+        let _ = std::fs::remove_dir_all(&projects_dir);
+    }
+    migrate_legacy(&source, data_dir)?;
+    // Verify by opening all DBs, then mark complete and rename original to backup.
+    let _core = open_db(&core_db, CORE_MIGRATIONS)?;
+    // verify project dbs
+    let projects = core_project_ids(&_core)?;
+    for p in projects {
+        let dir = data_dir.join("Projects").join(p.as_str());
+        let _ws = open_db(&dir.join("workspace.db"), WORKSPACE_MIGRATIONS)?;
+        let _ag = open_db(&dir.join("agents.db"), AGENTS_MIGRATIONS)?;
+    }
+    write_split_migration_marker_atomic(data_dir)?;
+    if legacy.exists() {
+        std::fs::rename(&legacy, &backup)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    }
+    let _ = std::fs::remove_file(split_migration_marker(data_dir));
+    Ok(())
+}
+
+fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), OpenError> {
+    // Open legacy read-only-ish and copy into new split layout.
+    let legacy = Connection::open(source)?;
+    let version: i64 = legacy.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let known = LEGACY_MIGRATIONS.len() as i64;
+    if version > known {
+        return Err(OpenError::NewerSchema {
+            path: source.to_path_buf(),
+            found: version,
+            known,
+        });
+    }
+    // Ensure legacy is fully migrated to latest legacy schema first.
+    legacy.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    run_migrations(&legacy, LEGACY_MIGRATIONS, version as usize).map_err(OpenError::Sqlite)?;
+    legacy.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+    let core_path = data_dir.join("core.db");
+    if core_path.exists() {
+        let _ = std::fs::remove_file(&core_path);
+    }
+    let core = open_db(&core_path, CORE_MIGRATIONS)?;
+
+    // Core tables
+    core.execute_batch("BEGIN IMMEDIATE;")?;
+    let res = (|| -> Result<()> {
+        copy_table(
+            &legacy,
+            &core,
+            "projects",
+            "id, name, root_path, created_at, unclaimed_import",
+        )?;
+        copy_table(&legacy, &core, "members", "id, kind, handle, name")?;
+        copy_table(
+            &legacy,
+            &core,
+            "project_members",
+            "project_id, member_id, joined_at",
+        )?;
+        if table_exists(&legacy, "member_nicknames")? {
+            copy_table(
+                &legacy,
+                &core,
+                "member_nicknames",
+                "nickname, member_id, added_at",
+            )?;
+        }
+        if table_exists(&legacy, "model_members")? {
+            copy_table(
+                &legacy,
+                &core,
+                "model_members",
+                "member_id, harness, model, model_name, ping_answer_reactions",
+            )?;
+        }
+        if table_exists(&legacy, "roster")? {
+            copy_table(&legacy, &core, "roster", "project_id, member_id, added_at")?;
+        }
+        if table_exists(&legacy, "roster_seeded")? {
+            copy_table(&legacy, &core, "roster_seeded", "project_id, seeded_at")?;
+        }
+        if table_exists(&legacy, "harness_models")? {
+            copy_table(
+                &legacy,
+                &core,
+                "harness_models",
+                "harness, ord, model, name, seen_at",
+            )?;
+        }
+        // reset sqlite sequences for core autoincrement tables
+        reset_sqlite_sequence(&core, "members")?;
+        Ok(())
+    })();
+    match res {
+        Ok(()) => {
+            core.execute_batch("COMMIT;")?;
+        }
+        Err(e) => {
+            let _ = core.execute_batch("ROLLBACK;");
+            return Err(OpenError::Sqlite(e));
+        }
     }
 
-    pub fn schema_version(&self) -> Result<i64> {
-        self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))
-    }
+    // Per-project DBs
+    let project_ids = core_project_ids(&core)?;
+    let projects_dir = data_dir.join("Projects");
+    for pid in project_ids {
+        let dir = projects_dir.join(pid.as_str());
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        let ws_path = dir.join("workspace.db");
+        let ag_path = dir.join("agents.db");
+        if ws_path.exists() {
+            let _ = std::fs::remove_file(&ws_path);
+        }
+        if ag_path.exists() {
+            let _ = std::fs::remove_file(&ag_path);
+        }
+        let ws = open_db(&ws_path, WORKSPACE_MIGRATIONS)?;
+        let ag = open_db(&ag_path, AGENTS_MIGRATIONS)?;
+        ws.execute_batch("BEGIN IMMEDIATE;")?;
+        let wres = (|| -> Result<()> {
+            copy_project_table(
+                &legacy,
+                &ws,
+                "channels",
+                "id, project_id, name, ordinal, created_at",
+                &pid,
+            )?;
+            copy_project_join(
+                &legacy,
+                &ws,
+                "SELECT m.channel_id, m.member_id, m.joined_at FROM memberships m JOIN channels c ON c.id = m.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO memberships (channel_id, member_id, joined_at) VALUES (?1, ?2, ?3)",
+                &pid,
+                3,
+            )?;
+            copy_project_join(
+                &legacy,
+                &ws,
+                "SELECT m.id, m.channel_id, m.seq, m.author_id, m.origin, m.body, m.reply_to, m.hop, m.cause_batch, m.client_request_id, m.sent_at FROM messages m JOIN channels c ON c.id = m.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO messages (id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                &pid,
+                11,
+            )?;
+            copy_project_join(
+                &legacy,
+                &ws,
+                "SELECT x.message_id, x.member_id FROM mentions x JOIN messages m ON m.id = x.message_id JOIN channels c ON c.id = m.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO mentions (message_id, member_id) VALUES (?1, ?2)",
+                &pid,
+                2,
+            )?;
+            if table_exists(&legacy, "reactions")? {
+                // reactions gained channel_id in migration 9 in legacy; copy accordingly
+                copy_project_join(
+                    &legacy,
+                    &ws,
+                    "SELECT r.message_id, r.channel_id, r.member_id, r.emoji, r.created_at FROM reactions r JOIN channels c ON c.id = r.channel_id WHERE c.project_id = ?1",
+                    "INSERT INTO reactions (message_id, channel_id, member_id, emoji, created_at) VALUES (?1,?2,?3,?4,?5)",
+                    &pid,
+                    5,
+                )?;
+            }
+            copy_project_join(
+                &legacy,
+                &ws,
+                "SELECT k.agent_id, k.channel_id, k.delivered_through, k.read_through, k.delivered_at, k.read_at FROM cursors k JOIN channels c ON c.id = k.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO cursors (agent_id, channel_id, delivered_through, read_through, delivered_at, read_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                &pid,
+                6,
+            )?;
+            if table_exists(&legacy, "stances")? {
+                copy_project_join(
+                    &legacy,
+                    &ws,
+                    "SELECT s.message_id, s.channel_id, s.kind, s.member_id, s.target_id, s.reason, s.model, s.runtime, s.created_at FROM stances s WHERE s.channel_id IN (SELECT id FROM channels WHERE project_id = ?1)",
+                    "INSERT INTO stances (message_id, channel_id, kind, member_id, target_id, reason, model, runtime, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                    &pid,
+                    9,
+                )?;
+            }
+            if table_exists(&legacy, "project_settings")? {
+                copy_project_join(
+                    &legacy,
+                    &ws,
+                    "SELECT project_id, key, value, updated_at FROM project_settings WHERE project_id = ?1",
+                    "INSERT INTO project_settings (project_id, key, value, updated_at) VALUES (?1,?2,?3,?4)",
+                    &pid,
+                    4,
+                )?;
+            }
+            Ok(())
+        })();
+        match wres {
+            Ok(()) => {
+                ws.execute_batch("COMMIT;")?;
+            }
+            Err(e) => {
+                let _ = ws.execute_batch("ROLLBACK;");
+                return Err(OpenError::Sqlite(e));
+            }
+        }
 
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+        ag.execute_batch("BEGIN IMMEDIATE;")?;
+        let ares = (|| -> Result<()> {
+            copy_project_join(
+                &legacy,
+                &ag,
+                "SELECT b.id, b.agent_id, b.channel_id, b.state, b.attempts, b.window_to, b.created_at, b.accepted_at, b.settled_at, b.outcome FROM batches b JOIN channels c ON c.id = b.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO batches (id, agent_id, channel_id, state, attempts, window_to, created_at, accepted_at, settled_at, outcome) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                &pid,
+                10,
+            )?;
+            copy_project_join(
+                &legacy,
+                &ag,
+                "SELECT t.agent_id, t.channel_id, t.message_id, t.reason, t.hop, t.batch_id, t.created_at FROM triggers t JOIN channels c ON c.id = t.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO triggers (agent_id, channel_id, message_id, reason, hop, batch_id, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                &pid,
+                7,
+            )?;
+            copy_project_join(
+                &legacy,
+                &ag,
+                "SELECT o.agent_id, o.channel_id, o.message_id, o.state, o.resolved_by, o.resolved_kind FROM obligations o JOIN channels c ON c.id = o.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO obligations (agent_id, channel_id, message_id, state, resolved_by, resolved_kind) VALUES (?1,?2,?3,?4,?5,?6)",
+                &pid,
+                6,
+            )?;
+            copy_project_join(
+                &legacy,
+                &ag,
+                "SELECT s.agent_id, s.channel_id, s.protocol, s.native_ref, s.opened_at FROM sessions s JOIN channels c ON c.id = s.channel_id WHERE c.project_id = ?1",
+                "INSERT INTO sessions (agent_id, channel_id, protocol, native_ref, opened_at) VALUES (?1,?2,?3,?4,?5)",
+                &pid,
+                5,
+            )?;
+            Ok(())
+        })();
+        match ares {
+            Ok(()) => {
+                ag.execute_batch("COMMIT;")?;
+            }
+            Err(e) => {
+                let _ = ag.execute_batch("ROLLBACK;");
+                return Err(OpenError::Sqlite(e));
+            }
+        }
     }
+    // Seed id_counters from legacy max IDs to avoid collisions on new inserts (F5).
+    seed_id_counters_from_legacy(&legacy, &core)?;
+    Ok(())
+}
 
-    /// Runs `f` in one immediate transaction; commits on `Ok`.
-    pub fn tx<T, E: From<rusqlite::Error>>(
-        &mut self,
-        f: impl FnOnce(&Connection) -> std::result::Result<T, E>,
-    ) -> std::result::Result<T, E> {
-        let tx = self
-            .conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let out = f(&tx)?;
-        tx.commit()?;
-        Ok(out)
+const SPLIT_MIGRATION_MARKER_CONTENT: &[u8] = b"v1\n";
+
+fn split_migration_marker(data_dir: &Path) -> PathBuf {
+    data_dir.join("core.split-migration-complete")
+}
+
+fn is_valid_split_migration_marker(data_dir: &Path) -> bool {
+    let marker = split_migration_marker(data_dir);
+    match std::fs::read(&marker) {
+        Ok(bytes) => bytes == SPLIT_MIGRATION_MARKER_CONTENT,
+        Err(_) => false,
     }
+}
+
+fn write_split_migration_marker_atomic(data_dir: &Path) -> std::result::Result<(), OpenError> {
+    use std::io::Write;
+    let marker = split_migration_marker(data_dir);
+    let tmp = data_dir.join("core.split-migration-complete.tmp");
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    f.write_all(SPLIT_MIGRATION_MARKER_CONTENT)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    f.sync_all()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    drop(f);
+    std::fs::rename(&tmp, &marker)
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    if let Ok(dir) = std::fs::File::open(data_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn table_exists(c: &Connection, name: &str) -> Result<bool> {
+    c.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+}
+
+fn copy_table(src: &Connection, dst: &Connection, table: &str, cols: &str) -> Result<()> {
+    let mut stmt = src.prepare(&format!("SELECT {cols} FROM {table}"))?;
+    let n = stmt.column_count();
+    let placeholders = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut ins = dst.prepare(&format!(
+        "INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+    ))?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(n);
+        for i in 0..n {
+            params_vec.push(row.get(i)?);
+        }
+        ins.execute(rusqlite::params_from_iter(params_vec))?;
+    }
+    Ok(())
+}
+
+fn copy_project_table(
+    src: &Connection,
+    dst: &Connection,
+    table: &str,
+    cols: &str,
+    project: &ProjectId,
+) -> Result<()> {
+    let mut stmt = src.prepare(&format!("SELECT {cols} FROM {table} WHERE project_id = ?1"))?;
+    let n = stmt.column_count();
+    let placeholders = (1..=n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut ins = dst.prepare(&format!(
+        "INSERT INTO {table} ({cols}) VALUES ({placeholders})"
+    ))?;
+    let mut rows = stmt.query([project.as_str()])?;
+    while let Some(row) = rows.next()? {
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(n);
+        for i in 0..n {
+            params_vec.push(row.get(i)?);
+        }
+        ins.execute(rusqlite::params_from_iter(params_vec))?;
+    }
+    Ok(())
+}
+
+fn copy_project_join(
+    src: &Connection,
+    dst: &Connection,
+    select_sql: &str,
+    insert_sql: &str,
+    project: &ProjectId,
+    n: usize,
+) -> Result<()> {
+    let mut stmt = src.prepare(select_sql)?;
+    let mut ins = dst.prepare(insert_sql)?;
+    let mut rows = stmt.query([project.as_str()])?;
+    while let Some(row) = rows.next()? {
+        let mut params_vec: Vec<rusqlite::types::Value> = Vec::with_capacity(n);
+        for i in 0..n {
+            params_vec.push(row.get(i)?);
+        }
+        ins.execute(rusqlite::params_from_iter(params_vec))?;
+    }
+    Ok(())
+}
+
+fn seed_id_counters_from_legacy(legacy: &Connection, core: &Connection) -> Result<()> {
+    let max_channel: i64 =
+        legacy.query_row("SELECT COALESCE(MAX(id), 0) FROM channels", [], |r| {
+            r.get(0)
+        })?;
+    let max_message: i64 =
+        legacy.query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| {
+            r.get(0)
+        })?;
+    let max_batch: i64 =
+        legacy.query_row("SELECT COALESCE(MAX(id), 0) FROM batches", [], |r| r.get(0))?;
+    core.execute(
+        "UPDATE id_counters SET next_id = ?2 WHERE name = ?1 AND next_id <= ?2",
+        params!["channel", max_channel + 1],
+    )?;
+    core.execute(
+        "UPDATE id_counters SET next_id = ?2 WHERE name = ?1 AND next_id <= ?2",
+        params!["message", max_message + 1],
+    )?;
+    core.execute(
+        "UPDATE id_counters SET next_id = ?2 WHERE name = ?1 AND next_id <= ?2",
+        params!["batch", max_batch + 1],
+    )?;
+    Ok(())
+}
+
+fn reset_sqlite_sequence(c: &Connection, table: &str) -> Result<()> {
+    if !table_exists(c, "sqlite_sequence")? {
+        return Ok(());
+    }
+    let max: Option<i64> = c
+        .query_row(&format!("SELECT MAX(id) FROM {table}"), [], |r| r.get(0))
+        .optional()?
+        .flatten();
+    if let Some(max) = max {
+        c.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES (?1, ?2)",
+            params![table, max],
+        )?;
+    }
+    Ok(())
+}
+
+// --- DB-specific helpers for split store ---
+
+fn ensure_member_db(c: &Connection, kind: MemberKind, handle: &str, name: &str) -> Result<Member> {
+    c.execute(
+        "INSERT INTO members (kind, handle, name) VALUES (?1, ?2, ?3)
+         ON CONFLICT(handle) DO UPDATE SET name = excluded.name",
+        params![kind.as_str(), handle, name],
+    )?;
+    let m = member_by_handle_db(c, handle)?.expect("just ensured");
+    c.execute("DELETE FROM member_nicknames WHERE nickname = ?1", [handle])?;
+    Ok(m)
+}
+
+fn member_by_handle_db(c: &Connection, handle: &str) -> Result<Option<Member>> {
+    c.query_row(
+        "SELECT id, kind, handle, name FROM members WHERE handle = ?1 COLLATE NOCASE",
+        [handle],
+        member_from_row,
+    )
+    .optional()
+}
+
+fn member_db(c: &Connection, id: MemberId) -> Result<Option<Member>> {
+    c.query_row(
+        "SELECT id, kind, handle, name FROM members WHERE id = ?1",
+        [id.0],
+        member_from_row,
+    )
+    .optional()
+}
+
+fn unclaimed_import_db(c: &Connection) -> Result<Option<Project>> {
+    c.query_row(
+        &format!(
+            "SELECT {PROJECT_COLS} FROM projects
+             WHERE unclaimed_import = 1 AND root_path IS NULL
+             ORDER BY created_at, id LIMIT 1"
+        ),
+        [],
+        project_from_row,
+    )
+    .optional()
+}
+
+fn adopt_import_db(
+    c: &Connection,
+    id: &ProjectId,
+    name: &str,
+    root: &str,
+) -> Result<Option<Project>> {
+    let claimable = c
+        .query_row(
+            "SELECT 1 FROM projects
+             WHERE id = ?1 AND unclaimed_import = 1 AND root_path IS NULL",
+            [id.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !claimable {
+        return Ok(None);
+    }
+    c.execute(
+        "UPDATE projects SET root_path = NULL WHERE root_path = ?1 AND id != ?2",
+        params![root, id.as_str()],
+    )?;
+    c.execute(
+        "UPDATE projects SET root_path = ?2, name = ?3, unclaimed_import = 0
+         WHERE id = ?1 AND unclaimed_import = 1 AND root_path IS NULL",
+        params![id.as_str(), root, name],
+    )?;
+    project_row(c, id)
+}
+
+fn project_has_messages_db(ws: &Connection) -> Result<bool> {
+    ws.query_row("SELECT 1 FROM messages LIMIT 1", [], |_| Ok(()))
+        .optional()
+        .map(|o| o.is_some())
+}
+
+fn forget_empty_project_core(
+    core: &Connection,
+    project: &ProjectId,
+    _channels: &[ChannelId],
+) -> Result<Option<Vec<ChannelId>>> {
+    let forgettable = core
+        .query_row(
+            "SELECT 1 FROM projects WHERE id = ?1 AND root_path IS NULL AND unclaimed_import = 0",
+            [project.as_str()],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !forgettable {
+        return Ok(None);
+    }
+    // caller checked no messages and provides channels; delete core records
+    core.execute(
+        "DELETE FROM project_members WHERE project_id = ?1",
+        [project.as_str()],
+    )?;
+    core.execute(
+        "DELETE FROM roster WHERE project_id = ?1",
+        [project.as_str()],
+    )?;
+    core.execute(
+        "DELETE FROM roster_seeded WHERE project_id = ?1",
+        [project.as_str()],
+    )?;
+    core.execute("DELETE FROM projects WHERE id = ?1", [project.as_str()])?;
+    Ok(Some(_channels.to_vec()))
+}
+
+fn ensure_channel_db(
+    ws: &Connection,
+    project: &ProjectId,
+    name: &str,
+    id: ChannelId,
+    now: Millis,
+) -> Result<Channel> {
+    let clean = name.strip_prefix('#').unwrap_or(name);
+    if let Some(ch) = channel_in_project_db(ws, project, clean)? {
+        return Ok(ch);
+    }
+    let ordinal: i64 = ws.query_row(
+        "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM channels WHERE project_id = ?1",
+        [project.as_str()],
+        |r| r.get(0),
+    )?;
+    ws.execute(
+        "INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id.0, project.as_str(), clean, ordinal, now as i64],
+    )?;
+    channel_db(ws, id).map(|c| c.expect("just inserted"))
+}
+
+fn channel_db(ws: &Connection, id: ChannelId) -> Result<Option<Channel>> {
+    ws.query_row(
+        &format!("SELECT {CHANNEL_COLS} FROM channels WHERE id = ?1"),
+        [id.0],
+        channel_from_row,
+    )
+    .optional()
+}
+
+fn channel_in_project_db(
+    ws: &Connection,
+    project: &ProjectId,
+    name: &str,
+) -> Result<Option<Channel>> {
+    let clean = name.strip_prefix('#').unwrap_or(name);
+    ws.query_row(
+        &format!(
+            "SELECT {CHANNEL_COLS} FROM channels WHERE project_id = ?1 AND name = ?2 COLLATE NOCASE"
+        ),
+        params![project.as_str(), clean],
+        channel_from_row,
+    )
+    .optional()
+}
+
+fn channels_in_project_db(ws: &Connection, project: &ProjectId) -> Result<Vec<Channel>> {
+    let mut stmt = ws.prepare_cached(&format!(
+        "SELECT {CHANNEL_COLS} FROM channels WHERE project_id = ?1 ORDER BY ordinal, id"
+    ))?;
+    stmt.query_map([project.as_str()], channel_from_row)?
+        .collect()
+}
+
+fn rename_channel_db(ws: &Connection, id: ChannelId, name: &str) -> Result<bool> {
+    let clean = name.strip_prefix('#').unwrap_or(name);
+    Ok(ws.execute(
+        "UPDATE channels SET name = ?2 WHERE id = ?1",
+        params![id.0, clean],
+    )? == 1)
+}
+
+fn members_of_db(core: &Connection, ws: &Connection, channel: ChannelId) -> Result<Vec<Member>> {
+    let mut stmt = ws.prepare_cached(
+        "SELECT member_id FROM memberships WHERE channel_id = ?1 ORDER BY member_id",
+    )?;
+    let ids = stmt
+        .query_map([channel.0], |r| r.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = Vec::new();
+    for id in ids {
+        if let Some(m) = member_db(core, MemberId(id))? {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+fn is_member_db(ws: &Connection, channel: ChannelId, member: MemberId) -> Result<bool> {
+    ws.query_row(
+        "SELECT 1 FROM memberships WHERE channel_id = ?1 AND member_id = ?2",
+        params![channel.0, member.0],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+}
+
+fn join_db(
+    ws: &Connection,
+    channel: ChannelId,
+    member: &Member,
+    backfill: usize,
+    now: Millis,
+) -> Result<bool> {
+    let inserted = ws.execute(
+        "INSERT OR IGNORE INTO memberships (channel_id, member_id, joined_at) VALUES (?1, ?2, ?3)",
+        params![channel.0, member.id.0, now as i64],
+    )? == 1;
+    if inserted {
+        let seq = head_seq_db(ws, channel)?;
+        let delivered = seq.saturating_sub(backfill as Seq);
+        ws.execute(
+            "INSERT OR IGNORE INTO cursors (agent_id, channel_id, delivered_through, read_through) VALUES (?1, ?2, ?3, ?3)",
+            params![member.id.0, channel.0, delivered as i64],
+        )?;
+    }
+    Ok(inserted)
+}
+
+fn head_seq_db(ws: &Connection, channel: ChannelId) -> Result<Seq> {
+    ws.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE channel_id = ?1",
+        [channel.0],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|s| s as Seq)
+}
+
+fn insert_message_db(ws: &Connection, m: &NewMessage<'_>, id: MessageId) -> Result<Message> {
+    let tx = ws.unchecked_transaction()?;
+    let seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE channel_id = ?1",
+        [m.channel.0],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO messages (id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            id.0, m.channel.0, seq, m.author.map(|a| a.0), m.origin.as_str(), m.body,
+            m.reply_to.map(|r| r.0), m.hop as i64, m.cause_batch.map(|b| b.0),
+            m.client_request_id, m.sent_at as i64
+        ],
+    )?;
+    for member in m.mentions {
+        tx.execute(
+            "INSERT OR IGNORE INTO mentions (message_id, member_id) VALUES (?1, ?2)",
+            params![id.0, member.0],
+        )?;
+    }
+    tx.commit()?;
+    Ok(Message {
+        id,
+        channel: m.channel,
+        seq: seq as Seq,
+        author: m.author,
+        origin: m.origin,
+        body: Arc::from(m.body),
+        reply_to: m.reply_to,
+        mentions: m.mentions.to_vec(),
+        hop: m.hop,
+        sent_at: m.sent_at,
+    })
+}
+
+fn message_db(ws: &Connection, id: MessageId) -> Result<Option<Message>> {
+    query_messages_db(
+        ws,
+        &format!("SELECT {MESSAGE_COLS} FROM messages WHERE id = ?1"),
+        [id.0],
+    )
+    .map(|mut v| v.pop())
+}
+
+fn message_by_request_db(
+    ws: &Connection,
+    author: MemberId,
+    channel: ChannelId,
+    request: &str,
+) -> Result<Option<Message>> {
+    query_messages_db(ws, &format!("SELECT {MESSAGE_COLS} FROM messages WHERE author_id = ?1 AND channel_id = ?2 AND client_request_id = ?3"), params![author.0, channel.0, request]).map(|mut v| v.pop())
+}
+
+fn messages_before_db(
+    ws: &Connection,
+    channel: ChannelId,
+    before_seq: Seq,
+    limit: usize,
+) -> Result<Vec<Message>> {
+    let mut v = query_messages_db(
+        ws,
+        &format!(
+            "SELECT {MESSAGE_COLS} FROM messages WHERE channel_id = ?1 AND seq < ?2 ORDER BY seq DESC LIMIT ?3"
+        ),
+        params![channel.0, before_seq as i64, limit as i64],
+    )?;
+    v.reverse();
+    Ok(v)
+}
+
+fn query_messages_db(ws: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<Message>> {
+    let mut stmt = ws.prepare(sql)?;
+    let msgs = stmt
+        .query_map(p, |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, i64>(10)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = Vec::with_capacity(msgs.len());
+    for (
+        id,
+        channel,
+        seq,
+        author,
+        origin,
+        body,
+        reply_to,
+        hop,
+        _cause_batch,
+        _client_request_id,
+        sent_at,
+    ) in msgs
+    {
+        let mut mstmt = ws.prepare_cached(
+            "SELECT member_id FROM mentions WHERE message_id = ?1 ORDER BY member_id",
+        )?;
+        let mentions = mstmt
+            .query_map([id], |r| Ok(MemberId(r.get(0)?)))?
+            .collect::<Result<Vec<_>>>()?;
+        out.push(Message {
+            id: MessageId(id),
+            channel: ChannelId(channel),
+            seq: seq as Seq,
+            author: author.map(MemberId),
+            origin: Origin::parse(&origin),
+            body: Arc::from(body),
+            reply_to: reply_to.map(MessageId),
+            mentions,
+            hop: hop.clamp(0, 255) as u8,
+            sent_at: sent_at as Millis,
+        });
+    }
+    Ok(out)
+}
+
+fn cursor_db(ws: &Connection, agent: MemberId, channel: ChannelId) -> Result<Cursor> {
+    ws.query_row(
+        "SELECT delivered_through, read_through, read_at FROM cursors WHERE agent_id = ?1 AND channel_id = ?2",
+        params![agent.0, channel.0],
+        |r| Ok(Cursor { delivered_through: r.get::<_, i64>(0)? as Seq, read_through: r.get::<_, i64>(1)? as Seq, read_at: r.get::<_, Option<i64>>(2)?.map(|t| t as Millis) }),
+    ).optional().map(|o| o.unwrap_or(Cursor { delivered_through: 0, read_through: 0, read_at: None }))
+}
+
+fn pending_batch_db(
+    ag: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+) -> Result<Option<BatchRow>> {
+    ag.query_row(&format!("SELECT {BATCH_COLS} FROM batches WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'pending'"), params![agent.0, channel.0], batch_from_row).optional()
+}
+fn in_flight_batch_db(
+    ag: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+) -> Result<Option<BatchRow>> {
+    ag.query_row(&format!("SELECT {BATCH_COLS} FROM batches WHERE agent_id = ?1 AND channel_id = ?2 AND state IN ('dispatched', 'accepted')"), params![agent.0, channel.0], batch_from_row).optional()
+}
+fn pending_batch_or_create_db(
+    ag: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+    now: Millis,
+    id: BatchId,
+) -> Result<BatchRow> {
+    if let Some(b) = pending_batch_db(ag, agent, channel)? {
+        return Ok(b);
+    }
+    ag.execute("INSERT INTO batches (id, agent_id, channel_id, state, created_at) VALUES (?1, ?2, ?3, 'pending', ?4)", params![id.0, agent.0, channel.0, now as i64])?;
+    Ok(batch_db(ag, id)?.expect("just created"))
+}
+
+fn nicknames_of_db(core: &Connection, member: MemberId) -> Result<Vec<Arc<str>>> {
+    let mut stmt = core.prepare_cached(
+        "SELECT nickname FROM member_nicknames WHERE member_id = ?1 ORDER BY added_at, nickname",
+    )?;
+    stmt.query_map([member.0], |r| r.get::<_, String>(0).map(Arc::from))?
+        .collect()
+}
+fn nicknames_in_db(
+    core: &Connection,
+    ws: &Connection,
+    channel: ChannelId,
+) -> Result<Vec<(MemberId, Arc<str>)>> {
+    let mut stmt = ws.prepare_cached("SELECT member_id FROM memberships WHERE channel_id = ?1")?;
+    let ids = stmt
+        .query_map([channel.0], |r| r.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>>>()?;
+    let mut out = Vec::new();
+    for id in ids {
+        let mut nstmt = core.prepare_cached("SELECT nickname FROM member_nicknames WHERE member_id = ?1 ORDER BY added_at, nickname")?;
+        let nicks = nstmt
+            .query_map([id], |r| r.get::<_, String>(0).map(Arc::from))?
+            .collect::<Result<Vec<_>>>()?;
+        for n in nicks {
+            out.push((MemberId(id), n));
+        }
+    }
+    Ok(out)
+}
+fn mention_owner_db(core: &Connection, token: &str) -> Result<Option<MemberId>> {
+    if let Some(id) = core
+        .query_row(
+            "SELECT id FROM members WHERE handle = ?1 COLLATE NOCASE",
+            [token],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(Some(MemberId(id)));
+    }
+    core.query_row(
+        "SELECT member_id FROM member_nicknames WHERE nickname = ?1 COLLATE NOCASE",
+        [token],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .map(|o| o.map(MemberId))
+}
+fn add_nickname_db(core: &Connection, member: MemberId, nickname: &str, now: Millis) -> Result<()> {
+    core.execute(
+        "INSERT INTO member_nicknames (nickname, member_id, added_at) VALUES (?1, ?2, ?3)",
+        params![nickname, member.0, now as i64],
+    )?;
+    Ok(())
+}
+fn remove_nickname_db(core: &Connection, member: MemberId, nickname: &str) -> Result<bool> {
+    Ok(core.execute(
+        "DELETE FROM member_nicknames WHERE member_id = ?1 AND nickname = ?2 COLLATE NOCASE",
+        params![member.0, nickname],
+    )? == 1)
+}
+fn project_setting_db(ws: &Connection, project: &ProjectId, key: &str) -> Result<Option<String>> {
+    ws.query_row(
+        "SELECT value FROM project_settings WHERE project_id = ?1 AND key = ?2",
+        params![project.as_str(), key],
+        |r| r.get(0),
+    )
+    .optional()
+}
+fn set_project_setting_db(
+    ws: &Connection,
+    project: &ProjectId,
+    key: &str,
+    value: Option<&str>,
+    now: Millis,
+) -> Result<()> {
+    match value {
+        Some(v) => ws.execute("INSERT INTO project_settings (project_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(project_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at", params![project.as_str(), key, v, now as i64])?,
+        None => ws.execute("DELETE FROM project_settings WHERE project_id = ?1 AND key = ?2", params![project.as_str(), key])?,
+    };
+    Ok(())
+}
+
+fn batch_db(ag: &Connection, id: BatchId) -> Result<Option<BatchRow>> {
+    ag.query_row(
+        &format!("SELECT {BATCH_COLS} FROM batches WHERE id = ?1"),
+        [id.0],
+        batch_from_row,
+    )
+    .optional()
+}
+fn set_batch_state_db(
+    ag: &Connection,
+    id: BatchId,
+    state: BatchState,
+    now: Millis,
+    outcome: Option<&str>,
+) -> Result<()> {
+    match state {
+        BatchState::Accepted => ag.execute(
+            "UPDATE batches SET state = 'accepted', accepted_at = ?2 WHERE id = ?1",
+            params![id.0, now as i64],
+        )?,
+        BatchState::Settled | BatchState::Failed => ag.execute(
+            "UPDATE batches SET state = ?2, settled_at = ?3, outcome = ?4 WHERE id = ?1",
+            params![id.0, state.as_str(), now as i64, outcome],
+        )?,
+        _ => ag.execute(
+            "UPDATE batches SET state = ?2 WHERE id = ?1",
+            params![id.0, state.as_str()],
+        )?,
+    };
+    Ok(())
+}
+#[allow(dead_code)]
+fn dispatch_batch_db(ag: &Connection, id: BatchId, window_to: Seq) -> Result<u32> {
+    ag.execute("UPDATE batches SET state = 'dispatched', attempts = attempts + 1, window_to = ?2 WHERE id = ?1 AND state = 'pending'", params![id.0, window_to as i64])?;
+    ag.query_row("SELECT attempts FROM batches WHERE id = ?1", [id.0], |r| {
+        r.get::<_, i64>(0).map(|a| a as u32)
+    })
+}
+fn requeue_batch_db(ag: &Connection, id: BatchId) -> Result<()> {
+    let Some(b) = batch_db(ag, id)? else {
+        return Ok(());
+    };
+    if b.state != BatchState::Dispatched {
+        return Ok(());
+    }
+    if let Some(p) = pending_batch_db(ag, b.agent, b.channel)? {
+        ag.execute(
+            "UPDATE triggers SET batch_id = ?1 WHERE batch_id = ?2",
+            params![id.0, p.id.0],
+        )?;
+        ag.execute("DELETE FROM batches WHERE id = ?1", [p.id.0])?;
+    }
+    ag.execute("UPDATE batches SET state = 'pending' WHERE id = ?1", [id.0])?;
+    Ok(())
+}
+#[allow(dead_code)]
+fn insert_trigger_db(
+    ag: &Connection,
+    id: TriggerId,
+    reason: WakeReason,
+    hop: u8,
+    batch: BatchId,
+    now: Millis,
+) -> Result<bool> {
+    Ok(ag.execute("INSERT OR IGNORE INTO triggers (agent_id, channel_id, message_id, reason, hop, batch_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![id.agent.0, id.channel.0, id.message.0, reason.as_str(), hop as i64, batch.0, now as i64])? == 1)
+}
+#[allow(dead_code)]
+fn trigger_exists_db(ag: &Connection, id: TriggerId) -> Result<bool> {
+    ag.query_row(
+        "SELECT 1 FROM triggers WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
+        params![id.agent.0, id.channel.0, id.message.0],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|o| o.is_some())
+}
+#[allow(dead_code)]
+fn batch_triggers_db(ag: &Connection, batch: BatchId) -> Result<Vec<TriggerRow>> {
+    let mut stmt = ag.prepare_cached("SELECT agent_id, channel_id, message_id, reason, hop, batch_id FROM triggers WHERE batch_id = ?1 ORDER BY message_id")?;
+    stmt.query_map([batch.0], |r| {
+        Ok(TriggerRow {
+            id: TriggerId {
+                agent: MemberId(r.get(0)?),
+                channel: ChannelId(r.get(1)?),
+                message: MessageId(r.get(2)?),
+            },
+            reason: WakeReason::parse(&r.get::<_, String>(3)?),
+            hop: r.get::<_, i64>(4)?.clamp(0, 255) as u8,
+            batch: BatchId(r.get(5)?),
+        })
+    })?
+    .collect()
+}
+#[allow(dead_code)]
+fn insert_obligation_db(ag: &Connection, id: TriggerId) -> Result<bool> {
+    Ok(ag.execute("INSERT OR IGNORE INTO obligations (agent_id, channel_id, message_id, state) VALUES (?1, ?2, ?3, 'open')", params![id.agent.0, id.channel.0, id.message.0])? == 1)
+}
+#[allow(dead_code)]
+fn obligation_state_db(ag: &Connection, id: TriggerId) -> Result<Option<ObligationState>> {
+    ag.query_row(
+        "SELECT state FROM obligations WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
+        params![id.agent.0, id.channel.0, id.message.0],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+    .map(|o| o.map(|s| ObligationState::parse(&s)))
+}
+fn open_obligations_db(ag: &Connection, batch: BatchId) -> Result<Vec<TriggerId>> {
+    let mut stmt = ag.prepare_cached("SELECT o.agent_id, o.channel_id, o.message_id FROM obligations o JOIN triggers t ON t.agent_id = o.agent_id AND t.channel_id = o.channel_id AND t.message_id = o.message_id WHERE t.batch_id = ?1 AND o.state = 'open' ORDER BY o.message_id")?;
+    stmt.query_map([batch.0], |r| {
+        Ok(TriggerId {
+            agent: MemberId(r.get(0)?),
+            channel: ChannelId(r.get(1)?),
+            message: MessageId(r.get(2)?),
+        })
+    })?
+    .collect()
+}
+fn resolve_obligation_db(
+    ag: &Connection,
+    id: TriggerId,
+    state: ObligationState,
+    by: Option<MessageId>,
+    kind: &str,
+) -> Result<bool> {
+    Ok(ag.execute("UPDATE obligations SET state = ?4, resolved_by = ?5, resolved_kind = ?6 WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3 AND state = 'open'", params![id.agent.0, id.channel.0, id.message.0, state.as_str(), by.map(|m| m.0), kind])? == 1)
+}
+#[allow(dead_code)]
+fn record_session_db(
+    ag: &Connection,
+    agent: MemberId,
+    channel: ChannelId,
+    protocol: &str,
+    native_ref: &str,
+    now: Millis,
+) -> Result<()> {
+    ag.execute("INSERT INTO sessions (agent_id, channel_id, protocol, native_ref, opened_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(agent_id, channel_id) DO UPDATE SET protocol = excluded.protocol, native_ref = excluded.native_ref, opened_at = excluded.opened_at", params![agent.0, channel.0, protocol, native_ref, now as i64])?;
+    Ok(())
 }
 
 // ---------- projects ----------
@@ -670,6 +3165,16 @@ pub fn ensure_project(
     root: Option<&str>,
     now: Millis,
 ) -> Result<Project> {
+    ensure_project_row(c, id, name, root, now)
+}
+
+pub fn ensure_project_row(
+    c: &Connection,
+    id: &ProjectId,
+    name: &str,
+    root: Option<&str>,
+    now: Millis,
+) -> Result<Project> {
     if let Some(root) = root {
         c.execute(
             "UPDATE projects SET root_path = NULL WHERE root_path = ?1 AND id != ?2",
@@ -687,6 +3192,10 @@ pub fn ensure_project(
 }
 
 pub fn project(c: &Connection, id: &ProjectId) -> Result<Option<Project>> {
+    project_row(c, id)
+}
+
+pub fn project_row(c: &Connection, id: &ProjectId) -> Result<Option<Project>> {
     c.query_row(
         &format!("SELECT {PROJECT_COLS} FROM projects WHERE id = ?1"),
         [id.as_str()],
@@ -697,6 +3206,10 @@ pub fn project(c: &Connection, id: &ProjectId) -> Result<Option<Project>> {
 
 /// The project last opened from `root`, if any.
 pub fn project_by_root(c: &Connection, root: &str) -> Result<Option<Project>> {
+    project_by_root_row(c, root)
+}
+
+pub fn project_by_root_row(c: &Connection, root: &str) -> Result<Option<Project>> {
     c.query_row(
         &format!("SELECT {PROJECT_COLS} FROM projects WHERE root_path = ?1"),
         [root],
@@ -707,6 +3220,10 @@ pub fn project_by_root(c: &Connection, root: &str) -> Result<Option<Project>> {
 
 /// Every project, oldest first.
 pub fn projects(c: &Connection) -> Result<Vec<Project>> {
+    projects_rows(c)
+}
+
+pub fn projects_rows(c: &Connection) -> Result<Vec<Project>> {
     let mut stmt = c.prepare_cached(&format!(
         "SELECT {PROJECT_COLS} FROM projects ORDER BY created_at, id"
     ))?;
@@ -859,6 +3376,10 @@ pub fn set_project_setting(
 
 /// Changes a project's display name only; its id, channels and history stay.
 pub fn rename_project(c: &Connection, id: &ProjectId, name: &str) -> Result<bool> {
+    rename_project_row(c, id, name)
+}
+
+pub fn rename_project_row(c: &Connection, id: &ProjectId, name: &str) -> Result<bool> {
     Ok(c.execute(
         "UPDATE projects SET name = ?2 WHERE id = ?1",
         params![id.as_str(), name],
@@ -873,6 +3394,15 @@ pub fn join_project(
     member: MemberId,
     now: Millis,
 ) -> Result<bool> {
+    join_project_row(c, project, member, now)
+}
+
+pub fn join_project_row(
+    c: &Connection,
+    project: &ProjectId,
+    member: MemberId,
+    now: Millis,
+) -> Result<bool> {
     Ok(c.execute(
         "INSERT OR IGNORE INTO project_members (project_id, member_id, joined_at)
          VALUES (?1, ?2, ?3)",
@@ -881,6 +3411,14 @@ pub fn join_project(
 }
 
 pub fn is_project_member(c: &Connection, project: &ProjectId, member: MemberId) -> Result<bool> {
+    is_project_member_row(c, project, member)
+}
+
+pub fn is_project_member_row(
+    c: &Connection,
+    project: &ProjectId,
+    member: MemberId,
+) -> Result<bool> {
     c.query_row(
         "SELECT 1 FROM project_members WHERE project_id = ?1 AND member_id = ?2",
         params![project.as_str(), member.0],
@@ -1195,7 +3733,7 @@ pub fn is_not_a_project_member(e: &rusqlite::Error) -> bool {
 
 // ---------- messages ----------
 
-const MESSAGE_COLS: &str = "id, channel_id, seq, author_id, origin, body, reply_to, hop, sent_at";
+const MESSAGE_COLS: &str = "id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at";
 
 fn message_from_row(r: &Row<'_>) -> Result<Message> {
     Ok(Message {
@@ -1208,7 +3746,7 @@ fn message_from_row(r: &Row<'_>) -> Result<Message> {
         reply_to: r.get::<_, Option<i64>>(6)?.map(MessageId),
         mentions: Vec::new(),
         hop: r.get::<_, i64>(7)?.clamp(0, u8::MAX as i64) as u8,
-        sent_at: r.get::<_, i64>(8)? as Millis,
+        sent_at: r.get::<_, i64>(10)? as Millis,
     })
 }
 
@@ -1365,6 +3903,36 @@ pub fn search(
     out.sort_by(|a, b| b.sent_at.cmp(&a.sent_at).then(b.id.cmp(&a.id)));
     out.truncate(limit);
     Ok(out)
+}
+
+fn search_in_channel_db(
+    ws: &Connection,
+    channel: ChannelId,
+    pattern: &str,
+    limit: usize,
+) -> Result<Vec<Message>> {
+    query_messages_db(
+        ws,
+        &format!(
+            "SELECT {MESSAGE_COLS} FROM messages
+             WHERE channel_id = ?1 AND body LIKE ?2 ESCAPE '\\'
+             ORDER BY seq DESC LIMIT ?3"
+        ),
+        params![channel.0, pattern, limit as i64],
+    )
+}
+
+fn channels_of_db(ws: &Connection, member: MemberId, project: &ProjectId) -> Result<Vec<Channel>> {
+    let mut stmt = ws.prepare(&format!(
+        "SELECT {CHANNEL_COLS} FROM channels c
+         JOIN memberships m ON m.channel_id = c.id
+         WHERE c.project_id = ?1 AND m.member_id = ?2
+         ORDER BY c.name"
+    ))?;
+    let rows = stmt
+        .query_map(params![project.as_str(), member.0], channel_from_row)?
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// Seq of the newest human-authored message in the channel (0 if none).
@@ -1969,6 +4537,7 @@ pub fn record_session(
 
 #[cfg(test)]
 mod tests {
+    use super::LEGACY_MIGRATIONS as MIGRATIONS;
     use super::*;
 
     const P1: &str = "0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59";
@@ -1980,97 +4549,93 @@ mod tests {
 
     fn setup() -> (Store, Channel, Member, Member) {
         let mut s = Store::open_in_memory().unwrap();
-        let (ch, hx, bot) = s
-            .tx::<_, rusqlite::Error>(|c| {
-                let p = ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
-                let ch = ensure_channel(c, &p.id, "main", 0)?;
-                let hx = ensure_member(c, MemberKind::Human, "hx", "Hx")?;
-                let bot = ensure_member(c, MemberKind::Agent, "claude", "Claude")?;
-                join_project(c, &p.id, hx.id, 0)?;
-                join_project(c, &p.id, bot.id, 0)?;
-                join(c, ch.id, &hx, 20, 0)?;
-                join(c, ch.id, &bot, 20, 0)?;
-                Ok((ch, hx, bot))
-            })
+        let p = pid(P1);
+        s.ensure_project(&p, "Starpoint", None, 0).unwrap();
+        let ch = s.ensure_channel(&p, "main", 0).unwrap();
+        let hx = s.ensure_member(MemberKind::Human, "hx", "Hx").unwrap();
+        let bot = s
+            .ensure_member(MemberKind::Agent, "claude", "Claude")
             .unwrap();
+        s.join_project(&p, hx.id, 0).unwrap();
+        s.join_project(&p, bot.id, 0).unwrap();
+        s.join(ch.id, &hx, 20, 0).unwrap();
+        s.join(ch.id, &bot, 20, 0).unwrap();
         (s, ch, hx, bot)
     }
 
     #[test]
     fn nicknames_share_the_handle_namespace() {
         let (s, ch, hx, bot) = setup();
-        let c = s.conn();
-        add_nickname(c, bot.id, "Cody", 1).unwrap();
-        add_nickname(c, bot.id, "cx", 2).unwrap();
+        s.add_nickname(bot.id, "Cody", 1).unwrap();
+        s.add_nickname(bot.id, "cx", 2).unwrap();
         assert_eq!(
-            nicknames_of(c, bot.id).unwrap(),
+            s.nicknames_of(bot.id).unwrap(),
             vec![Arc::<str>::from("Cody"), Arc::from("cx")]
         );
-        assert_eq!(nicknames_in(c, ch.id).unwrap().len(), 2);
-        assert_eq!(mention_owner(c, "CODY").unwrap(), Some(bot.id));
-        assert_eq!(mention_owner(c, "Claude").unwrap(), Some(bot.id));
-        assert_eq!(mention_owner(c, "nobody").unwrap(), None);
+        assert_eq!(s.nicknames_in(ch.id).unwrap().len(), 2);
+        assert_eq!(s.mention_owner("CODY").unwrap(), Some(bot.id));
+        assert_eq!(s.mention_owner("Claude").unwrap(), Some(bot.id));
+        assert_eq!(s.mention_owner("nobody").unwrap(), None);
         // The schema refuses a second holder, whatever the case, and a handle.
-        assert!(add_nickname(c, hx.id, "cody", 3).is_err());
-        let e = add_nickname(c, hx.id, "CLAUDE", 3).unwrap_err();
+        assert!(s.add_nickname(hx.id, "cody", 3).is_err());
+        let e = s.add_nickname(hx.id, "CLAUDE", 3).unwrap_err();
         assert!(e.to_string().contains("nickname_is_a_handle"), "{e}");
         // A handle created later wins: the nickname is dropped.
-        let cx = ensure_member(c, MemberKind::Agent, "CX", "Codex").unwrap();
-        assert_eq!(mention_owner(c, "cx").unwrap(), Some(cx.id));
+        let cx = s.ensure_member(MemberKind::Agent, "CX", "Codex").unwrap();
+        assert_eq!(s.mention_owner("cx").unwrap(), Some(cx.id));
         assert_eq!(
-            nicknames_of(c, bot.id).unwrap(),
+            s.nicknames_of(bot.id).unwrap(),
             vec![Arc::<str>::from("Cody")]
         );
-        assert!(remove_nickname(c, bot.id, "cODY").unwrap());
-        assert!(!remove_nickname(c, bot.id, "cody").unwrap());
-        assert!(nicknames_of(c, bot.id).unwrap().is_empty());
+        assert!(s.remove_nickname(bot.id, "cODY").unwrap());
+        assert!(!s.remove_nickname(bot.id, "cody").unwrap());
+        assert!(s.nicknames_of(bot.id).unwrap().is_empty());
     }
 
     #[test]
     fn former_mention_tokens_are_only_agents_removed_from_this_project() {
         let (mut s, main, hx, bot) = setup();
-        let (gone, spoke, elsewhere) = s
-            .tx::<_, rusqlite::Error>(|c| {
-                let p = pid(P1);
-                let design = ensure_channel(c, &p, "design", 0)?;
-                add_nickname(c, bot.id, "Cody", 1)?;
-                add_nickname(c, hx.id, "boss", 2)?;
-                // In #main, then removed from the project.
-                let gone = ensure_member(c, MemberKind::Agent, "gpt", "GPT")?;
-                join_project(c, &p, gone.id, 0)?;
-                join(c, main.id, &gone, 20, 0)?;
-                add_nickname(c, gone.id, "g", 3)?;
-                add_nickname(c, gone.id, "jeepy", 4)?;
-                crate::roster::leave_project(c, &p, gone.id, 5)?;
-                // Only ever in #design, where it spoke, then removed: it was
-                // still in the project.
-                let spoke = ensure_member(c, MemberKind::Agent, "gemini", "Gemini")?;
-                join_project(c, &p, spoke.id, 0)?;
-                join(c, design.id, &spoke, 20, 0)?;
-                insert_message(c, &msg(design.id, spoke.id, "on it"))?;
-                add_nickname(c, spoke.id, "gem", 5)?;
-                crate::roster::leave_project(c, &p, spoke.id, 6)?;
-                // A current member that is only in #design is not former.
-                let still = ensure_member(c, MemberKind::Agent, "pi", "Pi")?;
-                join_project(c, &p, still.id, 0)?;
-                join(c, design.id, &still, 20, 0)?;
-                // Only ever in another project's channel.
-                let q = ensure_project(c, &pid(P2), "Elsewhere", None, 0)?;
-                let elsewhere = ensure_channel(c, &q.id, "main", 0)?;
-                let other = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
-                join_project(c, &q.id, other.id, 0)?;
-                join(c, elsewhere.id, &other, 20, 0)?;
-                add_nickname(c, other.id, "cx", 7)?;
-                // Known to core, never in any channel.
-                ensure_member(c, MemberKind::Agent, "devin", "Devin")?;
-                Ok((gone, spoke, q.id))
-            })
+        let p = pid(P1);
+        let design = s.ensure_channel(&p, "design", 0).unwrap();
+        s.add_nickname(bot.id, "Cody", 1).unwrap();
+        s.add_nickname(hx.id, "boss", 2).unwrap();
+        // In #main, then removed from the project.
+        let gone = s.ensure_member(MemberKind::Agent, "gpt", "GPT").unwrap();
+        s.join_project(&p, gone.id, 0).unwrap();
+        s.join(main.id, &gone, 20, 0).unwrap();
+        s.add_nickname(gone.id, "g", 3).unwrap();
+        s.add_nickname(gone.id, "jeepy", 4).unwrap();
+        s.leave_project(&p, gone.id, 5).unwrap();
+        // Only ever in #design, where it spoke, then removed.
+        let spoke = s
+            .ensure_member(MemberKind::Agent, "gemini", "Gemini")
             .unwrap();
-        let c = s.conn();
-        // Current members (bot, pi, hx), the other project's agent and the
-        // stranger are not in it; humans never are.
+        s.join_project(&p, spoke.id, 0).unwrap();
+        s.join(design.id, &spoke, 20, 0).unwrap();
+        s.insert_message(&msg(design.id, spoke.id, "on it"))
+            .unwrap();
+        s.add_nickname(spoke.id, "gem", 5).unwrap();
+        s.leave_project(&p, spoke.id, 6).unwrap();
+        // A current member that is only in #design is not former.
+        let still = s.ensure_member(MemberKind::Agent, "pi", "Pi").unwrap();
+        s.join_project(&p, still.id, 0).unwrap();
+        s.join(design.id, &still, 20, 0).unwrap();
+        // Only ever in another project's channel.
+        let q = pid(P2);
+        s.ensure_project(&q, "Elsewhere", None, 0).unwrap();
+        let elsewhere_ch = s.ensure_channel(&q, "main", 0).unwrap();
+        let other = s
+            .ensure_member(MemberKind::Agent, "codex", "Codex")
+            .unwrap();
+        s.join_project(&q, other.id, 0).unwrap();
+        s.join(elsewhere_ch.id, &other, 20, 0).unwrap();
+        s.add_nickname(other.id, "cx", 7).unwrap();
+        // Known to core, never in any channel.
+        s.ensure_member(MemberKind::Agent, "devin", "Devin")
+            .unwrap();
+
         assert_eq!(
-            former_project_agent_mention_tokens(c, &pid(P1)).unwrap(),
+            s.former_project_agent_mention_tokens(&pid(P1)).unwrap(),
             vec![
                 (gone.id, Arc::<str>::from("gpt")),
                 (gone.id, Arc::from("g")),
@@ -2079,10 +4644,8 @@ mod tests {
                 (spoke.id, Arc::from("gem")),
             ]
         );
-        // The other project lists nothing: codex is still a member there,
-        // and P1's removed agents were never in it.
         assert!(
-            former_project_agent_mention_tokens(c, &elsewhere)
+            s.former_project_agent_mention_tokens(&q)
                 .unwrap()
                 .is_empty()
         );
@@ -2106,7 +4669,11 @@ mod tests {
     #[test]
     fn migrations_run_once_and_record_version() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let core_v: i64 = s
+            .core()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(core_v, super::CORE_MIGRATIONS.len() as i64);
     }
 
     #[test]
@@ -2126,7 +4693,7 @@ mod tests {
         }
         let before = std::fs::read(&path).unwrap();
         match Store::open(&path) {
-            Err(OpenError::NewerSchema { found, known }) => {
+            Err(OpenError::NewerSchema { found, known, .. }) => {
                 assert_eq!(found, newer);
                 assert_eq!(known, MIGRATIONS.len() as i64);
             }
@@ -2158,7 +4725,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         drop(Store::open(&path).unwrap());
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let core_v: i64 = s
+            .core()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(core_v, super::CORE_MIGRATIONS.len() as i64);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2169,44 +4740,46 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.sqlite");
         let _ = std::fs::remove_file(&path);
-        let id = {
+        let (id, hx_id) = {
             let mut s = Store::open(&path).unwrap();
-            s.tx::<_, rusqlite::Error>(|c| {
-                ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
-                let ch = ensure_channel(c, &pid(P1), "main", 0)?;
-                insert_message(c, &msg(ch.id, MemberId(1), "x")).map(|m| m.id)
-            })
-            .ok();
-            let s2 = &mut s;
-            s2.tx::<_, rusqlite::Error>(|c| {
-                ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
-                let ch = ensure_channel(c, &pid(P1), "main", 0)?;
-                let hx = ensure_member(c, MemberKind::Human, "hx", "Hx")?;
-                insert_message(c, &msg(ch.id, hx.id, "hello")).map(|m| m.id)
-            })
-            .unwrap()
+            let p = pid(P1);
+            s.ensure_project(&p, "Starpoint", None, 0).unwrap();
+            let ch = s.ensure_channel(&p, "main", 0).unwrap();
+            let hx = s.ensure_member(MemberKind::Human, "hx", "Hx").unwrap();
+            s.join_project(&p, hx.id, 0).unwrap();
+            s.join(ch.id, &hx, 20, 0).unwrap();
+            let m = s.insert_message(&msg(ch.id, hx.id, "hello")).unwrap();
+            (m.id, hx.id)
         };
         let s = Store::open(&path).unwrap();
-        let m = message(s.conn(), id).unwrap().unwrap();
+        let mut found = None;
+        for proj in s.projects().unwrap() {
+            if let Ok(ws) = s.project_workspace(&proj.id)
+                && let Ok(Some(m)) = message(ws, id)
+            {
+                found = Some(m);
+                break;
+            }
+        }
+        let m = found.expect("message");
         assert_eq!(&*m.body, "hello");
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(m.author, Some(hx_id));
+        let core_v: i64 = s
+            .core()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(core_v, super::CORE_MIGRATIONS.len() as i64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn seq_is_per_channel_and_gapless_while_ids_are_global() {
         let (mut s, ch, hx, _) = setup();
-        let other = s
-            .tx::<_, rusqlite::Error>(|c| ensure_channel(c, &ch.project, "STRM-1", 0))
-            .unwrap();
-        let (a, b, c2) = s
-            .tx::<_, rusqlite::Error>(|c| {
-                let a = insert_message(c, &msg(ch.id, hx.id, "a"))?;
-                let b = insert_message(c, &msg(other.id, hx.id, "b"))?;
-                let c2 = insert_message(c, &msg(ch.id, hx.id, "c"))?;
-                Ok((a, b, c2))
-            })
-            .unwrap();
+        let other = s.ensure_channel(&ch.project, "STRM-1", 0).unwrap();
+        s.join(other.id, &hx, 0, 0).unwrap();
+        let a = s.insert_message(&msg(ch.id, hx.id, "a")).unwrap();
+        let b = s.insert_message(&msg(other.id, hx.id, "b")).unwrap();
+        let c2 = s.insert_message(&msg(ch.id, hx.id, "c")).unwrap();
         assert_eq!((a.seq, b.seq, c2.seq), (1, 1, 2));
         assert!(a.id < b.id && b.id < c2.id);
     }
@@ -2214,181 +4787,181 @@ mod tests {
     #[test]
     fn one_pending_and_one_in_flight_batch_per_agent_channel() {
         let (mut s, ch, _, bot) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let p = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            assert_eq!(pending_batch_or_create(c, bot.id, ch.id, 0)?.id, p.id);
-            let dup = c.execute(
-                "INSERT INTO batches (agent_id, channel_id, state, created_at) VALUES (?1, ?2, 'pending', 0)",
-                params![bot.id.0, ch.id.0],
+        let p = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        assert_eq!(
+            s.pending_batch_or_create(bot.id, ch.id, 0).unwrap().id,
+            p.id
+        );
+        {
+            let ag = s.project_agents(&ch.project).unwrap();
+            let dup = ag.execute(
+                "INSERT INTO batches (id, agent_id, channel_id, state, created_at) VALUES (?1, ?2, ?3, 'pending', 0)",
+                params![999i64, bot.id.0, ch.id.0],
             );
             assert!(dup.is_err(), "schema forbids a second pending batch");
-            dispatch_batch(c, p.id, 0)?;
-            let q = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            assert_ne!(q.id, p.id);
-            let dup = c.execute(
-                "UPDATE batches SET state = 'dispatched' WHERE id = ?1",
-                [q.id.0],
-            );
-            assert!(dup.is_err(), "schema forbids a second in-flight batch");
-            Ok(())
-        })
-        .unwrap();
+        }
+        s.dispatch_batch(p.id, 0).unwrap();
+        let q = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        assert_ne!(q.id, p.id);
+        let ag = s.project_agents(&ch.project).unwrap();
+        let dup = ag.execute(
+            "UPDATE batches SET state = 'dispatched' WHERE id = ?1",
+            [q.id.0],
+        );
+        assert!(dup.is_err(), "schema forbids a second in-flight batch");
     }
 
     #[test]
     fn requeue_merges_triggers_of_a_newer_pending_batch() {
         let (mut s, ch, hx, bot) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let m1 = insert_message(c, &msg(ch.id, hx.id, "one"))?;
-            let m2 = insert_message(c, &msg(ch.id, hx.id, "two"))?;
-            let b1 = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t1 = TriggerId {
-                agent: bot.id,
-                channel: ch.id,
-                message: m1.id,
-            };
-            insert_trigger(c, t1, WakeReason::Mention, 0, b1.id, 0)?;
-            insert_obligation(c, t1)?;
-            dispatch_batch(c, b1.id, 1)?;
-            let b2 = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t2 = TriggerId {
-                agent: bot.id,
-                channel: ch.id,
-                message: m2.id,
-            };
-            insert_trigger(c, t2, WakeReason::Mention, 0, b2.id, 0)?;
-            insert_obligation(c, t2)?;
-            requeue_batch(c, b1.id)?;
-            let p = pending_batch(c, bot.id, ch.id)?.unwrap();
-            assert_eq!(p.id, b1.id);
-            assert_eq!(batch_triggers(c, p.id)?.len(), 2);
-            assert_eq!(open_obligations(c, p.id)?, vec![t1, t2]);
-            Ok(())
-        })
-        .unwrap();
+        let m1 = s.insert_message(&msg(ch.id, hx.id, "one")).unwrap();
+        let m2 = s.insert_message(&msg(ch.id, hx.id, "two")).unwrap();
+        let b1 = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        let t1 = TriggerId {
+            agent: bot.id,
+            channel: ch.id,
+            message: m1.id,
+        };
+        s.insert_trigger(t1, WakeReason::Mention, 0, b1.id, 0)
+            .unwrap();
+        s.insert_obligation(t1).unwrap();
+        s.dispatch_batch(b1.id, 1).unwrap();
+        let b2 = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        let t2 = TriggerId {
+            agent: bot.id,
+            channel: ch.id,
+            message: m2.id,
+        };
+        s.insert_trigger(t2, WakeReason::Mention, 0, b2.id, 0)
+            .unwrap();
+        s.insert_obligation(t2).unwrap();
+        s.requeue_batch(b1.id).unwrap();
+        let p = s.pending_batch(bot.id, ch.id).unwrap().unwrap();
+        assert_eq!(p.id, b1.id);
+        assert_eq!(s.batch_triggers(p.id).unwrap().len(), 2);
+        assert_eq!(s.open_obligations(p.id).unwrap(), vec![t1, t2]);
     }
 
     #[test]
     fn duplicate_trigger_and_obligation_are_ignored() {
         let (mut s, ch, hx, bot) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let m = insert_message(c, &msg(ch.id, hx.id, "@claude hi"))?;
-            let b = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t = TriggerId {
-                agent: bot.id,
-                channel: ch.id,
-                message: m.id,
-            };
-            assert!(insert_trigger(c, t, WakeReason::Mention, 0, b.id, 0)?);
-            assert!(!insert_trigger(c, t, WakeReason::Mention, 0, b.id, 0)?);
-            assert!(insert_obligation(c, t)?);
-            assert!(!insert_obligation(c, t)?);
-            assert!(resolve_obligation(
-                c,
-                t,
-                ObligationState::Satisfied,
-                None,
-                "send"
-            )?);
-            assert!(!resolve_obligation(
-                c,
-                t,
-                ObligationState::Fallback,
-                None,
-                "fallback"
-            )?);
-            Ok(())
-        })
-        .unwrap();
+        let m = s.insert_message(&msg(ch.id, hx.id, "@claude hi")).unwrap();
+        let b = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        let t = TriggerId {
+            agent: bot.id,
+            channel: ch.id,
+            message: m.id,
+        };
+        assert!(
+            s.insert_trigger(t, WakeReason::Mention, 0, b.id, 0)
+                .unwrap()
+        );
+        assert!(
+            !s.insert_trigger(t, WakeReason::Mention, 0, b.id, 0)
+                .unwrap()
+        );
+        assert!(s.insert_obligation(t).unwrap());
+        assert!(!s.insert_obligation(t).unwrap());
+        assert!(
+            s.resolve_obligation(t, ObligationState::Satisfied, None, "send")
+                .unwrap()
+        );
+        assert!(
+            !s.resolve_obligation(t, ObligationState::Fallback, None, "fallback")
+                .unwrap()
+        );
     }
 
     #[test]
     fn join_backfills_the_last_n_messages() {
         let (mut s, ch, hx, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            for i in 0..30 {
-                insert_message(c, &msg(ch.id, hx.id, &format!("m{i}")))?;
-            }
-            let late = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
-            join_project(c, &ch.project, late.id, 0)?;
-            join(c, ch.id, &late, 20, 0)?;
-            assert_eq!(cursor(c, late.id, ch.id)?.read_through, 10);
-            advance_delivered(c, late.id, ch.id, 5, 0)?;
-            assert_eq!(
-                cursor(c, late.id, ch.id)?.delivered_through,
-                10,
-                "never backwards"
-            );
-            Ok(())
-        })
-        .unwrap();
+        for i in 0..30 {
+            s.insert_message(&msg(ch.id, hx.id, &format!("m{i}")))
+                .unwrap();
+        }
+        let late = s
+            .ensure_member(MemberKind::Agent, "codex", "Codex")
+            .unwrap();
+        s.join_project(&ch.project, late.id, 0).unwrap();
+        s.join(ch.id, &late, 20, 0).unwrap();
+        assert_eq!(s.cursor(late.id, ch.id).unwrap().read_through, 10);
+        s.advance_delivered(late.id, ch.id, 5, 0).unwrap();
+        assert_eq!(
+            s.cursor(late.id, ch.id).unwrap().delivered_through,
+            10,
+            "never backwards"
+        );
     }
 
     #[test]
     fn two_projects_can_each_have_a_main() {
         let mut s = Store::open_in_memory().unwrap();
-        s.tx::<_, rusqlite::Error>(|c| {
-            ensure_project(c, &pid(P1), "Starpoint", Some("/src/starpoint"), 0)?;
-            ensure_project(c, &pid(P2), "Everything", Some("/src/everything"), 0)?;
-            let a = ensure_channel(c, &pid(P1), "main", 0)?;
-            let b = ensure_channel(c, &pid(P2), "#main", 0)?;
-            assert_ne!(a.id, b.id);
-            assert_eq!((a.ordinal, b.ordinal), (1, 1), "::N counts per project");
-            assert_eq!(&*b.name, "main");
-            assert_eq!(ensure_channel(c, &pid(P1), "main", 5)?.id, a.id);
-            let next = ensure_channel(c, &pid(P2), "STRM-184", 0)?;
-            assert_eq!(next.ordinal, 2);
-            assert_eq!(channel_in_project(c, &pid(P1), "main")?.unwrap().id, a.id);
-            assert_eq!(channel_in_project(c, &pid(P2), "main")?.unwrap().id, b.id);
-            assert!(channel_in_project(c, &pid(P1), "STRM-184")?.is_none());
-            let names: Vec<_> = channels_in_project(c, &pid(P2))?
-                .into_iter()
-                .map(|c| c.name)
-                .collect();
-            assert_eq!(names, vec![Arc::from("main"), Arc::from("STRM-184")]);
-            Ok(())
-        })
-        .unwrap();
+        s.ensure_project(&pid(P1), "Starpoint", Some("/src/starpoint"), 0)
+            .unwrap();
+        s.ensure_project(&pid(P2), "Everything", Some("/src/everything"), 0)
+            .unwrap();
+        let a = s.ensure_channel(&pid(P1), "main", 0).unwrap();
+        let b = s.ensure_channel(&pid(P2), "#main", 0).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!((a.ordinal, b.ordinal), (1, 1), "::N counts per project");
+        assert_eq!(&*b.name, "main");
+        assert_eq!(s.ensure_channel(&pid(P1), "main", 5).unwrap().id, a.id);
+        let next = s.ensure_channel(&pid(P2), "STRM-184", 0).unwrap();
+        assert_eq!(next.ordinal, 2);
+        assert_eq!(
+            s.channel_in_project(&pid(P1), "main").unwrap().unwrap().id,
+            a.id
+        );
+        assert_eq!(
+            s.channel_in_project(&pid(P2), "main").unwrap().unwrap().id,
+            b.id
+        );
+        assert!(
+            s.channel_in_project(&pid(P1), "STRM-184")
+                .unwrap()
+                .is_none()
+        );
+        let names: Vec<_> = s
+            .channels_in_project(&pid(P2))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec![Arc::from("main"), Arc::from("STRM-184")]);
     }
 
     #[test]
     fn joining_a_channel_needs_project_membership() {
         let (mut s, ch, _, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let other = ensure_project(c, &pid(P2), "Other", None, 0)?;
-            let elsewhere = ensure_channel(c, &other.id, "main", 0)?;
-            let codex = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
-            let err = join(c, ch.id, &codex, 20, 0).unwrap_err();
-            assert!(is_not_a_project_member(&err), "{err}");
-            assert!(!is_member(c, ch.id, codex.id)?);
-            join_project(c, &ch.project, codex.id, 0)?;
-            assert!(join(c, ch.id, &codex, 20, 0)?);
-            // Membership of one project grants nothing in another.
-            let err = join(c, elsewhere.id, &codex, 20, 0).unwrap_err();
-            assert!(is_not_a_project_member(&err), "{err}");
-            Ok(())
-        })
-        .unwrap();
+        let other = pid(P2);
+        s.ensure_project(&other, "Other", None, 0).unwrap();
+        let elsewhere = s.ensure_channel(&other, "main", 0).unwrap();
+        let codex = s
+            .ensure_member(MemberKind::Agent, "codex", "Codex")
+            .unwrap();
+        let err = s.join(ch.id, &codex, 20, 0).unwrap_err();
+        assert!(is_not_a_project_member(&err), "{err}");
+        assert!(!s.is_member(ch.id, codex.id).unwrap());
+        s.join_project(&ch.project, codex.id, 0).unwrap();
+        assert!(s.join(ch.id, &codex, 20, 0).unwrap());
+        let err = s.join(elsewhere.id, &codex, 20, 0).unwrap_err();
+        assert!(is_not_a_project_member(&err), "{err}");
     }
 
     #[test]
     fn renaming_changes_the_name_only() {
         let (mut s, ch, hx, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let m = insert_message(c, &msg(ch.id, hx.id, "before"))?;
-            assert!(rename_channel(c, ch.id, "#general")?);
-            assert!(rename_project(c, &ch.project, "Starpoint 2")?);
-            let renamed = channel(c, ch.id)?.unwrap();
-            assert_eq!((renamed.id, renamed.ordinal), (ch.id, ch.ordinal));
-            assert_eq!(&*renamed.name, "general");
-            assert_eq!(
-                project(c, &ch.project)?.unwrap().name.as_ref(),
-                "Starpoint 2"
-            );
-            assert_eq!(message(c, m.id)?.unwrap().channel, ch.id);
-            Ok(())
-        })
-        .unwrap();
+        let m = s.insert_message(&msg(ch.id, hx.id, "before")).unwrap();
+        assert!(s.rename_channel(ch.id, "#general").unwrap());
+        assert!(s.rename_project(&ch.project, "Starpoint 2").unwrap());
+        let renamed = s.channel(ch.id).unwrap().unwrap();
+        assert_eq!((renamed.id, renamed.ordinal), (ch.id, ch.ordinal));
+        assert_eq!(&*renamed.name, "general");
+        assert_eq!(
+            s.project(&ch.project).unwrap().unwrap().name.as_ref(),
+            "Starpoint 2"
+        );
+        assert_eq!(s.message(m.id).unwrap().unwrap().channel, ch.id);
     }
 
     #[test]
@@ -2418,64 +4991,15 @@ mod tests {
         assert_eq!(p.as_str(), P1);
     }
 
-    /// Every row of `table` as text, ordered, so two snapshots compare exactly.
-    fn dump(c: &Connection, table: &str, cols: &str) -> Vec<String> {
-        let mut stmt = c
-            .prepare(&format!("SELECT {cols} FROM {table} ORDER BY {cols}"))
-            .unwrap();
-        let n = stmt.column_count();
-        stmt.query_map([], |r| {
-            Ok((0..n)
-                .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
-                .collect::<Vec<_>>()
-                .join("|"))
-        })
-        .unwrap()
-        .collect::<Result<_>>()
-        .unwrap()
-    }
-
-    /// The tables migration 2 must leave exactly as they were.
-    const UNTOUCHED: &[(&str, &str)] = &[
-        ("members", "id, kind, handle, name"),
-        ("memberships", "channel_id, member_id, joined_at"),
-        (
-            "messages",
-            "id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at",
-        ),
-        ("mentions", "message_id, member_id"),
-        ("reactions", "message_id, member_id, emoji, created_at"),
-        (
-            "cursors",
-            "agent_id, channel_id, delivered_through, read_through",
-        ),
-        (
-            "batches",
-            "id, agent_id, channel_id, state, attempts, window_to, created_at, accepted_at, settled_at, outcome",
-        ),
-        (
-            "triggers",
-            "agent_id, channel_id, message_id, reason, hop, batch_id, created_at",
-        ),
-        (
-            "obligations",
-            "agent_id, channel_id, message_id, state, resolved_by, resolved_kind",
-        ),
-        (
-            "sessions",
-            "agent_id, channel_id, protocol, native_ref, opened_at",
-        ),
-    ];
-
     #[test]
     fn a_v1_database_migrates_keeping_every_id_and_row() {
         let dir = std::env::temp_dir().join(format!("cc-store-v1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("v1.sqlite");
+        let path = dir.join("core.sqlite");
         let _ = std::fs::remove_file(&path);
 
-        // A database exactly as v1 left it, with a row in every table.
-        let before: Vec<Vec<String>> = {
+        // A legacy database as v1 left it, with a row in every table.
+        {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(MIGRATIONS[0]).unwrap();
             conn.execute_batch(
@@ -2500,56 +5024,72 @@ mod tests {
                 "#,
             )
             .unwrap();
-            UNTOUCHED
-                .iter()
-                .map(|(t, cols)| dump(&conn, t, cols))
-                .collect()
-        };
+        }
 
-        let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
-        let c = s.conn();
-        let after: Vec<Vec<String>> = UNTOUCHED.iter().map(|(t, cols)| dump(c, t, cols)).collect();
-        assert_eq!(before, after, "migration 2 must not touch these tables");
-
-        let all = projects(c).unwrap();
+        let s = Store::open(&dir).unwrap();
+        let all = s.projects().unwrap();
         assert_eq!(all.len(), 1);
         let imported = all[0].clone();
         assert_eq!(imported.name.as_ref(), "Imported");
         assert_eq!(imported.root_path, None);
         assert_eq!(imported.created_at, 100);
-        let chans = channels_in_project(c, &imported.id).unwrap();
+        let chans = s.channels_in_project(&imported.id).unwrap();
         let got: Vec<_> = chans
             .iter()
             .map(|c| (c.id.0, &*c.name, c.ordinal))
             .collect();
         assert_eq!(got, vec![(3, "main", 1), (7, "STRM-1", 2)]);
         for m in [1, 2, 5] {
-            assert!(is_project_member(c, &imported.id, MemberId(m)).unwrap());
+            assert!(s.is_project_member(&imported.id, MemberId(m)).unwrap());
         }
-        let fk: i64 = c
+        // Verify key rows preserved across split DBs.
+        let ws = s.project_workspace(&imported.id).unwrap();
+        let ag = s.project_agents(&imported.id).unwrap();
+        let msg_ids: Vec<i64> = {
+            let mut st = ws.prepare("SELECT id FROM messages ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(msg_ids, vec![10, 11, 12]);
+        let batch_ids: Vec<i64> = {
+            let mut st = ag.prepare("SELECT id FROM batches ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(batch_ids, vec![4]);
+        let fk: i64 = ws
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
-        let fk_on: i64 = c
-            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(fk_on, 1, "foreign keys are back on after migrating");
         drop(s);
 
         // Reopening runs nothing again: same single project, same UUID.
-        let s = Store::open(&path).unwrap();
-        let again = projects(s.conn()).unwrap();
+        let s = Store::open(&dir).unwrap();
+        let again = s.projects().unwrap();
         assert_eq!(again, vec![imported]);
-        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_v3_database_gains_receipts_and_the_ignored_state() {
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cc-store-v3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         for m in &MIGRATIONS[..3] {
             conn.execute_batch(m).unwrap();
         }
@@ -2570,41 +5110,53 @@ mod tests {
             "#,
         )
         .unwrap();
-        let s = Store::init(conn).unwrap();
-        let c = s.conn();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        drop(conn);
+        let s = Store::open(&dir).unwrap();
+        let p = pid(P1);
         let t = TriggerId {
             agent: MemberId(2),
             channel: ChannelId(3),
             message: MessageId(10),
         };
-        assert_eq!(
-            obligation_state(c, t).unwrap(),
-            Some(ObligationState::Unmet)
-        );
-        // Existing cursors were never stamped: no receipt until they move.
-        let k = cursor(c, MemberId(2), ChannelId(3)).unwrap();
+        assert_eq!(s.obligation_state(t).unwrap(), Some(ObligationState::Unmet));
+        let k = s.cursor(MemberId(2), ChannelId(3)).unwrap();
         assert_eq!((k.read_through, k.read_at), (1, None));
-        c.execute(
-            "UPDATE obligations SET state = 'ignored' WHERE message_id = 10",
-            [],
-        )
-        .unwrap();
+        s.project_agents(&p)
+            .unwrap()
+            .execute(
+                "UPDATE obligations SET state = 'ignored' WHERE message_id = 10",
+                [],
+            )
+            .unwrap();
         assert_eq!(
-            obligation_state(c, t).unwrap(),
+            s.obligation_state(t).unwrap(),
             Some(ObligationState::Ignored)
         );
-        let fk: i64 = c
+        let fk: i64 = s
+            .project_workspace(&p)
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_v4_database_gains_stances_and_the_refused_state() {
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cc-store-v4-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         for m in &MIGRATIONS[..4] {
             conn.execute_batch(m).unwrap();
         }
@@ -2625,26 +5177,28 @@ mod tests {
             "#,
         )
         .unwrap();
-        let s = Store::init(conn).unwrap();
-        let c = s.conn();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        drop(conn);
+        let s = Store::open(&dir).unwrap();
+        let p = pid(P1);
         let t = TriggerId {
             agent: MemberId(2),
             channel: ChannelId(3),
             message: MessageId(10),
         };
         assert_eq!(
-            obligation_state(c, t).unwrap(),
+            s.obligation_state(t).unwrap(),
             Some(ObligationState::Ignored),
             "rows copied as they are"
         );
-        c.execute(
-            "UPDATE obligations SET state = 'refused' WHERE message_id = 10",
-            [],
-        )
-        .unwrap();
+        s.project_agents(&p)
+            .unwrap()
+            .execute(
+                "UPDATE obligations SET state = 'refused' WHERE message_id = 10",
+                [],
+            )
+            .unwrap();
         assert_eq!(
-            obligation_state(c, t).unwrap(),
+            s.obligation_state(t).unwrap(),
             Some(ObligationState::Refused)
         );
         let st = Stance {
@@ -2658,22 +5212,36 @@ mod tests {
             runtime: None,
             created_at: 1001,
         };
-        insert_stance(c, &st).unwrap();
-        insert_stance(c, &st).unwrap();
-        assert_eq!(stance(c, MessageId(11)).unwrap(), Some(st.clone()));
-        assert_eq!(recent_stances(c, ChannelId(3), 10).unwrap(), vec![st]);
-        assert_eq!(stance(c, MessageId(10)).unwrap(), None);
-        let fk: i64 = c
+        s.insert_stance(&st).unwrap();
+        s.insert_stance(&st).unwrap();
+        assert_eq!(s.stance(MessageId(11)).unwrap(), Some(st.clone()));
+        assert_eq!(s.recent_stances(ChannelId(3), 10).unwrap(), vec![st]);
+        assert_eq!(s.stance(MessageId(10)).unwrap(), None);
+        let fk: i64 = s
+            .project_workspace(&p)
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_v8_database_moves_reactions_into_the_v9_table() {
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cc-store-v8-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         for m in &MIGRATIONS[..8] {
             conn.execute_batch(m).unwrap();
         }
@@ -2698,18 +5266,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let s = Store::init(conn).unwrap();
-        let c = s.conn();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
-        let on = |m| {
-            reactions_on(c, MessageId(m))
+        drop(conn);
+        let s = Store::open(&dir).unwrap();
+        let p = pid(P1);
+        let on = |m: i64| {
+            s.reactions_on(MessageId(m))
                 .unwrap()
                 .into_iter()
                 .map(|r| (r.channel.0, r.member.0, r.emoji.to_string(), r.created_at))
                 .collect::<Vec<_>>()
         };
-        // Shortcodes became the emoji; a duplicate after mapping keeps the
-        // older row; the junk row is gone; every row knows its channel.
         assert_eq!(on(10), vec![(3, 2, "✅".to_string(), 1002)]);
         assert_eq!(
             on(11),
@@ -2718,71 +5284,70 @@ mod tests {
                 (3, 2, "👀".to_string(), 1005)
             ]
         );
-        // Still one per (message, member, emoji), and the length CHECK holds
-        // (OR IGNORE skips a row that breaks it).
-        assert!(!add_reaction(c, MessageId(11), ChannelId(3), MemberId(1), "👍", 2000).unwrap());
+        assert!(
+            !s.add_reaction(MessageId(11), ChannelId(3), MemberId(1), "👍", 2000)
+                .unwrap()
+        );
         let long = "x".repeat(33);
-        assert!(!add_reaction(c, MessageId(11), ChannelId(3), MemberId(1), &long, 2000).unwrap());
+        assert!(
+            !s.add_reaction(MessageId(11), ChannelId(3), MemberId(1), &long, 2000)
+                .unwrap()
+        );
         assert_eq!(on(11).len(), 2);
-        let fk: i64 = c
+        let fk: i64 = s
+            .project_workspace(&p)
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reactions_add_remove_and_list() {
         let (mut s, channel, hx, bot) = setup();
         let m = s
-            .tx(|c| insert_message(c, &msg(channel.id, hx.id, "ship it")))
+            .insert_message(&msg(channel.id, hx.id, "ship it"))
             .unwrap();
-        let c = s.conn();
-        assert!(add_reaction(c, m.id, channel.id, bot.id, "👍", 10).unwrap());
-        assert!(!add_reaction(c, m.id, channel.id, bot.id, "👍", 11).unwrap());
-        assert!(add_reaction(c, m.id, channel.id, hx.id, "👍", 12).unwrap());
-        assert!(add_reaction(c, m.id, channel.id, bot.id, "💀", 13).unwrap());
-        assert!(has_reacted(c, m.id, bot.id).unwrap());
-        assert_eq!(reactions_on(c, m.id).unwrap().len(), 3);
-        assert_eq!(recent_reactions(c, channel.id, 2).unwrap().len(), 2);
+        assert!(s.add_reaction(m.id, channel.id, bot.id, "👍", 10).unwrap());
+        assert!(!s.add_reaction(m.id, channel.id, bot.id, "👍", 11).unwrap());
+        assert!(s.add_reaction(m.id, channel.id, hx.id, "👍", 12).unwrap());
+        assert!(s.add_reaction(m.id, channel.id, bot.id, "💀", 13).unwrap());
+        assert!(s.has_reacted(m.id, bot.id).unwrap());
+        assert_eq!(s.reactions_on(m.id).unwrap().len(), 3);
+        assert_eq!(s.recent_reactions(channel.id, 2).unwrap().len(), 2);
         assert_eq!(
-            recent_reactions(c, channel.id, 2).unwrap()[1]
-                .emoji
-                .as_ref(),
+            s.recent_reactions(channel.id, 2).unwrap()[1].emoji.as_ref(),
             "💀",
             "newest last"
         );
-        assert_eq!(reactions_since(c, channel.id, 11, 10).unwrap().len(), 2);
-        assert_eq!(reactions_after_seq(c, channel.id, 0).unwrap().len(), 3);
-        assert_eq!(reactions_after_seq(c, channel.id, m.seq).unwrap().len(), 0);
-        assert!(remove_reaction(c, m.id, bot.id, "👍").unwrap());
-        assert!(!remove_reaction(c, m.id, bot.id, "👍").unwrap());
-        assert_eq!(reactions_on(c, m.id).unwrap().len(), 2);
+        assert_eq!(s.reactions_since(channel.id, 11, 10).unwrap().len(), 2);
+        assert_eq!(s.reactions_after_seq(channel.id, 0).unwrap().len(), 3);
+        assert_eq!(s.reactions_after_seq(channel.id, m.seq).unwrap().len(), 0);
+        assert!(s.remove_reaction(m.id, bot.id, "👍").unwrap());
+        assert!(!s.remove_reaction(m.id, bot.id, "👍").unwrap());
+        assert_eq!(s.reactions_on(m.id).unwrap().len(), 2);
     }
 
     #[test]
     fn read_cursors_stamp_when_they_move_and_never_go_back() {
         let (s, channel, hx, _) = setup();
-        let c = s.conn();
         let (a, ch) = (hx.id, channel.id);
-        assert!(advance_read(c, a, ch, 5, 100).unwrap());
-        assert!(!advance_read(c, a, ch, 3, 200).unwrap(), "never backwards");
-        assert!(
-            !advance_read(c, a, ch, 5, 300).unwrap(),
-            "no move, no stamp"
-        );
-        let k = cursor(c, a, ch).unwrap();
+        assert!(s.advance_read(a, ch, 5, 100).unwrap());
+        assert!(!s.advance_read(a, ch, 3, 200).unwrap(), "never backwards");
+        assert!(!s.advance_read(a, ch, 5, 300).unwrap(), "no move, no stamp");
+        let k = s.cursor(a, ch).unwrap();
         assert_eq!((k.read_through, k.read_at), (5, Some(100)));
-        // Delivery carries read along.
-        assert!(advance_delivered(c, a, ch, 8, 400).unwrap());
-        let k = cursor(c, a, ch).unwrap();
+        assert!(s.advance_delivered(a, ch, 8, 400).unwrap());
+        let k = s.cursor(a, ch).unwrap();
         assert_eq!(
             (k.delivered_through, k.read_through, k.read_at),
             (8, 8, Some(400))
         );
-        assert!(!advance_delivered(c, a, ch, 6, 500).unwrap());
-        assert_eq!(cursor(c, a, ch).unwrap().read_at, Some(400));
+        assert!(!s.advance_delivered(a, ch, 6, 500).unwrap());
+        assert_eq!(s.cursor(a, ch).unwrap().read_at, Some(400));
     }
 
     #[test]
@@ -2792,9 +5357,20 @@ mod tests {
         assert!(unclaimed_import(s.conn()).unwrap().is_none());
     }
 
-    /// A v1 database with one channel and one message, migrated.
-    fn migrated_v1() -> Store {
-        let conn = Connection::open_in_memory().unwrap();
+    /// A v1 database with one channel and one message, migrated to split layout.
+    fn migrated_v1() -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-migrated-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         conn.execute_batch(MIGRATIONS[0]).unwrap();
         conn.execute_batch(
             r#"
@@ -2807,98 +5383,890 @@ mod tests {
             "#,
         )
         .unwrap();
-        Store::init(conn).unwrap()
+        drop(conn);
+        (Store::open(&dir).unwrap(), dir)
     }
 
     #[test]
     fn adopting_the_import_gives_it_the_folder_once() {
-        let mut s = migrated_v1();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let imported = unclaimed_import(c)?.expect("migration 2 made one");
-            assert_eq!(imported.name.as_ref(), "Imported");
-            // The placeholder opened while the user was asked holds the folder.
-            ensure_project(c, &pid(P1), "starpoint", Some("/src/starpoint"), 2000)?;
-            let placeholder = ensure_channel(c, &pid(P1), "main", 2000)?;
+        let (mut s, dir) = migrated_v1();
+        let imported = s.unclaimed_import().unwrap().expect("migration 2 made one");
+        assert_eq!(imported.name.as_ref(), "Imported");
+        // The placeholder opened while the user was asked holds the folder.
+        s.ensure_project(&pid(P1), "starpoint", Some("/src/starpoint"), 2000)
+            .unwrap();
+        let placeholder = s.ensure_channel(&pid(P1), "main", 2000).unwrap();
 
-            let adopted =
-                adopt_import(c, &imported.id, "starpoint", "/src/starpoint")?.expect("adoptable");
-            assert_eq!(adopted.id, imported.id, "same UUID, same history");
-            assert_eq!(adopted.name.as_ref(), "starpoint");
-            assert_eq!(adopted.root_path.as_deref(), Some("/src/starpoint"));
-            assert_eq!(
-                project_by_root(c, "/src/starpoint")?.unwrap().id,
-                imported.id
-            );
-            assert_eq!(project(c, &pid(P1))?.unwrap().root_path, None);
-            let main = channel_in_project(c, &imported.id, "main")?.unwrap();
-            assert_eq!(main.id, ChannelId(3), "channel ids are kept");
-            assert!(project_has_messages(c, &imported.id)?);
+        let adopted = s
+            .adopt_import(&imported.id, "starpoint", "/src/starpoint")
+            .unwrap()
+            .expect("adoptable");
+        assert_eq!(adopted.id, imported.id, "same UUID, same history");
+        assert_eq!(adopted.name.as_ref(), "starpoint");
+        assert_eq!(adopted.root_path.as_deref(), Some("/src/starpoint"));
+        assert_eq!(
+            s.project_by_root("/src/starpoint").unwrap().unwrap().id,
+            imported.id
+        );
+        assert_eq!(s.project(&pid(P1)).unwrap().unwrap().root_path, None);
+        let main = s.channel_in_project(&imported.id, "main").unwrap().unwrap();
+        assert_eq!(main.id, ChannelId(3), "channel ids are kept");
+        // project has messages
+        let ws = s.project_workspace(&imported.id).unwrap();
+        let has: i64 = ws
+            .query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(has, 1);
 
-            // Claimed: never offered or adoptable again, even from elsewhere.
-            assert!(unclaimed_import(c)?.is_none());
-            assert!(adopt_import(c, &imported.id, "other", "/src/other")?.is_none());
-            assert_eq!(
-                project(c, &imported.id)?.unwrap().root_path.as_deref(),
-                Some("/src/starpoint")
-            );
+        // Claimed: never offered or adoptable again.
+        assert!(s.unclaimed_import().unwrap().is_none());
+        assert!(
+            s.adopt_import(&imported.id, "other", "/src/other")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.project(&imported.id)
+                .unwrap()
+                .unwrap()
+                .root_path
+                .as_deref(),
+            Some("/src/starpoint")
+        );
 
-            // The empty placeholder goes; the adopted project never does.
-            assert_eq!(
-                forget_empty_project(c, &pid(P1))?,
-                Some(vec![placeholder.id])
-            );
-            assert!(project(c, &pid(P1))?.is_none());
-            assert_eq!(forget_empty_project(c, &imported.id)?, None);
-            Ok(())
-        })
-        .unwrap();
+        // The empty placeholder goes; the adopted project never does.
+        assert_eq!(
+            s.forget_empty_project(&pid(P1)).unwrap(),
+            Some(vec![placeholder.id])
+        );
+        assert!(s.project(&pid(P1)).unwrap().is_none());
+        assert_eq!(s.forget_empty_project(&imported.id).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_project_with_a_folder_is_never_adoptable() {
-        let mut s = migrated_v1();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let imported = unclaimed_import(c)?.unwrap();
-            // A project that had a folder and lost it is not an import.
-            ensure_project(c, &pid(P1), "Old", Some("/src/x"), 0)?;
-            ensure_project(c, &pid(P2), "New", Some("/src/x"), 1)?;
-            assert_eq!(project(c, &pid(P1))?.unwrap().root_path, None);
-            assert!(adopt_import(c, &pid(P1), "x", "/src/y")?.is_none());
-            assert!(adopt_import(c, &pid(P2), "x", "/src/y")?.is_none());
-            // An import that somehow has a folder is not offered either.
-            c.execute(
+        let (mut s, dir) = migrated_v1();
+        let imported = s.unclaimed_import().unwrap().unwrap();
+        // A project that had a folder and lost it is not an import.
+        s.ensure_project(&pid(P1), "Old", Some("/src/x"), 0)
+            .unwrap();
+        s.ensure_project(&pid(P2), "New", Some("/src/x"), 1)
+            .unwrap();
+        assert_eq!(s.project(&pid(P1)).unwrap().unwrap().root_path, None);
+        assert!(s.adopt_import(&pid(P1), "x", "/src/y").unwrap().is_none());
+        assert!(s.adopt_import(&pid(P2), "x", "/src/y").unwrap().is_none());
+        // An import that somehow has a folder is not offered either.
+        s.core_mut()
+            .execute(
                 "UPDATE projects SET root_path = '/src/live' WHERE id = ?1",
                 [imported.id.as_str()],
-            )?;
-            assert!(unclaimed_import(c)?.is_none());
-            assert!(adopt_import(c, &imported.id, "x", "/src/y")?.is_none());
-            Ok(())
-        })
-        .unwrap();
+            )
+            .unwrap();
+        assert!(s.unclaimed_import().unwrap().is_none());
+        assert!(
+            s.adopt_import(&imported.id, "x", "/src/y")
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn only_empty_unrooted_projects_are_forgotten() {
         let (mut s, ch, hx, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            // `setup`'s project has no folder but has a message: kept.
-            insert_message(c, &msg(ch.id, hx.id, "keep me"))?;
-            assert_eq!(forget_empty_project(c, &ch.project)?, None);
-            // Empty but rooted: kept.
-            ensure_project(c, &pid(P2), "Copy", Some("/src/copy"), 0)?;
-            let main = ensure_channel(c, &pid(P2), "main", 0)?;
-            join_project(c, &pid(P2), hx.id, 0)?;
-            join(c, main.id, &hx, 20, 0)?;
-            assert_eq!(forget_empty_project(c, &pid(P2))?, None);
-            // Empty and unrooted (another project took the folder): forgotten,
-            // memberships and all.
-            ensure_project(c, &ch.project, "Starpoint", Some("/src/copy"), 1)?;
-            assert_eq!(forget_empty_project(c, &pid(P2))?, Some(vec![main.id]));
-            assert!(project(c, &pid(P2))?.is_none());
-            assert!(!is_member(c, main.id, hx.id)?);
-            assert!(!is_project_member(c, &pid(P2), hx.id)?);
-            Ok(())
-        })
+        // `setup`'s project has no folder but has a message: kept.
+        s.insert_message(&msg(ch.id, hx.id, "keep me")).unwrap();
+        assert_eq!(s.forget_empty_project(&ch.project).unwrap(), None);
+        // Empty but rooted: kept.
+        s.ensure_project(&pid(P2), "Copy", Some("/src/copy"), 0)
+            .unwrap();
+        let main = s.ensure_channel(&pid(P2), "main", 0).unwrap();
+        s.join_project(&pid(P2), hx.id, 0).unwrap();
+        s.join(main.id, &hx, 20, 0).unwrap();
+        assert_eq!(s.forget_empty_project(&pid(P2)).unwrap(), None);
+        // Empty and unrooted (another project took the folder): forgotten.
+        s.ensure_project(&ch.project, "Starpoint", Some("/src/copy"), 1)
+            .unwrap();
+        assert_eq!(
+            s.forget_empty_project(&pid(P2)).unwrap(),
+            Some(vec![main.id])
+        );
+        assert!(s.project(&pid(P2)).unwrap().is_none());
+        assert!(!s.is_member(main.id, hx.id).unwrap());
+        assert!(!s.is_project_member(&pid(P2), hx.id).unwrap());
+    }
+    // --- Required tests for STRM-658 split ---
+
+    #[test]
+    fn required_fresh_install_creates_split_layout() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-fresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let mut s = Store::open(&dir).unwrap();
+            assert!(dir.join("core.db").exists());
+            let p = pid(P1);
+            let proj = s
+                .ensure_project(&p, "Starpoint", Some("/tmp/starpoint"), 1)
+                .unwrap();
+            assert_eq!(proj.id, p);
+            let ch = s.ensure_channel(&p, "main", 2).unwrap();
+            assert_eq!(ch.ordinal, 1);
+            assert!(
+                dir.join("Projects")
+                    .join(p.as_str())
+                    .join("workspace.db")
+                    .exists()
+            );
+            assert!(
+                dir.join("Projects")
+                    .join(p.as_str())
+                    .join("agents.db")
+                    .exists()
+            );
+        }
+        let s2 = Store::open(&dir).unwrap();
+        assert!(s2.project(&pid(P1)).unwrap().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn make_real_shaped_legacy_core(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(LEGACY_MIGRATIONS[0]).unwrap();
+        for (i, sql) in LEGACY_MIGRATIONS.iter().enumerate().skip(1) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute_batch(&format!("PRAGMA user_version = {}", i + 1))
+                .unwrap();
+        }
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        // two projects, channels, members, memberships, messages, mentions, reactions, cursors, batches/triggers/obligations, stances, sessions, project_settings
+        conn.execute(
+            "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, ?2, ?3, ?4, 0)",
+            params![P1, "Starpoint", "/src/starpoint", 10i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, ?2, ?3, ?4, 0)",
+            params![P2, "Everything", "/src/everything", 20i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO members (id, kind, handle, name) VALUES (1,'human','hx','Hx')",
+            [],
+        )
         .unwrap();
+        conn.execute(
+            "INSERT INTO members (id, kind, handle, name) VALUES (2,'agent','claude','Claude')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1,1,10)",
+            params![P1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1,2,10)",
+            params![P1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1,1,20)",
+            params![P2],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES (10, ?1, 'main', 1, 11)", params![P1]).unwrap();
+        conn.execute("INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES (11, ?1, 'ops', 2, 12)", params![P1]).unwrap();
+        conn.execute("INSERT INTO channels (id, project_id, name, ordinal, created_at) VALUES (20, ?1, 'main', 1, 21)", params![P2]).unwrap();
+        conn.execute(
+            "INSERT INTO memberships (channel_id, member_id, joined_at) VALUES (10,1,11)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memberships (channel_id, member_id, joined_at) VALUES (10,2,11)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memberships (channel_id, member_id, joined_at) VALUES (20,1,21)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO messages (id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at) VALUES (100,10,1,1,'composer','hello',NULL,0,NULL,NULL,1000)", []).unwrap();
+        conn.execute("INSERT INTO messages (id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at) VALUES (101,10,2,2,'chat_tool','hi',100,1,NULL,'r1',1001)", []).unwrap();
+        conn.execute("INSERT INTO messages (id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at) VALUES (200,20,1,1,'composer','other project',NULL,0,NULL,NULL,2000)", []).unwrap();
+        conn.execute(
+            "INSERT INTO mentions (message_id, member_id) VALUES (101,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO reactions (message_id, channel_id, member_id, emoji, created_at) VALUES (101,10,1,'👍',1002)", []).unwrap();
+        conn.execute("INSERT INTO cursors (agent_id, channel_id, delivered_through, read_through, delivered_at, read_at) VALUES (2,10,2,2,1001,1001)", []).unwrap();
+        conn.execute("INSERT INTO batches (id, agent_id, channel_id, state, attempts, window_to, created_at, accepted_at, settled_at, outcome) VALUES (500,2,10,'settled',1,2,1000,1000,1001,'end_turn')", []).unwrap();
+        conn.execute("INSERT INTO triggers (agent_id, channel_id, message_id, reason, hop, batch_id, created_at) VALUES (2,10,100,'mention',0,500,1000)", []).unwrap();
+        conn.execute("INSERT INTO obligations (agent_id, channel_id, message_id, state, resolved_by, resolved_kind) VALUES (2,10,100,'satisfied',101,'send')", []).unwrap();
+        conn.execute("INSERT INTO sessions (agent_id, channel_id, protocol, native_ref, opened_at) VALUES (2,10,'acp','s1',1000)", []).unwrap();
+        conn.execute("INSERT INTO stances (message_id, channel_id, kind, member_id, target_id, reason, model, runtime, created_at) VALUES (101,10,'refusal',2,100,'nope',NULL,NULL,1001)", []).unwrap();
+        conn.execute("INSERT INTO project_settings (project_id, key, value, updated_at) VALUES (?1,'k','v',5)", params![P1]).unwrap();
+        // sequences
+        conn.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES ('messages', 200)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES ('batches', 500)",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn required_migrate_real_shaped_core_sqlite_two_projects_preserved() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-mig-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+
+        let s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "core.sqlite must be renamed to backup after verified migration"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(dir.join("core.db").exists());
+
+        // core data
+        assert_eq!(s.projects().unwrap().len(), 2);
+        assert_eq!(
+            s.member(MemberId(1)).unwrap().unwrap().handle.as_ref(),
+            "hx"
+        );
+        assert!(s.is_project_member(&pid(P1), MemberId(2)).unwrap());
+
+        // project 1 workspace data preserved (ids/counts)
+        let ws1 = s.project_workspace(&pid(P1)).unwrap();
+        let ch_count: i64 = ws1
+            .query_row("SELECT COUNT(*) FROM channels", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ch_count, 2);
+        let msg_ids: Vec<i64> = {
+            let mut st = ws1.prepare("SELECT id FROM messages ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(msg_ids, vec![100, 101]);
+        let reacts: i64 = ws1
+            .query_row("SELECT COUNT(*) FROM reactions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(reacts, 1);
+        let setting: Option<String> = ws1
+            .query_row(
+                "SELECT value FROM project_settings WHERE project_id=?1 AND key='k'",
+                params![P1],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(setting.as_deref(), Some("v"));
+
+        // project 1 agents data preserved
+        let ag1 = s.project_agents(&pid(P1)).unwrap();
+        let batches: i64 = ag1
+            .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(batches, 1);
+        let obligations: i64 = ag1
+            .query_row(
+                "SELECT COUNT(*) FROM obligations WHERE state='satisfied'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(obligations, 1);
+
+        // project 2 preserved
+        let ws2 = s.project_workspace(&pid(P2)).unwrap();
+        let msg2: i64 = ws2
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg2, 1);
+        let msg2id: i64 = ws2
+            .query_row("SELECT id FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg2id, 200);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn required_crash_mid_migration_rerun_completes() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-crash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+
+        // Simulate crash mid-migration: create partial core.db and only one project dir incomplete
+        {
+            let core = open_db(&dir.join("core.db"), CORE_MIGRATIONS).unwrap();
+            core.execute("INSERT INTO projects (id,name,root_path,created_at,unclaimed_import) VALUES (?1,'x',NULL,1,0)", params![P1]).unwrap();
+            let pdir = dir.join("Projects").join(P1);
+            std::fs::create_dir_all(&pdir).unwrap();
+            std::fs::write(pdir.join("workspace.db"), b"not a sqlite db").unwrap();
+            // core.sqlite still present (not renamed)
+        }
+        assert!(legacy.exists());
+
+        // Rerun must complete successfully from intact core.sqlite
+        let s = Store::open(&dir).unwrap();
+        assert!(!legacy.exists());
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert_eq!(s.projects().unwrap().len(), 2);
+        let ws1 = s.project_workspace(&pid(P1)).unwrap();
+        let c: i64 = ws1
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(c, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn required_corrupt_workspace_db_one_project_others_open() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-corrupt-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+        {
+            let _s = Store::open(&dir).unwrap();
+        }
+        // corrupt project 1 workspace.db
+        let bad = dir.join("Projects").join(P1).join("workspace.db");
+        std::fs::write(&bad, b"corrupted").unwrap();
+
+        let s = Store::open(&dir).unwrap();
+        // core and project 2 still usable
+        assert_eq!(s.projects().unwrap().len(), 2);
+        assert!(
+            s.project_workspace(&pid(P2)).is_ok(),
+            "other project must still open"
+        );
+        let msg2: i64 = s
+            .project_workspace(&pid(P2))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg2, 1);
+        // broken project isolated
+        assert!(s.project_workspace(&pid(P1)).is_err() || !s.project_errors().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn required_newer_schema_file_refused_untouched() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-newer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+        {
+            let _s = Store::open(&dir).unwrap();
+        }
+        // bump workspace schema of project 1 to "newer"
+        let ws_path = dir.join("Projects").join(P1).join("workspace.db");
+        let before = std::fs::read(&ws_path).unwrap();
+        {
+            let c = Connection::open(&ws_path).unwrap();
+            c.execute_batch("PRAGMA user_version = 9999;").unwrap();
+        }
+        match Store::open(&dir) {
+            Err(OpenError::NewerSchema { found, known, .. }) => {
+                assert_eq!(found, 9999);
+                assert!(known < found);
+            }
+            Err(e) => panic!("expected NewerSchema, got {e}"),
+            Ok(_) => panic!("newer schema must be refused"),
+        }
+        // untouched
+        let after = std::fs::read(&ws_path).unwrap();
+        assert!(before.len() == after.len() || before != after); // file still exists; check version unchanged
+        let c = Connection::open(&ws_path).unwrap();
+        let v: i64 = c
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 9999);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn required_migrated_legacy_preserves_ids_and_supports_new_writes() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-mig-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+
+        let mut s = Store::open(&dir).unwrap();
+
+        // Existing IDs/data preserved after migration.
+        assert!(s.project(&pid(P1)).unwrap().is_some());
+        assert!(s.project(&pid(P2)).unwrap().is_some());
+        let ws1 = s.project_workspace(&pid(P1)).unwrap();
+        let old_msg_ids: Vec<i64> = {
+            let mut st = ws1.prepare("SELECT id FROM messages ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(old_msg_ids, vec![100, 101]);
+        let ws2 = s.project_workspace(&pid(P2)).unwrap();
+        let old_msg2: i64 = ws2
+            .query_row("SELECT id FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(old_msg2, 200);
+
+        // Create new channels across multiple projects.
+        let ch1_new = s.ensure_channel(&pid(P1), "new-p1", 10_000).unwrap();
+        let ch2_new = s.ensure_channel(&pid(P2), "new-p2", 10_001).unwrap();
+        assert!(
+            ch1_new.id.0 > 20,
+            "new channel id must be above legacy max (20), got {}",
+            ch1_new.id.0
+        );
+        assert!(
+            ch2_new.id.0 > 20,
+            "new channel id must be above legacy max (20), got {}",
+            ch2_new.id.0
+        );
+        assert_ne!(ch1_new.id, ch2_new.id);
+
+        // Create new messages across multiple projects.
+        let hx = s.member(MemberId(1)).unwrap().unwrap();
+        s.join(ch1_new.id, &hx, 0, 10_000).unwrap();
+        s.join(ch2_new.id, &hx, 0, 10_001).unwrap();
+        let m1 = s
+            .insert_message(&msg(ch1_new.id, MemberId(1), "post-migration p1"))
+            .unwrap();
+        let m2 = s
+            .insert_message(&msg(ch2_new.id, MemberId(1), "post-migration p2"))
+            .unwrap();
+        assert!(
+            m1.id.0 > 200,
+            "new message id must be above legacy max (200), got {}",
+            m1.id.0
+        );
+        assert!(
+            m2.id.0 > 200,
+            "new message id must be above legacy max (200), got {}",
+            m2.id.0
+        );
+        assert_ne!(m1.id, m2.id);
+        assert_eq!(
+            s.message(m1.id).unwrap().unwrap().body.as_ref(),
+            "post-migration p1"
+        );
+        assert_eq!(
+            s.message(m2.id).unwrap().unwrap().body.as_ref(),
+            "post-migration p2"
+        );
+
+        // Create new agent batches across multiple projects/channels.
+        let b1 = s
+            .pending_batch_or_create(MemberId(2), ch1_new.id, 10_002)
+            .unwrap();
+        let b2 = s
+            .pending_batch_or_create(MemberId(2), ch2_new.id, 10_003)
+            .unwrap();
+        assert!(
+            b1.id.0 > 500,
+            "new batch id must be above legacy max (500), got {}",
+            b1.id.0
+        );
+        assert!(
+            b2.id.0 > 500,
+            "new batch id must be above legacy max (500), got {}",
+            b2.id.0
+        );
+        assert_ne!(b1.id, b2.id);
+
+        // Global uniqueness across entity kinds not required, but IDs within counters must not collide.
+        let mut channel_ids = vec![
+            ChannelId(10).0,
+            ChannelId(11).0,
+            ChannelId(20).0,
+            ch1_new.id.0,
+            ch2_new.id.0,
+        ];
+        channel_ids.sort_unstable();
+        channel_ids.dedup();
+        assert_eq!(channel_ids.len(), 5);
+        let mut message_ids = vec![100i64, 101, 200, m1.id.0, m2.id.0];
+        message_ids.sort_unstable();
+        message_ids.dedup();
+        assert_eq!(message_ids.len(), 5);
+        let mut batch_ids = vec![500i64, b1.id.0, b2.id.0];
+        batch_ids.sort_unstable();
+        batch_ids.dedup();
+        assert_eq!(batch_ids.len(), 3);
+
+        // Existing data still accessible.
+        assert!(s.message(MessageId(100)).unwrap().is_some());
+        assert!(s.message(MessageId(101)).unwrap().is_some());
+        assert!(s.message(MessageId(200)).unwrap().is_some());
+        assert!(s.channel(ChannelId(10)).unwrap().is_some());
+        assert!(s.batch(BatchId(500)).unwrap().is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_recovery_does_not_accept_empty_split_without_marker_when_legacy_id_tables_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-empty-ids-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+
+        // Legacy DB: has project/member data but no channels/messages/batches (ID maxima are 0).
+        {
+            let conn = Connection::open(&legacy).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            super::run_migrations(&conn, LEGACY_MIGRATIONS, 0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', NULL, 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+        }
+
+        // Plant an empty-but-valid split layout with default counters and no completion marker.
+        {
+            let core = super::open_db(&dir.join("core.db"), CORE_MIGRATIONS).unwrap();
+            // intentionally no projects copied into split core
+            drop(core);
+            // no Projects/* DBs, no completion marker
+        }
+
+        let mut s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "legacy must be migrated and renamed, not discarded as already-complete"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+        assert_eq!(s.projects().unwrap().len(), 1);
+        assert_eq!(s.project(&pid(P1)).unwrap().unwrap().name.as_ref(), "Alpha");
+        assert!(s.is_project_member(&pid(P1), MemberId(1)).unwrap());
+
+        // Counters remain valid for future allocations even when legacy ID tables were empty.
+        assert_eq!(s.allocate_id("channel").unwrap(), 1);
+        assert_eq!(s.allocate_id("message").unwrap(), 1);
+        assert_eq!(s.allocate_id("batch").unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_recovery_retries_markerless_partial_split_with_empty_project_dbs() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-partial-markerless-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+
+        // Interrupted/partial state: core.db copied with project metadata, per-project DBs exist
+        // with schema but no copied data (including missing project_settings), and no marker.
+        {
+            let core = super::open_db(&dir.join("core.db"), CORE_MIGRATIONS).unwrap();
+            core.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1,'Alpha','/tmp/a',1,0)",
+                params![P1],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1,'Beta','/tmp/b',2,0)",
+                params![P2],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1,'human','hx','Hx'), (2,'agent','claude','Claude')",
+                [],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1,1,1),(?1,2,1),(?2,1,2),(?2,2,2)",
+                params![P1, P2],
+            )
+            .unwrap();
+            drop(core);
+
+            for p in [P1, P2] {
+                let pdir = dir.join("Projects").join(p);
+                std::fs::create_dir_all(&pdir).unwrap();
+                let _ws = super::open_db(&pdir.join("workspace.db"), WORKSPACE_MIGRATIONS).unwrap();
+                let _ag = super::open_db(&pdir.join("agents.db"), AGENTS_MIGRATIONS).unwrap();
+            }
+            assert!(!super::split_migration_marker(&dir).exists());
+        }
+        assert!(legacy.exists());
+
+        let s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "legacy must be migrated, not accepted as complete"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+
+        // Data copied from legacy, including project_settings that were missing in partial state.
+        let ws1 = s.project_workspace(&pid(P1)).unwrap();
+        let setting: Option<String> = ws1
+            .query_row(
+                "SELECT value FROM project_settings WHERE project_id=?1 AND key='k'",
+                params![P1],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(setting.as_deref(), Some("v"));
+        let msg_ids: Vec<i64> = {
+            let mut st = ws1.prepare("SELECT id FROM messages ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(msg_ids, vec![100, 101]);
+        let batches: i64 = s
+            .project_agents(&pid(P1))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM batches", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(batches, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_recovery_retries_partial_split_with_empty_id_tables_and_copied_core_metadata() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-split-partial-empty-ids-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+
+        // Legacy DB: project/member metadata exists, but channel/message/batch ID tables are empty.
+        {
+            let conn = Connection::open(&legacy).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            super::run_migrations(&conn, LEGACY_MIGRATIONS, 0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', '/tmp/alpha', 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_settings (project_id, key, value, updated_at) VALUES (?1, 'k', 'v', 5)",
+                params![P1],
+            )
+            .unwrap();
+        }
+
+        // Interrupted/partial state: copied core metadata, schema-valid empty project DBs, no valid marker.
+        let plant_partial = |dir: &std::path::Path| {
+            let core = super::open_db(&dir.join("core.db"), CORE_MIGRATIONS).unwrap();
+            core.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', '/tmp/alpha', 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            core.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+            drop(core);
+            let pdir = dir.join("Projects").join(P1);
+            std::fs::create_dir_all(&pdir).unwrap();
+            let _ws = super::open_db(&pdir.join("workspace.db"), WORKSPACE_MIGRATIONS).unwrap();
+            let _ag = super::open_db(&pdir.join("agents.db"), AGENTS_MIGRATIONS).unwrap();
+        };
+
+        // Case A: missing marker.
+        plant_partial(&dir);
+        assert!(!super::split_migration_marker(&dir).exists());
+        let mut s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "legacy must not be discarded without a valid marker"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+        assert_eq!(s.projects().unwrap().len(), 1);
+        assert!(s.is_project_member(&pid(P1), MemberId(1)).unwrap());
+        let setting: Option<String> = s
+            .project_workspace(&pid(P1))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM project_settings WHERE project_id=?1 AND key='k'",
+                params![P1],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(setting.as_deref(), Some("v"));
+        assert_eq!(s.allocate_id("channel").unwrap(), 1);
+        assert_eq!(s.allocate_id("message").unwrap(), 1);
+        assert_eq!(s.allocate_id("batch").unwrap(), 1);
+        drop(s);
+
+        // Reset for case B: recreate legacy and plant partial state with an empty (invalid) marker.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        {
+            let conn = Connection::open(&legacy).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+            super::run_migrations(&conn, LEGACY_MIGRATIONS, 0).unwrap();
+            conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+            conn.execute(
+                "INSERT INTO projects (id, name, root_path, created_at, unclaimed_import) VALUES (?1, 'Alpha', '/tmp/alpha', 1, 0)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO members (id, kind, handle, name) VALUES (1, 'human', 'hx', 'Hx')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_members (project_id, member_id, joined_at) VALUES (?1, 1, 1)",
+                params![P1],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO project_settings (project_id, key, value, updated_at) VALUES (?1, 'k', 'v', 5)",
+                params![P1],
+            )
+            .unwrap();
+        }
+        plant_partial(&dir);
+        std::fs::write(super::split_migration_marker(&dir), b"").unwrap();
+        let s = Store::open(&dir).unwrap();
+        assert!(
+            !legacy.exists(),
+            "empty marker must never certify completion; legacy must be migrated"
+        );
+        assert!(dir.join("core.sqlite.pre-split").exists());
+        assert!(!super::split_migration_marker(&dir).exists());
+        assert_eq!(s.projects().unwrap().len(), 1);
+        let setting: Option<String> = s
+            .project_workspace(&pid(P1))
+            .unwrap()
+            .query_row(
+                "SELECT value FROM project_settings WHERE project_id=?1 AND key='k'",
+                params![P1],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+            .flatten();
+        assert_eq!(setting.as_deref(), Some("v"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

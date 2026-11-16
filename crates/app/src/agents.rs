@@ -582,7 +582,7 @@ pub(crate) fn start_with_in(
         args: vec!["mcp-bridge".into()],
     });
     let host = HostConfig {
-        db: Some(data.join("core.sqlite")),
+        db: Some(data.clone()),
         bridge,
         default_cwd: std::env::current_dir().unwrap_or_else(|_| data.clone()),
         ..HostConfig::default()

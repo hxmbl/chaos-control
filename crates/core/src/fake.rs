@@ -561,9 +561,10 @@ impl FakeAgent {
                 Step::Mcp { tool, args } => {
                     let args = substitute(args, trigger.as_deref(), n);
                     let endpoint = mcp.lock().expect("lock").clone();
+                    let tool_name = tool.clone();
                     let result = match endpoint {
                         Some((url, token)) => tokio::task::spawn_blocking(move || {
-                            crate::mcp::call_tool_http(&url, &token, &tool, args)
+                            crate::mcp::call_tool_http(&url, &token, &tool_name, args)
                         })
                         .await
                         .unwrap_or_else(|e| Err(e.to_string())),

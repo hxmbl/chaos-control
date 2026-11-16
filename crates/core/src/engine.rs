@@ -283,7 +283,7 @@ impl Engine {
             effects: Vec::new(),
             ping_answers: HashMap::new(),
         };
-        let pending = engine.store.tx(|c| store::recover(c, now))?;
+        let pending = engine.store.recover(now)?;
         for (agent, channel) in pending {
             engine.pump(now, agent, channel);
         }
@@ -296,6 +296,14 @@ impl Engine {
 
     pub fn conn(&self) -> &Connection {
         self.store.conn()
+    }
+
+    pub fn store(&self) -> &Store {
+        &self.store
+    }
+
+    pub fn store_mut(&mut self) -> &mut Store {
+        &mut self.store
     }
 
     pub fn take_effects(&mut self) -> Vec<Effect> {
@@ -313,8 +321,7 @@ impl Engine {
         root: Option<&str>,
         now: Millis,
     ) -> rusqlite::Result<Project> {
-        self.store
-            .tx(|c| store::ensure_project(c, id, name, root, now))
+        self.store.ensure_project(id, name, root, now)
     }
 
     /// See [`store::adopt_import`].
@@ -324,13 +331,13 @@ impl Engine {
         name: &str,
         root: &str,
     ) -> rusqlite::Result<Option<Project>> {
-        self.store.tx(|c| store::adopt_import(c, id, name, root))
+        self.store.adopt_import(id, name, root)
     }
 
     /// See [`store::forget_empty_project`]. Also drops any runtime state for
     /// the deleted channels. Returns whether the project went.
     pub fn forget_empty_project(&mut self, id: &ProjectId) -> rusqlite::Result<bool> {
-        let Some(gone) = self.store.tx(|c| store::forget_empty_project(c, id))? else {
+        let Some(gone) = self.store.forget_empty_project(id)? else {
             return Ok(false);
         };
         self.rt.retain(|(_, ch), _| !gone.contains(ch));
@@ -344,8 +351,7 @@ impl Engine {
         name: &str,
         now: Millis,
     ) -> rusqlite::Result<Channel> {
-        self.store
-            .tx(|c| store::ensure_channel(c, project, name, now))
+        self.store.ensure_channel(project, name, now)
     }
 
     /// Runs `f` in one store transaction (for host calls outside the
@@ -365,8 +371,7 @@ impl Engine {
         member: MemberId,
         now: Millis,
     ) -> rusqlite::Result<bool> {
-        self.store
-            .tx(|c| store::join_project(c, project, member, now))
+        self.store.join_project(project, member, now)
     }
 
     pub fn ensure_member(
@@ -375,8 +380,7 @@ impl Engine {
         handle: &str,
         name: &str,
     ) -> rusqlite::Result<Member> {
-        self.store
-            .tx(|c| store::ensure_member(c, kind, handle, name))
+        self.store.ensure_member(kind, handle, name)
     }
 
     pub fn join(
@@ -386,8 +390,7 @@ impl Engine {
         now: Millis,
     ) -> rusqlite::Result<()> {
         let backfill = self.policy.join_backfill;
-        self.store
-            .tx(|c| store::join(c, channel, member, backfill, now))?;
+        self.store.join(channel, member, backfill as usize, now)?;
         if member.kind == MemberKind::Agent {
             self.publish_status(member.id, channel);
         }
@@ -395,8 +398,8 @@ impl Engine {
     }
 
     pub fn history(&self, channel: ChannelId, limit: usize) -> rusqlite::Result<Vec<Message>> {
-        let head = store::head_seq(self.conn(), channel)?;
-        store::messages_before(self.conn(), channel, head + 1, limit)
+        let head = self.store.head_seq(channel)?;
+        self.store.messages_before(channel, head + 1, limit)
     }
 
     pub fn set_probe(&mut self, agent: MemberId, channel: ChannelId, probe: &Probe) {
@@ -410,7 +413,9 @@ impl Engine {
 
     /// Current glow and presence for agent x channel.
     pub fn status(&self, agent: MemberId, channel: ChannelId) -> AgentStatus {
-        let busy = store::in_flight_batch(self.conn(), agent, channel)
+        let busy = self
+            .store
+            .in_flight_batch(agent, channel)
             .ok()
             .flatten()
             .is_some();
@@ -479,24 +484,26 @@ impl Engine {
             return Err(PostError::Empty);
         }
         let body = body.as_ref();
-        let author = store::member(self.conn(), req.author)?.ok_or(PostError::NotMember)?;
-        let channel = store::channel(self.conn(), req.channel)?.ok_or(PostError::UnknownChannel)?;
-        if !store::is_member(self.conn(), req.channel, author.id)? {
+        let author = self.store.member(req.author)?.ok_or(PostError::NotMember)?;
+        let channel = self
+            .store
+            .channel(req.channel)?
+            .ok_or(PostError::UnknownChannel)?;
+        if !self.store.is_member(req.channel, author.id)? {
             // A human posting joins the channel, but only inside a project
             // they already belong to: posting never grants project access.
             if author.kind == MemberKind::Human
-                && store::is_project_member(self.conn(), &channel.project, author.id)?
+                && self.store.is_project_member(&channel.project, author.id)?
             {
                 let backfill = self.policy.join_backfill;
                 self.store
-                    .tx(|c| store::join(c, req.channel, &author, backfill, now))?;
+                    .join(req.channel, &author, backfill as usize, now)?;
             } else {
                 return Err(PostError::NotMember);
             }
         }
         if let Some(rid) = req.client_request_id
-            && let Some(existing) =
-                store::message_by_request(self.conn(), author.id, req.channel, rid)?
+            && let Some(existing) = self.store.message_by_request(author.id, req.channel, rid)?
         {
             return Ok(Posted {
                 message: existing,
@@ -505,7 +512,7 @@ impl Engine {
             });
         }
         if let Some(r) = req.reply_to {
-            let parent = store::message(self.conn(), r)?.ok_or(PostError::UnknownMessage)?;
+            let parent = self.store.message(r)?.ok_or(PostError::UnknownMessage)?;
             if parent.channel != req.channel {
                 return Err(PostError::UnknownMessage);
             }
@@ -523,28 +530,28 @@ impl Engine {
         let mut notes = Vec::new();
         let (mentions, everyone) = self.resolve_mentions(req.channel, &author, body, &mut notes)?;
         let cause = if author.kind == MemberKind::Agent {
-            store::in_flight_batch(self.conn(), author.id, req.channel)?.map(|b| b.id)
+            self.store
+                .in_flight_batch(author.id, req.channel)?
+                .map(|b| b.id)
         } else {
             None
         };
         let hop = self.hop_for(&author, req.channel, cause)?;
-        let message = self.store.tx::<_, PostError>(|c| {
-            Ok(store::insert_message(
-                c,
-                &NewMessage {
-                    channel: req.channel,
-                    author: Some(author.id),
-                    origin: req.origin,
-                    body,
-                    reply_to: req.reply_to,
-                    mentions: &mentions,
-                    hop,
-                    cause_batch: cause,
-                    client_request_id: req.client_request_id,
-                    sent_at: now,
-                },
-            )?)
-        })?;
+        let message = self
+            .store
+            .insert_message(&NewMessage {
+                channel: req.channel,
+                author: Some(author.id),
+                origin: req.origin,
+                body,
+                reply_to: req.reply_to,
+                mentions: &mentions,
+                hop,
+                cause_batch: cause,
+                client_request_id: req.client_request_id,
+                sent_at: now,
+            })
+            .map_err(|e| PostError::Store(e.to_string()))?;
         self.effects
             .push(Effect::Event(Box::new(CoreEvent::Message(message.clone()))));
         if author.kind == MemberKind::Agent {
@@ -559,7 +566,7 @@ impl Engine {
             }
             if let Some(parent) = message
                 .reply_to
-                .and_then(|r| store::message(self.conn(), r).ok().flatten())
+                .and_then(|r| self.store.message(r).ok().flatten())
                 && let Some(a) = parent.author
             {
                 self.pstate.human_addressed(req.channel, a);
@@ -582,8 +589,9 @@ impl Engine {
         body: &str,
         notes: &mut Vec<Arc<str>>,
     ) -> Result<(Vec<MemberId>, bool), PostError> {
-        let members = store::members_of(self.conn(), channel)?;
-        let nicknames = store::nicknames_in(self.conn(), channel)?;
+        let members = self.store.members_of(channel)?;
+        let nicknames = self.store.nicknames_in(channel)?;
+        let _ = (channel, author, &members, &nicknames);
         let mut out = Vec::new();
         let mut everyone = false;
         for handle in policy::parse_mentions(body) {
@@ -622,10 +630,10 @@ impl Engine {
 
     /// `member`'s nicknames, oldest first.
     pub fn nicknames(&self, member: MemberId) -> Result<Vec<Arc<str>>, NicknameError> {
-        if store::member(self.conn(), member)?.is_none() {
+        if self.store.member(member)?.is_none() {
             return Err(NicknameError::UnknownMember);
         }
-        Ok(store::nicknames_of(self.conn(), member)?)
+        Ok(self.store.nicknames_of(member)?)
     }
 
     /// Gives `member` a nickname that `@` reaches like its handle. Refused
@@ -684,13 +692,22 @@ impl Engine {
         if author.kind == MemberKind::Human {
             return Ok(0);
         }
-        let c = self.conn();
-        let last_human = store::last_human_seq(c, channel)?;
+        let last_human = self
+            .store
+            .last_human_seq(channel)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let base = match cause {
             Some(b) => {
                 let mut base = 0u8;
-                for t in store::batch_triggers(c, b)? {
-                    if let Some(m) = store::message(c, t.id.message)?
+                for t in self
+                    .store
+                    .batch_triggers(b)
+                    .map_err(|e| PostError::Store(e.to_string()))?
+                {
+                    if let Some(m) = self
+                        .store
+                        .message(t.id.message)
+                        .map_err(|e| PostError::Store(e.to_string()))?
                         && m.seq > last_human
                     {
                         base = base.max(t.hop);
@@ -698,7 +715,10 @@ impl Engine {
                 }
                 base
             }
-            None => store::last_agent_message_after(c, channel, last_human)?
+            None => self
+                .store
+                .last_agent_message_after(channel, last_human)
+                .map_err(|e| PostError::Store(e.to_string()))?
                 .map(|m| m.hop)
                 .unwrap_or(0),
         };
@@ -724,27 +744,32 @@ impl Engine {
                 channel,
                 message: r,
             };
-            if store::obligation_state(self.conn(), t)? == Some(ObligationState::Open) {
+            if self
+                .store
+                .obligation_state(t)
+                .map_err(|e| PostError::Store(e.to_string()))?
+                == Some(ObligationState::Open)
+            {
                 target = Some(t);
             }
         } else if let Some(b) = cause {
-            let open = store::open_obligations(self.conn(), b)?;
+            let open = self
+                .store
+                .open_obligations(b)
+                .map_err(|e| PostError::Store(e.to_string()))?;
             if open.len() == 1 {
                 target = Some(open[0]);
             }
         }
         if let Some(t) = target {
-            // A refusal is an answer like any other: it closes the obligation
-            // (as `refused`), so there is no fallback and no retry.
             let (state, kind) = match message.origin {
                 Origin::Refusal => (ObligationState::Refused, "refusal"),
                 Origin::Dissent => (ObligationState::Satisfied, "dissent"),
                 _ => (ObligationState::Satisfied, "send"),
             };
-            self.store.tx::<_, PostError>(|c| {
-                store::resolve_obligation(c, t, state, Some(message.id), kind)?;
-                Ok(())
-            })?;
+            self.store
+                .resolve_obligation(t, state, Some(message.id), kind)
+                .map_err(|e| PostError::Store(e.to_string()))?;
         }
         if cause.is_some() {
             let rt = self.rt.entry((agent.id, channel)).or_default();
@@ -767,14 +792,20 @@ impl Engine {
             return Ok(());
         }
         let channel = message.channel;
-        let members = store::members_of(self.conn(), channel)?;
+        let members = self
+            .store
+            .members_of(channel)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let reply_parent_author = match message.reply_to {
-            Some(r) => store::message(self.conn(), r)?.and_then(|m| m.author),
+            Some(r) => self
+                .store
+                .message(r)
+                .map_err(|e| PostError::Store(e.to_string()))?
+                .and_then(|m| m.author),
             None => None,
         };
         let mut woken = Vec::new();
         let mut trip_notice = None;
-        // The author already knows what it posted; every other agent hears it.
         for target in members
             .iter()
             .filter(|m| m.kind == MemberKind::Agent && m.id != author.id)
@@ -793,8 +824,12 @@ impl Engine {
                 channel,
                 message: message.id,
             };
-            if store::trigger_exists(self.conn(), id)? {
-                continue; // same message, same agent: already woken once
+            if self
+                .store
+                .trigger_exists(id)
+                .map_err(|e| PostError::Store(e.to_string()))?
+            {
+                continue;
             }
             if author.kind == MemberKind::Agent {
                 if message.hop > self.policy.max_hops {
@@ -821,16 +856,22 @@ impl Engine {
                     Damp::Paused => continue,
                 }
             }
-            self.store.tx::<_, PostError>(|c| {
-                let batch = store::pending_batch_or_create(c, target.id, channel, now)?;
-                store::insert_trigger(c, id, reason, message.hop, batch.id, now)?;
-                if reason.is_direct() {
-                    store::insert_obligation(c, id)?;
-                }
-                Ok(())
-            })?;
+            let inserted = self
+                .store
+                .ensure_pending_batch_trigger(
+                    target.id,
+                    channel,
+                    message.id,
+                    reason,
+                    message.hop,
+                    reason.is_direct(),
+                    now,
+                )
+                .map_err(|e| PostError::Store(e.to_string()))?;
+            if !inserted {
+                continue;
+            }
             if author.kind == MemberKind::Human {
-                // A human ping is a fresh start for an agent that went red.
                 let rt = self.rt.entry((target.id, channel)).or_default();
                 if rt.failures >= self.policy.max_failures || rt.red.is_some() {
                     rt.failures = 0;
@@ -852,11 +893,11 @@ impl Engine {
     /// Re-runs trigger creation for an existing message (startup reconciliation,
     /// tests). Existing triggers are no-ops, so this never wakes twice.
     pub fn retrigger(&mut self, now: Millis, message: MessageId) -> Result<(), PostError> {
-        let m = store::message(self.conn(), message)?.ok_or(PostError::UnknownMessage)?;
-        let Some(author) = m
-            .author
-            .and_then(|a| store::member(self.conn(), a).ok().flatten())
-        else {
+        let m = self
+            .store
+            .message(message)?
+            .ok_or(PostError::UnknownMessage)?;
+        let Some(author) = m.author.and_then(|a| self.store.member(a).ok().flatten()) else {
             return Ok(());
         };
         let everyone = author.kind == MemberKind::Human
@@ -872,23 +913,21 @@ impl Engine {
         channel: ChannelId,
         text: &str,
     ) -> Result<Message, PostError> {
-        let m = self.store.tx::<_, PostError>(|c| {
-            Ok(store::insert_message(
-                c,
-                &NewMessage {
-                    channel,
-                    author: None,
-                    origin: Origin::System,
-                    body: text,
-                    reply_to: None,
-                    mentions: &[],
-                    hop: 0,
-                    cause_batch: None,
-                    client_request_id: None,
-                    sent_at: now,
-                },
-            )?)
-        })?;
+        let m = self
+            .store
+            .insert_message(&NewMessage {
+                channel,
+                author: None,
+                origin: Origin::System,
+                body: text,
+                reply_to: None,
+                mentions: &[],
+                hop: 0,
+                cause_batch: None,
+                client_request_id: None,
+                sent_at: now,
+            })
+            .map_err(|e| PostError::Store(e.to_string()))?;
         self.effects
             .push(Effect::Event(Box::new(CoreEvent::Message(m.clone()))));
         Ok(m)
@@ -914,27 +953,23 @@ impl Engine {
         add: bool,
     ) -> Result<Reacted, PostError> {
         let emoji = reaction::normalize(emoji).ok_or(PostError::InvalidEmoji)?;
-        let m = store::message(self.conn(), message)?.ok_or(PostError::UnknownMessage)?;
-        if !store::is_member(self.conn(), m.channel, member)? {
+        let m = self
+            .store
+            .message(message)?
+            .ok_or(PostError::UnknownMessage)?;
+        if !self.store.is_member(m.channel, member)? {
             return Err(PostError::UnknownMessage);
         }
         let answers = self.ping_answers(member, m.channel);
-        let changed = self.store.tx::<_, PostError>(|c| {
-            let changed = if add {
-                store::add_reaction(c, message, m.channel, member, &emoji, now)?
-            } else {
-                store::remove_reaction(c, message, member, &emoji)?
-            };
-            if add && answers.answers(&emoji) {
-                let t = TriggerId {
-                    agent: member,
-                    channel: m.channel,
-                    message,
-                };
-                store::resolve_obligation(c, t, ObligationState::Satisfied, None, "react")?;
-            }
-            Ok(changed)
-        })?;
+        let changed = if add {
+            self.store
+                .add_reaction(message, m.channel, member, &emoji, now)
+                .map_err(|e| PostError::Store(e.to_string()))?
+        } else {
+            self.store
+                .remove_reaction(message, member, &emoji)
+                .map_err(|e| PostError::Store(e.to_string()))?
+        };
         if changed {
             self.effects
                 .push(Effect::Event(Box::new(CoreEvent::Reaction {
@@ -944,6 +979,16 @@ impl Engine {
                     emoji: emoji.clone(),
                     added: add,
                 })));
+        }
+        if add && answers.answers(&emoji) {
+            let t = TriggerId {
+                agent: member,
+                channel: m.channel,
+                message,
+            };
+            self.store
+                .resolve_obligation(t, ObligationState::Satisfied, None, "react")
+                .map_err(|e| PostError::Store(e.to_string()))?;
         }
         Ok(Reacted { emoji, changed })
     }
@@ -959,7 +1004,8 @@ impl Engine {
         if let Ok(Some(own)) = self.member_ping_answers(agent) {
             return own;
         }
-        store::channel(self.conn(), channel)
+        self.store
+            .channel(channel)
             .ok()
             .flatten()
             .and_then(|ch| self.project_ping_answers(&ch.project).ok().flatten())
@@ -1017,7 +1063,9 @@ impl Engine {
         &self,
         project: &ProjectId,
     ) -> Result<Option<PingAnswers>, rusqlite::Error> {
-        let Some(raw) = store::project_setting(self.conn(), project, reaction::PING_ANSWERS_KEY)?
+        let Some(raw) = self
+            .store
+            .project_setting(project, reaction::PING_ANSWERS_KEY)?
         else {
             return Ok(None);
         };
@@ -1039,11 +1087,10 @@ impl Engine {
         let value = parsed
             .as_ref()
             .map(|p| serde_json::to_string(&p.to_list()).expect("strings serialise"));
-        if store::project(self.conn(), project)?.is_none() {
+        if self.store.project(project)?.is_none() {
             return Err(SettingError::UnknownProject);
         }
-        store::set_project_setting(
-            self.conn(),
+        self.store.set_project_setting(
             project,
             reaction::PING_ANSWERS_KEY,
             value.as_deref(),
@@ -1098,9 +1145,11 @@ impl Engine {
             runtime,
             created_at: now,
         };
-        self.store.tx(|c| store::insert_stance(c, &stance))?;
+        self.store
+            .insert_stance(&stance)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         if req.kind == StanceKind::Refusal && !posted.deduped {
-            let target_seq = store::message(self.conn(), req.target)?.map(|m| m.seq);
+            let target_seq = self.store.message(req.target)?.map(|m| m.seq);
             // Agents only (humans have no runtime state or presence).
             if let Some(rt) = self.rt.get_mut(&(req.author, req.channel)) {
                 rt.note = Some(Arc::from(match target_seq {
@@ -1148,39 +1197,45 @@ impl Engine {
         if rt.retry_at.is_some_and(|t| t > now) {
             return Ok(());
         }
-        if store::in_flight_batch(self.conn(), agent, channel)?.is_some() {
+        if self.store.in_flight_batch(agent, channel)?.is_some() {
             return Ok(());
         }
-        let Some(pending) = store::pending_batch(self.conn(), agent, channel)? else {
+        let Some(pending) = self.store.pending_batch(agent, channel)? else {
             return Ok(());
         };
         // Everything in it already answered (e.g. by a reply sent mid-turn)?
-        let triggers = store::batch_triggers(self.conn(), pending.id)?;
+        let triggers = self
+            .store
+            .batch_triggers(pending.id)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let needs_delivery = triggers.iter().any(|t| {
             !t.reason.is_direct()
-                || store::obligation_state(self.conn(), t.id).ok().flatten()
-                    == Some(ObligationState::Open)
+                || self.store.obligation_state(t.id).ok().flatten() == Some(ObligationState::Open)
         });
         if !needs_delivery {
-            self.store.tx::<_, PostError>(|c| {
-                store::set_batch_state(
-                    c,
+            self.store
+                .set_batch_state(
                     pending.id,
                     BatchState::Settled,
                     now,
                     Some("answered before delivery"),
-                )?;
-                Ok(())
-            })?;
+                )
+                .map_err(|e| PostError::Store(e.to_string()))?;
             return Ok(());
         }
-        let window_to = store::head_seq(self.conn(), channel)?;
+        let window_to = self
+            .store
+            .head_seq(channel)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let attempt = self
             .store
-            .tx(|c| store::dispatch_batch(c, pending.id, window_to))?;
+            .dispatch_batch(pending.id, window_to)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let answers = self.ping_answers(agent, channel);
-        let prompt = notify::compose(self.conn(), agent, channel, pending.id, window_to, &answers)?;
-        let orientation = notify::orientation(self.conn(), agent, channel)?;
+        let prompt = notify::compose(&self.store, agent, channel, pending.id, window_to, &answers)
+            .map_err(|e| PostError::Store(e.to_string()))?;
+        let orientation = notify::orientation(&self.store, agent, channel)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.retry_at = None;
         rt.sent_in_turn.clear();
@@ -1206,9 +1261,9 @@ impl Engine {
         channel: ChannelId,
         info: &SessionInfo,
     ) {
-        let _ = self.store.tx(|c| {
-            store::record_session(c, agent, channel, &info.protocol, &info.native_ref, now)
-        });
+        let _ = self
+            .store
+            .record_session(agent, channel, &info.protocol, &info.native_ref, now);
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.phase = Phase::Open;
         rt.idle_since = Some(now);
@@ -1241,11 +1296,8 @@ impl Engine {
         project: &ProjectId,
         member: MemberId,
     ) -> rusqlite::Result<Vec<ChannelId>> {
-        let channels = self.store.tx(|c| {
-            let channels = crate::roster::leave_project(c, project, member, now)?;
-            crate::roster::roster_remove(c, project, member)?;
-            Ok::<_, rusqlite::Error>(channels)
-        })?;
+        let channels = self.store.leave_project(project, member, now)?;
+        let _ = crate::roster::roster_remove(self.conn(), project, member);
         for ch in &channels {
             self.rt.remove(&(member, *ch));
         }
@@ -1325,18 +1377,21 @@ impl Engine {
     }
 
     fn accepted(&mut self, now: Millis, agent: MemberId, channel: ChannelId, turn: BatchId) {
-        let Ok(Some(b)) = store::batch(self.conn(), turn) else {
+        let Ok(Some(b)) = self.store.batch(turn) else {
             return;
         };
         if b.agent != agent || b.channel != channel || b.state != BatchState::Dispatched {
             return;
         }
         let window_to = b.window_to.unwrap_or(0);
-        let read = self.store.tx(|c| {
-            store::set_batch_state(c, turn, BatchState::Accepted, now, None)?;
-            store::advance_delivered(c, agent, channel, window_to, now)
-        });
-        if read.unwrap_or(false) {
+        let _ = self
+            .store
+            .set_batch_state(turn, BatchState::Accepted, now, None);
+        let read = self
+            .store
+            .advance_delivered(agent, channel, window_to, now)
+            .unwrap_or(false);
+        if read {
             self.publish_receipt(agent, channel);
         }
         let rt = self.rt.entry((agent, channel)).or_default();
@@ -1354,13 +1409,13 @@ impl Engine {
         kind: AgentErrorKind,
         error: &str,
     ) {
-        let Ok(Some(b)) = store::batch(self.conn(), turn) else {
+        let Ok(Some(b)) = self.store.batch(turn) else {
             return;
         };
         if b.state != BatchState::Dispatched {
             return; // accepted turns are never retried
         }
-        let _ = self.store.tx(|c| store::requeue_batch(c, turn));
+        let _ = self.store.requeue_batch(turn);
         let max = self.policy.max_failures;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.failures += 1;
@@ -1389,19 +1444,25 @@ impl Engine {
         err: &AgentError,
     ) {
         let error: &str = &err.message;
-        let Ok(Some(b)) = store::batch(self.conn(), turn) else {
+        let Ok(Some(b)) = self.store.batch(turn) else {
             return;
         };
         if !matches!(b.state, BatchState::Accepted | BatchState::Dispatched) {
             return;
         }
-        let _ = self.store.tx(|c| {
-            for t in store::open_obligations(c, turn)? {
-                store::resolve_obligation(c, t, ObligationState::Unmet, None, "turn_failed")?;
+        if let Ok(open) = self.store.open_obligations(turn) {
+            for t in open {
+                let _ =
+                    self.store
+                        .resolve_obligation(t, ObligationState::Unmet, None, "turn_failed");
             }
-            store::set_batch_state(c, turn, BatchState::Failed, now, Some(error))
-        });
-        let handle = store::member(self.conn(), agent)
+        }
+        let _ = self
+            .store
+            .set_batch_state(turn, BatchState::Failed, now, Some(error));
+        let handle = self
+            .store
+            .member(agent)
             .ok()
             .flatten()
             .map(|m| m.handle)
@@ -1435,10 +1496,10 @@ impl Engine {
     /// Handles of the humans whose messages woke this batch.
     pub fn woken_by(&self, batch: BatchId) -> Vec<String> {
         let mut out = Vec::new();
-        for t in store::batch_triggers(self.conn(), batch).unwrap_or_default() {
-            if let Ok(Some(m)) = store::message(self.conn(), t.id.message)
+        for t in self.store.batch_triggers(batch).unwrap_or_default() {
+            if let Ok(Some(m)) = self.store.message(t.id.message)
                 && let Some(a) = m.author
-                && let Ok(Some(who)) = store::member(self.conn(), a)
+                && let Ok(Some(who)) = self.store.member(a)
                 && who.kind == MemberKind::Human
             {
                 let h = format!("@{}", who.handle);
@@ -1463,43 +1524,45 @@ impl Engine {
         outcome: &TurnOutcome,
         final_text: &str,
     ) -> Result<(), PostError> {
-        let Some(b) = store::batch(self.conn(), turn)? else {
+        let Some(b) = self
+            .store
+            .batch(turn)
+            .map_err(|e| PostError::Store(e.to_string()))?
+        else {
             return Ok(());
         };
         if b.agent != agent || b.channel != channel || b.state != BatchState::Accepted {
             return Ok(());
         }
-        let open = store::open_obligations(self.conn(), turn)?;
+        let open = self
+            .store
+            .open_obligations(turn)
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let _ = final_text;
         let _ = std::mem::take(&mut self.rt.entry((agent, channel)).or_default().sent_in_turn);
         let outcome_label = format!("{outcome:?}");
         if !open.is_empty() {
-            // A completed turn with nothing to say is the agent choosing to let
-            // the ping go: `ignored`, which is fine. Anything else (cancelled,
-            // refused, cut short) is `unmet`. A trigger the agent put 👀 on
-            // (an answering emoji closed it when it was added; this also
-            // catches one the config made answering since) was handled, not
-            // ignored. Any other reaction doesn't count: still `ignored`.
             let completed = *outcome == TurnOutcome::Completed;
             let answers = self.ping_answers(agent, channel);
             let mut ignored_any = false;
-            self.store.tx::<_, PostError>(|c| {
-                for t in &open {
-                    let (state, kind) = if !completed {
-                        (ObligationState::Unmet, "no_reply")
-                    } else if store::reactions_by(c, t.message, agent)?
-                        .iter()
-                        .any(|e| reaction::HOLDS_OBLIGATION.contains(&&**e) || answers.answers(e))
-                    {
+            for t in &open {
+                let (state, kind) = if !completed {
+                    (ObligationState::Unmet, "no_reply")
+                } else {
+                    let reacted = self.store.reactions_on(t.message).unwrap_or_default();
+                    if reacted.iter().filter(|r| r.member == agent).any(|r| {
+                        reaction::HOLDS_OBLIGATION.contains(&&*r.emoji) || answers.answers(&r.emoji)
+                    }) {
                         (ObligationState::Satisfied, "react")
                     } else {
                         ignored_any = true;
                         (ObligationState::Ignored, "ignored")
-                    };
-                    store::resolve_obligation(c, *t, state, None, kind)?;
-                }
-                Ok(())
-            })?;
+                    }
+                };
+                self.store
+                    .resolve_obligation(*t, state, None, kind)
+                    .map_err(|e| PostError::Store(e.to_string()))?;
+            }
             let rt = self.rt.entry((agent, channel)).or_default();
             if !completed {
                 rt.note = Some(Arc::from("turn ended without a reply"));
@@ -1507,10 +1570,9 @@ impl Engine {
                 rt.note = Some(Arc::from("read it and let it go"));
             }
         }
-        self.store.tx::<_, PostError>(|c| {
-            store::set_batch_state(c, turn, BatchState::Settled, now, Some(&outcome_label))?;
-            Ok(())
-        })?;
+        self.store
+            .set_batch_state(turn, BatchState::Settled, now, Some(&outcome_label))
+            .map_err(|e| PostError::Store(e.to_string()))?;
         let rt = self.rt.entry((agent, channel)).or_default();
         rt.activity = None;
         rt.status = None;
@@ -1552,7 +1614,9 @@ impl Engine {
             if idle_due {
                 // Busy sessions are not idle; the clock restarts at turn end.
                 self.rt.get_mut(&(agent, channel)).expect("key").idle_since = None;
-                let busy = store::in_flight_batch(self.conn(), agent, channel)
+                let busy = self
+                    .store
+                    .in_flight_batch(agent, channel)
                     .ok()
                     .flatten()
                     .is_some();
@@ -1569,7 +1633,7 @@ impl Engine {
     /// the channel head; never backwards). Agents read forward with
     /// `chat_read`; humans when the app shows them the channel.
     pub fn advance_read(&mut self, now: Millis, member: MemberId, channel: ChannelId, seq: Seq) {
-        let head = store::head_seq(self.conn(), channel).unwrap_or(0);
+        let head = self.store.head_seq(channel).unwrap_or(0);
         let seq = seq.min(head);
         if seq == 0 {
             return;
@@ -1584,11 +1648,11 @@ impl Engine {
 
     /// Read receipts in `channel` (see [`Receipt`]).
     pub fn receipts(&self, channel: ChannelId) -> rusqlite::Result<Vec<Receipt>> {
-        store::receipts(self.conn(), channel)
+        self.store.receipts(channel)
     }
 
     fn publish_receipt(&mut self, member: MemberId, channel: ChannelId) {
-        let Ok(cursor) = store::cursor(self.conn(), member, channel) else {
+        let Ok(cursor) = self.store.cursor(member, channel) else {
             return;
         };
         if let Some(read_at) = cursor.read_at {

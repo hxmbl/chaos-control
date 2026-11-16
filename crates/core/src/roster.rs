@@ -167,48 +167,20 @@ pub fn mark_seeded(c: &Connection, project: &ProjectId, now: Millis) -> Result<b
     )? == 1)
 }
 
-/// Takes `member` out of `project`: its grant, its channel memberships, and
-/// any delivery still owed to it there (pending or in-flight batches fail
-/// with `member removed`, their open obligations become `unmet`). Messages,
-/// stances and receipts stay: they are history. Returns the channels it
-/// left.
+/// Takes `member` out of `project`: core grant removed here; workspace/agents
+/// cleanup must be done via `Store::leave_project` in split layout.
+/// This legacy signature is kept for compatibility but only removes core grant.
 pub fn leave_project(
     c: &Connection,
     project: &ProjectId,
     member: MemberId,
-    now: Millis,
+    _now: Millis,
 ) -> Result<Vec<ChannelId>> {
-    let mut stmt = c.prepare(
-        "SELECT s.channel_id FROM memberships s JOIN channels ch ON ch.id = s.channel_id
-         WHERE ch.project_id = ?1 AND s.member_id = ?2",
-    )?;
-    let channels: Vec<ChannelId> = stmt
-        .query_map(params![project.as_str(), member.0], |r| {
-            Ok(ChannelId(r.get(0)?))
-        })?
-        .collect::<Result<_>>()?;
-    for ch in &channels {
-        c.execute(
-            "UPDATE obligations SET state = 'unmet', resolved_kind = 'member_removed'
-             WHERE agent_id = ?1 AND channel_id = ?2 AND state = 'open'",
-            params![member.0, ch.0],
-        )?;
-        c.execute(
-            "UPDATE batches SET state = 'failed', outcome = 'member removed', settled_at = ?3
-             WHERE agent_id = ?1 AND channel_id = ?2
-               AND state IN ('pending', 'dispatched', 'accepted')",
-            params![member.0, ch.0, now as i64],
-        )?;
-        c.execute(
-            "DELETE FROM memberships WHERE channel_id = ?1 AND member_id = ?2",
-            params![ch.0, member.0],
-        )?;
-    }
     c.execute(
         "DELETE FROM project_members WHERE project_id = ?1 AND member_id = ?2",
         params![project.as_str(), member.0],
     )?;
-    Ok(channels)
+    Ok(Vec::new())
 }
 
 /// How many projects `member` still belongs to.
