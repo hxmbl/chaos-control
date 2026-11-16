@@ -794,3 +794,23 @@ async fn agents_json_lists_still_win_and_plain_agents_have_no_member_slot() {
     assert_eq!(member, vec!["*"]);
     assert_eq!(file, vec!["👍"]);
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn untargeted_messages_wake_agents_without_reply_obligations() {
+    let mut h = Harness::new().await;
+    let bot = h
+        .agent("bot", script(json!({"turns": [{"steps": []}]})))
+        .await;
+    let message = h.say("the flaky test is back").await;
+    let prompts = h.wait_prompts("bot", 1).await;
+    assert!(
+        prompts[0].contains("posted a message"),
+        "untargeted messages are identified as broadcasts: {}",
+        prompts[0]
+    );
+    assert!(prompts[0].contains("No reply is owed."), "{}", prompts[0]);
+    assert_eq!(h.obligation(bot.id, message.id).await, None);
+    settled(&mut h, 1).await;
+    assert_eq!(h.prompts("bot").len(), 1);
+}

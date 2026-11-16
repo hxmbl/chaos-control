@@ -732,43 +732,40 @@ async fn agent_crash_and_restart_goes_red_after_three_failures() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn untargeted_message_wakes_nobody() {
+async fn untargeted_messages_wake_agents() {
     let mut h = Harness::new().await;
     let bot = h
         .agent(
             "bot",
-            script(json!({"turns": [{"steps": [{"text": "hi"}]}]})),
+            script(json!({"turns": [{"steps": []}, {"steps": []}, {"steps": []}]})),
         )
         .await;
-    h.say("morning all, CI is green again").await;
-    h.say("mail me at someone@bot.example").await;
-    h.advance(60_000).await;
-    assert!(h.prompts("bot").is_empty());
-    assert_eq!(h.count("SELECT COUNT(*) FROM triggers").await, 0);
-    assert_eq!(h.count("SELECT COUNT(*) FROM batches").await, 0);
-    assert_eq!(
-        h.core.status(bot.id, h.main).await.unwrap().glow,
-        Glow::Sleeping
-    );
-    assert_eq!(h.core.live_tokens(), 0, "no session was started");
-    // When it is woken later, the untargeted messages arrive as context.
+    let m1 = h.say("morning all, CI is green again").await;
+    h.quiesce().await;
+    assert_eq!(h.prompts("bot").len(), 1);
+    assert_eq!(h.obligation(bot.id, m1.id).await, None);
+
+    let m2 = h.say("mail me at someone@bot.example").await;
+    h.quiesce().await;
+    assert_eq!(h.prompts("bot").len(), 2);
+    assert_eq!(h.obligation(bot.id, m2.id).await, None);
+
+    // A direct mention still creates an obligation and includes prior context.
     let ping = h.say("@bot anything new?").await;
-    h.until("settled", |c| {
+    let bot_id = bot.id;
+    let main = h.main;
+    let ping_id = ping.id;
+    h.until("mention settled", move |c| {
         c.query_row(
-            "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
-            [],
-            |r| r.get::<_, i64>(0),
+            "SELECT state FROM obligations WHERE agent_id = ?1 AND channel_id = ?2 AND message_id = ?3",
+            [bot_id.0, main.0, ping_id.0],
+            |r| r.get::<_, String>(0),
         )
-        .unwrap()
-            == 1
+        .map(|s| s != "open")
+        .unwrap_or(false)
     })
     .await;
-    assert_eq!(
-        h.obligation(bot.id, ping.id).await,
-        Some(ObligationState::Ignored)
-    );
-    assert!(h.by(bot.id).await.is_empty(), "final text stays private");
-    assert!(h.prompts("bot")[0].contains("morning all, CI is green again"));
+    assert!(h.prompts("bot")[2].contains("morning all, CI is green again"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

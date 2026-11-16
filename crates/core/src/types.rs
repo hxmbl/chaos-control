@@ -199,6 +199,8 @@ pub enum WakeReason {
     ReplyToMe,
     /// A human wrote `@everyone`. Wakes, but creates no reply obligation.
     Everyone,
+    /// A new message in the channel. Wakes, but creates no reply obligation.
+    Broadcast,
 }
 
 impl WakeReason {
@@ -207,6 +209,7 @@ impl WakeReason {
             WakeReason::Mention => "mention",
             WakeReason::ReplyToMe => "reply",
             WakeReason::Everyone => "everyone",
+            WakeReason::Broadcast => "broadcast",
         }
     }
 
@@ -216,6 +219,7 @@ impl WakeReason {
             // Rows written before the permission model was removed may say
             // "permission": they woke without a reply obligation, like this.
             "everyone" | "permission" => WakeReason::Everyone,
+            "broadcast" => WakeReason::Broadcast,
             _ => WakeReason::Mention,
         }
     }

@@ -165,6 +165,7 @@ pub fn compose(
                 WakeReason::Mention => "mentioned you",
                 WakeReason::ReplyToMe => "replied to you",
                 WakeReason::Everyone => "pinged @everyone",
+                WakeReason::Broadcast => "posted a message",
             };
             format!("{} {how}", author_label(c, m))
         })

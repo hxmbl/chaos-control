@@ -20,6 +20,7 @@ async fn http_requires_a_live_session_token() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn six_tools_scoped_to_the_session_and_revoked_on_close() {
     let mut h = Harness::new().await;
+    h.say("the deploy went out at 3pm").await;
     // A real session: the fake agent lists the tools and reads before replying.
     let bot = h
         .agent("bot", script(json!({"turns": [{"steps": [
@@ -31,7 +32,6 @@ async fn six_tools_scoped_to_the_session_and_revoked_on_close() {
             {"mcp": {"tool": "chat_send", "args": {"body": "spoofed?", "author": "hx", "client_request_id": "y"}}}
         ]}]})))
         .await;
-    h.say("the deploy went out at 3pm").await;
     let ping = h.say("@bot did the deploy work?").await;
     let reply = h.wait_message("reply", Some(bot.id)).await;
     assert_eq!(reply.reply_to, Some(ping.id));

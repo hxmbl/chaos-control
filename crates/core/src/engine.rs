@@ -753,8 +753,9 @@ impl Engine {
         Ok(())
     }
 
-    /// Creates triggers for every agent this message addresses and merges them
-    /// into that agent's single pending batch. Untargeted messages create none.
+    /// Creates triggers for every other agent in the channel and merges them
+    /// into that agent's single pending batch. Untargeted messages create no
+    /// reply obligation.
     fn create_triggers(
         &mut self,
         now: Millis,
@@ -773,6 +774,7 @@ impl Engine {
         };
         let mut woken = Vec::new();
         let mut trip_notice = None;
+        // The author already knows what it posted; every other agent hears it.
         for target in members
             .iter()
             .filter(|m| m.kind == MemberKind::Agent && m.id != author.id)
@@ -784,8 +786,7 @@ impl Engine {
             } else if everyone {
                 WakeReason::Everyone
             } else {
-                // Untargeted messages create no obligation, but agents still hear about them.
-                WakeReason::Everyone
+                WakeReason::Broadcast
             };
             let id = TriggerId {
                 agent: target.id,
@@ -1156,7 +1157,9 @@ impl Engine {
         // Everything in it already answered (e.g. by a reply sent mid-turn)?
         let triggers = store::batch_triggers(self.conn(), pending.id)?;
         let needs_delivery = triggers.iter().any(|t| {
-            store::obligation_state(self.conn(), t.id).ok().flatten() == Some(ObligationState::Open)
+            !t.reason.is_direct()
+                || store::obligation_state(self.conn(), t.id).ok().flatten()
+                    == Some(ObligationState::Open)
         });
         if !needs_delivery {
             self.store.tx::<_, PostError>(|c| {
