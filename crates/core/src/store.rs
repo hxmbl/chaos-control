@@ -1402,13 +1402,9 @@ impl Store {
         member: MemberId,
         now: Millis,
     ) -> Result<Vec<ChannelId>> {
-        let ws = match self.project_workspace(project) {
-            Ok(c) => c,
-            Err(_) => {
-                crate::roster::leave_project(&self.core, project, member, now)?;
-                return Ok(vec![]);
-            }
-        };
+        let ws = self
+            .project_workspace(project)
+            .map_err(|_| cannot_inspect_project_storage(project))?;
         // find channels member is in
         let mut stmt = ws.prepare("SELECT channel_id FROM memberships WHERE member_id = ?1")?;
         let channels: Vec<ChannelId> = stmt
@@ -2080,12 +2076,56 @@ fn maybe_migrate_from_legacy(data_dir: &Path) -> std::result::Result<(), OpenErr
         let mut valid = false;
         if let Ok(core) = open_db(&core_db, CORE_MIGRATIONS)
             && let Ok(projects) = core_project_ids(&core)
-        {
-            valid = projects.into_iter().all(|p| {
+            && projects.iter().all(|p| {
                 let dir = data_dir.join("Projects").join(p.as_str());
                 open_db(&dir.join("workspace.db"), WORKSPACE_MIGRATIONS).is_ok()
                     && open_db(&dir.join("agents.db"), AGENTS_MIGRATIONS).is_ok()
-            });
+            })
+        {
+            // Reject "empty-but-valid" split DBs that would discard legacy data:
+            // only accept completion when id_counters are already seeded above legacy maxima.
+            if let Ok(legacy_src) = Connection::open(&legacy) {
+                let max_channel: i64 = legacy_src
+                    .query_row("SELECT COALESCE(MAX(id), 0) FROM channels", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap_or(i64::MAX);
+                let max_message: i64 = legacy_src
+                    .query_row("SELECT COALESCE(MAX(id), 0) FROM messages", [], |r| {
+                        r.get(0)
+                    })
+                    .unwrap_or(i64::MAX);
+                let max_batch: i64 = legacy_src
+                    .query_row("SELECT COALESCE(MAX(id), 0) FROM batches", [], |r| r.get(0))
+                    .unwrap_or(i64::MAX);
+                if max_channel != i64::MAX && max_message != i64::MAX && max_batch != i64::MAX {
+                    let c_ok = core
+                        .query_row(
+                            "SELECT next_id FROM id_counters WHERE name = 'channel'",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .map(|n| n > max_channel)
+                        .unwrap_or(false);
+                    let m_ok = core
+                        .query_row(
+                            "SELECT next_id FROM id_counters WHERE name = 'message'",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .map(|n| n > max_message)
+                        .unwrap_or(false);
+                    let b_ok = core
+                        .query_row(
+                            "SELECT next_id FROM id_counters WHERE name = 'batch'",
+                            [],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .map(|n| n > max_batch)
+                        .unwrap_or(false);
+                    valid = c_ok && m_ok && b_ok;
+                }
+            }
         }
         if valid {
             // Ensure counters are seeded even if a previous attempt crashed before seeding.
