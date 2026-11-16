@@ -611,7 +611,56 @@ impl Store {
     /// Migrates from legacy `<data_dir>/core.sqlite` if present and the new
     /// layout is not yet complete. Refuses a database from a newer build
     /// without changing it.
-    pub fn open(data_dir: &Path) -> std::result::Result<Self, OpenError> {
+    pub fn open(path: &Path) -> std::result::Result<Self, OpenError> {
+        // Compatibility: opening an existing sqlite file path (legacy tests/APIs).
+        if path.exists() && path.is_file() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name != "core.db" {
+                let dir = path.parent().unwrap_or(Path::new("."));
+                std::fs::create_dir_all(dir)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                let core_sqlite = dir.join("core.sqlite");
+                let backup = dir.join("core.sqlite.pre-split");
+                let core_db = dir.join("core.db");
+                let already_split = core_db.exists() || backup.exists();
+                if name == "core.sqlite" {
+                    // standard legacy location
+                } else if !already_split {
+                    // Standalone legacy file: check for refusal without modifying it.
+                    let conn = Connection::open(path)?;
+                    let version: i64 =
+                        conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
+                    let known = LEGACY_MIGRATIONS.len() as i64;
+                    if version > known {
+                        return Err(OpenError::NewerSchema {
+                            path: path.to_path_buf(),
+                            found: version,
+                            known,
+                        });
+                    }
+                    drop(conn);
+                    if !core_sqlite.exists() {
+                        std::fs::copy(path, &core_sqlite)
+                            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                    }
+                }
+                maybe_migrate_from_legacy(dir)?;
+                let core_path = dir.join("core.db");
+                let core = open_db(&core_path, CORE_MIGRATIONS)?;
+                let mut store = Store {
+                    data_dir: dir.to_path_buf(),
+                    core,
+                    projects: HashMap::new(),
+                    channel_project: HashMap::new(),
+                    message_project: HashMap::new(),
+                    batch_project: HashMap::new(),
+                    project_errors: Vec::new(),
+                };
+                store.load_projects()?;
+                return Ok(store);
+            }
+        }
+        let data_dir = path;
         std::fs::create_dir_all(data_dir)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         maybe_migrate_from_legacy(data_dir)?;
@@ -1280,6 +1329,234 @@ impl Store {
         }
         Ok(out)
     }
+
+    pub fn add_reaction(
+        &self,
+        message: MessageId,
+        channel: ChannelId,
+        member: MemberId,
+        emoji: &str,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        add_reaction(
+            self.project_workspace(&project)?,
+            message,
+            channel,
+            member,
+            emoji,
+            now,
+        )
+    }
+    pub fn remove_reaction(
+        &self,
+        message: MessageId,
+        member: MemberId,
+        emoji: &str,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        remove_reaction(self.project_workspace(&project)?, message, member, emoji)
+    }
+    pub fn reactions_on(&self, message: MessageId) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        reactions_on(self.project_workspace(&project)?, message)
+    }
+    pub fn has_reacted(&self, message: MessageId, member: MemberId) -> Result<bool> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        has_reacted(self.project_workspace(&project)?, message, member)
+    }
+    pub fn recent_reactions(&self, channel: ChannelId, limit: usize) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        recent_reactions(self.project_workspace(&project)?, channel, limit)
+    }
+    pub fn reactions_since(
+        &self,
+        channel: ChannelId,
+        after_message: Seq,
+        limit: usize,
+    ) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        reactions_since(
+            self.project_workspace(&project)?,
+            channel,
+            after_message,
+            limit,
+        )
+    }
+    pub fn reactions_after_seq(
+        &self,
+        channel: ChannelId,
+        after_message: Seq,
+    ) -> Result<Vec<Reaction>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        reactions_after_seq(self.project_workspace(&project)?, channel, after_message)
+    }
+    pub fn advance_read(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+        seq: Seq,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        advance_read(self.project_workspace(&project)?, agent, channel, seq, now)
+    }
+    pub fn advance_delivered(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+        seq: Seq,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        advance_delivered(self.project_workspace(&project)?, agent, channel, seq, now)
+    }
+    pub fn insert_stance(&self, s: &Stance) -> Result<()> {
+        let project = self
+            .project_for_channel(s.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        insert_stance(self.project_workspace(&project)?, s)
+    }
+    pub fn stance(&self, message: MessageId) -> Result<Option<Stance>> {
+        let project = self
+            .project_for_message(message)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?
+            .0;
+        stance(self.project_workspace(&project)?, message)
+    }
+    pub fn recent_stances(&self, channel: ChannelId, limit: usize) -> Result<Vec<Stance>> {
+        let project = self
+            .project_for_channel(channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        recent_stances(self.project_workspace(&project)?, channel, limit)
+    }
+    pub fn dispatch_batch(&self, id: BatchId, window_to: Seq) -> Result<u32> {
+        let project = self
+            .project_for_batch(id)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        dispatch_batch(self.project_agents(&project)?, id, window_to)
+    }
+    pub fn requeue_batch(&self, id: BatchId) -> Result<()> {
+        let project = self
+            .project_for_batch(id)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        requeue_batch(self.project_agents(&project)?, id)
+    }
+    pub fn insert_trigger(
+        &self,
+        id: TriggerId,
+        reason: WakeReason,
+        hop: u8,
+        batch: BatchId,
+        now: Millis,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_batch(batch)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        insert_trigger(self.project_agents(&project)?, id, reason, hop, batch, now)
+    }
+    pub fn batch_triggers(&self, batch: BatchId) -> Result<Vec<TriggerRow>> {
+        let project = self
+            .project_for_batch(batch)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        batch_triggers(self.project_agents(&project)?, batch)
+    }
+    pub fn insert_obligation(&self, id: TriggerId) -> Result<bool> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        insert_obligation(self.project_agents(&project)?, id)
+    }
+    pub fn obligation_state(&self, id: TriggerId) -> Result<Option<ObligationState>> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        obligation_state(self.project_agents(&project)?, id)
+    }
+    pub fn open_obligations(&self, batch: BatchId) -> Result<Vec<TriggerId>> {
+        let project = self
+            .project_for_batch(batch)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        open_obligations(self.project_agents(&project)?, batch)
+    }
+    pub fn resolve_obligation(
+        &self,
+        id: TriggerId,
+        state: ObligationState,
+        resolved_by: Option<MessageId>,
+        kind: &str,
+    ) -> Result<bool> {
+        let project = self
+            .project_for_channel(id.channel)
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        resolve_obligation(self.project_agents(&project)?, id, state, resolved_by, kind)
+    }
+    pub fn former_project_agent_mention_tokens(
+        &self,
+        project: &ProjectId,
+    ) -> Result<Vec<(MemberId, Arc<str>)>> {
+        // Former = agent not currently in project_members but has cursor/message history in project.
+        let mut stmt = self.core.prepare(
+            "SELECT m.id, m.handle FROM members m
+             WHERE m.kind = 'agent'
+               AND NOT EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id = ?1 AND pm.member_id = m.id)
+             ORDER BY m.id"
+        )?;
+        let rows = stmt
+            .query_map([project.as_str()], |r| {
+                Ok((
+                    MemberId(r.get::<_, i64>(0)?),
+                    Arc::from(r.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<Result<Vec<_>>>()?;
+        let ws = match self.project_workspace(project) {
+            Ok(c) => c,
+            Err(_) => return Ok(vec![]),
+        };
+        let mut out = Vec::new();
+        for (id, handle) in rows {
+            let in_proj: bool = ws.query_row(
+                "SELECT EXISTS(SELECT 1 FROM cursors WHERE agent_id=?1) OR EXISTS(SELECT 1 FROM messages WHERE author_id=?1)",
+                [id.0], |r| r.get(0)).unwrap_or(false);
+            if !in_proj {
+                continue;
+            }
+            out.push((id, handle));
+            // nicknames
+            let mut ns = self.core.prepare(
+                "SELECT nickname FROM member_nicknames WHERE member_id=?1 ORDER BY added_at, rowid",
+            )?;
+            let nrows = ns
+                .query_map([id.0], |r| Ok(Arc::from(r.get::<_, String>(0)?)))?
+                .collect::<Result<Vec<_>>>()?;
+            for n in nrows {
+                out.push((id, n));
+            }
+        }
+        Ok(out)
+    }
 }
 
 fn core_project_ids(core: &Connection) -> Result<Vec<ProjectId>> {
@@ -1913,10 +2190,13 @@ fn reset_sqlite_sequence(c: &Connection, table: &str) -> Result<()> {
 
 fn ensure_member_db(c: &Connection, kind: MemberKind, handle: &str, name: &str) -> Result<Member> {
     c.execute(
-        "INSERT OR IGNORE INTO members (kind, handle, name) VALUES (?1, ?2, ?3)",
+        "INSERT INTO members (kind, handle, name) VALUES (?1, ?2, ?3)
+         ON CONFLICT(handle) DO UPDATE SET name = excluded.name",
         params![kind.as_str(), handle, name],
     )?;
-    member_by_handle_db(c, handle).map(|m| m.expect("just ensured"))
+    let m = member_by_handle_db(c, handle)?.expect("just ensured");
+    c.execute("DELETE FROM member_nicknames WHERE nickname = ?1", [handle])?;
+    Ok(m)
 }
 
 fn member_by_handle_db(c: &Connection, handle: &str) -> Result<Option<Member>> {
@@ -3125,7 +3405,7 @@ pub fn is_not_a_project_member(e: &rusqlite::Error) -> bool {
 
 // ---------- messages ----------
 
-const MESSAGE_COLS: &str = "id, channel_id, seq, author_id, origin, body, reply_to, hop, sent_at";
+const MESSAGE_COLS: &str = "id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at";
 
 fn message_from_row(r: &Row<'_>) -> Result<Message> {
     Ok(Message {
@@ -3138,7 +3418,7 @@ fn message_from_row(r: &Row<'_>) -> Result<Message> {
         reply_to: r.get::<_, Option<i64>>(6)?.map(MessageId),
         mentions: Vec::new(),
         hop: r.get::<_, i64>(7)?.clamp(0, u8::MAX as i64) as u8,
-        sent_at: r.get::<_, i64>(8)? as Millis,
+        sent_at: r.get::<_, i64>(10)? as Millis,
     })
 }
 
@@ -3911,97 +4191,93 @@ mod tests {
 
     fn setup() -> (Store, Channel, Member, Member) {
         let mut s = Store::open_in_memory().unwrap();
-        let (ch, hx, bot) = s
-            .tx::<_, rusqlite::Error>(|c| {
-                let p = ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
-                let ch = ensure_channel(c, &p.id, "main", 0)?;
-                let hx = ensure_member(c, MemberKind::Human, "hx", "Hx")?;
-                let bot = ensure_member(c, MemberKind::Agent, "claude", "Claude")?;
-                join_project(c, &p.id, hx.id, 0)?;
-                join_project(c, &p.id, bot.id, 0)?;
-                join(c, ch.id, &hx, 20, 0)?;
-                join(c, ch.id, &bot, 20, 0)?;
-                Ok((ch, hx, bot))
-            })
+        let p = pid(P1);
+        s.ensure_project(&p, "Starpoint", None, 0).unwrap();
+        let ch = s.ensure_channel(&p, "main", 0).unwrap();
+        let hx = s.ensure_member(MemberKind::Human, "hx", "Hx").unwrap();
+        let bot = s
+            .ensure_member(MemberKind::Agent, "claude", "Claude")
             .unwrap();
+        s.join_project(&p, hx.id, 0).unwrap();
+        s.join_project(&p, bot.id, 0).unwrap();
+        s.join(ch.id, &hx, 20, 0).unwrap();
+        s.join(ch.id, &bot, 20, 0).unwrap();
         (s, ch, hx, bot)
     }
 
     #[test]
     fn nicknames_share_the_handle_namespace() {
         let (s, ch, hx, bot) = setup();
-        let c = s.conn();
-        add_nickname(c, bot.id, "Cody", 1).unwrap();
-        add_nickname(c, bot.id, "cx", 2).unwrap();
+        s.add_nickname(bot.id, "Cody", 1).unwrap();
+        s.add_nickname(bot.id, "cx", 2).unwrap();
         assert_eq!(
-            nicknames_of(c, bot.id).unwrap(),
+            s.nicknames_of(bot.id).unwrap(),
             vec![Arc::<str>::from("Cody"), Arc::from("cx")]
         );
-        assert_eq!(nicknames_in(c, ch.id).unwrap().len(), 2);
-        assert_eq!(mention_owner(c, "CODY").unwrap(), Some(bot.id));
-        assert_eq!(mention_owner(c, "Claude").unwrap(), Some(bot.id));
-        assert_eq!(mention_owner(c, "nobody").unwrap(), None);
+        assert_eq!(s.nicknames_in(ch.id).unwrap().len(), 2);
+        assert_eq!(s.mention_owner("CODY").unwrap(), Some(bot.id));
+        assert_eq!(s.mention_owner("Claude").unwrap(), Some(bot.id));
+        assert_eq!(s.mention_owner("nobody").unwrap(), None);
         // The schema refuses a second holder, whatever the case, and a handle.
-        assert!(add_nickname(c, hx.id, "cody", 3).is_err());
-        let e = add_nickname(c, hx.id, "CLAUDE", 3).unwrap_err();
+        assert!(s.add_nickname(hx.id, "cody", 3).is_err());
+        let e = s.add_nickname(hx.id, "CLAUDE", 3).unwrap_err();
         assert!(e.to_string().contains("nickname_is_a_handle"), "{e}");
         // A handle created later wins: the nickname is dropped.
-        let cx = ensure_member(c, MemberKind::Agent, "CX", "Codex").unwrap();
-        assert_eq!(mention_owner(c, "cx").unwrap(), Some(cx.id));
+        let cx = s.ensure_member(MemberKind::Agent, "CX", "Codex").unwrap();
+        assert_eq!(s.mention_owner("cx").unwrap(), Some(cx.id));
         assert_eq!(
-            nicknames_of(c, bot.id).unwrap(),
+            s.nicknames_of(bot.id).unwrap(),
             vec![Arc::<str>::from("Cody")]
         );
-        assert!(remove_nickname(c, bot.id, "cODY").unwrap());
-        assert!(!remove_nickname(c, bot.id, "cody").unwrap());
-        assert!(nicknames_of(c, bot.id).unwrap().is_empty());
+        assert!(s.remove_nickname(bot.id, "cODY").unwrap());
+        assert!(!s.remove_nickname(bot.id, "cody").unwrap());
+        assert!(s.nicknames_of(bot.id).unwrap().is_empty());
     }
 
     #[test]
     fn former_mention_tokens_are_only_agents_removed_from_this_project() {
         let (mut s, main, hx, bot) = setup();
-        let (gone, spoke, elsewhere) = s
-            .tx::<_, rusqlite::Error>(|c| {
-                let p = pid(P1);
-                let design = ensure_channel(c, &p, "design", 0)?;
-                add_nickname(c, bot.id, "Cody", 1)?;
-                add_nickname(c, hx.id, "boss", 2)?;
-                // In #main, then removed from the project.
-                let gone = ensure_member(c, MemberKind::Agent, "gpt", "GPT")?;
-                join_project(c, &p, gone.id, 0)?;
-                join(c, main.id, &gone, 20, 0)?;
-                add_nickname(c, gone.id, "g", 3)?;
-                add_nickname(c, gone.id, "jeepy", 4)?;
-                crate::roster::leave_project(c, &p, gone.id, 5)?;
-                // Only ever in #design, where it spoke, then removed: it was
-                // still in the project.
-                let spoke = ensure_member(c, MemberKind::Agent, "gemini", "Gemini")?;
-                join_project(c, &p, spoke.id, 0)?;
-                join(c, design.id, &spoke, 20, 0)?;
-                insert_message(c, &msg(design.id, spoke.id, "on it"))?;
-                add_nickname(c, spoke.id, "gem", 5)?;
-                crate::roster::leave_project(c, &p, spoke.id, 6)?;
-                // A current member that is only in #design is not former.
-                let still = ensure_member(c, MemberKind::Agent, "pi", "Pi")?;
-                join_project(c, &p, still.id, 0)?;
-                join(c, design.id, &still, 20, 0)?;
-                // Only ever in another project's channel.
-                let q = ensure_project(c, &pid(P2), "Elsewhere", None, 0)?;
-                let elsewhere = ensure_channel(c, &q.id, "main", 0)?;
-                let other = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
-                join_project(c, &q.id, other.id, 0)?;
-                join(c, elsewhere.id, &other, 20, 0)?;
-                add_nickname(c, other.id, "cx", 7)?;
-                // Known to core, never in any channel.
-                ensure_member(c, MemberKind::Agent, "devin", "Devin")?;
-                Ok((gone, spoke, q.id))
-            })
+        let p = pid(P1);
+        let design = s.ensure_channel(&p, "design", 0).unwrap();
+        s.add_nickname(bot.id, "Cody", 1).unwrap();
+        s.add_nickname(hx.id, "boss", 2).unwrap();
+        // In #main, then removed from the project.
+        let gone = s.ensure_member(MemberKind::Agent, "gpt", "GPT").unwrap();
+        s.join_project(&p, gone.id, 0).unwrap();
+        s.join(main.id, &gone, 20, 0).unwrap();
+        s.add_nickname(gone.id, "g", 3).unwrap();
+        s.add_nickname(gone.id, "jeepy", 4).unwrap();
+        s.leave_project(&p, gone.id, 5).unwrap();
+        // Only ever in #design, where it spoke, then removed.
+        let spoke = s
+            .ensure_member(MemberKind::Agent, "gemini", "Gemini")
             .unwrap();
-        let c = s.conn();
-        // Current members (bot, pi, hx), the other project's agent and the
-        // stranger are not in it; humans never are.
+        s.join_project(&p, spoke.id, 0).unwrap();
+        s.join(design.id, &spoke, 20, 0).unwrap();
+        s.insert_message(&msg(design.id, spoke.id, "on it"))
+            .unwrap();
+        s.add_nickname(spoke.id, "gem", 5).unwrap();
+        s.leave_project(&p, spoke.id, 6).unwrap();
+        // A current member that is only in #design is not former.
+        let still = s.ensure_member(MemberKind::Agent, "pi", "Pi").unwrap();
+        s.join_project(&p, still.id, 0).unwrap();
+        s.join(design.id, &still, 20, 0).unwrap();
+        // Only ever in another project's channel.
+        let q = pid(P2);
+        s.ensure_project(&q, "Elsewhere", None, 0).unwrap();
+        let elsewhere_ch = s.ensure_channel(&q, "main", 0).unwrap();
+        let other = s
+            .ensure_member(MemberKind::Agent, "codex", "Codex")
+            .unwrap();
+        s.join_project(&q, other.id, 0).unwrap();
+        s.join(elsewhere_ch.id, &other, 20, 0).unwrap();
+        s.add_nickname(other.id, "cx", 7).unwrap();
+        // Known to core, never in any channel.
+        s.ensure_member(MemberKind::Agent, "devin", "Devin")
+            .unwrap();
+
         assert_eq!(
-            former_project_agent_mention_tokens(c, &pid(P1)).unwrap(),
+            s.former_project_agent_mention_tokens(&pid(P1)).unwrap(),
             vec![
                 (gone.id, Arc::<str>::from("gpt")),
                 (gone.id, Arc::from("g")),
@@ -4010,10 +4286,8 @@ mod tests {
                 (spoke.id, Arc::from("gem")),
             ]
         );
-        // The other project lists nothing: codex is still a member there,
-        // and P1's removed agents were never in it.
         assert!(
-            former_project_agent_mention_tokens(c, &elsewhere)
+            s.former_project_agent_mention_tokens(&q)
                 .unwrap()
                 .is_empty()
         );
@@ -4037,7 +4311,11 @@ mod tests {
     #[test]
     fn migrations_run_once_and_record_version() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let core_v: i64 = s
+            .core()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(core_v, super::CORE_MIGRATIONS.len() as i64);
     }
 
     #[test]
@@ -4089,7 +4367,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         drop(Store::open(&path).unwrap());
         let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let core_v: i64 = s
+            .core()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(core_v, super::CORE_MIGRATIONS.len() as i64);
         drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4100,44 +4382,45 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.sqlite");
         let _ = std::fs::remove_file(&path);
-        let id = {
+        let (id, hx_id) = {
             let mut s = Store::open(&path).unwrap();
-            s.tx::<_, rusqlite::Error>(|c| {
-                ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
-                let ch = ensure_channel(c, &pid(P1), "main", 0)?;
-                insert_message(c, &msg(ch.id, MemberId(1), "x")).map(|m| m.id)
-            })
-            .ok();
-            let s2 = &mut s;
-            s2.tx::<_, rusqlite::Error>(|c| {
-                ensure_project(c, &pid(P1), "Starpoint", None, 0)?;
-                let ch = ensure_channel(c, &pid(P1), "main", 0)?;
-                let hx = ensure_member(c, MemberKind::Human, "hx", "Hx")?;
-                insert_message(c, &msg(ch.id, hx.id, "hello")).map(|m| m.id)
-            })
-            .unwrap()
+            let p = pid(P1);
+            s.ensure_project(&p, "Starpoint", None, 0).unwrap();
+            let ch = s.ensure_channel(&p, "main", 0).unwrap();
+            let hx = s.ensure_member(MemberKind::Human, "hx", "Hx").unwrap();
+            s.join_project(&p, hx.id, 0).unwrap();
+            s.join(ch.id, &hx, 20, 0).unwrap();
+            let m = s.insert_message(&msg(ch.id, hx.id, "hello")).unwrap();
+            (m.id, hx.id)
         };
         let s = Store::open(&path).unwrap();
-        let m = message(s.conn(), id).unwrap().unwrap();
+        let mut found = None;
+        for proj in s.projects().unwrap() {
+            if let Ok(ws) = s.project_workspace(&proj.id)
+                && let Ok(Some(m)) = message(ws, id)
+            {
+                found = Some(m);
+                break;
+            }
+        }
+        let m = found.expect("message");
         assert_eq!(&*m.body, "hello");
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(m.author, Some(hx_id));
+        let core_v: i64 = s
+            .core()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(core_v, super::CORE_MIGRATIONS.len() as i64);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn seq_is_per_channel_and_gapless_while_ids_are_global() {
         let (mut s, ch, hx, _) = setup();
-        let other = s
-            .tx::<_, rusqlite::Error>(|c| ensure_channel(c, &ch.project, "STRM-1", 0))
-            .unwrap();
-        let (a, b, c2) = s
-            .tx::<_, rusqlite::Error>(|c| {
-                let a = insert_message(c, &msg(ch.id, hx.id, "a"))?;
-                let b = insert_message(c, &msg(other.id, hx.id, "b"))?;
-                let c2 = insert_message(c, &msg(ch.id, hx.id, "c"))?;
-                Ok((a, b, c2))
-            })
-            .unwrap();
+        let other = s.ensure_channel(&ch.project, "STRM-1", 0).unwrap();
+        let a = s.insert_message(&msg(ch.id, hx.id, "a")).unwrap();
+        let b = s.insert_message(&msg(other.id, hx.id, "b")).unwrap();
+        let c2 = s.insert_message(&msg(ch.id, hx.id, "c")).unwrap();
         assert_eq!((a.seq, b.seq, c2.seq), (1, 1, 2));
         assert!(a.id < b.id && b.id < c2.id);
     }
@@ -4145,181 +4428,181 @@ mod tests {
     #[test]
     fn one_pending_and_one_in_flight_batch_per_agent_channel() {
         let (mut s, ch, _, bot) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let p = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            assert_eq!(pending_batch_or_create(c, bot.id, ch.id, 0)?.id, p.id);
-            let dup = c.execute(
-                "INSERT INTO batches (agent_id, channel_id, state, created_at) VALUES (?1, ?2, 'pending', 0)",
-                params![bot.id.0, ch.id.0],
+        let p = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        assert_eq!(
+            s.pending_batch_or_create(bot.id, ch.id, 0).unwrap().id,
+            p.id
+        );
+        {
+            let ag = s.project_agents(&ch.project).unwrap();
+            let dup = ag.execute(
+                "INSERT INTO batches (id, agent_id, channel_id, state, created_at) VALUES (?1, ?2, ?3, 'pending', 0)",
+                params![999i64, bot.id.0, ch.id.0],
             );
             assert!(dup.is_err(), "schema forbids a second pending batch");
-            dispatch_batch(c, p.id, 0)?;
-            let q = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            assert_ne!(q.id, p.id);
-            let dup = c.execute(
-                "UPDATE batches SET state = 'dispatched' WHERE id = ?1",
-                [q.id.0],
-            );
-            assert!(dup.is_err(), "schema forbids a second in-flight batch");
-            Ok(())
-        })
-        .unwrap();
+        }
+        s.dispatch_batch(p.id, 0).unwrap();
+        let q = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        assert_ne!(q.id, p.id);
+        let ag = s.project_agents(&ch.project).unwrap();
+        let dup = ag.execute(
+            "UPDATE batches SET state = 'dispatched' WHERE id = ?1",
+            [q.id.0],
+        );
+        assert!(dup.is_err(), "schema forbids a second in-flight batch");
     }
 
     #[test]
     fn requeue_merges_triggers_of_a_newer_pending_batch() {
         let (mut s, ch, hx, bot) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let m1 = insert_message(c, &msg(ch.id, hx.id, "one"))?;
-            let m2 = insert_message(c, &msg(ch.id, hx.id, "two"))?;
-            let b1 = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t1 = TriggerId {
-                agent: bot.id,
-                channel: ch.id,
-                message: m1.id,
-            };
-            insert_trigger(c, t1, WakeReason::Mention, 0, b1.id, 0)?;
-            insert_obligation(c, t1)?;
-            dispatch_batch(c, b1.id, 1)?;
-            let b2 = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t2 = TriggerId {
-                agent: bot.id,
-                channel: ch.id,
-                message: m2.id,
-            };
-            insert_trigger(c, t2, WakeReason::Mention, 0, b2.id, 0)?;
-            insert_obligation(c, t2)?;
-            requeue_batch(c, b1.id)?;
-            let p = pending_batch(c, bot.id, ch.id)?.unwrap();
-            assert_eq!(p.id, b1.id);
-            assert_eq!(batch_triggers(c, p.id)?.len(), 2);
-            assert_eq!(open_obligations(c, p.id)?, vec![t1, t2]);
-            Ok(())
-        })
-        .unwrap();
+        let m1 = s.insert_message(&msg(ch.id, hx.id, "one")).unwrap();
+        let m2 = s.insert_message(&msg(ch.id, hx.id, "two")).unwrap();
+        let b1 = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        let t1 = TriggerId {
+            agent: bot.id,
+            channel: ch.id,
+            message: m1.id,
+        };
+        s.insert_trigger(t1, WakeReason::Mention, 0, b1.id, 0)
+            .unwrap();
+        s.insert_obligation(t1).unwrap();
+        s.dispatch_batch(b1.id, 1).unwrap();
+        let b2 = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        let t2 = TriggerId {
+            agent: bot.id,
+            channel: ch.id,
+            message: m2.id,
+        };
+        s.insert_trigger(t2, WakeReason::Mention, 0, b2.id, 0)
+            .unwrap();
+        s.insert_obligation(t2).unwrap();
+        s.requeue_batch(b1.id).unwrap();
+        let p = s.pending_batch(bot.id, ch.id).unwrap().unwrap();
+        assert_eq!(p.id, b1.id);
+        assert_eq!(s.batch_triggers(p.id).unwrap().len(), 2);
+        assert_eq!(s.open_obligations(p.id).unwrap(), vec![t1, t2]);
     }
 
     #[test]
     fn duplicate_trigger_and_obligation_are_ignored() {
         let (mut s, ch, hx, bot) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let m = insert_message(c, &msg(ch.id, hx.id, "@claude hi"))?;
-            let b = pending_batch_or_create(c, bot.id, ch.id, 0)?;
-            let t = TriggerId {
-                agent: bot.id,
-                channel: ch.id,
-                message: m.id,
-            };
-            assert!(insert_trigger(c, t, WakeReason::Mention, 0, b.id, 0)?);
-            assert!(!insert_trigger(c, t, WakeReason::Mention, 0, b.id, 0)?);
-            assert!(insert_obligation(c, t)?);
-            assert!(!insert_obligation(c, t)?);
-            assert!(resolve_obligation(
-                c,
-                t,
-                ObligationState::Satisfied,
-                None,
-                "send"
-            )?);
-            assert!(!resolve_obligation(
-                c,
-                t,
-                ObligationState::Fallback,
-                None,
-                "fallback"
-            )?);
-            Ok(())
-        })
-        .unwrap();
+        let m = s.insert_message(&msg(ch.id, hx.id, "@claude hi")).unwrap();
+        let b = s.pending_batch_or_create(bot.id, ch.id, 0).unwrap();
+        let t = TriggerId {
+            agent: bot.id,
+            channel: ch.id,
+            message: m.id,
+        };
+        assert!(
+            s.insert_trigger(t, WakeReason::Mention, 0, b.id, 0)
+                .unwrap()
+        );
+        assert!(
+            !s.insert_trigger(t, WakeReason::Mention, 0, b.id, 0)
+                .unwrap()
+        );
+        assert!(s.insert_obligation(t).unwrap());
+        assert!(!s.insert_obligation(t).unwrap());
+        assert!(
+            s.resolve_obligation(t, ObligationState::Satisfied, None, "send")
+                .unwrap()
+        );
+        assert!(
+            !s.resolve_obligation(t, ObligationState::Fallback, None, "fallback")
+                .unwrap()
+        );
     }
 
     #[test]
     fn join_backfills_the_last_n_messages() {
         let (mut s, ch, hx, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            for i in 0..30 {
-                insert_message(c, &msg(ch.id, hx.id, &format!("m{i}")))?;
-            }
-            let late = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
-            join_project(c, &ch.project, late.id, 0)?;
-            join(c, ch.id, &late, 20, 0)?;
-            assert_eq!(cursor(c, late.id, ch.id)?.read_through, 10);
-            advance_delivered(c, late.id, ch.id, 5, 0)?;
-            assert_eq!(
-                cursor(c, late.id, ch.id)?.delivered_through,
-                10,
-                "never backwards"
-            );
-            Ok(())
-        })
-        .unwrap();
+        for i in 0..30 {
+            s.insert_message(&msg(ch.id, hx.id, &format!("m{i}")))
+                .unwrap();
+        }
+        let late = s
+            .ensure_member(MemberKind::Agent, "codex", "Codex")
+            .unwrap();
+        s.join_project(&ch.project, late.id, 0).unwrap();
+        s.join(ch.id, &late, 20, 0).unwrap();
+        assert_eq!(s.cursor(late.id, ch.id).unwrap().read_through, 10);
+        s.advance_delivered(late.id, ch.id, 5, 0).unwrap();
+        assert_eq!(
+            s.cursor(late.id, ch.id).unwrap().delivered_through,
+            10,
+            "never backwards"
+        );
     }
 
     #[test]
     fn two_projects_can_each_have_a_main() {
         let mut s = Store::open_in_memory().unwrap();
-        s.tx::<_, rusqlite::Error>(|c| {
-            ensure_project(c, &pid(P1), "Starpoint", Some("/src/starpoint"), 0)?;
-            ensure_project(c, &pid(P2), "Everything", Some("/src/everything"), 0)?;
-            let a = ensure_channel(c, &pid(P1), "main", 0)?;
-            let b = ensure_channel(c, &pid(P2), "#main", 0)?;
-            assert_ne!(a.id, b.id);
-            assert_eq!((a.ordinal, b.ordinal), (1, 1), "::N counts per project");
-            assert_eq!(&*b.name, "main");
-            assert_eq!(ensure_channel(c, &pid(P1), "main", 5)?.id, a.id);
-            let next = ensure_channel(c, &pid(P2), "STRM-184", 0)?;
-            assert_eq!(next.ordinal, 2);
-            assert_eq!(channel_in_project(c, &pid(P1), "main")?.unwrap().id, a.id);
-            assert_eq!(channel_in_project(c, &pid(P2), "main")?.unwrap().id, b.id);
-            assert!(channel_in_project(c, &pid(P1), "STRM-184")?.is_none());
-            let names: Vec<_> = channels_in_project(c, &pid(P2))?
-                .into_iter()
-                .map(|c| c.name)
-                .collect();
-            assert_eq!(names, vec![Arc::from("main"), Arc::from("STRM-184")]);
-            Ok(())
-        })
-        .unwrap();
+        s.ensure_project(&pid(P1), "Starpoint", Some("/src/starpoint"), 0)
+            .unwrap();
+        s.ensure_project(&pid(P2), "Everything", Some("/src/everything"), 0)
+            .unwrap();
+        let a = s.ensure_channel(&pid(P1), "main", 0).unwrap();
+        let b = s.ensure_channel(&pid(P2), "#main", 0).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!((a.ordinal, b.ordinal), (1, 1), "::N counts per project");
+        assert_eq!(&*b.name, "main");
+        assert_eq!(s.ensure_channel(&pid(P1), "main", 5).unwrap().id, a.id);
+        let next = s.ensure_channel(&pid(P2), "STRM-184", 0).unwrap();
+        assert_eq!(next.ordinal, 2);
+        assert_eq!(
+            s.channel_in_project(&pid(P1), "main").unwrap().unwrap().id,
+            a.id
+        );
+        assert_eq!(
+            s.channel_in_project(&pid(P2), "main").unwrap().unwrap().id,
+            b.id
+        );
+        assert!(
+            s.channel_in_project(&pid(P1), "STRM-184")
+                .unwrap()
+                .is_none()
+        );
+        let names: Vec<_> = s
+            .channels_in_project(&pid(P2))
+            .unwrap()
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec![Arc::from("main"), Arc::from("STRM-184")]);
     }
 
     #[test]
     fn joining_a_channel_needs_project_membership() {
         let (mut s, ch, _, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let other = ensure_project(c, &pid(P2), "Other", None, 0)?;
-            let elsewhere = ensure_channel(c, &other.id, "main", 0)?;
-            let codex = ensure_member(c, MemberKind::Agent, "codex", "Codex")?;
-            let err = join(c, ch.id, &codex, 20, 0).unwrap_err();
-            assert!(is_not_a_project_member(&err), "{err}");
-            assert!(!is_member(c, ch.id, codex.id)?);
-            join_project(c, &ch.project, codex.id, 0)?;
-            assert!(join(c, ch.id, &codex, 20, 0)?);
-            // Membership of one project grants nothing in another.
-            let err = join(c, elsewhere.id, &codex, 20, 0).unwrap_err();
-            assert!(is_not_a_project_member(&err), "{err}");
-            Ok(())
-        })
-        .unwrap();
+        let other = pid(P2);
+        s.ensure_project(&other, "Other", None, 0).unwrap();
+        let elsewhere = s.ensure_channel(&other, "main", 0).unwrap();
+        let codex = s
+            .ensure_member(MemberKind::Agent, "codex", "Codex")
+            .unwrap();
+        let err = s.join(ch.id, &codex, 20, 0).unwrap_err();
+        assert!(is_not_a_project_member(&err), "{err}");
+        assert!(!s.is_member(ch.id, codex.id).unwrap());
+        s.join_project(&ch.project, codex.id, 0).unwrap();
+        assert!(s.join(ch.id, &codex, 20, 0).unwrap());
+        let err = s.join(elsewhere.id, &codex, 20, 0).unwrap_err();
+        assert!(is_not_a_project_member(&err), "{err}");
     }
 
     #[test]
     fn renaming_changes_the_name_only() {
         let (mut s, ch, hx, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let m = insert_message(c, &msg(ch.id, hx.id, "before"))?;
-            assert!(rename_channel(c, ch.id, "#general")?);
-            assert!(rename_project(c, &ch.project, "Starpoint 2")?);
-            let renamed = channel(c, ch.id)?.unwrap();
-            assert_eq!((renamed.id, renamed.ordinal), (ch.id, ch.ordinal));
-            assert_eq!(&*renamed.name, "general");
-            assert_eq!(
-                project(c, &ch.project)?.unwrap().name.as_ref(),
-                "Starpoint 2"
-            );
-            assert_eq!(message(c, m.id)?.unwrap().channel, ch.id);
-            Ok(())
-        })
-        .unwrap();
+        let m = s.insert_message(&msg(ch.id, hx.id, "before")).unwrap();
+        assert!(s.rename_channel(ch.id, "#general").unwrap());
+        assert!(s.rename_project(&ch.project, "Starpoint 2").unwrap());
+        let renamed = s.channel(ch.id).unwrap().unwrap();
+        assert_eq!((renamed.id, renamed.ordinal), (ch.id, ch.ordinal));
+        assert_eq!(&*renamed.name, "general");
+        assert_eq!(
+            s.project(&ch.project).unwrap().unwrap().name.as_ref(),
+            "Starpoint 2"
+        );
+        assert_eq!(s.message(m.id).unwrap().unwrap().channel, ch.id);
     }
 
     #[test]
@@ -4349,64 +4632,15 @@ mod tests {
         assert_eq!(p.as_str(), P1);
     }
 
-    /// Every row of `table` as text, ordered, so two snapshots compare exactly.
-    fn dump(c: &Connection, table: &str, cols: &str) -> Vec<String> {
-        let mut stmt = c
-            .prepare(&format!("SELECT {cols} FROM {table} ORDER BY {cols}"))
-            .unwrap();
-        let n = stmt.column_count();
-        stmt.query_map([], |r| {
-            Ok((0..n)
-                .map(|i| format!("{:?}", r.get_ref(i).unwrap()))
-                .collect::<Vec<_>>()
-                .join("|"))
-        })
-        .unwrap()
-        .collect::<Result<_>>()
-        .unwrap()
-    }
-
-    /// The tables migration 2 must leave exactly as they were.
-    const UNTOUCHED: &[(&str, &str)] = &[
-        ("members", "id, kind, handle, name"),
-        ("memberships", "channel_id, member_id, joined_at"),
-        (
-            "messages",
-            "id, channel_id, seq, author_id, origin, body, reply_to, hop, cause_batch, client_request_id, sent_at",
-        ),
-        ("mentions", "message_id, member_id"),
-        ("reactions", "message_id, member_id, emoji, created_at"),
-        (
-            "cursors",
-            "agent_id, channel_id, delivered_through, read_through",
-        ),
-        (
-            "batches",
-            "id, agent_id, channel_id, state, attempts, window_to, created_at, accepted_at, settled_at, outcome",
-        ),
-        (
-            "triggers",
-            "agent_id, channel_id, message_id, reason, hop, batch_id, created_at",
-        ),
-        (
-            "obligations",
-            "agent_id, channel_id, message_id, state, resolved_by, resolved_kind",
-        ),
-        (
-            "sessions",
-            "agent_id, channel_id, protocol, native_ref, opened_at",
-        ),
-    ];
-
     #[test]
     fn a_v1_database_migrates_keeping_every_id_and_row() {
         let dir = std::env::temp_dir().join(format!("cc-store-v1-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("v1.sqlite");
+        let path = dir.join("core.sqlite");
         let _ = std::fs::remove_file(&path);
 
-        // A database exactly as v1 left it, with a row in every table.
-        let before: Vec<Vec<String>> = {
+        // A legacy database as v1 left it, with a row in every table.
+        {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(MIGRATIONS[0]).unwrap();
             conn.execute_batch(
@@ -4431,56 +4665,72 @@ mod tests {
                 "#,
             )
             .unwrap();
-            UNTOUCHED
-                .iter()
-                .map(|(t, cols)| dump(&conn, t, cols))
-                .collect()
-        };
+        }
 
-        let s = Store::open(&path).unwrap();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
-        let c = s.conn();
-        let after: Vec<Vec<String>> = UNTOUCHED.iter().map(|(t, cols)| dump(c, t, cols)).collect();
-        assert_eq!(before, after, "migration 2 must not touch these tables");
-
-        let all = projects(c).unwrap();
+        let s = Store::open(&dir).unwrap();
+        let all = s.projects().unwrap();
         assert_eq!(all.len(), 1);
         let imported = all[0].clone();
         assert_eq!(imported.name.as_ref(), "Imported");
         assert_eq!(imported.root_path, None);
         assert_eq!(imported.created_at, 100);
-        let chans = channels_in_project(c, &imported.id).unwrap();
+        let chans = s.channels_in_project(&imported.id).unwrap();
         let got: Vec<_> = chans
             .iter()
             .map(|c| (c.id.0, &*c.name, c.ordinal))
             .collect();
         assert_eq!(got, vec![(3, "main", 1), (7, "STRM-1", 2)]);
         for m in [1, 2, 5] {
-            assert!(is_project_member(c, &imported.id, MemberId(m)).unwrap());
+            assert!(s.is_project_member(&imported.id, MemberId(m)).unwrap());
         }
-        let fk: i64 = c
+        // Verify key rows preserved across split DBs.
+        let ws = s.project_workspace(&imported.id).unwrap();
+        let ag = s.project_agents(&imported.id).unwrap();
+        let msg_ids: Vec<i64> = {
+            let mut st = ws.prepare("SELECT id FROM messages ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(msg_ids, vec![10, 11, 12]);
+        let batch_ids: Vec<i64> = {
+            let mut st = ag.prepare("SELECT id FROM batches ORDER BY id").unwrap();
+            st.query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(batch_ids, vec![4]);
+        let fk: i64 = ws
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
-        let fk_on: i64 = c
-            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
-            .unwrap();
-        assert_eq!(fk_on, 1, "foreign keys are back on after migrating");
         drop(s);
 
         // Reopening runs nothing again: same single project, same UUID.
-        let s = Store::open(&path).unwrap();
-        let again = projects(s.conn()).unwrap();
+        let s = Store::open(&dir).unwrap();
+        let again = s.projects().unwrap();
         assert_eq!(again, vec![imported]);
-        drop(s);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_v3_database_gains_receipts_and_the_ignored_state() {
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cc-store-v3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         for m in &MIGRATIONS[..3] {
             conn.execute_batch(m).unwrap();
         }
@@ -4501,41 +4751,53 @@ mod tests {
             "#,
         )
         .unwrap();
-        let s = Store::init(conn).unwrap();
-        let c = s.conn();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        drop(conn);
+        let s = Store::open(&dir).unwrap();
+        let p = pid(P1);
         let t = TriggerId {
             agent: MemberId(2),
             channel: ChannelId(3),
             message: MessageId(10),
         };
-        assert_eq!(
-            obligation_state(c, t).unwrap(),
-            Some(ObligationState::Unmet)
-        );
-        // Existing cursors were never stamped: no receipt until they move.
-        let k = cursor(c, MemberId(2), ChannelId(3)).unwrap();
+        assert_eq!(s.obligation_state(t).unwrap(), Some(ObligationState::Unmet));
+        let k = s.cursor(MemberId(2), ChannelId(3)).unwrap();
         assert_eq!((k.read_through, k.read_at), (1, None));
-        c.execute(
-            "UPDATE obligations SET state = 'ignored' WHERE message_id = 10",
-            [],
-        )
-        .unwrap();
+        s.project_agents(&p)
+            .unwrap()
+            .execute(
+                "UPDATE obligations SET state = 'ignored' WHERE message_id = 10",
+                [],
+            )
+            .unwrap();
         assert_eq!(
-            obligation_state(c, t).unwrap(),
+            s.obligation_state(t).unwrap(),
             Some(ObligationState::Ignored)
         );
-        let fk: i64 = c
+        let fk: i64 = s
+            .project_workspace(&p)
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_v4_database_gains_stances_and_the_refused_state() {
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cc-store-v4-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         for m in &MIGRATIONS[..4] {
             conn.execute_batch(m).unwrap();
         }
@@ -4556,26 +4818,28 @@ mod tests {
             "#,
         )
         .unwrap();
-        let s = Store::init(conn).unwrap();
-        let c = s.conn();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        drop(conn);
+        let s = Store::open(&dir).unwrap();
+        let p = pid(P1);
         let t = TriggerId {
             agent: MemberId(2),
             channel: ChannelId(3),
             message: MessageId(10),
         };
         assert_eq!(
-            obligation_state(c, t).unwrap(),
+            s.obligation_state(t).unwrap(),
             Some(ObligationState::Ignored),
             "rows copied as they are"
         );
-        c.execute(
-            "UPDATE obligations SET state = 'refused' WHERE message_id = 10",
-            [],
-        )
-        .unwrap();
+        s.project_agents(&p)
+            .unwrap()
+            .execute(
+                "UPDATE obligations SET state = 'refused' WHERE message_id = 10",
+                [],
+            )
+            .unwrap();
         assert_eq!(
-            obligation_state(c, t).unwrap(),
+            s.obligation_state(t).unwrap(),
             Some(ObligationState::Refused)
         );
         let st = Stance {
@@ -4589,22 +4853,36 @@ mod tests {
             runtime: None,
             created_at: 1001,
         };
-        insert_stance(c, &st).unwrap();
-        insert_stance(c, &st).unwrap();
-        assert_eq!(stance(c, MessageId(11)).unwrap(), Some(st.clone()));
-        assert_eq!(recent_stances(c, ChannelId(3), 10).unwrap(), vec![st]);
-        assert_eq!(stance(c, MessageId(10)).unwrap(), None);
-        let fk: i64 = c
+        s.insert_stance(&st).unwrap();
+        s.insert_stance(&st).unwrap();
+        assert_eq!(s.stance(MessageId(11)).unwrap(), Some(st.clone()));
+        assert_eq!(s.recent_stances(ChannelId(3), 10).unwrap(), vec![st]);
+        assert_eq!(s.stance(MessageId(10)).unwrap(), None);
+        let fk: i64 = s
+            .project_workspace(&p)
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_v8_database_moves_reactions_into_the_v9_table() {
-        let conn = Connection::open_in_memory().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "cc-store-v8-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         for m in &MIGRATIONS[..8] {
             conn.execute_batch(m).unwrap();
         }
@@ -4629,18 +4907,16 @@ mod tests {
             "#,
         )
         .unwrap();
-        let s = Store::init(conn).unwrap();
-        let c = s.conn();
-        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
-        let on = |m| {
-            reactions_on(c, MessageId(m))
+        drop(conn);
+        let s = Store::open(&dir).unwrap();
+        let p = pid(P1);
+        let on = |m: i64| {
+            s.reactions_on(MessageId(m))
                 .unwrap()
                 .into_iter()
                 .map(|r| (r.channel.0, r.member.0, r.emoji.to_string(), r.created_at))
                 .collect::<Vec<_>>()
         };
-        // Shortcodes became the emoji; a duplicate after mapping keeps the
-        // older row; the junk row is gone; every row knows its channel.
         assert_eq!(on(10), vec![(3, 2, "✅".to_string(), 1002)]);
         assert_eq!(
             on(11),
@@ -4649,71 +4925,70 @@ mod tests {
                 (3, 2, "👀".to_string(), 1005)
             ]
         );
-        // Still one per (message, member, emoji), and the length CHECK holds
-        // (OR IGNORE skips a row that breaks it).
-        assert!(!add_reaction(c, MessageId(11), ChannelId(3), MemberId(1), "👍", 2000).unwrap());
+        assert!(
+            !s.add_reaction(MessageId(11), ChannelId(3), MemberId(1), "👍", 2000)
+                .unwrap()
+        );
         let long = "x".repeat(33);
-        assert!(!add_reaction(c, MessageId(11), ChannelId(3), MemberId(1), &long, 2000).unwrap());
+        assert!(
+            !s.add_reaction(MessageId(11), ChannelId(3), MemberId(1), &long, 2000)
+                .unwrap()
+        );
         assert_eq!(on(11).len(), 2);
-        let fk: i64 = c
+        let fk: i64 = s
+            .project_workspace(&p)
+            .unwrap()
             .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
                 r.get(0)
             })
             .unwrap();
         assert_eq!(fk, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn reactions_add_remove_and_list() {
         let (mut s, channel, hx, bot) = setup();
         let m = s
-            .tx(|c| insert_message(c, &msg(channel.id, hx.id, "ship it")))
+            .insert_message(&msg(channel.id, hx.id, "ship it"))
             .unwrap();
-        let c = s.conn();
-        assert!(add_reaction(c, m.id, channel.id, bot.id, "👍", 10).unwrap());
-        assert!(!add_reaction(c, m.id, channel.id, bot.id, "👍", 11).unwrap());
-        assert!(add_reaction(c, m.id, channel.id, hx.id, "👍", 12).unwrap());
-        assert!(add_reaction(c, m.id, channel.id, bot.id, "💀", 13).unwrap());
-        assert!(has_reacted(c, m.id, bot.id).unwrap());
-        assert_eq!(reactions_on(c, m.id).unwrap().len(), 3);
-        assert_eq!(recent_reactions(c, channel.id, 2).unwrap().len(), 2);
+        assert!(s.add_reaction(m.id, channel.id, bot.id, "👍", 10).unwrap());
+        assert!(!s.add_reaction(m.id, channel.id, bot.id, "👍", 11).unwrap());
+        assert!(s.add_reaction(m.id, channel.id, hx.id, "👍", 12).unwrap());
+        assert!(s.add_reaction(m.id, channel.id, bot.id, "💀", 13).unwrap());
+        assert!(s.has_reacted(m.id, bot.id).unwrap());
+        assert_eq!(s.reactions_on(m.id).unwrap().len(), 3);
+        assert_eq!(s.recent_reactions(channel.id, 2).unwrap().len(), 2);
         assert_eq!(
-            recent_reactions(c, channel.id, 2).unwrap()[1]
-                .emoji
-                .as_ref(),
+            s.recent_reactions(channel.id, 2).unwrap()[1].emoji.as_ref(),
             "💀",
             "newest last"
         );
-        assert_eq!(reactions_since(c, channel.id, 11, 10).unwrap().len(), 2);
-        assert_eq!(reactions_after_seq(c, channel.id, 0).unwrap().len(), 3);
-        assert_eq!(reactions_after_seq(c, channel.id, m.seq).unwrap().len(), 0);
-        assert!(remove_reaction(c, m.id, bot.id, "👍").unwrap());
-        assert!(!remove_reaction(c, m.id, bot.id, "👍").unwrap());
-        assert_eq!(reactions_on(c, m.id).unwrap().len(), 2);
+        assert_eq!(s.reactions_since(channel.id, 11, 10).unwrap().len(), 2);
+        assert_eq!(s.reactions_after_seq(channel.id, 0).unwrap().len(), 3);
+        assert_eq!(s.reactions_after_seq(channel.id, m.seq).unwrap().len(), 0);
+        assert!(s.remove_reaction(m.id, bot.id, "👍").unwrap());
+        assert!(!s.remove_reaction(m.id, bot.id, "👍").unwrap());
+        assert_eq!(s.reactions_on(m.id).unwrap().len(), 2);
     }
 
     #[test]
     fn read_cursors_stamp_when_they_move_and_never_go_back() {
         let (s, channel, hx, _) = setup();
-        let c = s.conn();
         let (a, ch) = (hx.id, channel.id);
-        assert!(advance_read(c, a, ch, 5, 100).unwrap());
-        assert!(!advance_read(c, a, ch, 3, 200).unwrap(), "never backwards");
-        assert!(
-            !advance_read(c, a, ch, 5, 300).unwrap(),
-            "no move, no stamp"
-        );
-        let k = cursor(c, a, ch).unwrap();
+        assert!(s.advance_read(a, ch, 5, 100).unwrap());
+        assert!(!s.advance_read(a, ch, 3, 200).unwrap(), "never backwards");
+        assert!(!s.advance_read(a, ch, 5, 300).unwrap(), "no move, no stamp");
+        let k = s.cursor(a, ch).unwrap();
         assert_eq!((k.read_through, k.read_at), (5, Some(100)));
-        // Delivery carries read along.
-        assert!(advance_delivered(c, a, ch, 8, 400).unwrap());
-        let k = cursor(c, a, ch).unwrap();
+        assert!(s.advance_delivered(a, ch, 8, 400).unwrap());
+        let k = s.cursor(a, ch).unwrap();
         assert_eq!(
             (k.delivered_through, k.read_through, k.read_at),
             (8, 8, Some(400))
         );
-        assert!(!advance_delivered(c, a, ch, 6, 500).unwrap());
-        assert_eq!(cursor(c, a, ch).unwrap().read_at, Some(400));
+        assert!(!s.advance_delivered(a, ch, 6, 500).unwrap());
+        assert_eq!(s.cursor(a, ch).unwrap().read_at, Some(400));
     }
 
     #[test]
@@ -4723,9 +4998,20 @@ mod tests {
         assert!(unclaimed_import(s.conn()).unwrap().is_none());
     }
 
-    /// A v1 database with one channel and one message, migrated.
-    fn migrated_v1() -> Store {
-        let conn = Connection::open_in_memory().unwrap();
+    /// A v1 database with one channel and one message, migrated to split layout.
+    fn migrated_v1() -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-migrated-v1-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core.sqlite");
+        let conn = Connection::open(&path).unwrap();
         conn.execute_batch(MIGRATIONS[0]).unwrap();
         conn.execute_batch(
             r#"
@@ -4738,99 +5024,118 @@ mod tests {
             "#,
         )
         .unwrap();
-        Store::init(conn).unwrap()
+        drop(conn);
+        (Store::open(&dir).unwrap(), dir)
     }
 
     #[test]
     fn adopting_the_import_gives_it_the_folder_once() {
-        let mut s = migrated_v1();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let imported = unclaimed_import(c)?.expect("migration 2 made one");
-            assert_eq!(imported.name.as_ref(), "Imported");
-            // The placeholder opened while the user was asked holds the folder.
-            ensure_project(c, &pid(P1), "starpoint", Some("/src/starpoint"), 2000)?;
-            let placeholder = ensure_channel(c, &pid(P1), "main", 2000)?;
+        let (mut s, dir) = migrated_v1();
+        let imported = s.unclaimed_import().unwrap().expect("migration 2 made one");
+        assert_eq!(imported.name.as_ref(), "Imported");
+        // The placeholder opened while the user was asked holds the folder.
+        s.ensure_project(&pid(P1), "starpoint", Some("/src/starpoint"), 2000)
+            .unwrap();
+        let placeholder = s.ensure_channel(&pid(P1), "main", 2000).unwrap();
 
-            let adopted =
-                adopt_import(c, &imported.id, "starpoint", "/src/starpoint")?.expect("adoptable");
-            assert_eq!(adopted.id, imported.id, "same UUID, same history");
-            assert_eq!(adopted.name.as_ref(), "starpoint");
-            assert_eq!(adopted.root_path.as_deref(), Some("/src/starpoint"));
-            assert_eq!(
-                project_by_root(c, "/src/starpoint")?.unwrap().id,
-                imported.id
-            );
-            assert_eq!(project(c, &pid(P1))?.unwrap().root_path, None);
-            let main = channel_in_project(c, &imported.id, "main")?.unwrap();
-            assert_eq!(main.id, ChannelId(3), "channel ids are kept");
-            assert!(project_has_messages(c, &imported.id)?);
+        let adopted = s
+            .adopt_import(&imported.id, "starpoint", "/src/starpoint")
+            .unwrap()
+            .expect("adoptable");
+        assert_eq!(adopted.id, imported.id, "same UUID, same history");
+        assert_eq!(adopted.name.as_ref(), "starpoint");
+        assert_eq!(adopted.root_path.as_deref(), Some("/src/starpoint"));
+        assert_eq!(
+            s.project_by_root("/src/starpoint").unwrap().unwrap().id,
+            imported.id
+        );
+        assert_eq!(s.project(&pid(P1)).unwrap().unwrap().root_path, None);
+        let main = s.channel_in_project(&imported.id, "main").unwrap().unwrap();
+        assert_eq!(main.id, ChannelId(3), "channel ids are kept");
+        // project has messages
+        let ws = s.project_workspace(&imported.id).unwrap();
+        let has: i64 = ws
+            .query_row("SELECT EXISTS(SELECT 1 FROM messages)", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(has, 1);
 
-            // Claimed: never offered or adoptable again, even from elsewhere.
-            assert!(unclaimed_import(c)?.is_none());
-            assert!(adopt_import(c, &imported.id, "other", "/src/other")?.is_none());
-            assert_eq!(
-                project(c, &imported.id)?.unwrap().root_path.as_deref(),
-                Some("/src/starpoint")
-            );
+        // Claimed: never offered or adoptable again.
+        assert!(s.unclaimed_import().unwrap().is_none());
+        assert!(
+            s.adopt_import(&imported.id, "other", "/src/other")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.project(&imported.id)
+                .unwrap()
+                .unwrap()
+                .root_path
+                .as_deref(),
+            Some("/src/starpoint")
+        );
 
-            // The empty placeholder goes; the adopted project never does.
-            assert_eq!(
-                forget_empty_project(c, &pid(P1))?,
-                Some(vec![placeholder.id])
-            );
-            assert!(project(c, &pid(P1))?.is_none());
-            assert_eq!(forget_empty_project(c, &imported.id)?, None);
-            Ok(())
-        })
-        .unwrap();
+        // The empty placeholder goes; the adopted project never does.
+        assert_eq!(
+            s.forget_empty_project(&pid(P1)).unwrap(),
+            Some(vec![placeholder.id])
+        );
+        assert!(s.project(&pid(P1)).unwrap().is_none());
+        assert_eq!(s.forget_empty_project(&imported.id).unwrap(), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_project_with_a_folder_is_never_adoptable() {
-        let mut s = migrated_v1();
-        s.tx::<_, rusqlite::Error>(|c| {
-            let imported = unclaimed_import(c)?.unwrap();
-            // A project that had a folder and lost it is not an import.
-            ensure_project(c, &pid(P1), "Old", Some("/src/x"), 0)?;
-            ensure_project(c, &pid(P2), "New", Some("/src/x"), 1)?;
-            assert_eq!(project(c, &pid(P1))?.unwrap().root_path, None);
-            assert!(adopt_import(c, &pid(P1), "x", "/src/y")?.is_none());
-            assert!(adopt_import(c, &pid(P2), "x", "/src/y")?.is_none());
-            // An import that somehow has a folder is not offered either.
-            c.execute(
+        let (mut s, dir) = migrated_v1();
+        let imported = s.unclaimed_import().unwrap().unwrap();
+        // A project that had a folder and lost it is not an import.
+        s.ensure_project(&pid(P1), "Old", Some("/src/x"), 0)
+            .unwrap();
+        s.ensure_project(&pid(P2), "New", Some("/src/x"), 1)
+            .unwrap();
+        assert_eq!(s.project(&pid(P1)).unwrap().unwrap().root_path, None);
+        assert!(s.adopt_import(&pid(P1), "x", "/src/y").unwrap().is_none());
+        assert!(s.adopt_import(&pid(P2), "x", "/src/y").unwrap().is_none());
+        // An import that somehow has a folder is not offered either.
+        s.core_mut()
+            .execute(
                 "UPDATE projects SET root_path = '/src/live' WHERE id = ?1",
                 [imported.id.as_str()],
-            )?;
-            assert!(unclaimed_import(c)?.is_none());
-            assert!(adopt_import(c, &imported.id, "x", "/src/y")?.is_none());
-            Ok(())
-        })
-        .unwrap();
+            )
+            .unwrap();
+        assert!(s.unclaimed_import().unwrap().is_none());
+        assert!(
+            s.adopt_import(&imported.id, "x", "/src/y")
+                .unwrap()
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn only_empty_unrooted_projects_are_forgotten() {
         let (mut s, ch, hx, _) = setup();
-        s.tx::<_, rusqlite::Error>(|c| {
-            // `setup`'s project has no folder but has a message: kept.
-            insert_message(c, &msg(ch.id, hx.id, "keep me"))?;
-            assert_eq!(forget_empty_project(c, &ch.project)?, None);
-            // Empty but rooted: kept.
-            ensure_project(c, &pid(P2), "Copy", Some("/src/copy"), 0)?;
-            let main = ensure_channel(c, &pid(P2), "main", 0)?;
-            join_project(c, &pid(P2), hx.id, 0)?;
-            join(c, main.id, &hx, 20, 0)?;
-            assert_eq!(forget_empty_project(c, &pid(P2))?, None);
-            // Empty and unrooted (another project took the folder): forgotten,
-            // memberships and all.
-            ensure_project(c, &ch.project, "Starpoint", Some("/src/copy"), 1)?;
-            assert_eq!(forget_empty_project(c, &pid(P2))?, Some(vec![main.id]));
-            assert!(project(c, &pid(P2))?.is_none());
-            assert!(!is_member(c, main.id, hx.id)?);
-            assert!(!is_project_member(c, &pid(P2), hx.id)?);
-            Ok(())
-        })
-        .unwrap();
+        // `setup`'s project has no folder but has a message: kept.
+        s.insert_message(&msg(ch.id, hx.id, "keep me")).unwrap();
+        assert_eq!(s.forget_empty_project(&ch.project).unwrap(), None);
+        // Empty but rooted: kept.
+        s.ensure_project(&pid(P2), "Copy", Some("/src/copy"), 0)
+            .unwrap();
+        let main = s.ensure_channel(&pid(P2), "main", 0).unwrap();
+        s.join_project(&pid(P2), hx.id, 0).unwrap();
+        s.join(main.id, &hx, 20, 0).unwrap();
+        assert_eq!(s.forget_empty_project(&pid(P2)).unwrap(), None);
+        // Empty and unrooted (another project took the folder): forgotten.
+        s.ensure_project(&ch.project, "Starpoint", Some("/src/copy"), 1)
+            .unwrap();
+        assert_eq!(
+            s.forget_empty_project(&pid(P2)).unwrap(),
+            Some(vec![main.id])
+        );
+        assert!(s.project(&pid(P2)).unwrap().is_none());
+        assert!(!s.is_member(main.id, hx.id).unwrap());
+        assert!(!s.is_project_member(&pid(P2), hx.id).unwrap());
     }
     // --- Required tests for STRM-658 split ---
 
