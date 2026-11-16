@@ -30,6 +30,8 @@ CHAOS_DEMO_CHANNELS=12 cargo run --release      # add sample channels to the sid
 
 Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
+After cloning, run `git config core.hooksPath .githooks` to enable the local pre-commit (secrets scan) and pre-push (fmt + clippy) hooks.
+
 ## Layout
 
 ```

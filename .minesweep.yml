@@ -1,0 +1,12 @@
+# MineSweep configuration
+# https://github.com/hxmbl/minesweep — `minesweep init` writes a fuller template.
+
+profile: default
+
+# Gate: findings at or above this severity exit non-zero.
+# Note: a config found by walking up from the scan target is untrusted, so
+# these keys apply when you pass --config or run `minesweep trust .`.
+fail_on: high
+
+# Test files are skipped by default.
+include_test_files: false

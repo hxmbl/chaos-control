@@ -1,0 +1,43 @@
+#!/bin/sh
+# MineSweep pre-commit hook
+# minesweep-pre-commit-hook v1
+#
+# Sweeps staged files for exposed secrets before every commit.
+
+# Resolve the scanner binary. We deliberately never execute a minesweep
+# binary from inside the repository: a malicious checkout could ship one.
+if [ -n "$MINESWEEP_BIN" ] && [ -x "$MINESWEEP_BIN" ]; then
+    MINESWEEP="$MINESWEEP_BIN"
+elif command -v minesweep >/dev/null 2>&1; then
+    MINESWEEP="$(command -v minesweep)"
+else
+    if [ "$MINESWEEP_HOOK_ALLOW_MISSING" = "1" ]; then
+        echo "minesweep: not found on PATH; skipping pre-commit scan (MINESWEEP_HOOK_ALLOW_MISSING=1)" >&2
+        exit 0
+    fi
+    echo "minesweep: not found on PATH - commit blocked (fail-closed)." >&2
+    echo "  install:      brew install hxmbl/tap/minesweep" >&2
+    echo "  or point at:  export MINESWEEP_BIN=/path/to/minesweep" >&2
+    echo "  soft-skip:    export MINESWEEP_HOOK_ALLOW_MISSING=1" >&2
+    exit 1
+fi
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR)
+[ -z "$STAGED_FILES" ] && exit 0
+
+echo "minesweep: sweeping staged files for exposed secrets..."
+
+# Scan the staged index directly so staged-but-deleted or renamed content is
+# still checked. --fail-on high matches .minesweep.yml; the config file's
+# fail_on is ignored without `minesweep trust`, so pass it explicitly.
+"$MINESWEEP" --fail-on high --no-pager --color never --staged .
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo ""
+    echo "minesweep: suspected secrets in staged files — defuse them before committing."
+    echo "To bypass: git commit --no-verify"
+    exit 1
+fi
+
+exit 0

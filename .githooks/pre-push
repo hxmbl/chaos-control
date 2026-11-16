@@ -1,0 +1,11 @@
+#!/bin/sh
+# Chaos Control pre-push hook: formatting and lint must be clean before push.
+set -e
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-push: cargo fmt --all --check"
+cargo fmt --all --check
+
+echo "pre-push: cargo clippy --workspace --all-targets --locked -- -D warnings"
+cargo clippy --workspace --all-targets --locked -- -D warnings
