@@ -13,17 +13,11 @@ use serde::{Deserialize, Serialize};
 
 const FILE: &str = "profile.json";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     /// Display name shown in chat/mentions/UI. Empty means not set.
     #[serde(default)]
     pub name: String,
-}
-
-impl Default for Profile {
-    fn default() -> Self {
-        Self { name: String::new() }
-    }
 }
 
 impl Profile {

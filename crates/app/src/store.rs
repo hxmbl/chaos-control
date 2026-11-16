@@ -375,6 +375,7 @@ impl EventEmitter<StoreEvent> for ChatStore {}
 impl ChatStore {
     /// Current active project-context generation. Async results must match this
     /// generation before being applied to avoid stale cross-project writes.
+    #[allow(dead_code)]
     pub fn project_generation(&self) -> u64 {
         self.project_generation
     }
@@ -833,10 +834,10 @@ impl ChatStore {
                     if !store.is_current_generation(generation) {
                         return;
                     }
-                    if let Some(a) = &mut store.core {
-                        if a.generation == generation {
-                            a.agent_ids.extend(ids);
-                        }
+                    if let Some(a) = &mut store.core
+                        && a.generation == generation
+                    {
+                        a.agent_ids.extend(ids);
                     }
                 });
                 if ok.is_err() {
@@ -850,7 +851,11 @@ impl ChatStore {
                         if !store.is_current_generation(generation) {
                             return;
                         }
-                        if store.core.as_ref().is_none_or(|a| a.generation != generation) {
+                        if store
+                            .core
+                            .as_ref()
+                            .is_none_or(|a| a.generation != generation)
+                        {
                             return;
                         }
                         for m in history {
@@ -865,7 +870,11 @@ impl ChatStore {
                             if !store.is_current_generation(generation) {
                                 return;
                             }
-                            if store.core.as_ref().is_none_or(|a| a.generation != generation) {
+                            if store
+                                .core
+                                .as_ref()
+                                .is_none_or(|a| a.generation != generation)
+                            {
                                 return;
                             }
                             store.load_reactions(reactions, cx)
@@ -882,10 +891,11 @@ impl ChatStore {
                     if !store.is_current_generation(generation) {
                         return;
                     }
-                    if let Some(a) = &mut store.core {
-                        if a.generation == generation && a.link.main() == main {
-                            a.names = members.into_iter().map(|m| (m.id, m.name)).collect();
-                        }
+                    if let Some(a) = &mut store.core
+                        && a.generation == generation
+                        && a.link.main() == main
+                    {
+                        a.names = members.into_iter().map(|m| (m.id, m.name)).collect();
                     }
                 });
                 if ok.is_err() {
@@ -897,7 +907,11 @@ impl ChatStore {
                     if !store.is_current_generation(generation) {
                         return;
                     }
-                    if store.core.as_ref().is_none_or(|a| a.generation != generation) {
+                    if store
+                        .core
+                        .as_ref()
+                        .is_none_or(|a| a.generation != generation)
+                    {
                         return;
                     }
                     for r in receipts {
@@ -1183,7 +1197,12 @@ impl ChatStore {
         self.load_ping_answers_for(generation, project, cx);
     }
 
-    fn load_ping_answers_for(&mut self, generation: u64, project: ct::ProjectId, cx: &mut Context<Self>) {
+    fn load_ping_answers_for(
+        &mut self,
+        generation: u64,
+        project: ct::ProjectId,
+        cx: &mut Context<Self>,
+    ) {
         let Some(attached) = &self.core else {
             return;
         };
@@ -1310,7 +1329,12 @@ impl ChatStore {
         self.load_nicknames_for(generation, project, cx);
     }
 
-    fn load_nicknames_for(&mut self, generation: u64, project: ct::ProjectId, cx: &mut Context<Self>) {
+    fn load_nicknames_for(
+        &mut self,
+        generation: u64,
+        project: ct::ProjectId,
+        cx: &mut Context<Self>,
+    ) {
         let Some(attached) = &self.core else {
             return;
         };
@@ -1841,7 +1865,8 @@ impl ChatStore {
                         return;
                     }
                     if store.core.as_ref().is_none_or(|a| {
-                        a.generation != generation || a.link.open.project.id.to_string() != project_id
+                        a.generation != generation
+                            || a.link.open.project.id.to_string() != project_id
                     }) {
                         return;
                     }
@@ -1873,7 +1898,8 @@ impl ChatStore {
                         return;
                     }
                     if store.core.as_ref().is_none_or(|a| {
-                        a.generation != generation || a.link.open.project.id.to_string() != project_id
+                        a.generation != generation
+                            || a.link.open.project.id.to_string() != project_id
                     }) {
                         return;
                     }
@@ -1909,7 +1935,11 @@ impl ChatStore {
     /// agent/session/message/reaction/setting state from the previous project can
     /// leak into the new context. Bumps the project generation so stale async
     /// results from the previous context are ignored.
-    fn opened(&mut self, open: OpenProject, cx: &mut Context<Self>) -> (u64, ct::ChannelId, String) {
+    fn opened(
+        &mut self,
+        open: OpenProject,
+        cx: &mut Context<Self>,
+    ) -> (u64, ct::ChannelId, String) {
         let Some(mut attached) = self.core.take() else {
             let generation = self.bump_project_generation();
             return (generation, ct::ChannelId(0), String::new());
