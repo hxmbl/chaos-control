@@ -5,13 +5,13 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::PathBuf,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use chaos_core::emoji::{self, EmojiMatch};
 use gpui::{
-    Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent,
-    SharedString, StyledText, Subscription, TextRun, TextStyle, Window, actions, div, linear,
+    Animation, AnimationExt, Context, Entity, Focusable, Hsla, KeyBinding, KeyDownEvent, Pixels,
+    SharedString, StyledText, Subscription, Task, TextRun, TextStyle, Window, actions, div, linear,
     prelude::*, px,
 };
 use model::{Id, ReplyRef, pane::author_name};
@@ -75,44 +75,81 @@ fn sent_body(text: &str) -> &str {
     text.trim()
 }
 
-fn working_indicator_label(agents: &[(std::sync::Arc<str>, &'static str)]) -> Option<String> {
+/// Verbs cycled in the working indicator (last word only).
+const WORKING_WORDS: &[&str] = &[
+    "working",
+    "pondering",
+    "thinking",
+    "cooking",
+    "brewing",
+    "tinkering",
+    "crafting",
+    "scheming",
+    "mulling",
+    "noodling",
+];
+
+const WORKING_WORD_INTERVAL: Duration = Duration::from_secs(5);
+
+fn working_indicator_parts(
+    agents: &[(std::sync::Arc<str>, &'static str)],
+) -> Option<(String, &'static str)> {
     match agents {
         [] => None,
-        [(name, verb)] => Some(format!("{name} is {verb}…")),
-        [(a, _), (b, _)] => Some(format!("{a} and {b} are working…")),
+        [(name, _)] => Some((format!("{name} is "), "…")),
+        [(a, _), (b, _)] => Some((format!("{a} and {b} are "), "…")),
         [all @ .., last] => {
             let names = all
                 .iter()
                 .map(|(n, _)| n.as_ref())
                 .collect::<Vec<_>>()
                 .join(", ");
-            Some(format!("{names}, and {} are working…", last.0))
+            Some((format!("{names}, and {} are ", last.0), "…"))
         }
     }
 }
 
-fn working_indicator_text(
+fn working_word_width(word: &str, style: &TextStyle, window: &mut Window) -> Pixels {
+    let font_size = text::SMALL.size;
+    let runs = [style.to_run(word.len())];
+    window
+        .text_system()
+        .shape_line(SharedString::from(word.to_string()), font_size, &runs, None)
+        .width
+        .ceil()
+}
+
+fn working_indicator_crossfade(cycle: f32) -> (f32, f32) {
+    let t = ((cycle - 0.9) / 0.1).clamp(0.0, 1.0);
+    let eased = t * t * (3.0 - 2.0 * t);
+    (1.0 - eased, eased)
+}
+
+fn working_shimmer_text(
     label: &str,
-    delta: f32,
+    shimmer_delta: f32,
     base_style: &TextStyle,
     base: Hsla,
     bright: Hsla,
+    global_offset: usize,
+    global_total: usize,
 ) -> StyledText {
     let label_s: SharedString = label.to_string().into();
     let chars: Vec<(usize, char)> = label_s.char_indices().collect();
     if chars.is_empty() {
         return StyledText::new(label_s);
     }
-    let n = chars.len() as f32;
-    let center = -0.25 + delta * 1.5;
+    let total = global_total.max(1) as f32;
+    let center = -0.25 + shimmer_delta * 1.5;
     let mut runs: Vec<TextRun> = Vec::with_capacity(chars.len());
     for (i, &(byte_ix, _ch)) in chars.iter().enumerate() {
         let next = chars.get(i + 1).map(|(ix, _)| *ix).unwrap_or(label_s.len());
         let len = next - byte_ix;
-        let p = (i as f32 + 0.5) / n;
+        // Global position so shimmer sweeps continuously across prefix + word + suffix.
+        let p = ((global_offset + i) as f32 + 0.5) / total;
         let d = (p - center).abs();
         let highlight = (1.0 - (d / 0.18).min(1.0)).powf(1.8);
-        let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (delta - 0.5)).abs());
+        let pulse = 0.55 + 0.45 * (1.0 - (2.0 * (shimmer_delta - 0.5)).abs());
         let mix = (highlight * 0.85 + pulse * 0.15).clamp(0.0, 1.0);
         let mut color = base;
         color.h = base.h + (bright.h - base.h) * mix;
@@ -129,6 +166,92 @@ fn working_indicator_text(
         });
     }
     StyledText::new(label_s).with_runs(runs)
+}
+
+/// Small, smooth word-only opacity transition with a continuous global shimmer.
+#[allow(clippy::too_many_arguments)]
+fn working_indicator_element(
+    prefix: &str,
+    suffix: &str,
+    current_word: &str,
+    next_word: &str,
+    cycle: f32,
+    shimmer: f32,
+    base_style: &TextStyle,
+    base: Hsla,
+    bright: Hsla,
+    slot_width: Pixels,
+) -> impl IntoElement {
+    let (current_alpha, next_alpha) = working_indicator_crossfade(cycle);
+
+    let prefix_chars = prefix.chars().count();
+    let current_chars = current_word.chars().count();
+    let next_chars = next_word.chars().count();
+    let total_current = prefix_chars + current_chars + suffix.chars().count();
+    let total_next = prefix_chars + next_chars + suffix.chars().count();
+    let offset = prefix_chars;
+
+    let prefix_el =
+        working_shimmer_text(prefix, shimmer, base_style, base, bright, 0, total_current);
+    let suffix_el = working_shimmer_text(
+        suffix,
+        shimmer,
+        base_style,
+        base,
+        bright,
+        prefix_chars + current_chars,
+        total_current,
+    );
+
+    let current_el = working_shimmer_text(
+        current_word,
+        shimmer,
+        base_style,
+        base,
+        bright,
+        offset,
+        total_current,
+    );
+    let next_el = working_shimmer_text(
+        next_word, shimmer, base_style, base, bright, offset, total_next,
+    );
+
+    let slot = div()
+        .relative()
+        .w(slot_width)
+        .flex_none()
+        // Keep intrinsic height/baseline from text while width is fixed to the widest verb.
+        .child(div().opacity(0.0).child(StyledText::new(SharedString::from(
+            current_word.to_string(),
+        ))))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .opacity(current_alpha)
+                .child(current_el),
+        )
+        .when(next_alpha > 0.001, |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .opacity(next_alpha)
+                    .child(next_el),
+            )
+        });
+
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_baseline()
+        .child(div().whitespace_normal().child(prefix_el))
+        .child(slot)
+        .child(div().whitespace_normal().child(suffix_el))
+        .into_any_element()
 }
 
 fn echo_matches_in(
@@ -479,6 +602,10 @@ pub struct Composer {
     mention_usage: HashMap<String, UsageStat>,
     emoji_usage: HashMap<String, UsageStat>,
     usage_path: Option<PathBuf>,
+    working_word_index: usize,
+    working_word_changed_at: Option<Instant>,
+    working_timer_nonce: u64,
+    _working_timer: Option<Task<()>>,
     _subscriptions: [Subscription; 4],
 }
 
@@ -669,7 +796,7 @@ impl Composer {
                 TextInputEvent::Changed => this.refresh_suggestions(cx),
             }),
             cx.observe(&input, |this, _, cx| this.refresh_suggestions(cx)),
-            cx.observe(&store, |_, _, cx| cx.notify()),
+            cx.observe(&store, |this, _, cx| this.sync_working_indicator(cx)),
             cx.subscribe(&store, |this, store, event, cx| match event {
                 StoreEvent::Selected => {
                     let next = store.read(cx).selected();
@@ -721,7 +848,7 @@ impl Composer {
             }),
         ];
         let (mention_usage, emoji_usage) = load_suggestion_usage(usage_path.as_deref());
-        Self {
+        let mut this = Self {
             store,
             input,
             channel,
@@ -733,8 +860,60 @@ impl Composer {
             mention_usage,
             emoji_usage,
             usage_path,
+            working_word_index: 0,
+            working_word_changed_at: None,
+            working_timer_nonce: 0,
+            _working_timer: None,
             _subscriptions: subscriptions,
+        };
+        this.sync_working_indicator(cx);
+        this
+    }
+
+    fn has_working_agents(&self, cx: &Context<Self>) -> bool {
+        let store = self.store.read(cx);
+        !store.working_agents(store.selected()).is_empty()
+    }
+
+    fn sync_working_indicator(&mut self, cx: &mut Context<Self>) {
+        if self.has_working_agents(cx) {
+            if self._working_timer.is_none() {
+                self.working_word_index = 0;
+                self.working_word_changed_at = Some(Instant::now());
+                self.start_working_timer(cx);
+            }
+            cx.notify();
+        } else {
+            self.working_timer_nonce = self.working_timer_nonce.wrapping_add(1);
+            self._working_timer = None;
+            self.working_word_index = 0;
+            self.working_word_changed_at = None;
         }
+    }
+
+    fn start_working_timer(&mut self, cx: &mut Context<Self>) {
+        self.working_timer_nonce = self.working_timer_nonce.wrapping_add(1);
+        let timer_nonce = self.working_timer_nonce;
+        self._working_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(WORKING_WORD_INTERVAL).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if this.working_timer_nonce != timer_nonce || !this.has_working_agents(cx) {
+                            return false;
+                        }
+                        this.working_word_index =
+                            (this.working_word_index + 1) % WORKING_WORDS.len();
+                        this.working_word_changed_at = Some(Instant::now());
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        }));
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -785,6 +964,7 @@ impl Composer {
         self.mention = None;
         self.emoji = None;
         self.refresh_suggestions(cx);
+        self.sync_working_indicator(cx);
         cx.notify();
     }
 
@@ -1337,9 +1517,14 @@ impl Render for Composer {
         let focused = self.input.focus_handle(cx).contains_focused(window, cx);
         let hover = t.hover;
 
-        let working = {
+        let working_agents = {
             let store = self.store.read(cx);
-            working_indicator_label(&store.working_agents(store.selected()))
+            let agents = store.working_agents(store.selected());
+            if agents.is_empty() {
+                None
+            } else {
+                Some(agents)
+            }
         };
 
         let box_el = div()
@@ -1438,29 +1623,53 @@ impl Render for Composer {
                     .mb(space::X1)
                     .child(el)
             }))
-            .when_some(working, |d, label| {
+            .when_some(working_agents, |d, agents| {
+                let Some((prefix, suffix)) = working_indicator_parts(&agents) else {
+                    return d;
+                };
                 let base = t.muted;
                 let bright = t.ink;
+                let idx = self.working_word_index;
+                let current = WORKING_WORDS[idx % WORKING_WORDS.len()];
+                let next = WORKING_WORDS[(idx + 1) % WORKING_WORDS.len()];
+                let slot_width = WORKING_WORDS.iter().fold(px(0.), |w, word| {
+                    w.max(working_word_width(word, &base_style, window))
+                });
+                let changed_at = self.working_word_changed_at;
                 d.child(
                     div()
                         .px(space::X2)
                         .py(space::X0_5)
                         .type_style(text::SMALL)
-                        .child(div().id("working-indicator").with_animation(
-                            "working-indicator-shimmer",
-                            Animation::new(Duration::from_millis(1800))
-                                .repeat()
-                                .with_easing(linear),
-                            move |el, delta| {
-                                el.child(working_indicator_text(
-                                    &label,
-                                    delta,
-                                    &base_style,
-                                    base,
-                                    bright,
-                                ))
-                            },
-                        )),
+                        .child(
+                            div().id("working-indicator").with_animation(
+                                "working-indicator-shimmer",
+                                Animation::new(Duration::from_millis(1800))
+                                    .repeat()
+                                    .with_easing(linear),
+                                move |el, shimmer| {
+                                    let cycle = changed_at
+                                        .map(|t| {
+                                            (t.elapsed().as_secs_f32()
+                                                / WORKING_WORD_INTERVAL.as_secs_f32())
+                                            .clamp(0.0, 1.0)
+                                        })
+                                        .unwrap_or(0.0);
+                                    el.child(working_indicator_element(
+                                        &prefix,
+                                        suffix,
+                                        current,
+                                        next,
+                                        cycle,
+                                        shimmer,
+                                        &base_style,
+                                        base,
+                                        bright,
+                                        slot_width,
+                                    ))
+                                },
+                            ),
+                        ),
                 )
             })
             .child(box_el)
@@ -1917,5 +2126,61 @@ mod tests {
         assert_eq!(emoji_query("http://x", 7), None);
         assert_eq!(emoji_query(":fire:", 6), Some((0..6, "fire".to_string())));
         assert_eq!(emoji_query("(:sm", 4), Some((1..4, "sm".to_string())));
+    }
+
+    #[test]
+    fn working_indicator_cycles_every_five_seconds_through_word_bank() {
+        assert_eq!(WORKING_WORD_INTERVAL, Duration::from_secs(5));
+        for (i, word) in WORKING_WORDS.iter().enumerate() {
+            assert_eq!(
+                WORKING_WORDS[(i + 1) % WORKING_WORDS.len()],
+                match *word {
+                    "working" => "pondering",
+                    "pondering" => "thinking",
+                    "thinking" => "cooking",
+                    "cooking" => "brewing",
+                    "brewing" => "tinkering",
+                    "tinkering" => "crafting",
+                    "crafting" => "scheming",
+                    "scheming" => "mulling",
+                    "mulling" => "noodling",
+                    "noodling" => "working",
+                    _ => panic!("unexpected word"),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn working_indicator_crossfades_only_during_the_end_of_each_cycle() {
+        assert_eq!(working_indicator_crossfade(0.9), (1.0, 0.0));
+        assert_eq!(working_indicator_crossfade(1.0), (0.0, 1.0));
+        let (current, next) = working_indicator_crossfade(0.95);
+        assert!((current - 0.5).abs() < 0.001);
+        assert!((next - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn working_indicator_parts_preserve_surrounding_text() {
+        let a: std::sync::Arc<str> = "Codex".into();
+        let b: std::sync::Arc<str> = "Claude".into();
+        let c: std::sync::Arc<str> = "Gemini".into();
+        let one = vec![(a.clone(), "working")];
+        let two = vec![(a.clone(), "working"), (b.clone(), "working")];
+        let many = vec![(a, "working"), (b, "working"), (c, "working")];
+
+        let (p, s) = working_indicator_parts(&one).unwrap();
+        assert_eq!(p, "Codex is ");
+        assert_eq!(s, "…");
+
+        let (p, s) = working_indicator_parts(&two).unwrap();
+        assert_eq!(p, "Codex and Claude are ");
+        assert_eq!(s, "…");
+
+        let (p, s) = working_indicator_parts(&many).unwrap();
+        assert_eq!(p, "Codex, Claude, and Gemini are ");
+        assert_eq!(s, "…");
+
+        assert!(working_indicator_parts(&[]).is_none());
     }
 }
