@@ -203,9 +203,11 @@ fn snippet(body: &str, at: usize) -> Arc<str> {
         .checked_sub(SNIPPET_LEAD)
         .map_or(0, |ix| before[ix].0);
     if start > 0
-        && let Some(space) = body[start..at].find(char::is_whitespace)
+        && let Some((space, ch)) = body[start..at]
+            .char_indices()
+            .find(|(_, c)| c.is_whitespace())
     {
-        start += space + 1;
+        start += space + ch.len_utf8();
     }
     let text: String = body[start..]
         .chars()
