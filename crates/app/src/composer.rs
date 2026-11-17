@@ -2314,8 +2314,9 @@ mod tests {
             .iter()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), WORKING_WORDS.len());
+        let last_index = WORKING_WORDS.len() - 1;
         assert_eq!(
-            WORKING_WORDS[(WORKING_WORDS.len() - 1) % WORKING_WORDS.len()],
+            WORKING_WORDS[(last_index + 1) % WORKING_WORDS.len()],
             "accomplishing"
         );
     }
