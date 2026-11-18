@@ -14,8 +14,8 @@
 //!   batch per agent x channel (partial unique indexes).
 //! - `obligations` has the trigger's key as its primary key: at most one reply
 //!   obligation per trigger.
-//! - At most one fallback reply per (agent, trigger message) (partial unique
-//!   index on `messages`).
+//! - At most one legacy fallback reply per (agent, trigger message) (partial
+//!   unique index on `messages`).
 //! - Every channel belongs to a project; names and `::N` ordinals are unique
 //!   within it (`UNIQUE(project_id, name)`, `UNIQUE(project_id, ordinal)`).
 //! - Joining a channel needs membership of its project: a trigger on

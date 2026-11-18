@@ -4,15 +4,17 @@
 //! - **Hop budget.** A message's `hop` is 0 for a human. An agent's post gets
 //!   `1 + ` the hop of what woke it, where anything older than the channel's
 //!   newest human message counts as 0. So any human message resets the chain.
-//!   A mention in a message with `hop > max_hops` wakes nobody (it stays as
-//!   unread context and the target shows "hop limit" presence).
+//!   An agent-authored message with `hop > max_hops` creates no triggers (the
+//!   targets show "hop limit" presence).
 //! - **Ping-pong damper.** Counts agent-to-agent wakes between the same two
 //!   agents that alternate direction. The `max_alternations + 1`-th is
 //!   suppressed, the pair is paused and one system line is posted. Plain human
 //!   chatter does not reset it (it does reset hops, which is exactly the case
 //!   the damper exists for); a human addressing either agent does.
-//! - **Rate limit.** A token bucket per agent per channel on `chat_send`.
-//! - **No `@everyone` for agents.** Stripped from agent posts at parse time.
+//! - **Rate limit.** A token bucket per agent per channel on agent posts.
+//! - **No broadcast tokens for agents.** `@everyone`/`@here`/`@channel` from an
+//!   agent are ignored with a note; a human's use wakes every agent without an
+//!   obligation.
 
 use std::collections::HashMap;
 

@@ -134,8 +134,8 @@ pub enum Origin {
     Composer,
     /// Posted by an agent through `chat_send`.
     ChatTool,
-    /// The runtime posted an agent's final turn text because a reply it owed was
-    /// still unmet when the turn ended (see `docs/agents.md`).
+    /// Legacy: the removed final-text fallback posted an agent's last turn text
+    /// as its reply. Kept so old rows still parse; nothing writes it now.
     Fallback,
     /// A runtime notice ("Pausing @a and @b ..."). Never wakes anyone.
     System,
@@ -303,15 +303,15 @@ pub enum ObligationState {
     Open,
     /// An explicit `chat_send` or a qualifying reaction answered it.
     Satisfied,
-    /// The runtime posted the final turn text as the reply.
+    /// Legacy: the removed final-text fallback answered it.
     Fallback,
-    /// The turn was cancelled, refused or failed with nothing posted.
+    /// The turn ended before completing while the obligation was still open.
     Unmet,
     /// The agent finished its turn without replying or reacting: it read the
     /// ping and chose to let it go. Legitimate, never retried, not owed.
     Ignored,
     /// The agent said no (`chat_refuse`). A legitimate answer: never a
-    /// failure, never retried, no fallback reply.
+    /// failure and never retried.
     Refused,
 }
 

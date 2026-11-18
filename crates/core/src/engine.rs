@@ -5,7 +5,7 @@
 //! (dispatch a batch, close a session, tell the UI). Nothing here does I/O
 //! beyond SQLite, so it can be driven by a fake clock and a fake transport.
 //!
-//! The rules (triggers, batches, acceptance, obligations, fallback) are written
+//! The rules (triggers, batches, acceptance, obligations) are written
 //! up in `docs/agents.md`; the comments here point at the code that enforces them.
 
 use std::{collections::HashMap, sync::Arc};

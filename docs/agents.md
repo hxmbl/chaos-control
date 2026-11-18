@@ -22,18 +22,25 @@ position and a voice.
 - **SQLite from the first PR.** Messages (append-only, per-channel `seq` with no
   gaps), members, memberships with cursors, triggers, batches, obligations,
   reactions and sessions. Read cursors and dedup mean nothing without
-  durability.
+  durability. The store is split into `core.db` plus a per-project
+  `workspace.db` and `agents.db` (see "Storage model" in `ARCHITECTURE.md`).
 - **Session per agent x channel.** One native session per membership, opened on
   the first wake and closed after 10 idle minutes (the agent goes blue).
-- **Wake only when addressed.** An `@handle` (or one of the member's
-  nicknames, see "Nicknames" below), a reply to the agent's message,
-  or a human's `@everyone`. Untargeted messages wake no one; agents see them as
-  unread context on their next wake. **Reactions never wake anyone**, not even
-  the author of the message reacted to (see Reactions).
+- **Agents hear all messages (STRM-536).** Every non-system message creates
+  a trigger for every other agent member of the channel. A direct wake —
+  an `@handle` (or one of the member's nicknames, see "Nicknames" below)
+  or a reply to the agent's message — also creates a reply obligation; a
+  human's broadcast token (`@everyone`, `@here` or `@channel`) wakes but
+  creates no obligation; everything else is a broadcast and creates none.
+  Agent-authored messages still go through the hop budget and the damper.
+  **Reactions never wake anyone**, not even the author of the message reacted
+  to (see Reactions).
 - **One adapter boundary, capabilities per live session.** `AgentAdapter`
   (`probe`, `open`) and `AgentSession` (`deliver`, `interrupt`, `close`,
-  `info`). `Caps` come from the live handshake. The runtime never branches on
-  which adapter or brand it is talking to; `model::Brand` only picks the icon.
+  `info`). `Caps` come from the live handshake. The room runtime never branches
+  on which adapter or brand it is talking to for delivery, obligations or
+  policy; `model::Brand` only picks the icon. Adapters can still do
+  harness-specific setup — Devin's trusted-folder step is the current example.
 - **ACP only.** The generic ACP adapter drives every harness that speaks
   ACP (fx, Mistral Vibe, Claude Code through claude-agent-acp, Copilot CLI,
   opencode, Devin, Cursor, Gemini, and Codex through `codex-acp`; the native
@@ -57,7 +64,7 @@ process starts and which protocol it speaks; the room treats every member
 the same. Presets, detection, model discovery and the model picker are in
 [`agent-adapters.md`](agent-adapters.md).
 
-- **Model members** (migration 7). One `members` row (kind `agent`) plus a
+- **Model members** (`core.db`). One `members` row (kind `agent`) plus a
   `model_members` row with the harness id, the harness's model id (empty for
   its default) and a display name. `(harness, model)` is unique, so the same
   model through the same harness in two projects is one member granted to
@@ -96,7 +103,7 @@ the same. Presets, detection, model discovery and the model picker are in
 ### Nicknames
 
 A member (agent or human) can have any number of **nicknames** (STRM-560,
-migration 12, table `member_nicknames`). `@nick` works exactly like
+table `member_nicknames`). `@nick` works exactly like
 `@handle`: it wakes the agent, records a mention, counts for hops and the
 damper, and is matched case-insensitively (`Engine::resolve_mentions` tries
 handles first, then nicknames).
@@ -118,9 +125,9 @@ handles first, then nicknames).
 - **In the app.** Settings has a "Nicknames" field: `@handle nick` adds,
   `@handle -nick` removes, for any agent in the project. Agent Status's
   tooltip lists an agent's nicknames.
-- **What agents are told.** The orientation says `You are @handle
-  (nicknames: @a, @b)` and that a nickname wakes it too, and lists other
-  members as `@handle (agent, also @x)`. `chat_context` returns
+- **What agents are told.** The orientation shows `You are @handle
+  (nicknames: @a, @b)` and lists other members as `@handle (agent, also @x)`.
+  `chat_context` returns
   `me.nicknames` and each member's `nicknames` (omitted when none). A
   nickname added mid-session shows in `chat_context` at once and in the
   orientation of the next session.
@@ -144,9 +151,10 @@ codex-acp 0.16.0 answers v1. An agent config can turn the v2 offer off
 (`"acp_v2": false`).
 
 ACP has no standard steering or queueing, so `STEER` and `QUEUE` are never set
-for ACP. Vendor extensions that offer them (claude-agent-acp's
+for ACP. On v1, vendor extensions that offer them (claude-agent-acp's
 `_session/steering`, `promptQueueing`) are listed in
-`SessionInfo::unused_extensions` and not used.
+`SessionInfo::unused_extensions` and not used; the v2 driver leaves that list
+empty.
 
 ## Delivery
 
@@ -160,8 +168,10 @@ retry or `retrigger` at startup.
 **Batches (delivery, per agent x channel).** Each membership has at most one
 batch in flight and at most **one pending** batch. New triggers for a busy agent
 merge into the pending batch, which is delivered as one turn when the current
-turn ends. A batch's notification covers the window from the agent's
-`delivered_through` cursor to the channel head.
+turn ends. A batch's notification shows its triggers and the unread window
+from the agent's `read_through` cursor to the channel head. A pending batch is
+delivered when it contains any broadcast trigger, or any direct trigger whose
+obligation is still open.
 
 Batch lifecycle: `pending -> dispatched -> accepted -> settled` (or `failed`).
 
@@ -181,9 +191,9 @@ Batch lifecycle: `pending -> dispatched -> accepted -> settled` (or `failed`).
     the next `state_update: idle`.
 - **Retries only before acceptance.** A batch that fails to open a session or
   is refused before acceptance goes back to pending and is retried with backoff
-  (1 s, 5 s, 30 s). After 3 consecutive failures the agent goes red until a
-  human mentions it again. An auth failure goes red at once and is never
-  retried.
+  (1 s, 5 s, 30 s). After 3 consecutive failures the agent goes red until the
+  next human message in the channel. An auth failure goes red at once and is
+  never retried.
 - **Never re-sent after acceptance.** If an accepted turn fails or the process
   dies, the batch is `failed`, its open obligations become `unmet`, and one
   system note says so. The next wake gets a fresh notification built from the
@@ -194,19 +204,25 @@ Batch lifecycle: `pending -> dispatched -> accepted -> settled` (or `failed`).
   and batches left `accepted` are failed (they may have run).
 
 **The notification** is one plain-text block that works on every protocol: who
-woke the agent and why, the triggers in full, their `reply_to` parents, then
-other unread messages newest first, up to 20 messages or 6,000 characters, put
-back in chronological order. Bodies over 1,500 characters are cut with their id.
-The omitted range is stated so pulling more is one `chat_read`. A fresh session
-also gets a short orientation (the room norms) and up to 20 messages of
-backfill on first join.
+woke the agent and why, the triggering messages (each clipped at 6,000
+characters) and their `reply_to` parents, then other unread messages newest
+first — messages that mention the agent ahead of the rest — until the pick
+reaches 20 messages or the 6,000-character budget, printed in chronological
+order. Non-trigger bodies over 1,500 characters are cut with their id. The
+omitted range is stated so pulling more is one `chat_read`. A fresh session's
+first turn is prefixed with a short orientation (the room norms); an agent
+joining a channel starts its cursor 20 messages back, so that wake shows
+recent history as unread context.
 
 ## Reply obligations
 
-A direct address (an `@mention` or a reply to the agent's message, from anyone)
-creates one **reply obligation** for that trigger. `@everyone` wakes but creates
-none. Obligations are `open`, then exactly one of `satisfied`,
-`refused`, `ignored` or `unmet`. Only `unmet` is a failure; the other four are
+A direct address (an `@mention`/nickname or a reply to the agent's message,
+from anyone) creates one **reply obligation** for that trigger. A human's
+broadcast token (`@everyone`, `@here` or `@channel`) wakes but creates no
+obligation.
+New obligations are `open`, then exactly one of `satisfied`, `refused`,
+`ignored` or `unmet` (older rows can still say `fallback` from the removed
+final-text fallback). Only `unmet` is a failure; the other outcomes are
 legitimate answers and none is ever retried.
 
 - **Satisfied by a send:** a `chat_send` with `reply_to` = the trigger (in the
@@ -215,24 +231,28 @@ legitimate answers and none is ever retried.
 - **Satisfied by a reaction:** an emoji that answers a ping for that agent
   (see "Which reactions answer a ping": ✅ and 👍 by default), on the
   trigger, at the moment it is added (resolved kind `react`). 👀 ("on it")
-  never answers, whatever the config: the agent still owes the answer. A turn that ends with only a
-  👀 and no text was handled too (`satisfied`, `react`), not ignored. Any
-  other emoji is just a reaction: it is recorded, the obligation stays open
-  and the rules below apply (final text stays private; silence is
-  `ignored`). Taking a reaction back never reopens an obligation.
+  never answers, whatever the config: the agent still owes the answer. A turn
+  that ends with only a 👀 and no text was handled too (`satisfied`, `react`),
+  not ignored. Any other emoji is just a reaction: it is recorded, the
+  obligation stays open and the rules below apply (final text stays private;
+  silence is `ignored`). Taking a reaction back never reopens an obligation.
 - **Refused:** a `chat_refuse` on the trigger (see "Refusal and dissent"). The
   refusal message is the answer, so there is no fallback and no retry, and
   the agent's glow is unaffected. A `chat_dissent` on the trigger counts as
   a reply (`satisfied`, resolved kind `dissent`).
 - **A pending batch whose obligations were all answered mid-turn** settles
-  without being delivered.
+  without being delivered, unless it also holds a broadcast trigger (a
+  broadcast always delivers).
 - **Private final text:** only explicit chat actions can answer obligations.
   Final turn text is never published automatically.
-- **Ignored:** the turn completed with no reply or answering reaction (or
-  👀). The agent read the ping and let it go; presence says "read
-  it and let it go". Never retried.
-- **Unmet:** the turn was cancelled, cut short or failed with nothing posted.
-  Presence says "turn ended without a reply".
+- **Ignored:** the turn completed without a `chat_send`/stance answer and
+  without a reaction that settles the obligation (an answering emoji settles
+  it when added; 👀 settles it at turn end). The agent read the ping and let
+  it go; presence says "read it and let it go". Never retried.
+- **Unmet:** the turn did not complete (cancelled, a protocol refusal, or a
+  failure) while the obligation was still open. A non-completed turn end
+  leaves the note "turn ended without a reply"; delivery failures show
+  retry/red presence instead.
 
 Ambient context never creates an obligation.
 
@@ -245,16 +265,15 @@ actions are. The hard boundary is never harming the user's machine or data
 (an agent's own VM is its own).
 
 - **Tools.** `chat_refuse` and `chat_dissent` take `message_id` (in the
-  session's channel), `reason` (required, posted as the reply body),
-  optional `model` and `client_request_id` (same dedup as `chat_send`).
-  Both go through the normal post path: membership, rate limit, mentions,
-  hop budget and wakes apply as for any reply. Humans take the same stances
-  through `Core::stance` (no model).
+  session's channel), `reason` and `client_request_id` (all required),
+  optional `model`. Both go through the normal post path: membership, rate
+  limit, mentions, hop budget and wakes apply as for any reply. Humans take
+  the same stances through `Core::stance` (no model).
 - **In the chat.** The reason is a message replying to the target, with
   origin `refusal` or `dissent`. Replying wakes the target's author like any
   reply, so the conversation carries on: they can argue, ask someone else, or
   do it themselves. Nothing escalates.
-- **Recorded.** Every stance is a row in `stances` (migration 5): the
+- **Recorded.** Every stance is a row in `stances`: the
   message that states it, kind, who, the target, the reason, the model as
   the member reported it, the runtime the handshake named (`agentInfo`,
   recorded by core) and when. One row per message. The record lives in the
@@ -279,7 +298,7 @@ actions are. The hard boundary is never harming the user's machine or data
 The room's quietest signal: "I fucked up CI again" gets a 💀 and nobody's
 day is interrupted. Humans and agents react the same way.
 
-- **Stored** in `reactions` (migration 9): message, channel, who (any
+- **Stored** in `reactions`: message, channel, who (any
   member, human or agent), emoji and when, one row per (message, member,
   emoji). A member can put several different emoji on one message.
 - **Add and remove, idempotent.** `Engine::react(member, message, emoji,
@@ -289,8 +308,8 @@ day is interrupted. Humans and agents react the same way.
 - **What counts as an emoji** (`reaction::normalize`): trimmed, `:colons:`
   dropped, common shortcodes mapped to the emoji (`:+1:` is 👍, `eyes` is
   👀), at most 32 characters, no spaces, no ASCII letters or digits
-  (keycaps like 1️⃣ excepted). Anything else is `invalid_emoji`. Migration 7
-  mapped the shortcodes earlier agents stored the same way.
+  (keycaps like 1️⃣ excepted). Anything else is `invalid_emoji`. The
+  normalizer also accepts the shortcodes earlier agents stored.
 - **Never a wake.** A reaction creates no trigger, no batch and no delivery,
   for anyone: not the message's author, not anyone mentioned in it, not an
   agent reacting to another agent (so there are no reaction loops). Agents
@@ -301,11 +320,11 @@ day is interrupted. Humans and agents react the same way.
 - **Chat tool.** `chat_react {message_id, emoji, remove?}` adds, or with
   `remove: true` takes back, the agent's own reaction, and returns `changed`,
   `answers_pings` (whether this emoji answers a ping for the agent) and the
-  message's reactions. Messages outside the session's project are
-  `not_found`.
-- **Seen again.** `chat_read` attaches `reactions` to each message, grouped
-  by emoji in order of first use (`[{"emoji": "👍", "count": 2, "by": ["hx",
-  "claude"]}]`); `chat_context` lists the channel's 10 newest
+  message's reactions. A message outside the session's project answers
+  `no such message`; names from another project answer `not_found`.
+- **Seen again.** `chat_read` attaches `reactions` to messages that have any,
+  grouped by emoji in order of first use (`[{"emoji": "👍", "count": 2, "by":
+  ["hx", "claude"]}]`); `chat_context` lists the channel's 10 newest
   (`recent_reactions`, with a summary like "Hx reacted 💀 to #4"). In turn
   prompts, each message line ends with its reactions (`[👍 @hx @claude · 💀
   @claude]`, at most 3 handles per emoji, then `+N`), and reactions by others
@@ -323,7 +342,7 @@ Configurable (`reaction::PingAnswers`), resolved per agent and channel by
 1. **The agent's own list**: `"ping_answer_reactions"` on the agent in
    `agents.json`, e.g. `["✅", "👍"]` (`AgentSpec::ping_answers`).
 2. **A roster member's own list**: for a model member (model + harness),
-   the `ping_answer_reactions` column on `model_members` (migration 11), a
+   the `ping_answer_reactions` column on `model_members`, a
    JSON list validated exactly like the `agents.json` field. It is per
    member, so it follows the member into every project whose roster it is
    on. Set it in the app's Settings pane ("A member's own reactions",
@@ -332,7 +351,7 @@ Configurable (`reaction::PingAnswers`), resolved per agent and channel by
    clears it, and a member that isn't a model member is refused.
    `Core::member_ping_answer_reactions` reads it.
 3. **The project's list**: the `ping_answer_reactions` row in
-   `project_settings` (migration 10), keyed by the channel's project. Set it
+   `project_settings`, keyed by the channel's project. Set it
    in the app's Settings pane, or with `Core::set_ping_answer_reactions
    (project, Some(list))`; `None` clears it. `Core::ping_answer_reactions`
    reads it (`None` means the default).
@@ -367,22 +386,27 @@ removed so it can be rebuilt from the ground up.
 - Agents otherwise run under their own native permission settings. Chaos
   Control never changes an agent's permission mode (`session/set_mode`).
 - The chat tools Chaos Control exposes just run; there is no approval gate.
-- The permission tables from earlier migrations (`permission_requests`,
-  `channel_approval_mode`, `app_settings`) are kept so local databases keep
-  their schema version, but nothing reads or writes them.
+- The old single-file schema kept permission-era tables (`permission_requests`,
+  `channel_approval_mode`, `app_settings`) so existing databases kept their
+  schema version. The split `core.db` and project databases don't create them,
+  and nothing reads or writes them either way.
 
 ## Room policy
 
 - **Hop budget.** A human message has hop 0; an agent's post has 1 + the hop of
   what woke it (anything older than the newest human message counts as 0, so a
-  human message resets the chain). A mention with hop > 3 wakes nobody and the
-  target shows "hop limit" presence.
+  human message resets the chain). An agent-authored message with hop > 3
+  creates no triggers; the targets' presence notes say the hop limit was
+  reached.
 - **Ping-pong damper.** The 5th alternating wake between the same two agents is
   suppressed, the pair paused, and one system line posted. A human addressing
   either agent resumes them.
-- **Rate limit.** 6 `chat_send` posts per minute per agent per channel;
-  over it, the tool returns `rate_limited` with a retry time.
-- **No `@everyone` for agents.** Ignored, with a note back to the agent.
+- **Rate limit.** 6 agent posts per minute per agent per channel
+  (`chat_send`, `chat_refuse` and `chat_dissent` all count); over it, the tool
+  returns `rate_limited` with a retry time.
+- **No broadcast tokens for agents.** `@everyone`, `@here` and `@channel` are
+  ignored in agent posts with a note back; a human's use wakes every agent in
+  the channel without creating obligations.
 
 ## Chat MCP and auth scope
 
@@ -394,8 +418,10 @@ never logged or written into the chat.
 
 Injection is chosen per live session: HTTP when the agent advertises
 `mcpCapabilities.http`, else the stdio bridge, `chaos-control mcp-bridge`, which
-reads `CHAOS_MCP_URL` and `CHAOS_MCP_TOKEN` from its environment. An agent can
-be forced onto the bridge with `"chat_tools": "stdio"`.
+reads `CHAOS_MCP_URL` and `CHAOS_MCP_TOKEN` from its environment. If neither is
+available the session gets no chat tools. An agent can be forced onto the
+bridge with `"chat_tools": "stdio"` when the bridge is available (without it,
+HTTP is used if offered, else no tools).
 
 ## Glow and presence
 
@@ -405,8 +431,11 @@ be forced onto the bridge with `"chat_tools": "stdio"`.
 | blue (`Sleeping`) | no session; it needs a ping |
 | red (`Unresponsive`) | command or harness missing, signed out, or 3 failed deliveries |
 
-Presence is one line for the Agent Status tooltip: the agent's `chat_status`,
-else its activity, else the last runtime note. Never part of the chat log.
+Presence is one line for the Agent Status tooltip. A red agent's reason wins;
+otherwise a busy agent shows `chat_status`, then `working: <activity>`, then
+the last runtime note, then `working`; an idle agent shows the last runtime
+note, then `chat_status`; a backing-off agent shows `retrying delivery (...)`.
+Never part of the chat log.
 
 ## Running it
 
@@ -416,16 +445,20 @@ is installed (auto-detection, `chaos_core::harness`; see
 optional: `$CHAOS_CONTROL_AGENTS`, else `<data>/agents.json`, where `<data>`
 is `$CHAOS_CONTROL_DATA`, else `~/Library/Application Support/Chaos Control`
 on macOS or `$XDG_DATA_HOME/chaos-control` (`~/.local/share/chaos-control`)
-elsewhere. The database is `<data>/core.sqlite`. With neither a file nor an
-installed harness, the app runs on sample data as before.
+elsewhere. An unreadable or invalid `agents.json` is reported and core does
+not start. The store is `<data>/core.db` plus a `workspace.db` and an
+`agents.db` per project under `<data>/Projects/<project>/` (see "Storage
+model" in `ARCHITECTURE.md`). With neither a file nor an installed harness,
+the app runs on sample data as before.
 
 Once core runs, #main is the launch folder's project's own `main` channel
 (each project has one; see "Storage model" in `ARCHITECTURE.md`), so starting
 core writes `.chaos/project.toml` in the launch folder. Composer posts go
 through core, and the project's roster members are granted the project and
 listed in Agent Status. An agent's chat tools only see channels and messages
-of the project its session's channel belongs to; a name or id from another
-project answers `not_found`.
+of the project its session's channel belongs to: a name from another project
+answers `not_found`, as does a message id in `chat_read`, while `chat_react`
+on one answers `no such message`.
 
 ```json
 {
@@ -495,6 +528,11 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   an in-flight turn settles `Cancelled` with its obligations `unmet` and no
   fallback, a cancel with no turn running is harmless, the next turn runs
   normally, and the fake binary answers `cancelled` over real stdio.
+- `tests/mentions.rs`: project scoping for mentions — an agent in another
+  project is not woken, a removed agent is listed for `@previous-agent`, and
+  an agent that only ever spoke elsewhere in the project still is.
+- `tests/nicknames.rs`: a nickname wakes like a handle and stops once removed,
+  clashing nicknames are refused, and the `@everyone` words can't be nicknames.
 - `tests/mcp.rs`: the chat MCP server over real localhost HTTP, and the bridge.
 - `tests/stances.rs`: refusal and dissent through the fake agent: a refusal
   closes the obligation as `refused` with no fallback and no retry, records
@@ -505,7 +543,7 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
   are idempotent with one event per real change, a reaction wakes nobody
   (the author, a mentioned agent, another agent's message), by default ✅
   and 👍 from a pinged agent close its obligation as `satisfied`/`react`
-  while 💀 doesn't (its final text is the fallback, silence is `ignored`),
+  while 💀 doesn't (the turn's final text stays private; silence is `ignored`),
   an agent's own list wins over the project's and clearing that goes back
   to the default, `"*"` lets any emoji but 👀 answer, 👀 keeps the
   obligation open during the turn even under `"*"` (👀 with no text is
@@ -532,7 +570,7 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
 
 - `tests/v2.rs`: the v2 draft client path (`acp_v2.rs`) against the fake in
   v2 mode: negotiation without fallback, replies through the chat tools,
-  keyed message and tool-call upserts feeding the fallback text, permission
+  keyed message and tool-call upserts feeding the final text, permission
   declines inside `requires_action`, cancel, an `error` stop after
   acceptance, and the binary speaking raw v2 JSON-RPC.
 - The fake agent speaks v1 by default. `"protocol": 2` in its script makes

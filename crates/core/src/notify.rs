@@ -1,10 +1,11 @@
 //! What an agent receives when it is woken: one plain-text notification that
 //! works on every protocol.
 //!
-//! Context, in priority order: the triggers in full, their `reply_to` parents,
-//! then other unread messages newest first, until 20 messages or 6,000 chars;
-//! then back into chronological order. The omitted range is stated so pulling
-//! more is one `chat_read` call.
+//! Context, in priority order: the triggers (up to 6,000 chars each) and their
+//! `reply_to` parents, then other unread messages newest first with messages
+//! that mention the agent ahead of the rest, until the pick reaches 20
+//! messages or 6,000 chars; then back into chronological order. The omitted
+//! range is stated so pulling more is one `chat_read` call.
 //!
 //! Reactions ride along compactly: each message line ends with its reactions
 //! (`[👍 @hx @claude · 💀 @claude]`), and reactions added since the agent last
@@ -235,12 +236,12 @@ pub fn compose(
         };
         let _ = writeln!(
             out,
-            "You owe a reply to {}. {react} If you end your turn without answering, your final message is posted as your reply.",
+            "You owe a reply to {}. {react} If you end your turn without answering, the ping is recorded as ignored.",
             owed.join(", ")
         );
         let _ = writeln!(
             out,
-            "You may also say no (chat_refuse with your reason) or ignore it: replying, reacting, refusing and ignoring are all fine, and none is required. To ignore it, end your turn with no final message."
+            "You may also say no (chat_refuse with your reason) or ignore it: replying, reacting, refusing and ignoring are all fine, and none is required. To ignore it, end your turn without answering."
         );
     }
     Ok(out)

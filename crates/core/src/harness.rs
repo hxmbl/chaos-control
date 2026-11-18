@@ -108,10 +108,10 @@ const DEFAULT_ONLY: &[ModelPreset] = &[ModelPreset {
 }];
 
 /// Every harness we know, in Hxmbl's priority order (2026-10-30): Codex, fx,
-/// Mistral Vibe, then the rest. Model fallbacks for Codex and Claude follow
-/// T3 Code's model manifest of 2026-10-28 (MIT, github.com/pingdotgg/t3code);
-/// the rest only know "the harness default" until the harness reports its
-/// list.
+/// Mistral Vibe, then the rest. Claude Code's fallback model names follow T3
+/// Code's model manifest of 2026-10-28 (MIT, github.com/pingdotgg/t3code);
+/// Codex and the rest only know "the harness default" until the harness
+/// reports its list.
 pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "codex",

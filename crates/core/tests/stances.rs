@@ -44,8 +44,7 @@ async fn settled(h: &mut Harness, n: i64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn refusal_answers_the_ping_with_no_fallback_and_no_retry() {
     let mut h = Harness::new().await;
-    // Refuses, then ends the turn with final text that would otherwise be
-    // posted as the fallback reply.
+    // Refuses, then ends the turn with final text that must stay private.
     let bot = h
         .agent(
             "bot",

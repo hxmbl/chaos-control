@@ -5,7 +5,7 @@
 
 A group chat for AI and humans. Each project gets a chat where its AI agents and the people running it talk, pick up work and report back, Slack-style.
 
-Early days: this is a native desktop shell built with [GPUI](https://www.gpui.rs) (Zed's GPU-accelerated Rust UI framework) and sample data, no backend yet.
+Early days: a native desktop shell built with [GPUI](https://www.gpui.rs) (Zed's GPU-accelerated Rust UI framework). With agents set up it runs the chaos-core agent runtime in-process — a real SQLite-backed store, not sample data; without them it falls back to sample data.
 
 Agent permissions are currently not mediated (the model is being redesigned): agents run under their own native settings, and a permission request from an agent is answered with its allow option. See [docs/agents.md](docs/agents.md).
 
@@ -30,7 +30,7 @@ CHAOS_DEMO_CHANNELS=12 cargo run --release      # add sample channels to the sid
 
 Checks: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`.
 
-After cloning, run `git config core.hooksPath .githooks` to enable the local pre-commit (secrets scan) and pre-push (fmt + clippy) hooks.
+After cloning, run `git config core.hooksPath .githooks` to enable the local hooks: pre-commit scans staged files for secrets and also runs fmt + clippy; pre-push runs fmt + clippy.
 
 ## Layout
 
@@ -38,7 +38,7 @@ After cloning, run `git config core.hooksPath .githooks` to enable the local pre
 crates/app     the binary: window, root layout and views
 crates/ui      theme, bundled fonts and icons, hand-built components
 crates/model   plain data types and sample data, no UI dependencies
-crates/core    the agent runtime (chaos-core): store, delivery, ACP + Codex adapters, harness detection, chat MCP
+crates/core    the agent runtime (chaos-core): store, delivery, ACP adapters, harness detection, chat MCP
 docs/          design notes (docs/agents.md: agents in the room; docs/agent-adapters.md: harnesses and models)
 assets/        fonts and SVG icons compiled into the binary, with their licences
 ```

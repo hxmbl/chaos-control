@@ -19,6 +19,11 @@ immediate-mode elements) instead of a webview.
   `RightSidebar`, `Conversation`, `Composer`, laid out by the
   root `Workspace` view, plus `PaneHost` (what the pane shows), the
   `AppSettings` global and `project` (which project the launch folder is).
+  Message bodies render as markdown (`markdown.rs`), with known
+  `@mentions` highlighted (`mention_highlight.rs`); `profile.rs` is the
+  local user profile, `project_context.rs` defines the active-project
+  context the store keeps in sync, and `recents.rs` persists recently
+  opened projects.
 - `core` (`chaos-core`): the agent runtime. SQLite store, delivery engine,
   room policy, the ACP adapter and the chat MCP server. No GPUI: the app is one
   client of it. See [docs/agents.md](docs/agents.md).
@@ -87,12 +92,15 @@ channels; each channel is a persistent group conversation.
 | What | Where | Keyed by |
 | --- | --- | --- |
 | Project id (UUID) and display name | `<folder>/.chaos/project.toml` | n/a |
-| Projects, channels, messages, project and channel membership, cursors, delivery state, sessions | `<data>/core.sqlite` | project UUID, channel id |
-| Model members (harness + model) and each project's roster, harness model lists | `<data>/core.sqlite` (migration 7) | member id, project UUID |
+| Projects, members (humans and model members), nicknames, rosters, harness model lists, id counters | `<data>/core.db` | project UUID, member id |
+| Channels, messages, mentions, reactions, memberships with cursors, stances, project settings | `<data>/Projects/<project-uuid>/workspace.db` | channel id |
+| Delivery state: batches, triggers, obligations, sessions | `<data>/Projects/<project-uuid>/agents.db` | channel id, agent |
+| Local profile (display name so far) | `<data>/profile.json` | n/a |
+| Recently opened projects and the last channel | `<data>/recents.json` | project id |
 | Optional overrides: harness commands, an explicit roster, original-shape agents | `<data>/agents.json` | harness id / handle (global) |
 
-`<data>` is the app data directory (see Agents above). The file holds nothing
-else, so no chat state ever lands in a repository, and agents working in the
+`<data>` is the app data directory (see Agents above). The databases hold
+nothing else, so no chat state ever lands in a repository, and agents working in the
 folder can't edit membership or history by editing files.
 
 ```toml
@@ -109,28 +117,41 @@ project: names are unique within it (two projects can each have a #main), and
 each channel has a per-project ordinal, its `::N`. Cursors, batches, triggers,
 obligations and sessions hang off channel ids as before.
 
-**Schema (core migration 2).** `projects (id TEXT UUID, name, root_path,
-created_at)`, where `root_path` is the folder it was last opened from and one
-folder maps to at most one project. `channels` gains `project_id` and
-`ordinal`, with `UNIQUE(project_id, name)` and `UNIQUE(project_id, ordinal)`;
-moving uniqueness off `name` is a SQLite table rebuild that keeps every
-channel id, so messages, cursors, obligations and sessions are untouched.
-`project_members (project_id, member_id, joined_at)`. A v1 database migrates
-into one project named "Imported" (fresh UUID, no folder) holding every
-existing channel, with each channel's members as project members. Migrations
-run with foreign keys off around them (SQLite can't drop a referenced table
-otherwise) and each checks `pragma_foreign_key_check` before it commits.
-Migration 3 adds `projects.unclaimed_import`, set only on that "Imported"
-project, so it can be adopted by one folder, once (see Relinking imported
-history below). Migrations 4 to 6 add read receipts, stances and permission
-requests; migration 7 adds model members and rosters, migration 8 the
-permission log's `read_only` (the permission tables are unused since the
-permission model was removed; the migrations stay); migration 9 rebuilds `reactions` with each
-reaction's channel (see "Reactions" in [docs/agents.md](docs/agents.md));
-migration 10 adds `project_settings`, one JSON value per (project, key), holding
-`ping_answer_reactions` so far; migration 11 adds a roster model member's own
-`ping_answer_reactions` as a column on `model_members`; migration 12 adds
-`member_nicknames` (see "Nicknames" in [docs/agents.md](docs/agents.md)).
+**Schema (STRM-658).** The store used to be one file, `core.sqlite` (18
+legacy migrations, numbered 1–13 and 16–20; message edits, STRM-575, were
+the last and are unused — editing was removed in STRM-604). It is now three
+files, each with its own baseline schema, migrated out of `core.sqlite` on
+first open: the old file is renamed `core.sqlite.pre-split` only after
+every project database opens cleanly, and a valid completion marker lets a
+crash after that point finish the rename. Without one, a partial split is
+discarded and the legacy migration is retried from the legacy source
+(`core.sqlite` or its backup).
+`core.db` holds
+`projects` (id UUID, name, `root_path` — the folder it was last opened
+from, one folder maps to at most one project — and `unclaimed_import`, set
+only on the "Imported" project a v1 database migrated into, so it can be
+adopted by one folder, once; see Relinking imported history below),
+`members` (humans and model members), `project_members`,
+`member_nicknames` (with a trigger refusing a nickname that is someone's
+handle), `model_members` (harness + model, plus each member's own
+`ping_answer_reactions`), `roster`, `harness_models` and `id_counters` —
+channel, message and batch ids are allocated globally there. A project's
+`workspace.db` holds the chat: `channels` (`project_id` + `ordinal`, with
+`UNIQUE(project_id, name)` and `UNIQUE(project_id, ordinal)`; moving
+uniqueness off `name` was a SQLite table rebuild that kept every channel
+id, so messages, cursors, obligations and sessions stayed untouched),
+`messages` (append-only, per-channel `seq` with no gaps), `mentions`,
+`reactions` (each reaction carries its channel), `memberships` with
+cursors, `stances` and `project_settings` (`ping_answer_reactions` so
+far). Its `agents.db` holds delivery: `batches`, `triggers`,
+`obligations`, `sessions`. The permission-era tables stay only in the legacy
+single-file schema, unused, so old databases keep their schema version; the
+split files don't recreate them. They come from migrations 6, 8, 13, 16 and
+19 (`permission_requests`), 17 (`channel_approval_mode`) and 18
+(`app_settings`). A broken project
+database is isolated: it doesn't stop `core.db` or other projects from
+opening, and a database from a newer build is refused without being
+changed.
 
 **`::N`.** A channel's ordinal is assigned when it is created: the project's
 highest so far plus one, starting at 1 (so a new project's #main is `::1`).
@@ -209,6 +230,25 @@ Not built yet: the "Share project identity" action (committing
   new rows onto its list, the composer swaps its placeholder.
 - Rendering reads straight from the store; no cloning of message bodies.
 
+Around the store:
+
+- **`ProjectContext`** (STRM-642) records "which project is active":
+  identity, location, lifecycle (`Open`, `Switching`, `Closed`, `Recovering`)
+  and a generation counter that drops stale async results when the project
+  changes. The store owns and updates it on project transitions; its public
+  read accessors are currently unused, and the composer and agent runtime do
+  not read it directly.
+- **Recents** (STRM-642): `<data>/recents.json` remembers the recently
+  opened projects (path, name, `last_opened`) and the last active project
+  and channel, so relaunching restores the session. A project whose folder
+  is gone is marked unavailable and kept, never silently deleted.
+- **Profile** (STRM-644): `<data>/profile.json` is the local person's
+  display name (empty falls back to "You"), edited in an overlay over the
+  right sidebar; it also seeds the placeholder avatar's colour.
+- **Refused data**: when core refuses to open its data — a newer build
+  wrote it — the app shows a plain window with the reason instead of the
+  workspace (`refused.rs`) and touches nothing.
+
 ## Messages arrive whole
 
 Agents post a complete message when their response is done; nothing is streamed
@@ -218,6 +258,36 @@ token by token. Incoming messages (one or a batch) go through
 `ListState::splice(len..len, n)`, so only the new rows are measured; history
 already laid out is left alone. Core's events are received on a GPUI task and
 handed to `append` on the main thread (see Agents above).
+
+## Messages render as markdown
+
+Display only: the stored payload is plain text and the composer sends plain
+text. `markdown.rs` renders with `pulldown-cmark` (strikethrough, tables,
+task lists) and highlights fenced code with `syntect` (tokyonight
+night/day themes bundled with the app, the language guessed from the
+content when missing), each block with a language label and a copy button
+("Copied" for 3 s). Soft breaks render as line breaks — chat, not a
+document. Links only with safe schemes (http, https, mailto); images
+render as `[image]` or their alt text. Known `@mentions` are highlighted
+on top of the runs (`mention_highlight.rs`): member handles and nicknames
+(the nickname coloured as its member), plus the broadcasts `@everyone`,
+`@here` and `@channel`; an arbitrary `@word` is untouched. Colours are
+deterministic per identity, from a 12-colour palette with light and dark
+variants.
+
+## Composer
+
+Plain text with two quiet helpers:
+
+- **Suggestions.** Typing `@` or `:` opens a suggestion popup (member
+  handles and nicknames, or emoji), ranked by recent use. `tab` accepts;
+  typing keeps going; Escape closes the popup first, then a reply
+  reference, then the pane rules take over (STRM-576).
+- **Working indicator.** While agents in the channel are working, a line
+  above the composer shows "<name> is <verb>…" ("A and B are …" for two,
+  "…, and C are" for more). The verb cycles a word bank every 5 s
+  (`WORKING_WORDS`, STRM-662), the changing word crossfading with a blur
+  while the rest shimmers; the line disappears when nobody is working.
 
 ## Reactions
 
@@ -292,17 +362,17 @@ never moves and there is never more than one.
   `Search`, `ProjectIdentity`. Each knows its title and its quick actions (`PaneAction` /
   `PaneActionKind`), so the agent runtime can open a pane by building one and
   calling `PaneHost::open`. The UI only decides how each body looks.
-- **Element and state.** `ui::Pane` is the element: a red macOS-style close dot
-  at the top left (12px, 12px from the corner; an × shows on hover) with a
-  header row beside it like a macOS title bar: the title (17px semibold,
-  8px past the dot, ellipsis when narrow) or a custom header such as search's
-  field, centred on the dot. Then a scrollable body that takes any element, and full-width rounded quick-action
-  rows under a 1px hairline divider. `ui::PaneState` is the bookkeeping, unit-tested
+- **Element and state.** `ui::Pane` is the element: a glass sheet with a
+  left-aligned header row starting 8px from its left edge — the title
+  (17px semibold, ellipsis when narrow) or a custom header such as search's
+  field. There is no visible close control. Then a scrollable body that takes
+  any element, and full-width rounded quick-action rows under a 1px hairline
+  divider. `ui::PaneState` is the bookkeeping, unit-tested
   without a window: it remembers what had focus when the pane opened and hands
   it back on close; opening over an open pane swaps the content in place (no
   second animation, focus still returns to where it was before the first).
-- **Closing.** The close dot, Escape (`Pane` key context) and a click
-  outside. Focus goes back to whatever had it, unless the click that closed
+- **Closing.** Escape (`Pane` key context) or a click outside. Focus goes
+  back to whatever had it, unless the click that closed
   the pane focused something itself (the search pill, the composer), which
   wins; with nothing to go back to, the composer gets it.
 - **Where it sits.** `pane_frame` (in `pane_host.rs`): between the docked
@@ -313,7 +383,8 @@ never moves and there is never more than one.
   slides in over it. Tall content scrolls inside the body; short content
   makes a short pane.
 - **Motion.** 140ms fade and scale-in (ease-out cubic), the same timing as the
-  search grow and the sidebar peek. Closing is instant.
+  search grow and the sidebar peek. Closing is a 130ms fade and scale-out; it
+  stops taking input as soon as it starts.
 - **The glass, faked.** gpui 0.2.2 has no backdrop blur, so `ui::Glass`
   (`glass.rs`, `Theme::glass`) builds it from a flat translucent fill (about
   92% opaque light, 91% dark), a
@@ -326,7 +397,7 @@ never moves and there is never more than one.
 
 ### Long messages
 
-A message over 600 characters or 8 lines (`model::pane::is_long`) shows
+A message over 3,600 characters or 50 lines (`model::pane::is_long`) shows
 collapsed in the chat: its first 4 lines or 320 characters, cut between words
 and ending in "…" (`model::pane::preview`), then an "Open" button and a word
 count. "Open" shows it in full in the pane, with the author and time, and two
@@ -375,8 +446,9 @@ any other open pane first, so there is still only one.
 
 ## Design tokens
 
-Every size the shell draws with comes from `ui::tokens`; colours come from
-`ui::Theme` by role. Views don't write one-off `px(..)` values.
+Sizes mostly come from `ui::tokens`; colours come from `ui::Theme` by role.
+A few one-off `px(..)` values remain (for example the refused window and the
+message menu).
 
 | Token | Values |
 | --- | --- |
@@ -415,13 +487,14 @@ Surface rules:
   the same per frame as 20. Try it with `CHAOS_DEMO_MESSAGES=100000`. The
   channel list uses `uniform_list` (fixed row height, so no measuring at all).
 - **Cached views.** The root wraps each region in `AnyView::cached`, so a view
-  re-renders only when it is notified itself. Nothing animates at rest: the
-  only animations are the sidebar slide, the search grow and the pane fade,
-  each of which stops when it finishes. (The wireframe's catch-up card, with
-  its endless shimmer, is not drawn until summaries exist.)
+  re-renders only when it is notified itself. The sidebar slide, search grow
+  and pane fade stop when they finish; the working indicator keeps shimmering
+  and crossfading words while agents are working. (The wireframe's catch-up
+  card, with its endless shimmer, is not drawn until summaries exist.)
 - **No work in hot paths.** Theme colours are `Copy`; icons are embedded SVGs
   that GPUI rasterises once per size and caches; fonts are compiled in. Row
-  rendering does no I/O and no string formatting beyond the timestamp.
+  rendering does no I/O, but does format small display strings such as reaction
+  tooltips, word counts and read receipts.
 - **Off the main thread.** Anything slow (network, disk, search indexing,
   summarising for catch-up) belongs on `cx.background_spawn`, handing results
   back to the store. The main thread only applies results and renders.
@@ -430,6 +503,9 @@ Surface rules:
 
 - macOS: transparent titlebar with the native traffic lights placed on the 52px
   bar; the titlebar drags the window and double-click follows the system setting.
+  The dock icon is set at runtime (`dock.rs`), since an unbundled debug binary
+  would otherwise show a generic icon. `tray.rs` is an unused stub (not in the
+  module tree), so there is no menu-bar item yet.
 - Linux: the window asks for client-side decorations. When the compositor
   agrees, the app draws minimise, maximise and close, a 1px border and resize
   handles on each edge; when it insists on server decorations, those are skipped.
@@ -507,10 +583,14 @@ macOS and ctrl elsewhere.
 | `up` / `down` | Move through results | Search |
 | `enter` | Jump to the highlighted result | Search |
 | `escape` | Clear the query; on an empty field, close | Search |
+| `up` / `down` | Move the highlight | Model picker |
+| `escape` | Back out of a step, then close | Model picker |
 | `escape` | Close the pane | Pane |
 | `enter` | Send | Composer |
 | `shift-enter` | New line | Composer |
 | `up` / `down` | Move between lines (`shift-` selects) | Composer |
+| `tab` | Accept the open suggestion | Composer |
+| `escape` | Dismiss the suggestion, then the reply reference | Composer |
 | `cmd/ctrl-Q` | Quit | Anywhere |
 
 Text editing in the composer and search field (`ui::TextInput`; GPUI 0.2.2

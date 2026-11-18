@@ -1,15 +1,17 @@
 //! The chat MCP server agents use to take part in the room, plus the stdio
 //! bridge for agents that drop HTTP MCP servers.
 //!
-//! Eight tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
-//! `chat_react`, `chat_status`, and the peer actions `chat_refuse` and
-//! `chat_dissent` (STRM-343). They just run: there is no approval gate.
-//! `chat_react` adds
-//! or removes a reaction and never wakes anyone (STRM-467). Every call is scoped by a bearer token minted
-//! for one session (agent x channel) and revoked when that session closes. The
-//! author of a post is taken from the token, never from the arguments. Channel
+//! Nine tools: `chat_context`, `chat_read`, `chat_search`, `chat_send`,
+//! `chat_react`, `chat_emoji_search`, `chat_status`, and the peer actions
+//! `chat_refuse` and `chat_dissent` (STRM-343). They just run: there is no
+//! approval gate. `chat_react` adds or removes a reaction and never wakes
+//! anyone (STRM-467). Every call is scoped by a bearer token minted for one
+//! session (agent x channel) and revoked when that session closes. The author
+//! of a post is taken from the token, never from the arguments. Channel
 //! names and message ids resolve only inside the session channel's project:
-//! anything in another project answers `not_found`, as if it didn't exist.
+//! a channel name from another project answers `not_found`, while a message
+//! id that resolves outside it answers `no such message` (`chat_read`'s
+//! `around` says `not_found: no such message`).
 //!
 //! Served over streamable HTTP on `127.0.0.1` (stateless, JSON responses) by
 //! `rmcp`. The bridge (`chaos-control mcp-bridge`) reads newline-delimited

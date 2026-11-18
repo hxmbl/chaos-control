@@ -1,9 +1,11 @@
 //! The boundary between the runtime and an agent protocol.
 //!
-//! The runtime reads [`Caps`] from a live session and never branches on which
-//! adapter (or brand) it is talking to. Adapters translate their protocol into
-//! [`AgentEvent`]s and hold no room policy: no dampers, no obligations, no
-//! retries. Those all live in the engine.
+//! The room runtime reads [`Caps`] from a live session and never branches on
+//! which adapter (or brand) it is talking to for delivery, obligations or
+//! policy. Adapters translate their protocol into [`AgentEvent`]s and hold no
+//! room policy: no dampers, no obligations, no retries. Those all live in the
+//! engine. Adapters can still do harness-specific setup (Devin's trusted-folder
+//! step is the current example).
 //!
 //! # Delivery contract (every adapter)
 //!
