@@ -30,7 +30,7 @@ echo "minesweep: sweeping staged files for exposed secrets..."
 # Scan the staged index directly so staged-but-deleted or renamed content is
 # still checked. --fail-on high matches .minesweep.yml; the config file's
 # fail_on is ignored without `minesweep trust`, so pass it explicitly.
-"$MINESWEEP" --fail-on high --no-pager --color never --staged .
+"$MINESWEEP" --fail-on high --min-severity medium --no-pager --color never --staged .
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -ne 0 ]; then
