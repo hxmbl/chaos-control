@@ -36,6 +36,8 @@ pub enum PaneEvent {
     /// drafts); the agent runtime will route these.
     #[allow(dead_code)]
     Action(PaneActionKind),
+    /// The current approval was resolved or dismissed; show the next queued one.
+    ApprovalClosed,
 }
 
 pub struct PaneHost {
@@ -128,9 +130,11 @@ impl PaneHost {
     /// closed the pane and focused something (the search pill, the
     /// composer), that click wins.
     pub fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let approval = self.visible_approval();
         let Some(restore) = self.state.close(Instant::now()) else {
             return;
         };
+        self.finish_approval_close(approval, cx);
         cx.notify();
         cx.defer_in(window, move |this, window, cx| {
             let pane_had_it = this.focus.is_focused(window) || window.focused(cx).is_none();
@@ -147,8 +151,29 @@ impl PaneHost {
     /// Closes without touching focus, for when something else is taking the
     /// keyboard on purpose (cmd/ctrl-K opening search).
     pub fn close_quietly(&mut self, cx: &mut Context<Self>) {
+        let approval = self.visible_approval();
         if self.state.close(Instant::now()).is_some() {
+            self.finish_approval_close(approval, cx);
             cx.notify();
+        }
+    }
+
+    fn visible_approval(&self) -> Option<model::ApprovalQuestion> {
+        match self.state.content() {
+            Some(PaneContent::Approval(request)) => Some(request.clone()),
+            _ => None,
+        }
+    }
+
+    fn finish_approval_close(
+        &mut self,
+        approval: Option<model::ApprovalQuestion>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(request) = approval {
+            self.store
+                .update(cx, |store, cx| store.answer_approval(&request.id, None, cx));
+            cx.emit(PaneEvent::ApprovalClosed);
         }
     }
 
@@ -181,6 +206,17 @@ impl PaneHost {
             ) => {
                 self.store
                     .update(cx, |store, cx| store.answer_identity(&kind, cx));
+                self.close(window, cx);
+            }
+            (PaneActionKind::ApprovalChoice(choice), Some(PaneContent::Approval(request))) => {
+                self.store.update(cx, |store, cx| {
+                    store.answer_approval(&request.id, Some(choice), cx)
+                });
+                self.close(window, cx);
+            }
+            (PaneActionKind::CancelApproval, Some(PaneContent::Approval(request))) => {
+                self.store
+                    .update(cx, |store, cx| store.answer_approval(&request.id, None, cx));
                 self.close(window, cx);
             }
             _ => {
@@ -289,6 +325,7 @@ impl PaneHost {
             // Search draws its own pane (see `Search::render_pane`).
             PaneContent::Search { .. } => pane,
             PaneContent::ProjectIdentity(q) => pane.children(paragraphs(&identity_text(q))),
+            PaneContent::Approval(q) => pane.children(paragraphs(&approval_text(q))),
         };
         Some(pane.into_any_element())
     }
@@ -747,6 +784,18 @@ fn identity_text(q: &model::ProjectQuestion) -> String {
             q.proposed
         ),
     }
+}
+
+fn approval_text(q: &model::ApprovalQuestion) -> String {
+    let mut text = format!("{} requests permission for {}.", q.agent, q.action);
+    if let Some(summary) = &q.summary {
+        text.push_str(&format!("\n\nRequested operation: {summary}"));
+    }
+    if let Some(arguments) = &q.arguments {
+        text.push_str(&format!("\n\nArguments:\n{arguments}"));
+    }
+    text.push_str("\n\nChoose a provider-supported decision. Cancel sends no reply.");
+    text
 }
 
 fn human_size(bytes: u64) -> String {

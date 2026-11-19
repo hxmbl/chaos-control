@@ -13,6 +13,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     adapter::*,
+    approval::{
+        ApprovalBroker, ApprovalBrokerError, ApprovalDecision, ApprovalDecisionKind, ApprovalId,
+        ApprovalRequest, ApprovalResolution,
+    },
     engine::{
         AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, Reacted,
         StanceRequest,
@@ -174,6 +178,7 @@ pub struct Core {
     tx: mpsc::UnboundedSender<Cmd>,
     mcp_url: Arc<str>,
     tokens: Arc<Tokens>,
+    approvals: Arc<RuntimeApprovalBroker>,
     /// The tokio runtime core was started on. Anything that touches a
     /// harness (process spawns, pipes, timers, `tokio::spawn`) runs here,
     /// never in the caller's future: the app awaits core from GPUI's
@@ -210,6 +215,222 @@ impl From<String> for StartError {
     }
 }
 
+struct PendingApproval {
+    request: ApprovalRequest,
+    decision: oneshot::Sender<ApprovalDecision>,
+}
+
+struct RuntimeApprovalBroker {
+    events: mpsc::UnboundedSender<CoreEvent>,
+    pending: std::sync::Mutex<HashMap<ApprovalId, PendingApproval>>,
+    outcomes: std::sync::Mutex<HashMap<ApprovalId, crate::approval::ApprovalOutcome>>,
+}
+
+impl RuntimeApprovalBroker {
+    fn new(events: mpsc::UnboundedSender<CoreEvent>) -> Self {
+        Self {
+            events,
+            pending: std::sync::Mutex::new(HashMap::new()),
+            outcomes: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn resolve(&self, id: &ApprovalId, choice: &str) -> Result<(), String> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| "approval broker lock poisoned".to_string())?;
+        let request = pending
+            .get(id)
+            .ok_or_else(|| format!("approval request {} is no longer pending", id.as_str()))?;
+        let choices = match &request.request.choices {
+            crate::approval::ApprovalChoices::DecisionVocabulary { decisions, .. } => decisions
+                .iter()
+                .any(|candidate| candidate.as_ref() == choice),
+            crate::approval::ApprovalChoices::ProviderOptions { options } => {
+                options.iter().any(|option| option.id.as_ref() == choice)
+            }
+        };
+        if !choices {
+            return Err(format!("choice {choice:?} is not valid for this approval"));
+        }
+        let entry = pending
+            .remove(id)
+            .ok_or_else(|| format!("approval request {} is no longer pending", id.as_str()))?;
+        drop(pending);
+        entry
+            .decision
+            .send(ApprovalDecision {
+                cc_request_id: id.clone(),
+                decision: ApprovalDecisionKind::Selected {
+                    choice: Arc::from(choice),
+                },
+                decided_at: SystemClock.now(),
+                actor: None,
+            })
+            .map_err(|_| format!("approval request {} was already abandoned", id.as_str()))
+    }
+
+    fn cancel(&self, id: &ApprovalId) -> Result<(), String> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| "approval broker lock poisoned".to_string())?
+            .remove(id)
+            .ok_or_else(|| format!("approval request {} is no longer pending", id.as_str()))?;
+        pending
+            .decision
+            .send(ApprovalDecision {
+                cc_request_id: id.clone(),
+                decision: ApprovalDecisionKind::NotResolved {
+                    resolution: ApprovalResolution::Cancelled,
+                },
+                decided_at: SystemClock.now(),
+                actor: None,
+            })
+            .map_err(|_| format!("approval request {} was already abandoned", id.as_str()))
+    }
+}
+
+impl ApprovalBroker for RuntimeApprovalBroker {
+    fn request_decision(
+        &self,
+        request: ApprovalRequest,
+    ) -> futures::future::BoxFuture<'_, Result<ApprovalDecision, ApprovalBrokerError>> {
+        Box::pin(async move {
+            let id = request.cc_request_id.clone();
+            let (decision, wait) = oneshot::channel();
+            {
+                let mut pending = self
+                    .pending
+                    .lock()
+                    .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?;
+                if pending.contains_key(&id) {
+                    return Err(ApprovalBrokerError::new(format!(
+                        "approval request {} is already pending",
+                        id.as_str()
+                    )));
+                }
+                pending.insert(
+                    id.clone(),
+                    PendingApproval {
+                        request: request.clone(),
+                        decision,
+                    },
+                );
+            }
+            if self
+                .events
+                .send(CoreEvent::ApprovalRequested(request))
+                .is_err()
+            {
+                self.pending
+                    .lock()
+                    .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?
+                    .remove(&id);
+                return Err(ApprovalBrokerError::new("approval event receiver is gone"));
+            }
+            let result = wait.await.map_err(|_| {
+                ApprovalBrokerError::new("approval request was abandoned before resolution")
+            });
+            if let Ok(mut pending) = self.pending.lock() {
+                pending.remove(&id);
+            }
+            result
+        })
+    }
+
+    fn record_outcome(
+        &self,
+        outcome: crate::approval::ApprovalOutcome,
+    ) -> futures::future::BoxFuture<'_, Result<(), ApprovalBrokerError>> {
+        Box::pin(async move {
+            self.outcomes
+                .lock()
+                .map_err(|_| ApprovalBrokerError::new("approval outcome lock poisoned"))?
+                .insert(outcome.cc_request_id.clone(), outcome.clone());
+            self.events
+                .send(CoreEvent::ApprovalOutcome(outcome))
+                .map_err(|_| ApprovalBrokerError::new("approval event receiver is gone"))
+        })
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+    use crate::approval::{
+        ApprovalChoices, ApprovalOperation, ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider,
+    };
+
+    fn request() -> ApprovalRequest {
+        ApprovalRequest {
+            cc_request_id: ApprovalId::from("opencode-v2:s1:p1"),
+            provider: ApprovalProvider::OpenCodeV2,
+            provider_request_ref: Arc::from("p1"),
+            session_id: Arc::from("s1"),
+            agent: MemberId(7),
+            channel: ChannelId(4),
+            turn: Some(BatchId(9)),
+            operation: ApprovalOperation {
+                action: Arc::from("shell"),
+                tool_name: None,
+                summary: Some(Arc::from("echo OK")),
+                arguments: None,
+                raw: None,
+            },
+            choices: ApprovalChoices::DecisionVocabulary {
+                decisions: vec![Arc::from("reject"), Arc::from("once")],
+                raw: None,
+            },
+            requested_at: 1,
+            context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_approval_broker_emits_validates_and_records_decisions() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx));
+        let pending_id = request().cc_request_id;
+        let pending_broker = broker.clone();
+        let pending = tokio::spawn(async move { pending_broker.request_decision(request()).await });
+
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalRequested(_))
+        ));
+        assert!(broker.resolve(&pending_id, "always").is_err());
+        broker.resolve(&pending_id, "once").unwrap();
+        let decision = pending.await.unwrap().unwrap();
+        assert_eq!(decision.cc_request_id, pending_id);
+        assert_eq!(
+            decision.decision,
+            ApprovalDecisionKind::Selected {
+                choice: Arc::from("once")
+            }
+        );
+
+        let outcome = ApprovalOutcome {
+            cc_request_id: pending_id.clone(),
+            state: ApprovalOutcomeState::Allowed,
+            provider_reply: None,
+            execution_effect: None,
+            error: None,
+            recorded_at: Some(2),
+        };
+        broker.record_outcome(outcome.clone()).await.unwrap();
+        assert_eq!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalOutcome(outcome.clone()))
+        );
+        assert_eq!(
+            broker.outcomes.lock().unwrap().get(&pending_id),
+            Some(&outcome)
+        );
+    }
+}
+
 impl Core {
     /// Starts the runtime on the current tokio runtime. Returns the handle and
     /// the stream of UI events.
@@ -232,6 +453,7 @@ impl Core {
             .map_err(|e| format!("recover: {e}"))?;
         let (tx, rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let approvals = Arc::new(RuntimeApprovalBroker::new(events_tx.clone()));
         let tokens = Arc::new(Tokens::default());
         let caller_tx = tx.clone();
         let caller: mcp::ToolCaller = Arc::new(move |scope: Scope, name: String, args: Value| {
@@ -258,6 +480,7 @@ impl Core {
             default_cwd: config.default_cwd,
             agents: HashMap::new(),
             slots: HashMap::new(),
+            approvals: approvals.clone(),
             next_epoch: 1,
             tx: tx.clone(),
             events: events_tx,
@@ -269,6 +492,7 @@ impl Core {
                 tx,
                 mcp_url: Arc::from(mcp_url),
                 tokens,
+                approvals,
                 rt: tokio::runtime::Handle::current(),
             },
             events_rx,
@@ -282,6 +506,28 @@ impl Core {
     /// Live (unrevoked) chat tokens. For tests and diagnostics.
     pub fn live_tokens(&self) -> usize {
         self.tokens.len()
+    }
+
+    /// Resolve a pending provider permission with one of its advertised choices.
+    pub fn resolve_approval(&self, id: &ApprovalId, choice: &str) -> Result<(), String> {
+        self.approvals.resolve(id, choice)
+    }
+
+    /// Leave a pending provider permission unanswered, closing the provider path.
+    pub fn cancel_approval(&self, id: &ApprovalId) -> Result<(), String> {
+        self.approvals.cancel(id)
+    }
+
+    /// Most recently recorded handling outcome for a provider permission.
+    pub fn approval_outcome(
+        &self,
+        id: &ApprovalId,
+    ) -> Result<Option<crate::approval::ApprovalOutcome>, String> {
+        self.approvals
+            .outcomes
+            .lock()
+            .map(|outcomes| outcomes.get(id).cloned())
+            .map_err(|_| "approval outcome lock poisoned".to_string())
     }
 
     /// Runs `f` on the engine inside the actor and returns its result.
@@ -938,6 +1184,7 @@ struct Actor {
     default_cwd: PathBuf,
     agents: HashMap<MemberId, AgentEntry>,
     slots: HashMap<(MemberId, ChannelId), Slot>,
+    approvals: Arc<RuntimeApprovalBroker>,
     next_epoch: u64,
     tx: mpsc::UnboundedSender<Cmd>,
     events: mpsc::UnboundedSender<CoreEvent>,
@@ -961,6 +1208,7 @@ impl Actor {
                     self.engine.tick(now);
                 }
             }
+
             self.apply_effects();
         }
     }
@@ -1231,6 +1479,7 @@ impl Actor {
                 bridge: self.bridge.clone(),
             },
             events: sink,
+            approval_broker: Some(self.approvals.clone()),
         };
         let adapter = entry.adapter.clone();
         let tx = self.tx.clone();

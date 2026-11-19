@@ -180,6 +180,7 @@ pub struct OpenSession {
     pub cwd: PathBuf,
     pub chat_tools: ChatToolsEndpoint,
     pub events: EventSink,
+    pub approval_broker: Option<Arc<dyn crate::approval::ApprovalBroker>>,
 }
 
 /// The kinds of option an agent offers on a permission request, across

@@ -8,6 +8,7 @@
 //! enforcement guarantees must be reported honestly; unsupported or unverified
 //! behavior must not be presented as protected.
 
+use std::collections::HashMap;
 use std::{path::PathBuf, sync::Arc};
 
 use futures::{StreamExt, future::BoxFuture};
@@ -18,7 +19,12 @@ use crate::{
         AgentAdapter, AgentError, AgentErrorKind, AgentEvent, AgentSession, Caps,
         ChatToolsTransport, EventSink, OpenSession, Probe, SessionInfo, TurnOutcome,
     },
-    types::BatchId,
+    approval::{
+        ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
+        ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest,
+        ApprovalResolution,
+    },
+    types::{BatchId, ChannelId, MemberId},
 };
 
 /// How to reach an OpenCode v2 server.
@@ -159,6 +165,9 @@ fn transport_error(e: reqwest::Error) -> AgentError {
 struct SessionInner {
     http: Http,
     session_id: Arc<str>,
+    agent: MemberId,
+    channel: ChannelId,
+    approval_broker: Option<Arc<dyn ApprovalBroker>>,
     mapper: std::sync::Mutex<EventMapper>,
     events: EventSink,
     /// The server we started ourselves, when `server_url` was not configured.
@@ -276,7 +285,10 @@ async fn stream_events(inner: Arc<SessionInner>) {
         };
         parser.push(&bytes);
         while let Some(frame) = parser.next_frame() {
-            answer_permission(&inner, &frame).await;
+            inner.mapper.lock().unwrap().observe(&frame);
+            // Awaiting a user decision inline would stall this SSE loop, so
+            // approvals are handled on their own task while events keep flowing.
+            tokio::spawn(answer_permission(Arc::clone(&inner), frame.data.clone()));
             let events = inner.mapper.lock().unwrap().handle(&frame);
             for event in events {
                 inner.events.emit(event);
@@ -292,10 +304,16 @@ async fn stream_events(inner: Arc<SessionInner>) {
     });
 }
 
-/// Permissions are not mediated (the model is being redesigned), so a request
-/// is answered at once with the narrowest allow: `once`.
-async fn answer_permission(inner: &SessionInner, frame: &SseFrame) {
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&frame.data) else {
+/// Sends no provider reply unless a CC approval broker resolves it explicitly.
+fn approval_decision_is_correlated(
+    expected: &ApprovalId,
+    decision: &crate::approval::ApprovalDecision,
+) -> bool {
+    decision.cc_request_id == *expected
+}
+
+async fn answer_permission(inner: Arc<SessionInner>, frame_data: String) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&frame_data) else {
         return;
     };
     if value.get("type").and_then(|t| t.as_str()) != Some("permission.asked") {
@@ -308,14 +326,194 @@ async fn answer_permission(inner: &SessionInner, frame: &SseFrame) {
     let Some(request) = data.get("id").and_then(|i| i.as_str()) else {
         return;
     };
+    let cc_request_id = ApprovalId::from(format!("opencode-v2:{}:{}", inner.session_id, request));
+    let source = data.get("source").cloned();
+    let source_id = source
+        .as_ref()
+        .and_then(|s| s.get("id"))
+        .and_then(|id| id.as_str())
+        .map(Arc::<str>::from);
+    let action = data
+        .get("action")
+        .and_then(|a| a.as_str())
+        .unwrap_or("unknown");
+    let arguments = source_id.as_ref().and_then(|id| {
+        inner
+            .mapper
+            .lock()
+            .unwrap()
+            .tool_arguments
+            .get(id.as_ref())
+            .cloned()
+    });
+    let turn = inner.mapper.lock().unwrap().turn;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+
+    let Some(broker) = inner.approval_broker.as_ref() else {
+        // Fail closed, but never silently: the operation was not approved and
+        // no provider reply was sent because no CC approval authority exists.
+        let reason = format!(
+            "opencode-v2: approval broker unavailable — permission request {request} in session {} left unanswered (unverified, fail-closed)",
+            inner.session_id
+        );
+        eprintln!("{reason}");
+        inner.events.emit(AgentEvent::Activity {
+            label: Arc::from(reason),
+        });
+        return;
+    };
+    let approval_request = ApprovalRequest {
+        cc_request_id: cc_request_id.clone(),
+        provider: ApprovalProvider::OpenCodeV2,
+        provider_request_ref: Arc::from(request),
+        session_id: inner.session_id.clone(),
+        agent: inner.agent,
+        channel: inner.channel,
+        turn,
+        operation: ApprovalOperation {
+            action: Arc::from(action),
+            tool_name: source
+                .as_ref()
+                .and_then(|s| s.get("type"))
+                .and_then(|t| t.as_str())
+                .filter(|t| *t == "tool")
+                .map(|_| Arc::from(action)),
+            summary: data
+                .get("resources")
+                .and_then(|r| r.as_array())
+                .and_then(|r| r.first())
+                .and_then(|r| r.as_str())
+                .map(Arc::<str>::from),
+            arguments,
+            raw: Some(value.clone()),
+        },
+        choices: ApprovalChoices::DecisionVocabulary {
+            decisions: vec![Arc::from("reject"), Arc::from("once"), Arc::from("always")],
+            raw: Some(value.clone()),
+        },
+        requested_at: now,
+        context: source,
+    };
+    let decision = match broker.request_decision(approval_request).await {
+        Ok(decision) => decision,
+        Err(_) => {
+            let _ = broker
+                .record_outcome(ApprovalOutcome {
+                    cc_request_id,
+                    state: ApprovalOutcomeState::Failed,
+                    provider_reply: None,
+                    execution_effect: None,
+                    error: Some(Arc::from("approval broker failed")),
+                    recorded_at: Some(now),
+                })
+                .await;
+            return;
+        }
+    };
+    if !approval_decision_is_correlated(&cc_request_id, &decision) {
+        eprintln!(
+            "opencode-v2 approval correlation mismatch: expected {}, got {}; no provider reply sent",
+            cc_request_id.as_str(),
+            decision.cc_request_id.as_str()
+        );
+        let _ = broker
+            .record_outcome(ApprovalOutcome {
+                cc_request_id: cc_request_id,
+                state: ApprovalOutcomeState::Failed,
+                provider_reply: None,
+                execution_effect: None,
+                error: Some(Arc::from("approval decision correlation mismatch")),
+                recorded_at: Some(now),
+            })
+            .await;
+        return;
+    }
+    if decision.cc_request_id != cc_request_id {
+        // A decision for another request must never authorize this operation.
+        eprintln!(
+            "opencode-v2: approval decision id mismatch (expected {}, got {}) — failing closed without a provider reply",
+            cc_request_id.as_str(),
+            decision.cc_request_id.as_str()
+        );
+        return;
+    }
+    let choice = match decision.decision {
+        ApprovalDecisionKind::Selected { choice } => choice,
+        ApprovalDecisionKind::NotResolved { resolution } => {
+            let resolution_name = match resolution {
+                ApprovalResolution::Lost => "lost",
+                ApprovalResolution::Timeout => "timeout",
+                ApprovalResolution::Disconnect => "disconnect",
+                ApprovalResolution::Cancelled => "cancelled",
+            };
+            let _ = broker
+                .record_outcome(ApprovalOutcome {
+                    cc_request_id: decision.cc_request_id,
+                    state: ApprovalOutcomeState::NotSent,
+                    provider_reply: None,
+                    execution_effect: None,
+                    error: Some(Arc::from(format!("approval unresolved: {resolution_name}"))),
+                    recorded_at: Some(now),
+                })
+                .await;
+            return;
+        }
+    };
+    if !["reject", "once", "always"].contains(&choice.as_ref()) {
+        let _ = broker
+            .record_outcome(ApprovalOutcome {
+                cc_request_id: decision.cc_request_id,
+                state: ApprovalOutcomeState::Failed,
+                provider_reply: None,
+                execution_effect: None,
+                error: Some(Arc::from("invalid OpenCode v2 decision")),
+                recorded_at: Some(now),
+            })
+            .await;
+        return;
+    }
     let path = format!(
         "/api/session/{}/permission/{request}/reply",
         inner.session_id
     );
-    let _ = inner
+    match inner
         .http
-        .post_json(&path, &serde_json::json!({ "decision": "once" }))
-        .await;
+        .post_json(&path, &serde_json::json!({ "decision": choice.as_ref() }))
+        .await
+    {
+        Ok(provider_reply) => {
+            let state = if choice.as_ref() == "reject" {
+                ApprovalOutcomeState::Denied
+            } else {
+                ApprovalOutcomeState::Allowed
+            };
+            let _ = broker
+                .record_outcome(ApprovalOutcome {
+                    cc_request_id: decision.cc_request_id,
+                    state,
+                    provider_reply: Some(provider_reply),
+                    execution_effect: None,
+                    error: None,
+                    recorded_at: Some(now),
+                })
+                .await;
+        }
+        Err(error) => {
+            let _ = broker
+                .record_outcome(ApprovalOutcome {
+                    cc_request_id: decision.cc_request_id,
+                    state: ApprovalOutcomeState::Failed,
+                    provider_reply: None,
+                    execution_effect: None,
+                    error: Some(Arc::from(error.message)),
+                    recorded_at: Some(now),
+                })
+                .await;
+        }
+    }
 }
 
 fn fail_in_flight(inner: &SessionInner, error: &AgentError) {
@@ -476,12 +674,44 @@ struct EventMapper {
     /// Our native session id, once known; `None` accepts every session.
     session: Option<String>,
     text: String,
+    tool_arguments: HashMap<Arc<str>, serde_json::Value>,
 }
 
 impl EventMapper {
     fn begin(&mut self, turn: BatchId) {
         self.turn = Some(turn);
         self.text.clear();
+    }
+
+    fn observe(&mut self, frame: &SseFrame) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&frame.data) else {
+            return;
+        };
+        let kind = value
+            .get("type")
+            .and_then(|k| k.as_str())
+            .or(frame.event.as_deref())
+            .unwrap_or_default();
+        if kind != "session.tool.input.ended" && kind != "session.tool.called" {
+            return;
+        }
+        let data = value
+            .get("data")
+            .or_else(|| value.get("properties"))
+            .unwrap_or(&value);
+        let id = data
+            .get("id")
+            .or_else(|| data.get("toolCallId"))
+            .or_else(|| data.get("tool_call_id"))
+            .and_then(|id| id.as_str());
+        let arguments = data
+            .get("input")
+            .or_else(|| data.get("arguments"))
+            .or_else(|| data.get("tool_input"))
+            .cloned();
+        if let (Some(id), Some(arguments)) = (id, arguments) {
+            self.tool_arguments.insert(Arc::from(id), arguments);
+        }
     }
 
     /// Removes and returns the turn that was in flight, if any.
@@ -657,6 +887,9 @@ async fn open_session(
     let inner = Arc::new(SessionInner {
         http,
         session_id: Arc::from(id.as_str()),
+        agent: req.agent,
+        channel: req.channel,
+        approval_broker: req.approval_broker,
         mapper: std::sync::Mutex::new(mapper),
         events: req.events.clone(),
         child: tokio::sync::Mutex::new(child),
@@ -694,6 +927,41 @@ async fn open_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_call_arguments_are_correlated_by_source_id() {
+        let mut mapper = EventMapper::default();
+        mapper.observe(&SseFrame {
+            event: None,
+            data: r#"{"type":"session.tool.input.ended","data":{"id":"tool-call-1","input":{"command":"echo OK"}}}"#
+                .into(),
+        });
+        assert_eq!(
+            mapper.tool_arguments.get("tool-call-1"),
+            Some(&serde_json::json!({"command": "echo OK"}))
+        );
+    }
+
+    #[test]
+    fn approval_decision_must_match_the_request_id() {
+        let expected = ApprovalId::from("opencode-v2:s1:req-1");
+        let matching = crate::approval::ApprovalDecision {
+            cc_request_id: expected.clone(),
+            decision: ApprovalDecisionKind::Selected {
+                choice: Arc::from("reject"),
+            },
+            decided_at: 1,
+            actor: None,
+        };
+        let mismatched = crate::approval::ApprovalDecision {
+            cc_request_id: ApprovalId::from("opencode-v2:s1:req-2"),
+            decision: matching.decision.clone(),
+            decided_at: 1,
+            actor: None,
+        };
+        assert!(approval_decision_is_correlated(&expected, &matching));
+        assert!(!approval_decision_is_correlated(&expected, &mismatched));
+    }
 
     fn parse_all(chunks: &[&[u8]]) -> Vec<SseFrame> {
         let mut parser = SseParser::default();
@@ -917,6 +1185,7 @@ mod tests {
                 events: EventSink::new(move |event| {
                     let _ = tx.send(event);
                 }),
+                approval_broker: None,
             })
             .await
             .expect("open");

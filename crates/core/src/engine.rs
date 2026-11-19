@@ -14,6 +14,7 @@ use rusqlite::Connection;
 
 use crate::{
     adapter::{AgentError, AgentErrorKind, AgentEvent, Probe, SessionInfo, TurnOutcome},
+    approval::{ApprovalOutcome, ApprovalRequest},
     notify,
     policy::{self, Damp, Policy, PolicyState},
     reaction::{self, PingAnswers, PingAnswersError},
@@ -65,6 +66,10 @@ pub enum CoreEvent {
         harness: Arc<str>,
         models: Vec<crate::harness::ModelInfo>,
     },
+    /// An agent is waiting for a user decision about a provider permission.
+    ApprovalRequested(ApprovalRequest),
+    /// The provider permission decision was attempted or failed closed.
+    ApprovalOutcome(ApprovalOutcome),
 }
 
 #[derive(Clone, Debug, PartialEq)]

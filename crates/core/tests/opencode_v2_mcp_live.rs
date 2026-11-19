@@ -153,6 +153,7 @@ async fn injected_mcp_tool_reaches_the_model() {
             events: EventSink::new(move |event| {
                 let _ = tx.send(event);
             }),
+            approval_broker: None,
         })
         .await
         .expect("open session");

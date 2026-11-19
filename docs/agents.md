@@ -372,24 +372,25 @@ longer parses counts as unset. Agents see their list in `chat_context`
 ("✅ or 👍 answers it; 👀 means you're on it, and other emoji don't
 answer").
 
-## Permissions: not mediated (being redesigned)
+## Permissions
 
-Chaos Control currently does **not** mediate agent permissions. The earlier
-model (where an agent runs, host/VM; request classification; approval modes;
-the approval queue, queued command execution and the permission log) was
-removed so it can be rebuilt from the ground up.
+Permission mediation is being restored incrementally under STRM-612.
 
-- **Native requests (ACP `session/request_permission`, v1 and v2).** Answered
-  at once with the agent's own allow option (`adapter::auto_allow`):
-  allow-once, else allow-always, else the first option offered; `cancelled`
-  only when the agent offers none. No prompt, no queue, no log, no chat note.
-- Agents otherwise run under their own native permission settings. Chaos
-  Control never changes an agent's permission mode (`session/set_mode`).
-- The chat tools Chaos Control exposes just run; there is no approval gate.
+- **Native OpenCode v2.** A `permission.asked` request opens a permission pane
+  with the operation details and provider-supported choices (`reject`, `once`,
+  `always`). The provider is not answered until the user chooses. Canceling or
+  dismissing the pane sends no provider reply; if the runtime/UI broker is
+  unavailable, the adapter also fails closed. Outcomes are currently held in
+  runtime memory, not persisted.
+- **ACP v1/v2.** Still uses `adapter::auto_allow`: allow-once, else
+  allow-always, else the first provider option; `cancelled` only when the agent
+  offers none. ACP mediation and parity with native v2 remain follow-up work.
+- Agents otherwise run under their native permission settings. Chaos Control
+  does not change an agent's permission mode (`session/set_mode`).
 - The old single-file schema kept permission-era tables (`permission_requests`,
   `channel_approval_mode`, `app_settings`) so existing databases kept their
-  schema version. The split `core.db` and project databases don't create them,
-  and nothing reads or writes them either way.
+  schema version. The split `core.db` and project databases don't create them;
+  they are not used by the current runtime broker.
 
 ## Room policy
 

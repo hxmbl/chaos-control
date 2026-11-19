@@ -63,9 +63,10 @@
 //!
 //! `record` appends every ACP frame as NDJSON `{dir, frame}` (the replay
 //! fixture format). `chat_tools` is `"auto"` (HTTP when the agent offers it,
-//! else the stdio bridge) or `"stdio"`. Agents run under their own native
-//! permission settings; Chaos Control does not mediate permissions (being
-//! redesigned), and an older file's `runs_in` / `approval` keys are ignored.
+//! else the stdio bridge) or `"stdio"`. ACP agents still use their native
+//! permission settings; native OpenCode v2 permission asks are shown to the
+//! user for a provider-supported decision. Older `runs_in` / `approval` keys
+//! are ignored.
 //!
 //! An `agents` entry may also set `ping_answer_reactions`: that agent's own
 //! list of reactions that answer a ping, over the project's (Settings) and
@@ -301,6 +302,14 @@ pub fn harnesses(config: &AgentsConfig, env: &DetectEnv) -> Vec<Harness> {
                 harness::Transport::OpenCodeV2
             } else {
                 preset.transport
+            };
+            // When using native OpenCode v2, override args to "serve" instead of
+            // the preset's ACP args ("acp"). If the override explicitly sets args,
+            // those are respected (user can pass "serve" or custom flags).
+            let args = if native_opencode_v2 && !o.as_ref().is_some_and(|o| o.args.is_some()) {
+                vec!["serve".to_string()]
+            } else {
+                args
             };
             let opts = AdapterOptions {
                 env: o

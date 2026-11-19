@@ -8,8 +8,9 @@
 //! - [`acp`]: the generic ACP adapter (v1, plus the v2 draft).
 //! - [`devin`]: Devin-only setup (per-folder workspace trust).
 //! - [`mcp`]: the chat MCP server and the stdio bridge.
-//! - Permissions are not mediated: an agent's permission request is answered
-//!   with its own allow option (see [`adapter::auto_allow`]); being redesigned.
+//! - [`approval`]: CC-owned permission requests and decisions. Native OpenCode
+//!   v2 uses the runtime/UI broker; ACP permission requests still use
+//!   [`adapter::auto_allow`] pending parity work (STRM-612).
 //! - [`host`]: the in-process runtime behind the [`host::Core`] handle.
 //! - [`fake`]: a scripted ACP agent for tests.
 //!
@@ -18,6 +19,7 @@
 pub mod acp;
 mod acp_v2;
 pub mod adapter;
+pub mod approval;
 pub mod devin;
 pub mod emoji;
 pub mod engine;

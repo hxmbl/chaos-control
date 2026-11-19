@@ -12,6 +12,7 @@ use std::{
 };
 
 use chaos_core::{
+    approval::{ApprovalChoices, ApprovalId, ApprovalRequest},
     engine::CoreEvent,
     harness::{self, Catalog, HarnessModels, ModelInfo, ModelSource},
     model_cache::{self, CachedModels, Freshness},
@@ -19,8 +20,9 @@ use chaos_core::{
 };
 use gpui::{Context, EventEmitter, Task};
 use model::{
-    Agent, AgentState, Author, ChannelLog, CorpusChannel, Id, Message, PaneActionKind, PaneContent,
-    ProjectEntry, ProjectQuestion, ProjectQuestionKind, ReplyRef, SearchCorpus, Stance, Workspace,
+    Agent, AgentState, ApprovalChoice, ApprovalQuestion, Author, ChannelLog, CorpusChannel, Id,
+    Message, PaneActionKind, PaneContent, ProjectEntry, ProjectQuestion, ProjectQuestionKind,
+    ReplyRef, SearchCorpus, Stance, Workspace,
 };
 
 use crate::{
@@ -113,6 +115,8 @@ pub enum StoreEvent {
         #[allow(dead_code)]
         error: Arc<str>,
     },
+    /// A permission request arrived and should be shown to the user.
+    ApprovalRequested,
 }
 
 /// Someone who has read up to a message (Slack/iMessage-style read marks).
@@ -187,6 +191,8 @@ struct Attached {
     agent_statuses: HashMap<(ct::MemberId, ct::ChannelId), chaos_core::engine::AgentStatus>,
     /// An unanswered project-identity question (see `project::decide`).
     confirm: Option<Confirm>,
+    /// Permission requests waiting for a user decision.
+    pending_approvals: Vec<ApprovalRequest>,
     /// Each usable harness's models: its cached list (`model_cache`), else
     /// its preset list until it reports its own.
     models: HashMap<&'static str, HarnessModels>,
@@ -1069,6 +1075,7 @@ impl ChatStore {
             reactions: HashMap::new(),
             agent_statuses: HashMap::new(),
             confirm,
+            pending_approvals: Vec::new(),
             models,
             discovering: HashSet::new(),
             stale,
@@ -1926,6 +1933,87 @@ impl ChatStore {
         }))
     }
 
+    /// The oldest provider permission request awaiting a user decision.
+    pub fn pending_approval(&self) -> Option<PaneContent> {
+        let attached = self.core.as_ref()?;
+        let request = attached.pending_approvals.first()?;
+        let agent = attached
+            .link
+            .agents
+            .iter()
+            .find(|agent| agent.member == request.agent)
+            .map_or_else(|| Arc::from("Agent"), |agent| agent.name.clone());
+        let choices = match &request.choices {
+            ApprovalChoices::DecisionVocabulary { decisions, .. } => decisions
+                .iter()
+                .map(|id| ApprovalChoice {
+                    id: id.clone(),
+                    label: Arc::from(match id.as_ref() {
+                        "once" => "Allow once",
+                        "always" => "Always allow",
+                        "reject" => "Reject",
+                        other => other,
+                    }),
+                })
+                .collect(),
+            ApprovalChoices::ProviderOptions { options } => options
+                .iter()
+                .map(|option| ApprovalChoice {
+                    id: option.id.clone(),
+                    label: option.label.clone().unwrap_or_else(|| option.id.clone()),
+                })
+                .collect(),
+        };
+        Some(PaneContent::Approval(ApprovalQuestion {
+            id: Arc::from(request.cc_request_id.as_str()),
+            agent,
+            action: request.operation.action.clone(),
+            summary: request.operation.summary.clone(),
+            arguments: request
+                .operation
+                .arguments
+                .as_ref()
+                .map(|value| Arc::from(value.to_string())),
+            choices,
+        }))
+    }
+
+    /// Resolve or cancel the approval currently shown in the pane.
+    pub fn answer_approval(
+        &mut self,
+        request_id: &str,
+        choice: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let id = ApprovalId::from(request_id);
+        let Some(attached) = self.core.as_ref() else {
+            return;
+        };
+        if !attached
+            .pending_approvals
+            .iter()
+            .any(|pending| pending.cc_request_id == id)
+        {
+            return;
+        }
+        let core = attached.link.core.clone();
+        let result = match choice {
+            Some(choice) => core.resolve_approval(&id, choice),
+            None => core.cancel_approval(&id),
+        };
+        match result {
+            Ok(()) => {
+                if let Some(attached) = &mut self.core {
+                    attached
+                        .pending_approvals
+                        .retain(|pending| pending.cc_request_id != id);
+                }
+                cx.notify();
+            }
+            Err(error) => self.system_note(&format!("Could not resolve approval: {error}"), cx),
+        }
+    }
+
     /// The user's answer to the identity question. Nothing about the folder's
     /// project changed before this.
     pub fn answer_identity(&mut self, answer: &PaneActionKind, cx: &mut Context<Self>) {
@@ -2149,6 +2237,33 @@ impl ChatStore {
 
     /// Folds one core event into the app's state.
     pub fn apply_core_event(&mut self, event: CoreEvent, cx: &mut impl EventSink) {
+        if let CoreEvent::ApprovalRequested(request) = event {
+            let Some(attached) = &mut self.core else {
+                return;
+            };
+            if !attached
+                .pending_approvals
+                .iter()
+                .any(|pending| pending.cc_request_id == request.cc_request_id)
+            {
+                let should_show = attached.pending_approvals.is_empty();
+                attached.pending_approvals.push(request);
+                if should_show {
+                    cx.emit(StoreEvent::ApprovalRequested);
+                }
+                cx.notify();
+            }
+            return;
+        }
+        if let CoreEvent::ApprovalOutcome(outcome) = event {
+            if let Some(attached) = &mut self.core {
+                attached
+                    .pending_approvals
+                    .retain(|pending| pending.cc_request_id != outcome.cc_request_id);
+            }
+            cx.notify();
+            return;
+        }
         // Models has side effects (cache write, harness lookup) that need the
         // attached link; handle it separately.
         if let CoreEvent::Models { harness, models } = event {
@@ -2362,6 +2477,8 @@ impl ChatStore {
                 cx.notify();
             }
             CoreEvent::Models { .. } => {}
+            CoreEvent::ApprovalRequested(_) => {}
+            CoreEvent::ApprovalOutcome(_) => {}
         }
     }
 
