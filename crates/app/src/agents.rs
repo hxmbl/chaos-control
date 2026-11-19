@@ -141,6 +141,14 @@ pub struct HarnessOverride {
     pub acp_v2: bool,
     #[serde(default)]
     pub chat_tools: ChatTools,
+    /// Use the native OpenCode v2 server adapter instead of ACP for this harness
+    /// (STRM-612). Preserves ACP as the default unless explicitly enabled.
+    #[serde(default)]
+    pub native_opencode_v2: bool,
+    /// Native OpenCode v2: connect to this server URL instead of starting one.
+    pub server_url: Option<String>,
+    /// Native OpenCode v2: HTTP basic auth password (user `opencode`).
+    pub server_password: Option<String>,
 }
 
 /// One member of the roster.
@@ -212,6 +220,9 @@ impl ChatTools {
 #[derive(Clone, Debug)]
 pub struct Harness {
     pub preset: &'static HarnessPreset,
+    /// Protocol/driver for this harness instance (may differ from the preset
+    /// when explicitly overridden, e.g. native OpenCode v2).
+    pub transport: harness::Transport,
     pub command: PathBuf,
     pub args: Vec<String>,
     pub opts: AdapterOptions,
@@ -221,7 +232,7 @@ impl Harness {
     /// The adapter for one member running `model` on this harness.
     pub fn adapter(&self, model: Option<&str>) -> Arc<dyn AgentAdapter> {
         harness::adapter_for(
-            self.preset.transport,
+            self.transport,
             self.command.clone(),
             self.args.clone(),
             model.map(Arc::from),
@@ -285,6 +296,12 @@ pub fn harnesses(config: &AgentsConfig, env: &DetectEnv) -> Vec<Harness> {
                 (None, Some(d)) => (d.command, o.and_then(|o| o.args.clone()).unwrap_or(d.args)),
                 (None, None) => return None,
             };
+            let native_opencode_v2 = o.is_some_and(|o| o.native_opencode_v2);
+            let transport = if native_opencode_v2 {
+                harness::Transport::OpenCodeV2
+            } else {
+                preset.transport
+            };
             let opts = AdapterOptions {
                 env: o
                     .map(|o| o.env.clone().into_iter().collect())
@@ -292,9 +309,12 @@ pub fn harnesses(config: &AgentsConfig, env: &DetectEnv) -> Vec<Harness> {
                 record: o.and_then(|o| o.record.clone()),
                 acp_v2: o.is_none_or(|o| o.acp_v2),
                 chat_tools: o.map_or(ChatToolsPreference::Auto, |o| o.chat_tools.preference()),
+                server_url: o.and_then(|o| o.server_url.clone()),
+                server_password: o.and_then(|o| o.server_password.clone()),
             };
             Some(Harness {
                 preset,
+                transport,
                 command,
                 args,
                 opts,

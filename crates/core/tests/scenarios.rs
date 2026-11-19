@@ -378,7 +378,7 @@ async fn agent_ping_pong_damper_trips() {
     let mut b_turn = 0;
     // Alternate: a posts, a human chats (resets hops, not the damper), b posts, ...
     let mut tripped = None;
-    for round in 0..6 {
+    for round in 0..12 {
         let (fake, gate, who) = if round % 2 == 0 {
             a_turn += 1;
             ("a", format!("a{}", a_turn - 1), a.id)
@@ -391,21 +391,31 @@ async fn agent_ping_pong_damper_trips() {
         h.say("unrelated human chatter").await;
         h.quiesce().await;
         h.drain();
-        if let Some(CoreEvent::Message(m)) = h
-            .seen
-            .iter()
-            .find(|e| matches!(e, CoreEvent::Message(m) if m.origin == Origin::System))
-            .cloned()
-        {
-            tripped = Some((round, m));
+        let damped = h.seen.iter().any(|e| {
+            matches!(
+                e,
+                CoreEvent::Agent(s)
+                    if s.agent == b.id
+                        && s.presence.as_deref().is_some_and(|p| p.contains("ping-pong limit"))
+            )
+        });
+        if damped {
+            tripped = Some(round);
             break;
         }
     }
-    let (round, notice) = tripped.expect("the damper tripped");
-    assert!(notice.body.contains("Pausing @a ↔ @b"), "{}", notice.body);
+    let round = tripped.expect("the damper tripped");
     assert_eq!(
-        round, 4,
-        "four alternating wakes allowed, the fifth is damped"
+        round, 10,
+        "ten alternating wakes allowed, the eleventh is damped"
+    );
+    // The pause is quiet: nothing is posted to the channel about it.
+    assert!(
+        h.history()
+            .await
+            .iter()
+            .all(|m| m.origin != Origin::System),
+        "the damper posts no system message"
     );
     // Every agent post had hop 1 (each followed human chatter), so this was
     // the damper, not the hop budget.

@@ -27,6 +27,7 @@ pub mod host;
 pub mod mcp;
 pub mod model_cache;
 pub mod notify;
+pub mod opencode_v2;
 pub mod policy;
 pub mod reaction;
 pub mod roster;

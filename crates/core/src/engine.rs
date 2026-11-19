@@ -805,7 +805,6 @@ impl Engine {
             None => None,
         };
         let mut woken = Vec::new();
-        let mut trip_notice = None;
         for target in members
             .iter()
             .filter(|m| m.kind == MemberKind::Agent && m.id != author.id)
@@ -847,10 +846,12 @@ impl Engine {
                 {
                     Damp::Allow => {}
                     Damp::Trip => {
-                        trip_notice = Some(format!(
-                            "Pausing @{} ↔ @{}: they have pinged each other {} times in a row. Mention either to continue.",
-                            author.handle, target.handle, self.policy.max_alternations
-                        ));
+                        let rt = self.rt.entry((target.id, channel)).or_default();
+                        rt.note = Some(Arc::from(format!(
+                            "@{} hit the ping-pong limit; a human mention lifts it",
+                            author.handle
+                        )));
+                        self.publish_status(target.id, channel);
                         continue;
                     }
                     Damp::Paused => continue,
@@ -880,9 +881,6 @@ impl Engine {
                 }
             }
             woken.push(target.id);
-        }
-        if let Some(text) = trip_notice {
-            self.system_note(now, channel, &text)?;
         }
         for agent in woken {
             self.pump(now, agent, channel);

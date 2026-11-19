@@ -398,9 +398,10 @@ removed so it can be rebuilt from the ground up.
   human message resets the chain). An agent-authored message with hop > 3
   creates no triggers; the targets' presence notes say the hop limit was
   reached.
-- **Ping-pong damper.** The 5th alternating wake between the same two agents is
-  suppressed, the pair paused, and one system line posted. A human addressing
-  either agent resumes them.
+- **Ping-pong damper.** The 11th alternating wake between the same two agents is
+  suppressed and the pair paused. Nothing is posted to the channel; the
+  suppressed agent's presence note says the ping-pong limit was reached. A
+  human addressing either agent resumes them.
 - **Rate limit.** 6 agent posts per minute per agent per channel
   (`chat_send`, `chat_refuse` and `chat_dissent` all count); over it, the tool
   returns `rate_limited` with a retry time.
