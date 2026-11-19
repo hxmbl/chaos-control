@@ -113,6 +113,19 @@ Classification buckets: **CC-mediated** (CC owns request/decision/outcome and en
 - [ ] Disconnect/callback-loss/recovery behavior under real failure conditions.
 - [ ] ACP parity confirmation post-change.
 
+### T3 Code reference review
+
+The T3 Code reference material was reviewed on 2026-11-19:
+
+- **Provider boundary:** provider-specific behavior stays in the provider adapter; orchestration reads capabilities rather than guessing.
+- **Permission modes:** offer only modes the provider enforces natively. Do not imitate a missing mode by automatically answering approval callbacks.
+- **Approval semantics:** pass provider-owned option IDs through unchanged and require an honored decline path.
+- **Lifecycle:** replay provider transcripts through the real orchestrator/adapter/projections; test interruption, failure, recovery and terminal pending-request settlement.
+- **ACP:** ACP agents run their own tools and sandbox/approval controls; ACP approval handling does not prove Chaos Control controls every operation.
+- **Resumption:** lost runtime state may preserve durable provider/session references, but it must not treat a lost callback or ambiguous response as an approved or resumable operation.
+
+This review supports the current STRM-612 design and identifies replayed real-provider transcripts through the real orchestrator, plus durable recovery of pending requests, as the remaining high-value evidence.
+
 ## Fixture/test matrix (STRM-612 AC coverage target)
 
 | Category | Expected behavior | Notes |
