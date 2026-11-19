@@ -411,10 +411,7 @@ async fn agent_ping_pong_damper_trips() {
     );
     // The pause is quiet: nothing is posted to the channel about it.
     assert!(
-        h.history()
-            .await
-            .iter()
-            .all(|m| m.origin != Origin::System),
+        h.history().await.iter().all(|m| m.origin != Origin::System),
         "the damper posts no system message"
     );
     // Every agent post had hop 1 (each followed human chatter), so this was

@@ -1071,6 +1071,7 @@ mod tests {
     fn members_whose_harness_is_missing_stay_out_of_the_room() {
         let fx = Harness {
             preset: harness::preset("fx").unwrap(),
+            transport: harness::Transport::Acp,
             command: PathBuf::from("/bin/fx"),
             args: vec!["acp".into()],
             opts: AdapterOptions::default(),

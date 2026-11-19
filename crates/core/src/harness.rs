@@ -480,15 +480,19 @@ pub fn adapter_for(
             .chat_tools(opts.chat_tools)
             .model(model),
         ),
-        Transport::OpenCodeV2 => Arc::new(crate::opencode_v2::OpenCodeV2Adapter::new(
-            crate::opencode_v2::OpenCodeV2Config {
-                command,
-                args,
-                env: opts.env,
-                server_url: opts.server_url,
-                server_password: opts.server_password,
-            },
-        )),
+        Transport::OpenCodeV2 => {
+            let server_password = opts.server_password;
+            Arc::new(crate::opencode_v2::OpenCodeV2Adapter::new(
+                crate::opencode_v2::OpenCodeV2Config {
+                    command,
+                    args,
+                    env: opts.env,
+                    server_url: opts.server_url,
+                    server_password,
+                    model,
+                },
+            ))
+        }
     }
 }
 
