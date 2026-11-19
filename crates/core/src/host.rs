@@ -321,7 +321,7 @@ impl ApprovalBroker for RuntimeApprovalBroker {
             }
             if self
                 .events
-                .send(CoreEvent::ApprovalRequested(request))
+                .send(CoreEvent::ApprovalRequested(Box::new(request)))
                 .is_err()
             {
                 self.pending
@@ -356,6 +356,7 @@ impl ApprovalBroker for RuntimeApprovalBroker {
     }
 }
 
+#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod approval_tests {
     use super::*;

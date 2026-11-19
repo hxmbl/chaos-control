@@ -67,7 +67,7 @@ pub enum CoreEvent {
         models: Vec<crate::harness::ModelInfo>,
     },
     /// An agent is waiting for a user decision about a provider permission.
-    ApprovalRequested(ApprovalRequest),
+    ApprovalRequested(Box<ApprovalRequest>),
     /// The provider permission decision was attempted or failed closed.
     ApprovalOutcome(ApprovalOutcome),
 }

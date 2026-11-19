@@ -2247,7 +2247,7 @@ impl ChatStore {
                 .any(|pending| pending.cc_request_id == request.cc_request_id)
             {
                 let should_show = attached.pending_approvals.is_empty();
-                attached.pending_approvals.push(request);
+                attached.pending_approvals.push(*request);
                 if should_show {
                     cx.emit(StoreEvent::ApprovalRequested);
                 }

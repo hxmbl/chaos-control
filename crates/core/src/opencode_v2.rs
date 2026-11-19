@@ -421,7 +421,7 @@ async fn answer_permission(inner: Arc<SessionInner>, frame_data: String) {
         );
         let _ = broker
             .record_outcome(ApprovalOutcome {
-                cc_request_id: cc_request_id,
+                cc_request_id,
                 state: ApprovalOutcomeState::Failed,
                 provider_reply: None,
                 execution_effect: None,
@@ -508,7 +508,7 @@ async fn answer_permission(inner: Arc<SessionInner>, frame_data: String) {
                     state: ApprovalOutcomeState::Failed,
                     provider_reply: None,
                     execution_effect: None,
-                    error: Some(Arc::from(error.message)),
+                    error: Some(error.message),
                     recorded_at: Some(now),
                 })
                 .await;
