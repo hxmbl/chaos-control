@@ -483,6 +483,28 @@ mod approval_tests {
         );
         assert!(broker.cancel(&pending_id).is_err());
     }
+
+    #[tokio::test]
+    async fn runtime_approval_broker_lost_event_callback_is_fail_closed() {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        drop(events_rx);
+        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let pending_id = request().cc_request_id;
+
+        let result = broker.request_decision(request()).await;
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .message
+                .as_ref()
+                .contains("event receiver is gone")
+        );
+        assert!(broker.pending.lock().unwrap().get(&pending_id).is_none());
+        assert!(broker.resolve(&pending_id, "once").is_err());
+        assert!(broker.cancel(&pending_id).is_err());
+    }
 }
 
 impl Core {
