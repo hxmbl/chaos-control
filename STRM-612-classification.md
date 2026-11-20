@@ -75,7 +75,7 @@ These describe **today’s** behavior unless/until a scoped change is made; STRM
 | Permission request reply shape | ACP adapters reply with provider-offered option IDs (`Selected(option_id)`) or `Cancelled` when no option is selectable. | `acp.rs:678-686`, `acp_v2.rs:123-131` |
 | Auto-allow choice (current) | Chooses allow-once, else allow-always, else first offered option. | `adapter.rs:auto_allow` |
 | No user approval mediation (current) | Permission requests are answered immediately in-adapter; no prompt/queue/log surfaced by these adapters. | `docs/agents.md`, `lib.rs`, adapter code |
-| Chat tools exposure | Injected per negotiated transport/capabilities; not gated by CC permission mediation today. | `acp.rs`, `acp_v2.rs`, `opencode_v2.rs` |
+| Chat tools exposure | Injected per negotiated transport/capabilities; intentionally auto-allowed (provider-native), never CC-gated — product decision 2026-11-20 (see decision note below). | `acp.rs`, `acp_v2.rs`, `opencode_v2.rs`; chat-tool gating decision in this doc |
 | Trust boundary claim | Current auto-answering is **not** a complete security boundary; agents may have unmediated paths/native controls. | `docs/agents.md`, STRM-612 issue text |
 
 **To document as part of completion:** which ACP paths remain in product, their actual enforcement level, and any changes required for new permission semantics (must be explicit, not silent).
@@ -91,7 +91,7 @@ Classification buckets: **CC-mediated** (CC owns request/decision/outcome and en
 | v2 file read (`action:"read"` in follow-up) | Not re-asked after `always` in spike case | `always` grant applied (pattern-saved) | Provider-native grant behavior observed | **Partially evidenced / provider-native grant behavior** | spike #248 | Baseline "asks on read?" under `*":"ask"` still needs explicit first-hit evidence per op |
 | v2 file edit/write/delete | TBD | TBD | TBD | Unverified | spike pending | Critical for `accept-edits` eligibility; capture per-op evidence |
 | v2 network/fetch/web ops | TBD | TBD | TBD | Unverified | spike pending |  |
-| v2 MCP tool calls (incl. chaos-control tools) | TBD | TBD | TBD | Unverified | `opencode_v2.rs:592-612`, spike pending | Distinguish MCP server install from per-call permission mediation |
+| v2 MCP tool calls (incl. chaos-control tools) | TBD | TBD | TBD | Unverified | `opencode_v2.rs:592-612`, spike pending | Distinguish MCP server install from per-call permission mediation; in-room chat tools are intentionally auto-allowed (see chat-tool gating decision), other MCP calls still need evidence |
 | v2 operations with **no prompt** | n/a | n/a | none observed by request path | **Bypass risk / Unverified** until disproven | spike pending | Must be reported, not treated as protected |
 | ACP v1 `session/request_permission` | Yes | Yes (option IDs passed; cancelled possible) | adapter auto-allows today (not CC-mediated) | Provider request observed, **currently auto-allowed** | `acp.rs:764-771`, `678-686` | Retained behavior; future mediation changes must be explicit |
 | ACP v2 `RequestPermissionRequest` | Yes | Yes (option IDs passed; cancelled possible) | adapter auto-allows today (not CC-mediated) | Provider request observed, **currently auto-allowed** | `acp_v2.rs:322-329`, `123-131` | Same |
@@ -157,6 +157,17 @@ and no provider callback is auto-answered to imitate one. The per-operation
 approval path above (CC-owned IDs, `reject|once|always`, one-shot, fail-closed) is
 unchanged and still mediated. This is a scope label, not a claim that the modes
 work; it is recorded on STRM-612 and re-openable with real-flow evidence.
+
+**Chat-tool gating decision (2026-11-20):** in-room chaos-control chat tools
+(`chat_send`, `chat_read`, `chat_search`, `chat_react`, etc.) are intentionally
+**auto-allowed / provider-native and never gated by CC approval**. Gating them
+would either drive agents into repeated approval loops or degrade the group-chat
+experience, so the current core behavior is the intended product behavior, not an
+unmediated gap to close. There is therefore **no separate permission slice to build**
+for chat tools. This closes the "chat-tool gating" open item as a deliberate scope
+choice; it does not change the per-operation mediation path for shell/read/edit/
+network/MCP/subagent ops, which remains as specified above. Re-openable only by an
+explicit product decision.
 
 **Failure-visibility decision (2026-11-20):** unsupported and unverified operations
 or modes must **fail loudly**, not silently — surface the blocked/unsupported state
