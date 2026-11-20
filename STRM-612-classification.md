@@ -235,3 +235,7 @@ incremental doc updates; keep the items below open rather than marking them done
 - [ ] Add PR #80 note summarizing permission/evidence status.
 
 **Notes:** pending prompts remain runtime-only/fail-closed (no persistence/replay). Avoid colliding with in-progress broker/adapter edits in `crates/core/src/host.rs`, `crates/core/src/opencode_v2.rs`; prefer adding fixtures/tests/docs.
+
+## Deferred follow-ups (later, post-612)
+
+- [ ] Remove the `harnesses.opencode.native_opencode_v2` dev flag (`crates/app/src/agents.rs:148,300-309`) and make the native V2 path the default so the opt-in is no longer needed. Deferred by Hx on 2026-11-20; keep it out of the 612 close-out.
