@@ -102,7 +102,6 @@ const WORKING_WORDS: &[&str] = &[
     "channelling",
     "choreographing",
     "churning",
-    "clauding",
     "coalescing",
     "cogitating",
     "combobulating",
@@ -2305,7 +2304,7 @@ mod tests {
     #[test]
     fn working_indicator_cycles_every_five_seconds_through_word_bank() {
         assert_eq!(WORKING_WORD_INTERVAL, Duration::from_secs(5));
-        assert_eq!(WORKING_WORDS.len(), 186);
+        assert_eq!(WORKING_WORDS.len(), 185);
         assert_eq!(WORKING_WORDS[0], "accomplishing");
         assert_eq!(WORKING_WORDS[WORKING_WORDS.len() - 1], "zigzagging");
         let unique = WORKING_WORDS
