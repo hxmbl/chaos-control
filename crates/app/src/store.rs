@@ -12,7 +12,7 @@ use std::{
 };
 
 use chaos_core::{
-    approval::{ApprovalChoices, ApprovalId, ApprovalRequest},
+    approval::{ApprovalChoices, ApprovalId, ApprovalOutcomeState, ApprovalRequest},
     engine::CoreEvent,
     harness::{self, Catalog, HarnessModels, ModelInfo, ModelSource},
     model_cache::{self, CachedModels, Freshness},
@@ -70,6 +70,30 @@ impl EventSink for Context<'_, ChatStore> {
         notify_store(self);
     }
 }
+
+/// A recent approval that did not end in an allow. Kept for the right
+/// sidebar's visible "blocked" signal: an outcome is not just bookkeeping.
+#[derive(Clone, Debug)]
+pub struct ApprovalNotice {
+    pub state: ApprovalOutcomeState,
+    pub error: Option<Arc<str>>,
+}
+
+impl ApprovalNotice {
+    /// Short label for the sidebar row.
+    pub fn label(&self) -> &'static str {
+        match self.state {
+            ApprovalOutcomeState::Allowed => "Allowed",
+            ApprovalOutcomeState::Denied => "Blocked: denied",
+            ApprovalOutcomeState::Sent => "Blocked: failed after reply",
+            ApprovalOutcomeState::NotSent => "Blocked: no reply sent",
+            ApprovalOutcomeState::Failed => "Blocked: request failed",
+        }
+    }
+}
+
+/// How many recent blocked approvals the sidebar keeps.
+const MAX_APPROVAL_NOTICES: usize = 8;
 
 /// Where a composer message in the selected channel goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,6 +173,8 @@ pub struct ChatStore {
     core: Option<Attached>,
     /// Core runtime running with no project opened.
     no_project_core: Option<CoreLink>,
+    /// Recent non-allowed approval outcomes, newest first, for the sidebar.
+    approval_notices: Vec<ApprovalNotice>,
 }
 
 /// One emoji under a message: how many put it there and who.
@@ -423,11 +449,17 @@ impl ChatStore {
             project_generation: 0,
             core: None,
             no_project_core: None,
+            approval_notices: Vec::new(),
         }
     }
 
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+
+    /// Recent approvals that blocked an operation, newest first (STRM-612).
+    pub fn approval_notices(&self) -> &[ApprovalNotice] {
+        &self.approval_notices
     }
 
     pub fn selected(&self) -> Id {
@@ -2255,14 +2287,13 @@ impl ChatStore {
             }
             return;
         }
-        if let CoreEvent::ApprovalOutcome(outcome) = event {
-            if let Some(attached) = &mut self.core {
-                attached
-                    .pending_approvals
-                    .retain(|pending| pending.cc_request_id != outcome.cc_request_id);
-            }
-            cx.notify();
-            return;
+        if let CoreEvent::ApprovalOutcome(ref outcome) = event
+            && let Some(attached) = &mut self.core
+        {
+            attached
+                .pending_approvals
+                .retain(|pending| pending.cc_request_id != outcome.cc_request_id);
+            // Fall through so apply_core_event_state records the visible notice.
         }
         // Models has side effects (cache write, harness lookup) that need the
         // attached link; handle it separately.
@@ -2331,8 +2362,9 @@ impl ChatStore {
         }
     }
 
-    /// UI-free core of [`apply_core_event`] for message/read/reaction/agent
-    /// events. Mutates the provided state and app/channel/log state on `self`.
+    /// UI-free core of [`apply_core_event`] for message/read/reaction/agent and
+    /// approval-outcome events. Mutates the provided state and app/channel/log
+    /// state on `self`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn apply_core_event_state(
         &mut self,
@@ -2478,7 +2510,21 @@ impl ChatStore {
             }
             CoreEvent::Models { .. } => {}
             CoreEvent::ApprovalRequested(_) => {}
-            CoreEvent::ApprovalOutcome(_) => {}
+            CoreEvent::ApprovalOutcome(outcome) => {
+                // A denied or fail-closed request is a blocked operation, not
+                // silent bookkeeping: keep it for the sidebar (STRM-612).
+                if outcome.state != ApprovalOutcomeState::Allowed {
+                    self.approval_notices.insert(
+                        0,
+                        ApprovalNotice {
+                            state: outcome.state,
+                            error: outcome.error,
+                        },
+                    );
+                    self.approval_notices.truncate(MAX_APPROVAL_NOTICES);
+                }
+                cx.notify();
+            }
         }
     }
 
@@ -2944,6 +2990,72 @@ mod apply_core_event_tests {
             &mut state.reactions,
             sink,
         );
+    }
+
+    #[test]
+    fn blocked_approval_outcomes_are_kept_for_the_sidebar() {
+        use chaos_core::approval::{ApprovalId, ApprovalOutcome};
+
+        let app_channel = Id(10);
+        let mut store = store_with_main(app_channel);
+        let mut sink = Sink::default();
+        let mut state = ApplyState::default();
+        let agent_ids = HashSet::new();
+        let ctx = ApplyCtx {
+            main: ct::ChannelId(1),
+            human: ct::MemberId(1),
+            app_channel,
+            agents: &[],
+            agent_ids: &agent_ids,
+        };
+        let outcome = |id: &str, st, error: Option<&str>| {
+            CoreEvent::ApprovalOutcome(ApprovalOutcome {
+                cc_request_id: ApprovalId(Arc::from(id)),
+                state: st,
+                provider_reply: None,
+                execution_effect: None,
+                error: error.map(Arc::from),
+                recorded_at: None,
+            })
+        };
+
+        apply(
+            &mut store,
+            &mut sink,
+            outcome("ok", ApprovalOutcomeState::Allowed, None),
+            &ctx,
+            &mut state,
+        );
+        assert!(store.approval_notices().is_empty());
+
+        apply(
+            &mut store,
+            &mut sink,
+            outcome("deny", ApprovalOutcomeState::Denied, None),
+            &ctx,
+            &mut state,
+        );
+        apply(
+            &mut store,
+            &mut sink,
+            outcome(
+                "lost",
+                ApprovalOutcomeState::NotSent,
+                Some("approval unresolved: lost"),
+            ),
+            &ctx,
+            &mut state,
+        );
+
+        let notices = store.approval_notices();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[0].label(), "Blocked: no reply sent");
+        assert_eq!(
+            notices[0].error.as_deref(),
+            Some("approval unresolved: lost")
+        );
+        assert_eq!(notices[1].label(), "Blocked: denied");
+        assert_eq!(sink.notifies, 3);
     }
 
     #[test]
