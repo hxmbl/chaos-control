@@ -16,8 +16,7 @@ use gpui::{
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
-    ActiveTheme, Elevation, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, TypeStyleExt,
-    icon,
+    ActiveTheme, Elevation, IconName, TextInput, TextInputEvent, Tooltip, TypeStyleExt, icon,
     tokens::{icon as icons, radius, size, space, text},
     truncated,
 };
@@ -1501,7 +1500,6 @@ impl Composer {
             .child(
                 div()
                     .flex_1()
-                    .ellipsis()
                     .text_color(t.ink_soft)
                     .child(truncated(reply.quote.clone())),
             )
