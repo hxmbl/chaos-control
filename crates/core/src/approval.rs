@@ -211,6 +211,14 @@ pub trait ApprovalBroker: Send + Sync {
         &self,
         outcome: ApprovalOutcome,
     ) -> BoxFuture<'_, Result<(), ApprovalBrokerError>>;
+
+    /// Fail closed all requests unresolved by this broker on transport loss.
+    fn cancel_pending(
+        &self,
+        _resolution: ApprovalResolution,
+    ) -> BoxFuture<'_, Result<(), ApprovalBrokerError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

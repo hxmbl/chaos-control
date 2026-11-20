@@ -380,6 +380,37 @@ impl ApprovalBroker for RuntimeApprovalBroker {
             Ok(())
         })
     }
+
+    fn cancel_pending(
+        &self,
+        resolution: ApprovalResolution,
+    ) -> futures::future::BoxFuture<'_, Result<(), ApprovalBrokerError>> {
+        Box::pin(async move {
+            let mut pending_map = self
+                .pending
+                .lock()
+                .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?;
+            let pending = pending_map
+                .drain()
+                .map(|(id, entry)| {
+                    let decision = ApprovalDecision {
+                        cc_request_id: id,
+                        decision: ApprovalDecisionKind::NotResolved { resolution },
+                        decided_at: SystemClock.now(),
+                        actor: None,
+                    };
+                    entry.decision.send(decision)
+                })
+                .collect::<Vec<_>>();
+            drop(pending_map);
+            for sent in pending {
+                sent.map_err(|_| {
+                    ApprovalBrokerError::new("approval request was already abandoned")
+                })?;
+            }
+            Ok(())
+        })
+    }
 }
 
 #[allow(clippy::items_after_test_module)]
@@ -504,6 +535,34 @@ mod approval_tests {
         assert!(broker.pending.lock().unwrap().get(&pending_id).is_none());
         assert!(broker.resolve(&pending_id, "once").is_err());
         assert!(broker.cancel(&pending_id).is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_approval_broker_cancel_pending_resolves_as_disconnect() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let pending_id = request().cc_request_id;
+        let pending_broker = broker.clone();
+        let pending = tokio::spawn(async move { pending_broker.request_decision(request()).await });
+
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalRequested(_))
+        ));
+        broker
+            .cancel_pending(ApprovalResolution::Disconnect)
+            .await
+            .unwrap();
+
+        let decision = pending.await.unwrap().unwrap();
+        assert_eq!(
+            decision.decision,
+            ApprovalDecisionKind::NotResolved {
+                resolution: ApprovalResolution::Disconnect,
+            }
+        );
+        assert!(broker.pending.lock().unwrap().is_empty());
+        assert!(broker.resolve(&pending_id, "once").is_err());
     }
 }
 

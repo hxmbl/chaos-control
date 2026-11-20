@@ -299,6 +299,9 @@ async fn stream_events(inner: Arc<SessionInner>) {
         &inner,
         &AgentError::new(AgentErrorKind::Transport, "event stream closed"),
     );
+    if let Some(broker) = &inner.approval_broker {
+        let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
+    }
     inner.events.emit(AgentEvent::Exited {
         error: Some("opencode v2 event stream closed".into()),
     });
