@@ -303,6 +303,21 @@ impl Engine {
         self.store.conn()
     }
 
+    pub fn approval_outcomes(
+        &self,
+    ) -> rusqlite::Result<
+        std::collections::HashMap<crate::approval::ApprovalId, crate::approval::ApprovalOutcome>,
+    > {
+        self.store.approval_outcomes()
+    }
+
+    pub fn record_approval_outcome(
+        &mut self,
+        outcome: &crate::approval::ApprovalOutcome,
+    ) -> rusqlite::Result<()> {
+        self.store.record_approval_outcome(outcome)
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }

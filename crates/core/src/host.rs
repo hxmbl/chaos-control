@@ -222,16 +222,22 @@ struct PendingApproval {
 
 struct RuntimeApprovalBroker {
     events: mpsc::UnboundedSender<CoreEvent>,
+    engine_tx: Option<mpsc::UnboundedSender<Cmd>>,
     pending: std::sync::Mutex<HashMap<ApprovalId, PendingApproval>>,
     outcomes: std::sync::Mutex<HashMap<ApprovalId, crate::approval::ApprovalOutcome>>,
 }
 
 impl RuntimeApprovalBroker {
-    fn new(events: mpsc::UnboundedSender<CoreEvent>) -> Self {
+    fn new(
+        events: mpsc::UnboundedSender<CoreEvent>,
+        engine_tx: Option<mpsc::UnboundedSender<Cmd>>,
+        outcomes: HashMap<ApprovalId, crate::approval::ApprovalOutcome>,
+    ) -> Self {
         Self {
             events,
+            engine_tx,
             pending: std::sync::Mutex::new(HashMap::new()),
-            outcomes: std::sync::Mutex::new(HashMap::new()),
+            outcomes: std::sync::Mutex::new(outcomes),
         }
     }
 
@@ -349,9 +355,29 @@ impl ApprovalBroker for RuntimeApprovalBroker {
                 .lock()
                 .map_err(|_| ApprovalBrokerError::new("approval outcome lock poisoned"))?
                 .insert(outcome.cc_request_id.clone(), outcome.clone());
-            self.events
-                .send(CoreEvent::ApprovalOutcome(outcome))
-                .map_err(|_| ApprovalBrokerError::new("approval event receiver is gone"))
+            if self
+                .events
+                .send(CoreEvent::ApprovalOutcome(outcome.clone()))
+                .is_err()
+            {
+                return Err(ApprovalBrokerError::new("approval event receiver is gone"));
+            }
+            if let Some(tx) = &self.engine_tx {
+                let (reply, wait) = oneshot::channel();
+                let outcome_for_store = outcome.clone();
+                let f: EngineFn = Box::new(move |engine, _now| {
+                    let result = engine
+                        .record_approval_outcome(&outcome_for_store)
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                });
+                tx.send(Cmd::Engine(f))
+                    .map_err(|_| ApprovalBrokerError::new("core runtime is gone"))?;
+                wait.await
+                    .map_err(|_| ApprovalBrokerError::new("approval outcome store was abandoned"))?
+                    .map_err(ApprovalBrokerError::new)?;
+            }
+            Ok(())
         })
     }
 }
@@ -392,7 +418,7 @@ mod approval_tests {
     #[tokio::test]
     async fn runtime_approval_broker_emits_validates_and_records_decisions() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx));
+        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
         let pending_id = request().cc_request_id;
         let pending_broker = broker.clone();
         let pending = tokio::spawn(async move { pending_broker.request_decision(request()).await });
@@ -454,7 +480,14 @@ impl Core {
             .map_err(|e| format!("recover: {e}"))?;
         let (tx, rx) = mpsc::unbounded_channel();
         let (events_tx, events_rx) = mpsc::unbounded_channel();
-        let approvals = Arc::new(RuntimeApprovalBroker::new(events_tx.clone()));
+        let approval_outcomes = engine
+            .approval_outcomes()
+            .map_err(|e| format!("recover approval outcomes: {e}"))?;
+        let approvals = Arc::new(RuntimeApprovalBroker::new(
+            events_tx.clone(),
+            Some(tx.clone()),
+            approval_outcomes,
+        ));
         let tokens = Arc::new(Tokens::default());
         let caller_tx = tx.clone();
         let caller: mcp::ToolCaller = Arc::new(move |scope: Scope, name: String, args: Value| {
