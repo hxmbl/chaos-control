@@ -1682,7 +1682,11 @@ impl ChatStore {
             .iter()
             .map(|a| MentionCandidate {
                 handle: a.handle.clone(),
-                name: a.name.clone(),
+                name: crate::agents::display_model_label(
+                    a.harness_id.as_deref(),
+                    a.model.as_deref(),
+                    &a.name,
+                ),
                 nicknames: attached
                     .nicknames
                     .get(&a.member)
@@ -2603,7 +2607,11 @@ fn monogram(name: &str) -> String {
 fn status_agent(a: &LinkedAgent) -> Agent {
     Agent {
         id: agent_id(a.member),
-        name: a.name.clone(),
+        name: crate::agents::display_model_label(
+            a.harness_id.as_deref(),
+            a.model.as_deref(),
+            &a.name,
+        ),
         brand: a.brand,
         state: AgentState::Sleeping,
         presence: None,

@@ -350,6 +350,99 @@ pub struct LinkedAgent {
     pub removable: bool,
 }
 
+/// Display label for a model member: `Harness/Provider/Model-With-Dashes`.
+///
+/// `harness_id` is the preset id (e.g. `opencode`), `model` is the full model
+/// id as stored (e.g. `opencode/iceman-free` or
+/// `opencode/openrouter/tencent/hy4-flash`), and `name` is the member's
+/// current/base name. If `name` already looks formatted, it is returned as-is.
+pub fn display_model_label(harness_id: Option<&str>, model: Option<&str>, name: &str) -> Arc<str> {
+    let Some(harness_id) = harness_id else {
+        return Arc::from(name);
+    };
+    if looks_formatted_label(harness_id, name) {
+        return Arc::from(name);
+    }
+
+    let harness_display = match harness_id {
+        "opencode" => "OpenCode",
+        "claude-code" => "Claude-Code",
+        "copilot" => "GitHub-Copilot-CLI",
+        "cursor" => "Cursor-Agent",
+        "vibe" => "Mistral-Vibe",
+        _ => harness::preset(harness_id).map_or(harness_id, |p| p.name),
+    };
+    // Normalize harness display spaces to dashes for segment consistency.
+    let harness_display = harness_display.replace(' ', "-");
+
+    let (provider_display, model_segment) = match harness_id {
+        "opencode" => opencode_provider_and_model(model, name),
+        _ => (None, name.replace(' ', "-")),
+    };
+
+    match provider_display {
+        Some(provider) => Arc::from(format!("{harness_display}/{provider}/{model_segment}")),
+        None => Arc::from(format!("{harness_display}/{model_segment}")),
+    }
+}
+
+fn looks_formatted_label(harness_id: &str, name: &str) -> bool {
+    let prefix = match harness_id {
+        "opencode" => "OpenCode/",
+        "codex" => "Codex/",
+        "fx" => "fx/",
+        "vibe" => "Mistral-Vibe/",
+        "claude-code" => "Claude-Code/",
+        "copilot" => "GitHub-Copilot-CLI/",
+        "devin" => "Devin/",
+        "cursor" => "Cursor-Agent/",
+        "gemini" => "Gemini-CLI/",
+        _ => return false,
+    };
+    name.starts_with(prefix) && name.matches('/').count() >= 1
+}
+
+fn opencode_provider_and_model(model: Option<&str>, name: &str) -> (Option<String>, String) {
+    let model_segment = name.replace(' ', "-");
+    let Some(model) = model else {
+        return (Some("OpenCode-Zen".to_string()), model_segment);
+    };
+    let parts: Vec<&str> = model.split('/').collect();
+    // opencode/<model> => OpenCode-Zen
+    // opencode/<provider>/... => provider display, model name from end/name
+    if parts.first().copied() != Some("opencode") {
+        return (Some("OpenCode-Zen".to_string()), model_segment);
+    }
+    if parts.len() == 2 {
+        return (Some("OpenCode-Zen".to_string()), model_segment);
+    }
+    let provider_id = parts.get(1).copied().unwrap_or("opencode");
+    let provider = match provider_id {
+        "openrouter" => "OpenRouter".to_string(),
+        "huggingface" => "HuggingFace".to_string(),
+        "opencode" => "OpenCode-Zen".to_string(),
+        other => other
+            .split(['-', '_'])
+            .filter(|s| !s.is_empty())
+            .map(capitalize_segment)
+            .collect::<Vec<_>>()
+            .join("-"),
+    };
+    (Some(provider), model_segment)
+}
+
+fn capitalize_segment(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            out.extend(chars);
+            out
+        }
+    }
+}
+
 impl LinkedAgent {
     fn from_member(m: &ModelMember) -> Self {
         let preset = harness::preset(&m.harness);
@@ -996,6 +1089,30 @@ pub fn keep(folder: &Path, target: &Target) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_model_label_builds_three_segments_and_dashes() {
+        let label = display_model_label(
+            Some("opencode"),
+            Some("opencode/openrouter/tencent/hy4-flash"),
+            "Hy4 Flash",
+        );
+        assert_eq!(&*label, "OpenCode/OpenRouter/Hy4-Flash");
+    }
+
+    #[test]
+    fn display_model_label_defaults_bare_opencode_models_to_zen() {
+        let label =
+            display_model_label(Some("opencode"), Some("opencode/big-pickle"), "Big Pickle");
+        assert_eq!(&*label, "OpenCode/OpenCode-Zen/Big-Pickle");
+    }
+
+    #[test]
+    fn display_model_label_leaves_stored_labels_alone() {
+        let stored = "OpenCode/OpenCode-Zen/Big-Pickle";
+        let label = display_model_label(Some("opencode"), Some("opencode/big-pickle"), stored);
+        assert_eq!(&*label, stored);
+    }
 
     #[test]
     fn the_original_shape_still_loads() {
