@@ -152,6 +152,34 @@ and labeled unprotected/unverified rather than inferred to be mediated.
 
 **Harness note:** fake agent (`crates/core/src/fake.rs`) already supports permission request steps and records outcomes; v2 adapter/orchestrator wiring will need real CC approval plumbing to drive these end-to-end.
 
+## Evidence ledger scaffold (foundation only — not yet evidence)
+
+Every row stays `TODO` until it is exercised through the real orchestrator/V2 adapter with a linked artifact. Broker unit tests do not tick acceptance criteria.
+
+| Matrix row | AC | Existing unit-level evidence | Status |
+|---|---|---|---|
+| Allowed (one-shot) | 4, 9 | `runtime_approval_broker_emits_validates_and_records_decisions` | TODO: real V2 op |
+| Denied | 4, 9 | spike: `reject` → `executed:false` | TODO: real V2 op |
+| Bypass / no-prompt-unmediated | 7, 8, 9 | inventory stub below | TODO |
+| Duplicate / replay | 6, 9 | `1dc147a` duplicate-pending rejection | TODO: real orchestrator |
+| Failure | 9 | — | TODO |
+| Disconnect / interruption | 9, 10 | `46eb91e` stream-close settlement | TODO: real V2 stream |
+| Callback loss | 10 | `b2edc26` lost-callback fail-closed | TODO: real V2 session |
+| Mode gating (`ask-all`/`accept-edits`) | 5 | — | TODO: verify or label unsupported |
+| ACP retained paths | 2 | — | TODO: regression check + one-line doc |
+
+**Per-op inventory stub** (fill from a real V2 session; `?` means unknown — never assume mediated):
+
+| Op | Emits request? | Provider-enforced before exec? | CC enforcement? | Evidence |
+|---|---|---|---|---|
+| shell/execute | ? | ? | ? | — |
+| read | ? | ? | ? | — |
+| edit/write/delete | ? | ? | ? | — |
+| network/fetch | ? | ? | ? | — |
+| MCP tool call | ? | ? | ? | — |
+| subagent/child | ? | ? | ? | — |
+| no-prompt paths | n/a | ? | unsupported/unverified until proven | — |
+
 ## Next actions
 
 1. **Big Pickle:** append/link raw spike artifacts if available, expand coverage (no-prompt/unmediated ops, disconnect/loss cases, broader op categories), and wire adapter to refined interface (decision vocabulary, tool-call arg correlation, fail-closed).
