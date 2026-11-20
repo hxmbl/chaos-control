@@ -144,6 +144,12 @@ settled as `Cancelled`/`Lost`/`Disconnect` and recorded `not_sent`; it is never
 rehydrated as approved or replayed. Persisting prompt payloads is optional future
 work, not required for fail-closed crash recovery.
 
+**Request model:** mediation is per operation, not a queue or retry grant. Each
+request has one CC identity and receives one explicit resolution; duplicate IDs
+are rejected, and a resolution is not reused for later operations. Harnesses
+that bypass provider permission callbacks remain a gap: they must be inventoried
+and labeled unprotected/unverified rather than inferred to be mediated.
+
 **Harness note:** fake agent (`crates/core/src/fake.rs`) already supports permission request steps and records outcomes; v2 adapter/orchestrator wiring will need real CC approval plumbing to drive these end-to-end.
 
 ## Next actions
