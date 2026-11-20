@@ -158,6 +158,13 @@ approval path above (CC-owned IDs, `reject|once|always`, one-shot, fail-closed) 
 unchanged and still mediated. This is a scope label, not a claim that the modes
 work; it is recorded on STRM-612 and re-openable with real-flow evidence.
 
+**Failure-visibility decision (2026-11-20):** unsupported and unverified operations
+or modes must **fail loudly**, not silently — surface the blocked/unsupported state
+in the right sidebar so the user can see what was refused or is not covered. The
+heavy real-orchestrator/T3 replay pass is **deferred, not dropped**; near-term we
+prefer this visible fail-closed behavior and incremental doc updates over building
+the full replay matrix now.
+
 **Harness note:** fake agent (`crates/core/src/fake.rs`) already supports permission request steps and records outcomes; v2 adapter/orchestrator wiring will need real CC approval plumbing to drive these end-to-end.
 
 ## Evidence ledger scaffold (foundation only — not yet evidence)
@@ -197,6 +204,12 @@ Every row stays `TODO` until it is exercised through the real orchestrator/V2 ad
 - [x] Durable outcomes/persistence baseline recorded (`3076c95` per sync); per-request model + fail-closed pending policy documented (`b22db97`, this doc).
 
 ### Remaining evidence to collect (real orchestrator / real v2 flow where possible)
+
+**Priority note (2026-11-20):** the heavy real-orchestrator/T3 replay pass is deferred.
+The currently running native V2 session is live evidence for the native transport/session
+work (AC 1), but not for permission mediation unless a mediated decision is actually
+exercised. Near-term focus: visible fail-closed behavior in the right sidebar plus
+incremental doc updates; keep the items below open rather than marking them done.
 - [ ] **Per-op mediation inventory:** for each op category record emits-request? honored `reject|once|always`? execution effect? exact args/correlation?
   - [ ] shell/exec (broaden beyond spike)
   - [ ] file read
