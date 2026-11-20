@@ -180,9 +180,37 @@ Every row stays `TODO` until it is exercised through the real orchestrator/V2 ad
 | subagent/child | ? | ? | ? | — |
 | no-prompt paths | n/a | ? | unsupported/unverified until proven | — |
 
-## Next actions
+## Next actions / pickup checklist (foundation)
 
-1. **Big Pickle:** append/link raw spike artifacts if available, expand coverage (no-prompt/unmediated ops, disconnect/loss cases, broader op categories), and wire adapter to refined interface (decision vocabulary, tool-call arg correlation, fail-closed).
-2. **Iceman:** refine contract/types in core to reflect v2 decision-vocabulary (no option IDs) while keeping provider-honored semantics explicit, maintain classification/retained-guarantees doc, and define `ask-all`/`accept-edits` verification criteria from evidence.
-3. **Devin (and shared):** implement replay fixtures/AC matrix through real orchestrator once plumbing exists; help finalize classification/doc polish.
-4. **All:** keep claims evidence-backed; label unsupported/unverified paths explicitly; update/tick STRM-612 ACs only when verified.
+### Already evidenced (landed)
+- [x] CC-owned request/decision/outcome contract + broker correlation, provider decision semantics preserved, fail-closed unresolved replies (`crates/core/src/approval.rs`, `crates/core/src/opencode_v2.rs`, `crates/core/tests/opencode_v2_approval.rs`).
+- [x] Broker unit coverage: emit/validate/record decisions, duplicate pending rejected + one-shot cancel, lost event callback fail-closed, cancel-pending resolves as disconnect (`crates/core/src/host.rs`, `1dc147a`, `b2edc26`).
+- [x] Stream disconnect settles unresolved pending approvals as `Disconnect`/`not_sent` (`46eb91e`).
+- [x] Durable outcomes/persistence baseline recorded (`3076c95` per sync); per-request model + fail-closed pending policy documented (`b22db97`, this doc).
+
+### Remaining evidence to collect (real orchestrator / real v2 flow where possible)
+- [ ] **Per-op mediation inventory:** for each op category record emits-request? honored `reject|once|always`? execution effect? exact args/correlation?
+  - [ ] shell/exec (broaden beyond spike)
+  - [ ] file read
+  - [ ] file edit/write/delete (critical for `accept-edits`)
+  - [ ] network/fetch/web
+  - [ ] MCP tool calls (incl. chaos-control tools) — distinguish install vs per-call mediation
+  - [ ] subagent/child tool calls (if exposed)
+- [ ] **No-prompt/unmediated paths:** operations that run without `permission.asked` → inventory with repro, mark unsupported/unverified (not protected). Include harnesses that bypass provider permission callbacks.
+- [ ] **Replay/AC matrix through real orchestrator** (extend `crates/core/tests/opencode_v2_approval.rs`, `crates/core/tests/v2.rs`, fixtures under `crates/core/tests/fixtures/` as needed):
+  - [ ] allowed (covered request, once-scoped)
+  - [ ] denied (provider-honored reject prevents execution)
+  - [ ] bypass/no-prompt-unmediated detected + reported
+  - [ ] duplicate/replay idempotent (no double exec/replayed approval)
+  - [ ] failure (before/after decision) recorded accurately
+  - [ ] disconnect/interruption mid-pending or mid-exec → fail closed
+  - [ ] callback loss/recovery under real failure conditions → not resumable as approval, never replay
+- [ ] **Policy modes:** `ask-all` and `accept-edits` verified with evidence or explicitly marked unsupported/unverified (no simulated modes).
+- [ ] **AC 2 (keep in STRM-612):** quick ACP regression check of retained paths + one-line/short doc of actual guarantees (no ACP build-out).
+
+### Close-out
+- [ ] Update operation classification table + retained ACP guarantees with evidence links/commits.
+- [ ] Tick STRM-612 ACs only where verified; note unsupported/unverified explicitly.
+- [ ] Add PR #80 note summarizing permission/evidence status.
+
+**Notes:** pending prompts remain runtime-only/fail-closed (no persistence/replay). Avoid colliding with in-progress broker/adapter edits in `crates/core/src/host.rs`, `crates/core/src/opencode_v2.rs`; prefer adding fixtures/tests/docs.
