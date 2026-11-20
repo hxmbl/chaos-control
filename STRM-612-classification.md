@@ -138,6 +138,12 @@ This review supports the current STRM-612 design and identifies replayed real-pr
 | Disconnect / interruption | transport/session interruption during pending or executing request | fail closed; no silent approval; lifecycle handled per issue scope |
 | Callback loss / recovery | response callback/session state lost or resumed ambiguously | fail as not resumable when needed; never replay/approve implicitly |
 
+**Pending-request policy:** in-flight approval prompts are runtime-only state. If
+Chaos Control restarts or loses the prompt callback, the provider request is
+settled as `Cancelled`/`Lost`/`Disconnect` and recorded `not_sent`; it is never
+rehydrated as approved or replayed. Persisting prompt payloads is optional future
+work, not required for fail-closed crash recovery.
+
 **Harness note:** fake agent (`crates/core/src/fake.rs`) already supports permission request steps and records outcomes; v2 adapter/orchestrator wiring will need real CC approval plumbing to drive these end-to-end.
 
 ## Next actions

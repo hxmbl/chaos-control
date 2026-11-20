@@ -456,6 +456,33 @@ mod approval_tests {
             Some(&outcome)
         );
     }
+
+    #[tokio::test]
+    async fn runtime_approval_broker_rejects_duplicate_requests_and_cancels_once() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let pending_id = request().cc_request_id;
+
+        let first_broker = broker.clone();
+        let first = tokio::spawn(async move { first_broker.request_decision(request()).await });
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalRequested(_))
+        ));
+
+        let duplicate = broker.request_decision(request()).await.unwrap_err();
+        assert!(duplicate.message.as_ref().contains("already pending"));
+
+        broker.cancel(&pending_id).unwrap();
+        let decision = first.await.unwrap().unwrap();
+        assert_eq!(
+            decision.decision,
+            ApprovalDecisionKind::NotResolved {
+                resolution: ApprovalResolution::Cancelled,
+            }
+        );
+        assert!(broker.cancel(&pending_id).is_err());
+    }
 }
 
 impl Core {
