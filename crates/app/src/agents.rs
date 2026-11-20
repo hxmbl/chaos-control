@@ -143,9 +143,9 @@ pub struct HarnessOverride {
     #[serde(default)]
     pub chat_tools: ChatTools,
     /// Use the native OpenCode v2 server adapter instead of ACP for this harness
-    /// (STRM-612). Preserves ACP as the default unless explicitly enabled.
+    /// (STRM-612). Defaults to enabled for opencode unless explicitly disabled.
     #[serde(default)]
-    pub native_opencode_v2: bool,
+    pub native_opencode_v2: Option<bool>,
     /// Native OpenCode v2: connect to this server URL instead of starting one.
     pub server_url: Option<String>,
     /// Native OpenCode v2: HTTP basic auth password (user `opencode`).
@@ -297,7 +297,9 @@ pub fn harnesses(config: &AgentsConfig, env: &DetectEnv) -> Vec<Harness> {
                 (None, Some(d)) => (d.command, o.and_then(|o| o.args.clone()).unwrap_or(d.args)),
                 (None, None) => return None,
             };
-            let native_opencode_v2 = o.is_some_and(|o| o.native_opencode_v2);
+            let native_opencode_v2 = o
+                .and_then(|o| o.native_opencode_v2)
+                .unwrap_or(preset.id == "opencode");
             let transport = if native_opencode_v2 {
                 harness::Transport::OpenCodeV2
             } else {
@@ -1191,6 +1193,49 @@ mod tests {
 
         let off: AgentsConfig = serde_json::from_str(r#"{"detect": false}"#).unwrap();
         assert!(harnesses(&off, &env).is_empty());
+    }
+
+    #[test]
+    fn native_v2_defaults_on_for_opencode_only_and_can_be_disabled() {
+        let files: std::collections::HashSet<PathBuf> = ["/bin/fx", "/bin/opencode"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let exists = |p: &Path| files.contains(p);
+        let env = DetectEnv {
+            path: vec![PathBuf::from("/bin")],
+            home: None,
+            is_executable: &exists,
+        };
+
+        // No `harnesses.opencode` block at all (fresh agents.json): V2 on,
+        // launch args switched to "serve"; other harnesses stay on ACP.
+        let fresh: AgentsConfig = serde_json::from_str(r#"{"detect": true}"#).unwrap();
+        let found = harnesses(&fresh, &env);
+        let opencode = found.iter().find(|h| h.preset.id == "opencode").unwrap();
+        assert_eq!(opencode.transport, harness::Transport::OpenCodeV2);
+        assert_eq!(opencode.args, ["serve"]);
+        let fx = found.iter().find(|h| h.preset.id == "fx").unwrap();
+        assert_eq!(fx.transport, harness::Transport::Acp);
+        assert_eq!(fx.args, ["acp"]);
+
+        // An explicit override block that omits the flag still defaults on.
+        let partial: AgentsConfig =
+            serde_json::from_str(r#"{"harnesses": {"opencode": {"command": "/bin/opencode"}}}"#)
+                .unwrap();
+        let found = harnesses(&partial, &env);
+        let opencode = found.iter().find(|h| h.preset.id == "opencode").unwrap();
+        assert_eq!(opencode.transport, harness::Transport::OpenCodeV2);
+        assert_eq!(opencode.args, ["serve"]);
+
+        // Explicit false opts back out to the preset's ACP transport/args.
+        let disabled: AgentsConfig =
+            serde_json::from_str(r#"{"harnesses": {"opencode": {"native_opencode_v2": false}}}"#)
+                .unwrap();
+        let found = harnesses(&disabled, &env);
+        let opencode = found.iter().find(|h| h.preset.id == "opencode").unwrap();
+        assert_eq!(opencode.transport, harness::Transport::Acp);
+        assert_eq!(opencode.args, ["acp"]);
     }
 
     #[test]

@@ -24,6 +24,7 @@ use crate::{
         ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest,
         ApprovalResolution,
     },
+    harness::ModelInfo,
     types::{BatchId, ChannelId, MemberId},
 };
 
@@ -89,6 +90,14 @@ impl AgentAdapter for OpenCodeV2Adapter {
         let config = self.config.clone();
         Box::pin(async move { open_session(config, req).await })
     }
+
+    fn list_models(
+        &self,
+        cwd: PathBuf,
+    ) -> BoxFuture<'_, Option<Result<Vec<ModelInfo>, AgentError>>> {
+        let config = self.config.clone();
+        Box::pin(async move { Some(list_models(config, cwd).await) })
+    }
 }
 
 /// Shared HTTP surface for one session. Basic auth is attached per request:
@@ -123,6 +132,29 @@ impl Http {
         body: &serde_json::Value,
     ) -> Result<serde_json::Value, AgentError> {
         self.send_json(reqwest::Method::PUT, path, body).await
+    }
+
+    async fn get_json(&self, path: &str) -> Result<serde_json::Value, AgentError> {
+        let resp = self
+            .request(reqwest::Method::GET, path)
+            .send()
+            .await
+            .map_err(transport_error)?;
+        let status = resp.status();
+        if !status.is_success() {
+            let detail = resp.text().await.unwrap_or_default();
+            return Err(AgentError::new(
+                AgentErrorKind::Protocol,
+                format!("GET {path} failed ({status}): {detail}"),
+            ));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if body.trim().is_empty() {
+            return Ok(serde_json::Value::Null);
+        }
+        serde_json::from_str(&body).map_err(|e| {
+            AgentError::new(AgentErrorKind::Protocol, format!("GET {path}: {e}: {body}"))
+        })
     }
 
     async fn send_json(
@@ -160,6 +192,129 @@ impl Http {
 
 fn transport_error(e: reqwest::Error) -> AgentError {
     AgentError::new(AgentErrorKind::Transport, e.to_string())
+}
+
+fn model_id_from_parts(provider_id: &str, model_id: &str) -> String {
+    if provider_id == "opencode" {
+        format!("opencode/{model_id}")
+    } else {
+        format!("opencode/{provider_id}/{model_id}")
+    }
+}
+
+fn model_info_from_value(value: &serde_json::Value) -> Option<ModelInfo> {
+    let name = value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?;
+    let provider_id = value
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let model_id = value
+        .get("modelID")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty());
+    let id = match (provider_id, model_id) {
+        (Some(provider), Some(model)) => model_id_from_parts(provider, model),
+        _ => {
+            let raw = value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())?;
+            if raw.starts_with("opencode/") {
+                raw.to_owned()
+            } else {
+                format!("opencode/{raw}")
+            }
+        }
+    };
+    Some(ModelInfo::new(Some(&id), name))
+}
+
+fn parse_model_list(value: serde_json::Value) -> Vec<ModelInfo> {
+    let items = value
+        .get("data")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .or_else(|| value.as_array().cloned())
+        .unwrap_or_default();
+    let mut models = Vec::new();
+    for item in &items {
+        if let Some(info) = model_info_from_value(item) {
+            models.push(info);
+        }
+    }
+    disambiguate_model_names(&mut models);
+    models
+}
+
+fn disambiguate_model_names(models: &mut [ModelInfo]) {
+    use std::collections::HashMap;
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut seen: HashMap<(String, String), usize> = HashMap::new();
+    for m in models.iter() {
+        if let Some(id) = m.id.as_deref() {
+            let provider = id
+                .strip_prefix("opencode/")
+                .and_then(|rest| rest.split_once('/').map(|(p, _)| p))
+                .unwrap_or("opencode")
+                .to_string();
+            *counts
+                .entry((provider, m.name.as_ref().to_string()))
+                .or_insert(0) += 1;
+        }
+    }
+    for m in models.iter_mut() {
+        let Some(id) = m.id.as_deref() else { continue };
+        let provider = id
+            .strip_prefix("opencode/")
+            .and_then(|rest| rest.split_once('/').map(|(p, _)| p))
+            .unwrap_or("opencode")
+            .to_string();
+        let key = (provider, m.name.as_ref().to_string());
+        if counts.get(&key).copied().unwrap_or(0) > 1 {
+            let n = seen.entry(key).or_insert(0);
+            *n += 1;
+            if *n > 1 {
+                m.name = Arc::from(format!("{} :{n}", m.name.as_ref()));
+            }
+        }
+    }
+}
+
+async fn fetch_models(http: &Http) -> Result<Vec<ModelInfo>, AgentError> {
+    let value = http.get_json("/api/model").await?;
+    Ok(parse_model_list(value))
+}
+
+async fn list_models(config: OpenCodeV2Config, cwd: PathBuf) -> Result<Vec<ModelInfo>, AgentError> {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (base, generated, mut child) = start_server(&config, &cwd).await?;
+        let password = config
+            .server_password
+            .clone()
+            .or_else(|| std::env::var("OPENCODE_SERVER_PASSWORD").ok())
+            .or(generated);
+        let http = Http {
+            client: reqwest::Client::new(),
+            base,
+            password,
+        };
+        let result = fetch_models(&http).await;
+        if let Some(child) = child.as_mut() {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+        result
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(AgentError::new(
+            AgentErrorKind::Transport,
+            "no answer while listing models",
+        ))
+    })
 }
 
 struct SessionInner {
@@ -866,9 +1021,10 @@ async fn open_session(
 
     let mut applied_model = None;
     if let Some(model) = config.model.as_deref() {
-        let (provider_id, model_id) = match model.split_once('/') {
+        let native = model.strip_prefix("opencode/").unwrap_or(model);
+        let (provider_id, model_id) = match native.split_once('/') {
             Some((provider, id)) if !provider.is_empty() && !id.is_empty() => (provider, id),
-            _ => ("opencode", model),
+            _ => ("opencode", native),
         };
         http.post_json(
             &format!("/api/session/{id}/model"),
@@ -898,6 +1054,8 @@ async fn open_session(
         child: tokio::sync::Mutex::new(child),
         sse: tokio::sync::Mutex::new(None),
     });
+    let models = fetch_models(&inner.http).await.unwrap_or_default();
+
     let sse = tokio::spawn(stream_events(inner.clone()));
     *inner.sse.lock().await = Some(sse);
 
@@ -921,7 +1079,7 @@ async fn open_session(
             ChatToolsTransport::Http
         },
         model: applied_model,
-        models: Vec::new(),
+        models,
         model_note: None,
     };
     Ok(Arc::new(OpenCodeV2Session { info, inner }))
@@ -1113,6 +1271,97 @@ mod tests {
             };
             assert!(mapper.handle(&frame).is_empty(), "data: {data}");
         }
+    }
+
+    #[test]
+    fn parses_model_list_from_api_response() {
+        let models = parse_model_list(serde_json::json!({
+            "location": {"directory": "/tmp"},
+            "data": [
+                {
+                    "id": "anthropic/claude-3-7-sonnet",
+                    "modelID": "claude-3-7-sonnet",
+                    "providerID": "anthropic",
+                    "name": "Claude 3.7 Sonnet"
+                },
+                {
+                    "id": "openai/gpt-4.1",
+                    "modelID": "gpt-4.1",
+                    "providerID": "openai",
+                    "name": "GPT-4.1"
+                }
+            ]
+        }));
+        assert_eq!(models.len(), 2);
+        assert_eq!(
+            models[0].id.as_deref(),
+            Some("opencode/anthropic/claude-3-7-sonnet")
+        );
+        assert_eq!(&*models[0].name, "Claude 3.7 Sonnet");
+        assert_eq!(models[1].id.as_deref(), Some("opencode/openai/gpt-4.1"));
+        assert_eq!(&*models[1].name, "GPT-4.1");
+    }
+
+    #[test]
+    fn parses_model_list_from_bare_array() {
+        let models = parse_model_list(serde_json::json!([
+            {
+                "id": "opencode/gpt-5",
+                "name": "GPT-5"
+            }
+        ]));
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id.as_deref(), Some("opencode/gpt-5"));
+        assert_eq!(&*models[0].name, "GPT-5");
+    }
+
+    #[test]
+    fn opencode_provider_models_use_single_prefix() {
+        let info = model_info_from_value(&serde_json::json!({
+            "modelID": "big-pickle",
+            "providerID": "opencode",
+            "name": "Big Pickle"
+        }))
+        .expect("model");
+        assert_eq!(info.id.as_deref(), Some("opencode/big-pickle"));
+        assert_eq!(&*info.name, "Big Pickle");
+    }
+
+    #[test]
+    fn model_without_name_is_ignored() {
+        assert!(
+            model_info_from_value(&serde_json::json!({
+                "id": "anthropic/claude-3-7-sonnet",
+                "modelID": "claude-3-7-sonnet",
+                "providerID": "anthropic"
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn duplicate_model_names_in_same_provider_are_disambiguated() {
+        let models = parse_model_list(serde_json::json!([
+            {
+                "modelID": "gpt-4o",
+                "providerID": "openai",
+                "name": "GPT-4o"
+            },
+            {
+                "modelID": "gpt-4o-latest",
+                "providerID": "openai",
+                "name": "GPT-4o"
+            },
+            {
+                "modelID": "gpt-4o",
+                "providerID": "azure",
+                "name": "GPT-4o"
+            }
+        ]));
+        assert_eq!(models.len(), 3);
+        assert_eq!(&*models[0].name, "GPT-4o");
+        assert_eq!(&*models[1].name, "GPT-4o :2");
+        assert_eq!(&*models[2].name, "GPT-4o");
     }
 
     /// End-to-end over loopback: session create, a delivered prompt, and the
