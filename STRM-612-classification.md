@@ -150,6 +150,14 @@ are rejected, and a resolution is not reused for later operations. Harnesses
 that bypass provider permission callbacks remain a gap: they must be inventoried
 and labeled unprotected/unverified rather than inferred to be mediated.
 
+**Mode-gating decision (2026-11-20):** `ask-all` and `accept-edits` are classified
+**Unsupported/unverified** for OpenCode V2. No real-V2 evidence yet shows either
+mode's effective behavior is enforced, so neither is offered as an enforced mode,
+and no provider callback is auto-answered to imitate one. The per-operation
+approval path above (CC-owned IDs, `reject|once|always`, one-shot, fail-closed) is
+unchanged and still mediated. This is a scope label, not a claim that the modes
+work; it is recorded on STRM-612 and re-openable with real-flow evidence.
+
 **Harness note:** fake agent (`crates/core/src/fake.rs`) already supports permission request steps and records outcomes; v2 adapter/orchestrator wiring will need real CC approval plumbing to drive these end-to-end.
 
 ## Evidence ledger scaffold (foundation only — not yet evidence)
@@ -165,7 +173,7 @@ Every row stays `TODO` until it is exercised through the real orchestrator/V2 ad
 | Failure | 9 | — | TODO |
 | Disconnect / interruption | 9, 10 | `46eb91e` stream-close settlement | TODO: real V2 stream |
 | Callback loss | 10 | `b2edc26` lost-callback fail-closed | TODO: real V2 session |
-| Mode gating (`ask-all`/`accept-edits`) | 5 | — | TODO: verify or label unsupported |
+| Mode gating (`ask-all`/`accept-edits`) | 5 | — | Unsupported/unverified by scope decision (2026-11-20); no simulated modes |
 | ACP retained paths | 2 | — | TODO: regression check + one-line doc |
 
 **Per-op inventory stub** (fill from a real V2 session; `?` means unknown — never assume mediated):
@@ -205,7 +213,7 @@ Every row stays `TODO` until it is exercised through the real orchestrator/V2 ad
   - [ ] failure (before/after decision) recorded accurately
   - [ ] disconnect/interruption mid-pending or mid-exec → fail closed
   - [ ] callback loss/recovery under real failure conditions → not resumable as approval, never replay
-- [ ] **Policy modes:** `ask-all` and `accept-edits` verified with evidence or explicitly marked unsupported/unverified (no simulated modes).
+- [x] **Policy modes (scope decision 2026-11-20):** `ask-all` and `accept-edits` explicitly labeled **unsupported/unverified** for OpenCode V2; no simulated modes, no provider callbacks auto-answered to imitate a mode. Re-open with real-V2 evidence if enforcement is verified. Recorded on STRM-612.
 - [ ] **AC 2 (keep in STRM-612):** quick ACP regression check of retained paths + one-line/short doc of actual guarantees (no ACP build-out).
 
 ### Close-out
