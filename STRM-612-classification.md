@@ -167,6 +167,24 @@ the full replay matrix now.
 
 **Harness note:** fake agent (`crates/core/src/fake.rs`) already supports permission request steps and records outcomes; v2 adapter/orchestrator wiring will need real CC approval plumbing to drive these end-to-end.
 
+## Normalized per-op capture (evidence)
+
+Capture a normalized record per observed operation/permission event from **real V2 runs**. Prefer CC-owned broker/adapter request/decision/outcome records plus observable tool/execution events as the source of truth. **UI signals are not evidence records:** the right-sidebar blocked-approval notice (`efe8951`) is intentionally thin (outcome state + error, bounded) for visibility; it must not be treated as proof of mediation or used as the evidence artifact. Keep **classification** (mediated-by-CC / provider-native / unverified-unsupported / no-prompt) distinct from fail-closed **outcome state** so a loud failure is not read as proof of mediation.
+
+| Field group | Capture |
+|---|---|
+| Identity/correlation | timestamp, provider/session (`session_id`), turn, `cc_request_id`, `provider_request_ref`, agent/channel |
+| Operation | category (`shell/exec`, `read`, `edit/write/delete`, `network/fetch`, `MCP tool`, `subagent/child`, `no-prompt/unmediated`), `action`/tool, target/resource summary, exact args/input when available (v2: correlate `permission.asked.source.id` with tool-call input events) |
+| Request/mediation | `permission.asked` emitted? choices presented (v2: `reject\|once\|always`), decision (selected or fail-closed: lost/timeout/disconnect/cancelled/invalid/correlation mismatch), provider reply sent? raw reply/result |
+| Effect/outcome | `ApprovalOutcomeState` (`allowed\|denied\|sent\|not_sent\|failed`), observed execution effect (ran/blocked/error with evidence), error/reason |
+| Classification signal | mediated-by-CC, provider-native, or unverified/unsupported/no-prompt; confidence and repro/source (live run, fixture, log) |
+
+**Where records feed:**
+- **Per-op inventory stub:** fill emits-request? / provider-enforced before exec? / CC enforcement? with evidence refs.
+- **Evidence ledger / AC matrix:** attach records as evidence for allowed, denied, bypass/no-prompt, duplicate/replay, failure, disconnect/interruption, callback loss; move from TODO only with a real orchestrator/V2-backed artifact or clearly labeled live evidence.
+- **Retained guarantees / mode notes:** record observed native/ACP behavior; keep `ask-all`/`accept-edits` unsupported/unverified unless evidenced.
+- **Docs / PR / Linear notes:** summarize proven vs unverified incrementally (snippets/commit-or-fixture links, not raw payload dumps).
+
 ## Evidence ledger scaffold (foundation only — not yet evidence)
 
 Every row stays `TODO` until it is exercised through the real orchestrator/V2 adapter with a linked artifact. Broker unit tests do not tick acceptance criteria.
