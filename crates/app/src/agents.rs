@@ -63,9 +63,10 @@
 //!
 //! `record` appends every ACP frame as NDJSON `{dir, frame}` (the replay
 //! fixture format). `chat_tools` is `"auto"` (HTTP when the agent offers it,
-//! else the stdio bridge) or `"stdio"`. Agents run under their own native
-//! permission settings; Chaos Control does not mediate permissions (being
-//! redesigned), and an older file's `runs_in` / `approval` keys are ignored.
+//! else the stdio bridge) or `"stdio"`. ACP agents still use their native
+//! permission settings; native OpenCode v2 permission asks are shown to the
+//! user for a provider-supported decision. Older `runs_in` / `approval` keys
+//! are ignored.
 //!
 //! An `agents` entry may also set `ping_answer_reactions`: that agent's own
 //! list of reactions that answer a ping, over the project's (Settings) and
@@ -141,6 +142,14 @@ pub struct HarnessOverride {
     pub acp_v2: bool,
     #[serde(default)]
     pub chat_tools: ChatTools,
+    /// Use the native OpenCode v2 server adapter instead of ACP for this harness
+    /// (STRM-612). Defaults to enabled for opencode unless explicitly disabled.
+    #[serde(default)]
+    pub native_opencode_v2: Option<bool>,
+    /// Native OpenCode v2: connect to this server URL instead of starting one.
+    pub server_url: Option<String>,
+    /// Native OpenCode v2: HTTP basic auth password (user `opencode`).
+    pub server_password: Option<String>,
 }
 
 /// One member of the roster.
@@ -212,6 +221,9 @@ impl ChatTools {
 #[derive(Clone, Debug)]
 pub struct Harness {
     pub preset: &'static HarnessPreset,
+    /// Protocol/driver for this harness instance (may differ from the preset
+    /// when explicitly overridden, e.g. native OpenCode v2).
+    pub transport: harness::Transport,
     pub command: PathBuf,
     pub args: Vec<String>,
     pub opts: AdapterOptions,
@@ -221,7 +233,7 @@ impl Harness {
     /// The adapter for one member running `model` on this harness.
     pub fn adapter(&self, model: Option<&str>) -> Arc<dyn AgentAdapter> {
         harness::adapter_for(
-            self.preset.transport,
+            self.transport,
             self.command.clone(),
             self.args.clone(),
             model.map(Arc::from),
@@ -285,6 +297,22 @@ pub fn harnesses(config: &AgentsConfig, env: &DetectEnv) -> Vec<Harness> {
                 (None, Some(d)) => (d.command, o.and_then(|o| o.args.clone()).unwrap_or(d.args)),
                 (None, None) => return None,
             };
+            let native_opencode_v2 = o
+                .and_then(|o| o.native_opencode_v2)
+                .unwrap_or(preset.id == "opencode");
+            let transport = if native_opencode_v2 {
+                harness::Transport::OpenCodeV2
+            } else {
+                preset.transport
+            };
+            // When using native OpenCode v2, override args to "serve" instead of
+            // the preset's ACP args ("acp"). If the override explicitly sets args,
+            // those are respected (user can pass "serve" or custom flags).
+            let args = if native_opencode_v2 && !o.as_ref().is_some_and(|o| o.args.is_some()) {
+                vec!["serve".to_string()]
+            } else {
+                args
+            };
             let opts = AdapterOptions {
                 env: o
                     .map(|o| o.env.clone().into_iter().collect())
@@ -292,9 +320,12 @@ pub fn harnesses(config: &AgentsConfig, env: &DetectEnv) -> Vec<Harness> {
                 record: o.and_then(|o| o.record.clone()),
                 acp_v2: o.is_none_or(|o| o.acp_v2),
                 chat_tools: o.map_or(ChatToolsPreference::Auto, |o| o.chat_tools.preference()),
+                server_url: o.and_then(|o| o.server_url.clone()),
+                server_password: o.and_then(|o| o.server_password.clone()),
             };
             Some(Harness {
                 preset,
+                transport,
                 command,
                 args,
                 opts,
@@ -319,6 +350,99 @@ pub struct LinkedAgent {
     pub model: Option<Arc<str>>,
     /// On the project's roster (a model member), so the user can remove it.
     pub removable: bool,
+}
+
+/// Display label for a model member: `Harness/Provider/Model-With-Dashes`.
+///
+/// `harness_id` is the preset id (e.g. `opencode`), `model` is the full model
+/// id as stored (e.g. `opencode/iceman-free` or
+/// `opencode/openrouter/tencent/hy4-flash`), and `name` is the member's
+/// current/base name. If `name` already looks formatted, it is returned as-is.
+pub fn display_model_label(harness_id: Option<&str>, model: Option<&str>, name: &str) -> Arc<str> {
+    let Some(harness_id) = harness_id else {
+        return Arc::from(name);
+    };
+    if looks_formatted_label(harness_id, name) {
+        return Arc::from(name);
+    }
+
+    let harness_display = match harness_id {
+        "opencode" => "OpenCode",
+        "claude-code" => "Claude-Code",
+        "copilot" => "GitHub-Copilot-CLI",
+        "cursor" => "Cursor-Agent",
+        "vibe" => "Mistral-Vibe",
+        _ => harness::preset(harness_id).map_or(harness_id, |p| p.name),
+    };
+    // Normalize harness display spaces to dashes for segment consistency.
+    let harness_display = harness_display.replace(' ', "-");
+
+    let (provider_display, model_segment) = match harness_id {
+        "opencode" => opencode_provider_and_model(model, name),
+        _ => (None, name.replace(' ', "-")),
+    };
+
+    match provider_display {
+        Some(provider) => Arc::from(format!("{harness_display}/{provider}/{model_segment}")),
+        None => Arc::from(format!("{harness_display}/{model_segment}")),
+    }
+}
+
+fn looks_formatted_label(harness_id: &str, name: &str) -> bool {
+    let prefix = match harness_id {
+        "opencode" => "OpenCode/",
+        "codex" => "Codex/",
+        "fx" => "fx/",
+        "vibe" => "Mistral-Vibe/",
+        "claude-code" => "Claude-Code/",
+        "copilot" => "GitHub-Copilot-CLI/",
+        "devin" => "Devin/",
+        "cursor" => "Cursor-Agent/",
+        "gemini" => "Gemini-CLI/",
+        _ => return false,
+    };
+    name.starts_with(prefix) && name.matches('/').count() >= 1
+}
+
+fn opencode_provider_and_model(model: Option<&str>, name: &str) -> (Option<String>, String) {
+    let model_segment = name.replace(' ', "-");
+    let Some(model) = model else {
+        return (Some("OpenCode-Zen".to_string()), model_segment);
+    };
+    let parts: Vec<&str> = model.split('/').collect();
+    // opencode/<model> => OpenCode-Zen
+    // opencode/<provider>/... => provider display, model name from end/name
+    if parts.first().copied() != Some("opencode") {
+        return (Some("OpenCode-Zen".to_string()), model_segment);
+    }
+    if parts.len() == 2 {
+        return (Some("OpenCode-Zen".to_string()), model_segment);
+    }
+    let provider_id = parts.get(1).copied().unwrap_or("opencode");
+    let provider = match provider_id {
+        "openrouter" => "OpenRouter".to_string(),
+        "huggingface" => "HuggingFace".to_string(),
+        "opencode" => "OpenCode-Zen".to_string(),
+        other => other
+            .split(['-', '_'])
+            .filter(|s| !s.is_empty())
+            .map(capitalize_segment)
+            .collect::<Vec<_>>()
+            .join("-"),
+    };
+    (Some(provider), model_segment)
+}
+
+fn capitalize_segment(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            out.extend(chars);
+            out
+        }
+    }
 }
 
 impl LinkedAgent {
@@ -969,6 +1093,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn display_model_label_builds_three_segments_and_dashes() {
+        let label = display_model_label(
+            Some("opencode"),
+            Some("opencode/openrouter/tencent/hy4-flash"),
+            "Hy4 Flash",
+        );
+        assert_eq!(&*label, "OpenCode/OpenRouter/Hy4-Flash");
+    }
+
+    #[test]
+    fn display_model_label_defaults_bare_opencode_models_to_zen() {
+        let label =
+            display_model_label(Some("opencode"), Some("opencode/big-pickle"), "Big Pickle");
+        assert_eq!(&*label, "OpenCode/OpenCode-Zen/Big-Pickle");
+    }
+
+    #[test]
+    fn display_model_label_leaves_stored_labels_alone() {
+        let stored = "OpenCode/OpenCode-Zen/Big-Pickle";
+        let label = display_model_label(Some("opencode"), Some("opencode/big-pickle"), stored);
+        assert_eq!(&*label, stored);
+    }
+
+    #[test]
     fn the_original_shape_still_loads() {
         let c: AgentsConfig = serde_json::from_str(
             r#"{"agents":[{"handle":"claude","command":"npx","args":["-y","x"]}]}"#,
@@ -1048,9 +1196,53 @@ mod tests {
     }
 
     #[test]
+    fn native_v2_defaults_on_for_opencode_only_and_can_be_disabled() {
+        let files: std::collections::HashSet<PathBuf> = ["/bin/fx", "/bin/opencode"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let exists = |p: &Path| files.contains(p);
+        let env = DetectEnv {
+            path: vec![PathBuf::from("/bin")],
+            home: None,
+            is_executable: &exists,
+        };
+
+        // No `harnesses.opencode` block at all (fresh agents.json): V2 on,
+        // launch args switched to "serve"; other harnesses stay on ACP.
+        let fresh: AgentsConfig = serde_json::from_str(r#"{"detect": true}"#).unwrap();
+        let found = harnesses(&fresh, &env);
+        let opencode = found.iter().find(|h| h.preset.id == "opencode").unwrap();
+        assert_eq!(opencode.transport, harness::Transport::OpenCodeV2);
+        assert_eq!(opencode.args, ["serve"]);
+        let fx = found.iter().find(|h| h.preset.id == "fx").unwrap();
+        assert_eq!(fx.transport, harness::Transport::Acp);
+        assert_eq!(fx.args, ["acp"]);
+
+        // An explicit override block that omits the flag still defaults on.
+        let partial: AgentsConfig =
+            serde_json::from_str(r#"{"harnesses": {"opencode": {"command": "/bin/opencode"}}}"#)
+                .unwrap();
+        let found = harnesses(&partial, &env);
+        let opencode = found.iter().find(|h| h.preset.id == "opencode").unwrap();
+        assert_eq!(opencode.transport, harness::Transport::OpenCodeV2);
+        assert_eq!(opencode.args, ["serve"]);
+
+        // Explicit false opts back out to the preset's ACP transport/args.
+        let disabled: AgentsConfig =
+            serde_json::from_str(r#"{"harnesses": {"opencode": {"native_opencode_v2": false}}}"#)
+                .unwrap();
+        let found = harnesses(&disabled, &env);
+        let opencode = found.iter().find(|h| h.preset.id == "opencode").unwrap();
+        assert_eq!(opencode.transport, harness::Transport::Acp);
+        assert_eq!(opencode.args, ["acp"]);
+    }
+
+    #[test]
     fn members_whose_harness_is_missing_stay_out_of_the_room() {
         let fx = Harness {
             preset: harness::preset("fx").unwrap(),
+            transport: harness::Transport::Acp,
             command: PathBuf::from("/bin/fx"),
             args: vec!["acp".into()],
             opts: AdapterOptions::default(),

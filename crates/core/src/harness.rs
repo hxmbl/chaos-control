@@ -35,12 +35,15 @@ pub enum Transport {
     /// Agent Client Protocol over stdio (`crate::acp`), natively or through an
     /// adapter binary.
     Acp,
+    /// Native OpenCode v2 server API (`opencode serve`, HTTP/SSE). STRM-612.
+    OpenCodeV2,
 }
 
 impl Transport {
     pub fn label(self) -> &'static str {
         match self {
             Transport::Acp => "acp",
+            Transport::OpenCodeV2 => "opencode-v2",
         }
     }
 }
@@ -437,6 +440,10 @@ pub struct AdapterOptions {
     /// ACP only: offer the v2 draft first.
     pub acp_v2: bool,
     pub chat_tools: crate::acp::ChatToolsPreference,
+    /// Native OpenCode v2: connect to this server URL instead of starting one.
+    pub server_url: Option<String>,
+    /// Native OpenCode v2: HTTP basic auth password (user `opencode`).
+    pub server_password: Option<String>,
 }
 
 impl Default for AdapterOptions {
@@ -446,6 +453,8 @@ impl Default for AdapterOptions {
             record: None,
             acp_v2: true,
             chat_tools: crate::acp::ChatToolsPreference::Auto,
+            server_url: None,
+            server_password: None,
         }
     }
 }
@@ -471,6 +480,19 @@ pub fn adapter_for(
             .chat_tools(opts.chat_tools)
             .model(model),
         ),
+        Transport::OpenCodeV2 => {
+            let server_password = opts.server_password;
+            Arc::new(crate::opencode_v2::OpenCodeV2Adapter::new(
+                crate::opencode_v2::OpenCodeV2Config {
+                    command,
+                    args,
+                    env: opts.env,
+                    server_url: opts.server_url,
+                    server_password,
+                    model,
+                },
+            ))
+        }
     }
 }
 
