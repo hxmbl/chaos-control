@@ -336,3 +336,140 @@ async fn acp_permission_interrupt_cancels_pending_and_fails_closed() {
     );
     let _ = ping;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_v2_permission_allow_through_real_orchestrator() {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use chaos_core::{
+        host::{AgentSpec, Core, HostConfig, ManualClock},
+        opencode_v2::{OpenCodeV2Adapter, OpenCodeV2Config},
+    };
+    use futures::{StreamExt, stream};
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let prompted = Arc::new(tokio::sync::Notify::new());
+    let sse_ready = prompted.clone();
+    let app = Router::new()
+        .route(
+            "/api/session",
+            post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }),
+        )
+        .route(
+            "/api/experimental/mcp/chaos-control",
+            axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
+        )
+        .route(
+            "/api/session/s1/prompt",
+            post({
+                let prompted = prompted.clone();
+                move || {
+                    let prompted = prompted.clone();
+                    async move {
+                        prompted.notify_one();
+                        Json(serde_json::json!({ "data": {} }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/event",
+            get(move || {
+                let prompted = sse_ready.clone();
+                async move {
+                    prompted.notified().await;
+                    let events = stream::iter(vec![
+                        Ok::<_, std::convert::Infallible>(Event::default().data(
+                            r#"{"type":"session.tool.input.ended","data":{"sessionID":"s1","id":"tool-1","input":{"command":"echo SAFE"}}}"#,
+                        )),
+                        Ok(Event::default().data(
+                            r#"{"type":"permission.asked","data":{"id":"p1","sessionID":"s1","action":"shell","resources":["echo SAFE"],"save":["echo *"],"source":{"type":"tool","messageID":"m1","id":"tool-1"}}}"#,
+                        )),
+                    ])
+                    .chain(stream::pending());
+                    Sse::new(events).keep_alive(KeepAlive::default())
+                }
+            }),
+        )
+        .route(
+            "/api/session/s1/permission/p1/reply",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let reply_tx = reply_tx.clone();
+                async move {
+                    let _ = reply_tx.send(body);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let clock = ManualClock::new(1_000_000);
+    let (core, mut events) = Core::start(HostConfig::default(), clock.clone())
+        .await
+        .unwrap();
+    let main = common::main_channel(&core).await.id;
+    let hx = core.human("hx", "Hx", main).await.unwrap();
+    let adapter = Arc::new(OpenCodeV2Adapter::new(OpenCodeV2Config {
+        command: "opencode".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        server_url: Some(format!("http://{addr}")),
+        server_password: None,
+        model: None,
+    }));
+    let agent = core
+        .add_agent(
+            AgentSpec {
+                handle: "v2".into(),
+                name: "V2".into(),
+                adapter,
+                cwd: Some(std::env::temp_dir()),
+                ping_answers: None,
+            },
+            main,
+        )
+        .await
+        .unwrap();
+
+    let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut seen = Vec::new();
+    let req = loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(CoreEvent::ApprovalRequested(req))) if req.agent == agent.id => break *req,
+            Ok(Some(e)) => seen.push(format!("{e:?}")),
+            Ok(None) => panic!("core stopped; seen={seen:#?}"),
+            Err(_) => panic!("no approval request; seen={seen:#?}"),
+        }
+    };
+    assert_eq!(req.cc_request_id.as_str(), "opencode-v2:s1:p1");
+
+    core.resolve_approval(&req.cc_request_id, "once").unwrap();
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+        .await
+        .expect("provider reply arrives")
+        .expect("reply channel open");
+    assert_eq!(reply["decision"], "once");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let outcome = loop {
+        if let Some(outcome) = core.approval_outcome(&req.cc_request_id).unwrap() {
+            break outcome;
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("outcome not recorded");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    assert_eq!(outcome.state, ApprovalOutcomeState::Allowed);
+
+    core.shutdown().await;
+}
