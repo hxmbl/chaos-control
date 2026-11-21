@@ -34,14 +34,17 @@
 //!
 //! # Permissions
 //!
-//! Chaos Control does not mediate permissions (the model is being redesigned).
-//! A `session/request_permission` is answered at once with the agent's own
-//! allow option ([`auto_allow`]): no prompt, no queue, no log. Agents otherwise
-//! run under their own native settings.
+//! Approval-required requests are mediated: a `session/request_permission`
+//! for a read/search/think tool is answered at once with the agent's own allow
+//! option ([`auto_allow`]): no prompt, no queue, no log. Every other
+//! permission-required request is surfaced through the approval broker — the
+//! user decides before the agent runs; when no user is available it is
+//! cancelled. Agents otherwise run under their own native settings.
 
 use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use agent_client_protocol::{
@@ -52,8 +55,12 @@ use futures::future::BoxFuture;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::adapter::*;
+use crate::approval::{
+    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
+    ApprovalProvider, ApprovalRequest, ProviderOption,
+};
 use crate::harness::ModelInfo;
-use crate::types::BatchId;
+use crate::types::{BatchId, ChannelId, MemberId};
 
 /// How to reach the agent process.
 pub trait AcpTransport: Send + Sync {
@@ -674,14 +681,105 @@ fn v1_kind(k: &v1::PermissionOptionKind) -> OptionKind {
     }
 }
 
-/// Answers a permission request with the agent's own allow option.
-fn v1_answer(req: &v1::RequestPermissionRequest) -> v1::RequestPermissionResponse {
+/// Reads, searches and thoughts need no user decision; other permission-required
+/// requests are surfaced to the user through the approval broker.
+fn v1_is_read(req: &v1::RequestPermissionRequest) -> bool {
+    matches!(
+        req.tool_call.fields.kind,
+        Some(v1::ToolKind::Read | v1::ToolKind::Search | v1::ToolKind::Think)
+    )
+}
+
+fn select_allow_v1(req: &v1::RequestPermissionRequest) -> v1::RequestPermissionResponse {
     let opts: Vec<OptionKind> = req.options.iter().map(|o| v1_kind(&o.kind)).collect();
     match auto_allow(&opts) {
         Some(ix) => v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Selected(
             v1::SelectedPermissionOutcome::new(req.options[ix].option_id.clone()),
         )),
-        None => v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled),
+        None => v1_cancelled(),
+    }
+}
+
+fn v1_cancelled() -> v1::RequestPermissionResponse {
+    v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled)
+}
+
+fn v1_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// Surfaces an approval-required request to the user via [`ApprovalBroker`] and
+/// answers with the option the user picked. Fails closed when no user decision
+/// is available, so nothing approval-required is ever auto-allowed.
+async fn v1_broker_answer(
+    req: &v1::RequestPermissionRequest,
+    agent: MemberId,
+    channel: ChannelId,
+    broker: Arc<dyn ApprovalBroker>,
+) -> v1::RequestPermissionResponse {
+    let now = v1_now_ms();
+    let request = ApprovalRequest {
+        cc_request_id: ApprovalId::from(format!("acp-v1:{}:{}", req.session_id.0, now)),
+        provider: ApprovalProvider::Other(Arc::from("acp_v1")),
+        provider_request_ref: req.session_id.0.clone(),
+        session_id: req.session_id.0.clone(),
+        agent,
+        channel,
+        turn: None,
+        operation: ApprovalOperation {
+            action: Arc::from("acp_permission"),
+            tool_name: None,
+            summary: req.tool_call.fields.title.as_deref().map(Arc::from),
+            arguments: None,
+            raw: Some(serde_json::to_value(req).unwrap_or_default()),
+        },
+        choices: ApprovalChoices::ProviderOptions {
+            options: req
+                .options
+                .iter()
+                .map(|o| ProviderOption {
+                    id: o.option_id.0.clone(),
+                    label: None,
+                    kind: None,
+                    raw: None,
+                })
+                .collect(),
+        },
+        requested_at: now,
+        context: None,
+    };
+    match broker.request_decision(request).await {
+        Ok(decision) => match decision.decision {
+            ApprovalDecisionKind::Selected { choice } => {
+                if let Some(o) = req.options.iter().find(|o| o.option_id.0 == choice) {
+                    v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Selected(
+                        v1::SelectedPermissionOutcome::new(o.option_id.clone()),
+                    ))
+                } else {
+                    v1_cancelled()
+                }
+            }
+            _ => v1_cancelled(),
+        },
+        Err(_) => v1_cancelled(),
+    }
+}
+
+async fn answer_v1(
+    req: &v1::RequestPermissionRequest,
+    agent: MemberId,
+    channel: ChannelId,
+    approval_broker: Option<Arc<dyn ApprovalBroker>>,
+) -> v1::RequestPermissionResponse {
+    if v1_is_read(req) {
+        return select_allow_v1(req);
+    }
+    match approval_broker {
+        Some(broker) => v1_broker_answer(req, agent, channel, broker).await,
+        None => v1_cancelled(),
     }
 }
 
@@ -695,8 +793,21 @@ async fn open_v1(
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<Cmd>();
     let tracker = Arc::new(Mutex::new(Tracker::default()));
     let events = req.events.clone();
+    let approval_broker = req.approval_broker.clone();
+    let agent = req.agent;
+    let channel = req.channel;
     tokio::spawn(run_v1(
-        transport, req, pref, model, tracker, cmd_rx, ready_tx, events,
+        transport,
+        req,
+        pref,
+        model,
+        tracker,
+        cmd_rx,
+        ready_tx,
+        events,
+        approval_broker,
+        agent,
+        channel,
     ));
     let info = ready_rx
         .await
@@ -714,6 +825,9 @@ async fn run_v1(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: oneshot::Sender<Result<SessionInfo, AgentError>>,
     events: EventSink,
+    approval_broker: Option<Arc<dyn ApprovalBroker>>,
+    agent: MemberId,
+    channel: ChannelId,
 ) {
     let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
     let ready_for_main = ready_tx.clone();
@@ -761,12 +875,15 @@ async fn run_v1(
             acp::on_receive_notification!(),
         )
         .on_receive_request(
-            async move |r: v1::RequestPermissionRequest, responder, _cx| {
-                let accepted = t_perm.lock().expect("lock").accept();
-                if let Some(e) = accepted {
-                    ev_perm.emit(e);
+            {
+                let approval_broker = approval_broker.clone();
+                async move |r: v1::RequestPermissionRequest, responder, _cx| {
+                    let accepted = t_perm.lock().expect("lock").accept();
+                    if let Some(e) = accepted {
+                        ev_perm.emit(e);
+                    }
+                    responder.respond(answer_v1(&r, agent, channel, approval_broker.clone()).await)
                 }
-                responder.respond(v1_answer(&r))
             },
             acp::on_receive_request!(),
         )

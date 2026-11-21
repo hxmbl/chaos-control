@@ -632,20 +632,20 @@ async fn slow_v1_turn_is_never_retried_after_acceptance() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn permission_request_is_auto_allowed() {
-    // Permissions are not mediated (being redesigned): the agent's own allow
-    // option is selected at once, with no note, prompt or queue.
+async fn permission_read_is_auto_allowed_without_prompt() {
+    // Reads are auto-allowed: the agent's own allow option is selected at
+    // once, with no note, prompt or queue.
     let mut h = Harness::new().await;
     let bot = h
         .agent(
             "bot",
             script(json!({"turns": [{"steps": [
-                {"permission": "rm -rf build/"},
-                {"text": "Deleted build/."}
+                {"permission_kind": {"title": "List files", "kind": "read"}},
+                {"text": "Listed files."}
             ]}]})),
         )
         .await;
-    let ping = h.say("@bot clean the build dir").await;
+    let ping = h.say("@bot list the files").await;
     h.until("settled", |c| {
         c.query_row(
             "SELECT COUNT(*) FROM batches WHERE state = 'settled'",
@@ -677,6 +677,44 @@ async fn permission_request_is_auto_allowed() {
         outcomes[0]
     );
     assert!(outcomes[0].get("_meta").is_none(), "{}", outcomes[0]);
+    assert!(
+        !h.seen
+            .iter()
+            .any(|e| matches!(e, CoreEvent::ApprovalRequested(_))),
+        "reads must not ask"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permission_non_read_is_asked_and_not_auto_allowed() {
+    // Approval-required, non-read requests are surfaced through the approval
+    // broker; the agent is not answered without a user decision.
+    let mut h = Harness::new().await;
+    let bot = h
+        .agent(
+            "bot",
+            script(json!({"turns": [{"steps": [
+                {"permission": "rm -rf build/"},
+                {"text": "Deleted build/."}
+            ]}]})),
+        )
+        .await;
+    let _ping = h.say("@bot clean the build dir").await;
+    let asked = h
+        .wait_for(
+            "approval asked",
+            |e| matches!(e, CoreEvent::ApprovalRequested(a) if a.agent == bot.id),
+        )
+        .await;
+    assert!(matches!(asked, CoreEvent::ApprovalRequested(_)));
+    let outcomes = h
+        .fake("bot")
+        .observed
+        .lock()
+        .unwrap()
+        .permission_outcomes
+        .clone();
+    assert!(outcomes.is_empty(), "nothing is auto-allowed: {outcomes:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

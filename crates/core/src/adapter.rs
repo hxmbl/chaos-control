@@ -192,11 +192,13 @@ pub enum OptionKind {
     Other,
 }
 
-/// The option Chaos Control selects for every `session/request_permission`:
-/// permissions are not mediated (the model is being redesigned), so the agent
-/// is answered at once with its own allow option. Allow-once wins over
-/// allow-always, which can write a lasting rule into the agent's settings;
-/// with no allow option, the first option. `None` only when none is offered.
+/// The option Chaos Control auto-answers for read/search/think permission
+/// requests (ACP and V2): the agent is answered at once with its own allow
+/// option. Allow-once wins over allow-always, which can write a lasting rule
+/// into the agent's settings; with no allow option, the first option.
+/// `None` only when none is offered. Approval-required non-read requests are
+/// never auto-allowed: on ACP they are surfaced to the user through the
+/// approval broker; on V2 they are CC-mediated.
 pub fn auto_allow(options: &[OptionKind]) -> Option<usize> {
     options
         .iter()
