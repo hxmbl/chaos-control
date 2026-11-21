@@ -9,8 +9,8 @@
 //! - [`devin`]: Devin-only setup (per-folder workspace trust).
 //! - [`mcp`]: the chat MCP server and the stdio bridge.
 //! - [`approval`]: CC-owned permission requests and decisions. Native OpenCode
-//!   v2 uses the runtime/UI broker; ACP permission requests still use
-//!   [`adapter::auto_allow`] pending parity work (STRM-612).
+//!   v2 uses the runtime/UI broker; ACP auto-allows only Read/Search/Think
+//!   requests and brokers other approval-required requests (STRM-612).
 //! - [`host`]: the in-process runtime behind the [`host::Core`] handle.
 //! - [`fake`]: a scripted ACP agent for tests.
 //!

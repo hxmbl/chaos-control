@@ -317,6 +317,20 @@ impl ApprovalBroker for RuntimeApprovalBroker {
                         id.as_str()
                     )));
                 }
+                // Replay guard: an id that already resolved — user decision,
+                // fail-closed cleanup, or an outcome recovered from the store —
+                // must never reopen as a new request.
+                if self
+                    .outcomes
+                    .lock()
+                    .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?
+                    .contains_key(&id)
+                {
+                    return Err(ApprovalBrokerError::new(format!(
+                        "approval request {} is already resolved",
+                        id.as_str()
+                    )));
+                }
                 pending.insert(
                     id.clone(),
                     PendingApproval {
@@ -563,6 +577,49 @@ mod approval_tests {
         );
         assert!(broker.pending.lock().unwrap().is_empty());
         assert!(broker.resolve(&pending_id, "once").is_err());
+    }
+
+    #[tokio::test]
+    async fn runtime_approval_broker_rejects_replays_after_resolution() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let pending_id = request().cc_request_id;
+
+        let first_broker = broker.clone();
+        let first = tokio::spawn(async move { first_broker.request_decision(request()).await });
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalRequested(_))
+        ));
+        broker.resolve(&pending_id, "once").unwrap();
+        let decision = first.await.unwrap().unwrap();
+        assert_eq!(
+            decision.decision,
+            ApprovalDecisionKind::Selected {
+                choice: Arc::from("once")
+            }
+        );
+        broker
+            .record_outcome(ApprovalOutcome {
+                cc_request_id: pending_id.clone(),
+                state: ApprovalOutcomeState::Allowed,
+                provider_reply: None,
+                execution_effect: None,
+                error: None,
+                recorded_at: Some(2),
+            })
+            .await
+            .unwrap();
+
+        // A replay of the resolved id must fail closed; it must not reopen
+        // the approval as a new request.
+        let replay = broker.request_decision(request()).await.unwrap_err();
+        assert!(
+            replay.message.as_ref().contains("already resolved"),
+            "unexpected replay error: {}",
+            replay.message
+        );
+        assert!(broker.pending.lock().unwrap().is_empty());
     }
 }
 

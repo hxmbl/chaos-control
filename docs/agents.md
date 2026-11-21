@@ -41,11 +41,13 @@ position and a voice.
   on which adapter or brand it is talking to for delivery, obligations or
   policy; `model::Brand` only picks the icon. Adapters can still do
   harness-specific setup — Devin's trusted-folder step is the current example.
-- **ACP only.** The generic ACP adapter drives every harness that speaks
-  ACP (fx, Mistral Vibe, Claude Code through claude-agent-acp, Copilot CLI,
-  opencode, Devin, Cursor, Gemini, and Codex through `codex-acp`; the native
-  Codex app-server adapter was removed in STRM-542). See
-  [`agent-adapters.md`](agent-adapters.md).
+- **ACP plus a native OpenCode v2 adapter.** The generic ACP adapter drives
+  harnesses that speak ACP (fx, Mistral Vibe, Claude Code through
+  claude-agent-acp, Copilot CLI, Devin, Cursor, Gemini, Codex through
+  `codex-acp`, and opencode when `native_opencode_v2: false`; the native Codex
+  app-server adapter was removed in STRM-542). Native v2 is the default for the
+  `opencode` harness; it is its own adapter, not an ACP path. See
+  [`agent-adapters.md`](agent-adapters.md) and the Permissions section below.
 - **Members are models.** A member is a model running through a harness,
   auto-detected and kept on a per-project roster (see "Members and the
   roster" below).
@@ -374,23 +376,79 @@ answer").
 
 ## Permissions
 
-Permission mediation is being restored incrementally under STRM-612.
+Permission mediation is being finished incrementally under STRM-612. Chaos
+Control owns request identity, the decision and the recorded outcome; adapters
+preserve the provider's own choice semantics and do not invent options.
+There is no permission-mode API: `ask-all` and `accept-edits` are
+**unsupported/unverified**, are not offered, and no provider callback is
+auto-answered to imitate a mode.
 
-- **Native OpenCode v2.** A `permission.asked` request opens a permission pane
-  with the operation details and provider-supported choices (`reject`, `once`,
-  `always`). The provider is not answered until the user chooses. Canceling or
-  dismissing the pane sends no provider reply; if the runtime/UI broker is
-  unavailable, the adapter also fails closed. Outcomes are currently held in
-  runtime memory, not persisted.
-- **ACP v1/v2.** Still uses `adapter::auto_allow`: allow-once, else
-  allow-always, else the first provider option; `cancelled` only when the agent
-  offers none. ACP mediation and parity with native v2 remain follow-up work.
+- **Native OpenCode v2.** A `permission.asked` frame for our session becomes a
+  CC-owned approval request with the provider's `reject|once|always` decision
+  vocabulary. The pane holds the provider reply until the user chooses;
+  cancel/dismiss sends no reply. Broker failure, correlation mismatch, an
+  unresolved decision or an invalid choice fails closed without a reply.
+  Outcomes are persisted in the `approval_outcomes` table of split `core.db`
+  and reloaded at startup; dismissed/denied/no-reply/failed outcomes are shown
+  in the right sidebar ("Blocked approvals"), bounded to the eight most recent.
+- **ACP v1/v2.** Permission requests whose tool kind is `Read`, `Search` or
+  `Think` are answered at once through `adapter::auto_allow` (allow-once, else
+  allow-always, else the first option); **the predicate is kind-based and does
+  not check MCP origin**. Every other permission-required request goes to the
+  approval broker, which replies with the user's provider-honored option ID or
+  fails closed (no broker, error, correlation mismatch or unresolved decision
+  → `cancelled`, no execution claimed). ACP agents still run their own tools
+  under their own settings; a protocol approval message is not proof that CC
+  controls every operation.
+- **Chat tools are deliberately not gated.** The in-room `chat_*` tools have no
+  CC approval gate: they run with a bearer token scoped to one agent x channel
+  and the post author comes from the token, not the arguments. This is a
+  product decision (2026-11-20), not an unmediated gap to close.
 - Agents otherwise run under their native permission settings. Chaos Control
   does not change an agent's permission mode (`session/set_mode`).
 - The old single-file schema kept permission-era tables (`permission_requests`,
   `channel_approval_mode`, `app_settings`) so existing databases kept their
   schema version. The split `core.db` and project databases don't create them;
-  they are not used by the current runtime broker.
+  they are not used by the current runtime broker. `approval_outcomes` is new
+  and is written in `core.db`.
+
+### Permission evidence matrix (STRM-612)
+
+This records the **predicate actually executed**, not the intended policy label.
+"Auto-allow" here means the adapter answers without a user decision.
+Classification buckets: **CC-mediated** (CC owns identity, decision and outcome
+and withholds the reply until resolved), **provider-native** (the provider or
+agent enforces; CC observes or answers mechanically), **unverified/unsupported**
+(no evidence of enforcement, must be reported as such). Fake/unit evidence is
+not real-orchestrator evidence.
+
+| Path | Actual dispatch predicate | Disposition | Outcome recorded | Evidence / status |
+|---|---|---|---|---|
+| Native v2 `permission.asked` (`opencode_v2.rs:491-698`) | Event type `permission.asked` + matching `sessionID` + request `id`; every match is surfaced. No operation allowlist, no MCP-origin or tool-kind check. | CC-mediated: broker with provider vocabulary `reject\|once\|always`; reply `POST /api/session/{id}/permission/{req}/reply` | `Allowed` for `once\|always`, `Denied` for `reject`, `NotSent`/`Failed` for unresolved/error; persisted in `approval_outcomes` | Live v2.3.2 spike (`reject` → `executed:false`; duplicate reply → 404); `tests/opencode_v2_approval.rs`; `tests/approval_real_orchestrator.rs` now covers allow and deny through the real Core + broker + fake V2 server. Replay/disconnect through real orchestrator still open. |
+| Native v2 with no broker (`opencode_v2.rs:531-543`) | `approval_broker` is `None` | Fail closed, no provider reply | **No outcome recorded** — visible only as activity text | Known gap; do not describe as protected. |
+| Native v2 interrupt/close/stream error (`opencode_v2.rs:375-477`) | `interrupt`, `close`, stream-open/chunk-read failure and stream close all call `broker.cancel_pending(Disconnect)` | Pending decisions settle as disconnect, no late reply | `NotSent` for the cancelled request; a replay is rejected by the broker | Unit coverage in `opencode_v2.rs` / `host.rs`; real disconnect/recovery evidence still open. |
+| Broker replay guard (`host.rs:302-333`) | `request_decision` rejects an ID already pending **or already resolved** (decided, cancelled, or recovered from `approval_outcomes`) | No reopened request, no second decision | Original outcome is preserved | `host.rs` unit tests plus `tests/approval_real_orchestrator.rs` (replay after resolution → one provider effect only). |
+| Native v2 operations that emit no `permission.asked` | None — `answer_permission` only sees emitted frames | No CC mediation | n/a | Unverified/unsupported until inventoried with a repro; report, don't claim protection. |
+| ACP v1 `Read`/`Search`/`Think` (`acp.rs:689-694`) | `v1_is_read`: `tool_call.fields.kind` matches one of the three kinds; **MCP origin not checked** | Provider-native auto-allow via `select_allow_v1` → `adapter::auto_allow` | No CC approval request or outcome | `tests/scenarios.rs` (read auto-allow, no prompt). |
+| ACP v2 `Read`/`Search`/`Think` (`acp_v2.rs:131-140`) | `v2_is_read`: subject is `ToolCall` with `kind` in the three kinds; **MCP origin not checked** | Provider-native auto-allow via `select_allow_v2` | No CC approval request or outcome | `tests/v2.rs` (read auto-allow, no prompt). |
+| ACP v1/v2 all other kinds (`acp.rs:862-875`, `acp_v2.rs:308-321`) | Fallthrough from the kind check | CC-mediated with `ProviderOptions` (option IDs and kind — allow/reject — passed through); no broker → `Cancelled` | `Allowed` for allow options, `Denied` for reject options, `Sent` for unknown option kinds, `NotSent`/`Failed` for unresolved/error; option kind stored on `ProviderOption.kind` | `tests/scenarios.rs` / `tests/v2.rs` show the request is surfaced, not answered. `tests/approval_real_orchestrator.rs` covers allow, deny, replay-after-resolution, cancel and interrupt fail-closed through the real Core/engine/host with the fake agent; native-v2 and loss/disconnect/restart paths still open. |
+| Chat MCP tools (`mcp.rs:4-9`, `747-768`) | No approval predicate; scoped bearer token only | Provider-native, deliberately auto-allowed | Tool errors, not approval outcomes | Intentional product decision 2026-11-20. |
+| Other MCP/subagent/tool calls | No provenance predicate in any adapter (native v2 ignores origin; ACP checks only tool kind) | Native: surfaced only if the provider emits an ask. ACP: kind-based. No provenance gate. | As per the path that handled it | Unverified for CC enforcement; distinguish "server-level MCP injection" from per-call mediation. |
+| `ask-all` / `accept-edits` | No mode handling or `session/set_mode` call exists in product code | Unsupported/unverified; nothing offered, nothing auto-answered | n/a | Scope decision 2026-11-20; re-open only with real-V2 enforcement evidence. |
+
+### Retained ACP guarantees
+
+These are the paths STRM-612 must not silently break. They describe actual
+behavior, not a security claim: ACP agents execute their own tools under their
+own sandbox and approval rules.
+
+| Area | Behavior | Evidence |
+|---|---|---|
+| Transport/session | ACP v1 and v2 remain separate protocol adapters; v2 is negotiated when offered. | `crates/core/src/acp.rs`, `acp_v2.rs`; version negotiation above. |
+| Permission reply shape | Provider option IDs and their allow/reject kind are passed through; selected reject options are recorded `Denied`, unresolved/failed requests `NotSent`/`Failed`. `Cancelled` when none offered or when mediation fails closed. | `v1_broker_answer`, `v2_broker_answer`; `adapter::auto_allow` for the kind-based fast path. |
+| Dispatch | Read/Search/Think auto-allowed without a decision; every other approval-required request surfaced to the user or denied when no user is available. | `tests/scenarios.rs`, `tests/v2.rs`; matrix above. |
+| Chat tools | Injected over the negotiated transport and intentionally auto-allowed/provider-native. | `chat_tools` injection in `acp.rs`/`acp_v2.rs`/`opencode_v2.rs`. |
+| Trust level | ACP's protocol approval message is not proof that CC intercepted every protected operation. | STRM-612 issue text; matrix above. |
 
 ## Room policy
 
@@ -606,6 +664,18 @@ format. Optional keys: `env` (object), `acp_v2` (default `true`),
 - **Against the fake only:** agent output, keyed message and tool-call
   upserts, auto-allowed permission requests and cancel over v2
   (`tests/v2.rs`).
+- **Permission mediation (unit/integration, not full real-orchestrator replay):**
+  native v2 allowed/denied/no-reply paths (`tests/opencode_v2_approval.rs`)
+  and ACP read auto-allow vs non-read surfacing (`tests/scenarios.rs`,
+  `tests/v2.rs`). The provider's real deny effect (`reject` → tool did not run)
+  and one-shot reply enforcement come from the v2.3.2 live spike, not product
+  tests. ACP broker outcomes (allow/reject/unknown → `Allowed`/`Denied`/`Sent`,
+  plus `NotSent`/`Failed`) are implemented, and `tests/approval_real_orchestrator.rs`
+  now covers ACP allow, deny, replay-after-resolution, cancel and interrupt
+  fail-closed, plus native-v2 allow and deny, through the real Core/engine/host.
+  Per-op coverage beyond shell, native-v2 replay/disconnect, and
+  disconnect/callback-loss/restart/no-prompt paths remain open — see the
+  permission evidence matrix above.
 - **Harnesses (not live-verified):** none of the harness presets (Codex
   via `codex-acp`, fx, Mistral Vibe, Claude Code via claude-agent-acp
   0.99.1, Copilot CLI, opencode, Devin, Cursor, Gemini), model discovery

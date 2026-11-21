@@ -6,10 +6,12 @@
 //! semantics, and must treat timeout/disconnect/loss/ambiguity as fail-closed
 //! (never approval, never replay).
 //!
-//! The initial consumer is the native OpenCode v2 adapter. Spike evidence
-//! (v2.3.2, #248) shows v2 permission requests use a decision vocabulary
-//! (`reject|once|always`) rather than provider option IDs; the types here are
-//! shaped to carry verified provider choices without guessing semantics.
+//! Consumers are the native OpenCode v2 adapter and the ACP v1/v2 adapters.
+//! Spike evidence (v2.3.2, #248) shows v2 permission requests use a decision
+//! vocabulary (`reject|once|always`) rather than provider option IDs, while ACP
+//! carries provider option IDs; the types here carry both without guessing
+//! semantics. The per-path predicates and verification status are recorded in
+//! `docs/agents.md` under "Permission evidence matrix".
 
 use std::sync::Arc;
 

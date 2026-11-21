@@ -57,7 +57,8 @@ use tokio::sync::{mpsc, oneshot};
 use crate::adapter::*;
 use crate::approval::{
     ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
-    ApprovalProvider, ApprovalRequest, ProviderOption,
+    ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution,
+    ProviderOption,
 };
 use crate::harness::ModelInfo;
 use crate::types::{BatchId, ChannelId, MemberId};
@@ -681,8 +682,10 @@ fn v1_kind(k: &v1::PermissionOptionKind) -> OptionKind {
     }
 }
 
-/// Reads, searches and thoughts need no user decision; other permission-required
-/// requests are surfaced to the user through the approval broker.
+/// Permission requests whose tool kind is Read/Search/Think are answered at once
+/// (kind-based; MCP origin is NOT checked). Every other permission-required
+/// request is surfaced to the user through the approval broker. See STRM-612
+/// evidence matrix for the actual per-path classification.
 fn v1_is_read(req: &v1::RequestPermissionRequest) -> bool {
     matches!(
         req.tool_call.fields.kind,
@@ -721,8 +724,9 @@ async fn v1_broker_answer(
     broker: Arc<dyn ApprovalBroker>,
 ) -> v1::RequestPermissionResponse {
     let now = v1_now_ms();
+    let cc_request_id = ApprovalId::from(format!("acp-v1:{}:{}", req.session_id.0, now));
     let request = ApprovalRequest {
-        cc_request_id: ApprovalId::from(format!("acp-v1:{}:{}", req.session_id.0, now)),
+        cc_request_id: cc_request_id.clone(),
         provider: ApprovalProvider::Other(Arc::from("acp_v1")),
         provider_request_ref: req.session_id.0.clone(),
         session_id: req.session_id.0.clone(),
@@ -743,7 +747,13 @@ async fn v1_broker_answer(
                 .map(|o| ProviderOption {
                     id: o.option_id.0.clone(),
                     label: None,
-                    kind: None,
+                    kind: Some(Arc::from(match o.kind {
+                        v1::PermissionOptionKind::AllowOnce => "allow_once",
+                        v1::PermissionOptionKind::AllowAlways => "allow_always",
+                        v1::PermissionOptionKind::RejectOnce => "reject_once",
+                        v1::PermissionOptionKind::RejectAlways => "reject_always",
+                        _ => "other",
+                    })),
                     raw: None,
                 })
                 .collect(),
@@ -751,20 +761,101 @@ async fn v1_broker_answer(
         requested_at: now,
         context: None,
     };
-    match broker.request_decision(request).await {
-        Ok(decision) => match decision.decision {
-            ApprovalDecisionKind::Selected { choice } => {
-                if let Some(o) = req.options.iter().find(|o| o.option_id.0 == choice) {
+    let decision = match broker.request_decision(request).await {
+        Ok(decision) => decision,
+        Err(_) => {
+            let _ = broker
+                .record_outcome(ApprovalOutcome {
+                    cc_request_id,
+                    state: ApprovalOutcomeState::Failed,
+                    provider_reply: None,
+                    execution_effect: None,
+                    error: Some(Arc::from("approval broker failed")),
+                    recorded_at: Some(now),
+                })
+                .await;
+            return v1_cancelled();
+        }
+    };
+    if decision.cc_request_id != cc_request_id {
+        eprintln!(
+            "acp-v1 approval correlation mismatch: expected {}, got {}; failing closed",
+            cc_request_id.as_str(),
+            decision.cc_request_id.as_str()
+        );
+        let _ = broker
+            .record_outcome(ApprovalOutcome {
+                cc_request_id,
+                state: ApprovalOutcomeState::Failed,
+                provider_reply: None,
+                execution_effect: None,
+                error: Some(Arc::from("approval decision correlation mismatch")),
+                recorded_at: Some(now),
+            })
+            .await;
+        return v1_cancelled();
+    }
+    match decision.decision {
+        ApprovalDecisionKind::Selected { choice } => {
+            if let Some(o) = req.options.iter().find(|o| o.option_id.0 == choice) {
+                let reply =
                     v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Selected(
                         v1::SelectedPermissionOutcome::new(o.option_id.clone()),
-                    ))
-                } else {
-                    v1_cancelled()
-                }
+                    ));
+                let _ = broker
+                    .record_outcome(ApprovalOutcome {
+                        cc_request_id: decision.cc_request_id,
+                        state: match o.kind {
+                            v1::PermissionOptionKind::AllowOnce
+                            | v1::PermissionOptionKind::AllowAlways => {
+                                ApprovalOutcomeState::Allowed
+                            }
+                            v1::PermissionOptionKind::RejectOnce
+                            | v1::PermissionOptionKind::RejectAlways => {
+                                ApprovalOutcomeState::Denied
+                            }
+                            _ => ApprovalOutcomeState::Sent,
+                        },
+                        provider_reply: Some(serde_json::to_value(&reply).unwrap_or_default()),
+                        execution_effect: None,
+                        error: None,
+                        recorded_at: Some(now),
+                    })
+                    .await;
+                reply
+            } else {
+                let _ = broker
+                    .record_outcome(ApprovalOutcome {
+                        cc_request_id: decision.cc_request_id,
+                        state: ApprovalOutcomeState::Failed,
+                        provider_reply: None,
+                        execution_effect: None,
+                        error: Some(Arc::from("invalid ACP v1 decision choice")),
+                        recorded_at: Some(now),
+                    })
+                    .await;
+                v1_cancelled()
             }
-            _ => v1_cancelled(),
-        },
-        Err(_) => v1_cancelled(),
+        }
+        ApprovalDecisionKind::NotResolved { resolution } => {
+            let resolution_name = match resolution {
+                ApprovalResolution::Lost => "lost",
+                ApprovalResolution::Timeout => "timeout",
+                ApprovalResolution::Disconnect => "disconnect",
+                ApprovalResolution::Cancelled => "cancelled",
+            };
+            let _ = broker
+                .record_outcome(ApprovalOutcome {
+                    cc_request_id: decision.cc_request_id,
+                    state: ApprovalOutcomeState::NotSent,
+                    provider_reply: None,
+                    execution_effect: None,
+                    error: Some(Arc::from(format!("approval unresolved: {resolution_name}"))),
+                    recorded_at: Some(now),
+                })
+                .await;
+            v1_cancelled()
+        }
     }
 }
 
@@ -1073,6 +1164,9 @@ async fn run_v1(
         });
     }
     events.emit(AgentEvent::Exited { error: why });
+    if let Some(broker) = &approval_broker {
+        let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
+    }
 }
 
 #[allow(dead_code)]

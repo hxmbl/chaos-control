@@ -78,9 +78,11 @@ channels from core and #main is the project's own `main` channel:
 
 Only #main is wired to post through core so far; other channels arrive with
 channel management. The delivery, batching and obligation rules are in
-[docs/agents.md](docs/agents.md). Agent permissions are currently not
-mediated (being redesigned): an agent's permission request is answered at once
-with its own allow option (see "Permissions" there).
+[docs/agents.md](docs/agents.md). Permission mediation (STRM-612) is in
+progress: native OpenCode v2 requests go through the CC-owned approval broker,
+and ACP auto-allows only read/search/think while surfacing other
+approval-required requests. Actual predicates, recorded outcomes and unverified
+paths are in "Permissions" there.
 
 ## Storage model
 

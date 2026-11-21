@@ -375,11 +375,20 @@ impl AgentSession for OpenCodeV2Session {
     fn interrupt(&self) -> BoxFuture<'_, Result<(), AgentError>> {
         Box::pin(async move {
             let path = format!("/api/session/{}/interrupt", self.inner.session_id);
-            self.inner
+            let result = self
+                .inner
                 .http
                 .post_json(&path, &serde_json::json!({}))
                 .await
-                .map(|_| ())
+                .map(|_| ());
+            if result.is_ok() {
+                // The interrupted turn can no longer resolve later decisions;
+                // fail pending approvals closed.
+                if let Some(broker) = &self.inner.approval_broker {
+                    let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
+                }
+            }
+            result
         })
     }
 
@@ -391,6 +400,9 @@ impl AgentSession for OpenCodeV2Session {
             if let Some(mut child) = self.inner.child.lock().await.take() {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
+            }
+            if let Some(broker) = &self.inner.approval_broker {
+                let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
             }
         })
     }
@@ -423,6 +435,9 @@ async fn stream_events(inner: Arc<SessionInner>) {
     let resp = match result {
         Ok(resp) => resp,
         Err(error) => {
+            if let Some(broker) = &inner.approval_broker {
+                let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
+            }
             fail_in_flight(&inner, &error);
             return;
         }
@@ -434,6 +449,9 @@ async fn stream_events(inner: Arc<SessionInner>) {
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(e) => {
+                if let Some(broker) = &inner.approval_broker {
+                    let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
+                }
                 fail_in_flight(&inner, &transport_error(e));
                 return;
             }
@@ -557,17 +575,21 @@ async fn answer_permission(inner: Arc<SessionInner>, frame_data: String) {
     };
     let decision = match broker.request_decision(approval_request).await {
         Ok(decision) => decision,
-        Err(_) => {
-            let _ = broker
-                .record_outcome(ApprovalOutcome {
-                    cc_request_id,
-                    state: ApprovalOutcomeState::Failed,
-                    provider_reply: None,
-                    execution_effect: None,
-                    error: Some(Arc::from("approval broker failed")),
-                    recorded_at: Some(now),
-                })
-                .await;
+        Err(error) => {
+            // A replay of an already-resolved request fails closed: the
+            // original outcome stands and is not overwritten as Failed.
+            if !error.message.as_ref().contains("already resolved") {
+                let _ = broker
+                    .record_outcome(ApprovalOutcome {
+                        cc_request_id,
+                        state: ApprovalOutcomeState::Failed,
+                        provider_reply: None,
+                        execution_effect: None,
+                        error: Some(Arc::from("approval broker failed")),
+                        recorded_at: Some(now),
+                    })
+                    .await;
+            }
             return;
         }
     };
@@ -1463,5 +1485,287 @@ mod tests {
         assert_eq!(turn, BatchId(1));
         assert_eq!(&*text, "done");
         session.close().await;
+    }
+
+    /// Broker that parks requests until `cancel_pending` answers them, so the
+    /// close/interrupt/open-failure paths can be observed end to end.
+    struct TestBroker {
+        state: std::sync::Arc<std::sync::Mutex<TestBrokerState>>,
+    }
+
+    impl Default for TestBroker {
+        fn default() -> Self {
+            TestBroker {
+                state: std::sync::Arc::new(std::sync::Mutex::new(TestBrokerState::default())),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct TestBrokerState {
+        pending:
+            HashMap<ApprovalId, tokio::sync::oneshot::Sender<crate::approval::ApprovalDecision>>,
+        cancels: Vec<ApprovalResolution>,
+    }
+
+    impl TestBroker {
+        fn park(
+            state: std::sync::Arc<std::sync::Mutex<TestBrokerState>>,
+            request: ApprovalRequest,
+        ) -> BoxFuture<
+            'static,
+            Result<crate::approval::ApprovalDecision, crate::approval::ApprovalBrokerError>,
+        > {
+            Box::pin(async move {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                {
+                    let mut state = state.lock().unwrap();
+                    if state.pending.contains_key(&request.cc_request_id) {
+                        return Err(crate::approval::ApprovalBrokerError::new("already pending"));
+                    }
+                    state.pending.insert(request.cc_request_id.clone(), tx);
+                }
+                let decision = rx.await.map_err(|_| {
+                    crate::approval::ApprovalBrokerError::new("parked request abandoned")
+                })?;
+                state.lock().unwrap().pending.remove(&request.cc_request_id);
+                Ok(decision)
+            })
+        }
+
+        fn cancels(&self) -> Vec<ApprovalResolution> {
+            self.state.lock().unwrap().cancels.clone()
+        }
+    }
+
+    impl ApprovalBroker for TestBroker {
+        fn request_decision(
+            &self,
+            request: ApprovalRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<crate::approval::ApprovalDecision, crate::approval::ApprovalBrokerError>,
+        > {
+            TestBroker::park(self.state.clone(), request)
+        }
+
+        fn record_outcome(
+            &self,
+            _outcome: ApprovalOutcome,
+        ) -> BoxFuture<'_, Result<(), crate::approval::ApprovalBrokerError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn cancel_pending(
+            &self,
+            resolution: ApprovalResolution,
+        ) -> BoxFuture<'_, Result<(), crate::approval::ApprovalBrokerError>> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                let parked: Vec<_> = {
+                    let mut state = state.lock().unwrap();
+                    state.cancels.push(resolution);
+                    state.pending.drain().collect()
+                };
+                for (id, tx) in parked {
+                    let _ = tx.send(crate::approval::ApprovalDecision {
+                        cc_request_id: id,
+                        decision: ApprovalDecisionKind::NotResolved { resolution },
+                        decided_at: 1,
+                        actor: None,
+                    });
+                }
+                Ok(())
+            })
+        }
+    }
+
+    fn parked_request(id: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            cc_request_id: ApprovalId::from(id),
+            provider: ApprovalProvider::OpenCodeV2,
+            provider_request_ref: Arc::from(id),
+            session_id: Arc::from("s1"),
+            agent: MemberId(0),
+            channel: ChannelId(0),
+            turn: None,
+            operation: ApprovalOperation {
+                action: Arc::from("shell"),
+                tool_name: None,
+                summary: Some(Arc::from("echo OK")),
+                arguments: None,
+                raw: None,
+            },
+            choices: ApprovalChoices::DecisionVocabulary {
+                decisions: vec![Arc::from("reject"), Arc::from("once"), Arc::from("always")],
+                raw: None,
+            },
+            requested_at: 1,
+            context: None,
+        }
+    }
+
+    async fn wait_for_parked(broker: &TestBroker, id: &ApprovalId) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !broker.state.lock().unwrap().pending.contains_key(id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "parked request {id:?} was not registered"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn open_with_broker(
+        server_url: &str,
+        broker: std::sync::Arc<TestBroker>,
+    ) -> Arc<dyn AgentSession> {
+        let approval_broker: Option<Arc<dyn ApprovalBroker>> = Some(broker);
+        let adapter = OpenCodeV2Adapter::new(OpenCodeV2Config {
+            command: "opencode".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            server_url: Some(server_url.to_owned()),
+            server_password: None,
+            model: None,
+        });
+        adapter
+            .open(OpenSession {
+                agent: MemberId(0),
+                channel: ChannelId(0),
+                handle: "tester".into(),
+                cwd: std::env::temp_dir(),
+                chat_tools: crate::adapter::ChatToolsEndpoint {
+                    url: String::new(),
+                    token: String::new(),
+                    bridge: None,
+                },
+                events: EventSink::new(|_| {}),
+                approval_broker,
+            })
+            .await
+            .expect("open")
+    }
+
+    #[tokio::test]
+    async fn close_cancels_pending_approvals() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+
+        let app = Router::new()
+            .route(
+                "/api/session",
+                post(|| async { Json(serde_json::json!({ "data": { "id": "s1" } })) }),
+            )
+            .route(
+                "/api/event",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    ([("content-type", "text/event-stream")], "")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let broker = Arc::new(TestBroker::default());
+        let session = open_with_broker(&format!("http://{addr}"), broker.clone()).await;
+
+        let parked_id = ApprovalId::from("opencode-v2:s1:req-close");
+        let parked = tokio::spawn(TestBroker::park(
+            broker.state.clone(),
+            parked_request(parked_id.as_str()),
+        ));
+        wait_for_parked(&broker, &parked_id).await;
+
+        session.close().await;
+
+        let decision = parked.await.unwrap().unwrap();
+        assert!(matches!(
+            decision.decision,
+            crate::approval::ApprovalDecisionKind::NotResolved {
+                resolution: ApprovalResolution::Disconnect
+            }
+        ));
+        assert_eq!(broker.cancels(), vec![ApprovalResolution::Disconnect]);
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_pending_approvals() {
+        use axum::{
+            Json, Router,
+            routing::{get, post},
+        };
+
+        let app = Router::new()
+            .route(
+                "/api/session",
+                post(|| async { Json(serde_json::json!({ "data": { "id": "s1" } })) }),
+            )
+            .route(
+                "/api/session/s1/interrupt",
+                post(|| async { Json(serde_json::json!({ "data": {} })) }),
+            )
+            .route(
+                "/api/event",
+                get(|| async {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                    ([("content-type", "text/event-stream")], "")
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let broker = Arc::new(TestBroker::default());
+        let session = open_with_broker(&format!("http://{addr}"), broker.clone()).await;
+
+        let parked_id = ApprovalId::from("opencode-v2:s1:req-interrupt");
+        let parked = tokio::spawn(TestBroker::park(
+            broker.state.clone(),
+            parked_request(parked_id.as_str()),
+        ));
+        wait_for_parked(&broker, &parked_id).await;
+
+        session.interrupt().await.unwrap();
+
+        let decision = parked.await.unwrap().unwrap();
+        assert!(matches!(
+            decision.decision,
+            crate::approval::ApprovalDecisionKind::NotResolved {
+                resolution: ApprovalResolution::Disconnect
+            }
+        ));
+        assert_eq!(broker.cancels(), vec![ApprovalResolution::Disconnect]);
+    }
+
+    #[tokio::test]
+    async fn event_stream_open_failure_cancels_pending_approvals() {
+        use axum::{Json, Router, routing::post};
+
+        let app = Router::new().route(
+            "/api/session",
+            post(|| async { Json(serde_json::json!({ "data": { "id": "s1" } })) }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let broker = Arc::new(TestBroker::default());
+        open_with_broker(&format!("http://{addr}"), broker.clone()).await;
+
+        // `/api/event` is absent: the stream open fails, and the failure must
+        // fail pending approvals closed.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while broker.cancels().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no cancel recorded for stream-open failure"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(broker.cancels(), vec![ApprovalResolution::Disconnect]);
     }
 }
