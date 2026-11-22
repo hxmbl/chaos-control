@@ -10,6 +10,3 @@ fail_on: high
 
 # Test files are skipped by default.
 include_test_files: false
-
-# Known, triaged findings (generated with `minesweep --update-baseline`).
-baseline_file: .minesweep-baseline.json

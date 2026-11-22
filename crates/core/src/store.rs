@@ -34,10 +34,7 @@ use std::{
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
-use crate::{
-    approval::{ApprovalId, ApprovalOutcome, ApprovalOutcomeState},
-    types::*,
-};
+use crate::types::*;
 
 pub type Result<T> = rusqlite::Result<T>;
 
@@ -862,101 +859,6 @@ impl Store {
     /// for operations that moved; callers must be updated.
     pub fn conn(&self) -> &Connection {
         &self.core
-    }
-
-    pub fn approval_outcomes(&self) -> rusqlite::Result<HashMap<ApprovalId, ApprovalOutcome>> {
-        let mut stmt = self.core.prepare(
-            "SELECT cc_request_id, state, provider_reply, execution_effect, error, recorded_at
-             FROM approval_outcomes",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let state: String = row.get(1)?;
-            let provider_reply: Option<String> = row.get(2)?;
-            let execution_effect: Option<String> = row.get(3)?;
-            let error: Option<String> = row.get(4)?;
-            let recorded_at: Option<i64> = row.get(5)?;
-            Ok((
-                ApprovalId::from(id),
-                state,
-                provider_reply,
-                execution_effect,
-                error,
-                recorded_at.map(|value| value as u64),
-            ))
-        })?;
-        let mut outcomes = HashMap::new();
-        for row in rows {
-            let (id, state, provider_reply, execution_effect, error, recorded_at) = row?;
-            let state = match state.as_str() {
-                "allowed" => ApprovalOutcomeState::Allowed,
-                "denied" => ApprovalOutcomeState::Denied,
-                "sent" => ApprovalOutcomeState::Sent,
-                "not_sent" => ApprovalOutcomeState::NotSent,
-                "failed" => ApprovalOutcomeState::Failed,
-                unknown => {
-                    return Err(rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Text,
-                        format!("unknown approval outcome state: {unknown}").into(),
-                    ));
-                }
-            };
-            outcomes.insert(
-                id.clone(),
-                ApprovalOutcome {
-                    cc_request_id: id,
-                    state,
-                    provider_reply: provider_reply
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str(value).ok()),
-                    execution_effect: execution_effect
-                        .as_deref()
-                        .and_then(|value| serde_json::from_str(value).ok()),
-                    error: error.map(Arc::from),
-                    recorded_at,
-                },
-            );
-        }
-        Ok(outcomes)
-    }
-
-    pub fn record_approval_outcome(&mut self, outcome: &ApprovalOutcome) -> rusqlite::Result<()> {
-        let state = match outcome.state {
-            ApprovalOutcomeState::Allowed => "allowed",
-            ApprovalOutcomeState::Denied => "denied",
-            ApprovalOutcomeState::Sent => "sent",
-            ApprovalOutcomeState::NotSent => "not_sent",
-            ApprovalOutcomeState::Failed => "failed",
-        };
-        self.tx(|conn| {
-            conn.execute(
-                "INSERT INTO approval_outcomes
-                 (cc_request_id, state, provider_reply, execution_effect, error, recorded_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(cc_request_id) DO UPDATE SET
-                   state=excluded.state,
-                   provider_reply=excluded.provider_reply,
-                   execution_effect=excluded.execution_effect,
-                   error=excluded.error,
-                   recorded_at=excluded.recorded_at",
-                params![
-                    outcome.cc_request_id.as_str(),
-                    state,
-                    outcome
-                        .provider_reply
-                        .as_ref()
-                        .map(|value| value.to_string()),
-                    outcome
-                        .execution_effect
-                        .as_ref()
-                        .map(|value| value.to_string()),
-                    outcome.error.as_deref(),
-                    outcome.recorded_at.map(|value| value as i64),
-                ],
-            )?;
-            Ok(())
-        })
     }
 
     pub fn project_workspace(&self, project: &ProjectId) -> Result<&Connection> {
@@ -1957,8 +1859,7 @@ fn run_migrations(conn: &Connection, migrations: &[&str], from: usize) -> Result
     result
 }
 
-const CORE_MIGRATIONS: &[&str] = &[
-    r#"
+const CORE_MIGRATIONS: &[&str] = &[r#"
 CREATE TABLE projects (
     id          TEXT PRIMARY KEY NOT NULL,
     name        TEXT NOT NULL,
@@ -2022,18 +1923,7 @@ CREATE TABLE id_counters (
     next_id INTEGER NOT NULL
 );
 INSERT INTO id_counters (name, next_id) VALUES ('channel', 1), ('message', 1), ('batch', 1);
-"#,
-    r#"
-CREATE TABLE approval_outcomes (
-    cc_request_id    TEXT PRIMARY KEY NOT NULL,
-    state            TEXT NOT NULL,
-    provider_reply   TEXT,
-    execution_effect TEXT,
-    error            TEXT,
-    recorded_at      INTEGER
-);
-"#,
-];
+"#];
 
 const WORKSPACE_MIGRATIONS: &[&str] = &[r#"
 CREATE TABLE channels (
@@ -4671,24 +4561,6 @@ mod tests {
         s.join(ch.id, &hx, 20, 0).unwrap();
         s.join(ch.id, &bot, 20, 0).unwrap();
         (s, ch, hx, bot)
-    }
-
-    #[test]
-    fn approval_outcome_round_trips_through_store() {
-        let mut store = Store::open_in_memory().unwrap();
-        let outcome = ApprovalOutcome {
-            cc_request_id: ApprovalId::from("opencode-v2:s1:p1"),
-            state: ApprovalOutcomeState::Allowed,
-            provider_reply: Some(serde_json::json!({"decision": "once"})),
-            execution_effect: Some(serde_json::json!({"ran": true})),
-            error: None,
-            recorded_at: Some(123),
-        };
-
-        store.record_approval_outcome(&outcome).unwrap();
-        let loaded = store.approval_outcomes().unwrap();
-
-        assert_eq!(loaded.get(&outcome.cc_request_id), Some(&outcome));
     }
 
     #[test]

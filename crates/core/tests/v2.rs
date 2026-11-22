@@ -16,7 +16,7 @@ use std::{
     time::Duration,
 };
 
-use chaos_core::{engine::CoreEvent, types::*};
+use chaos_core::types::*;
 use common::*;
 use serde_json::{Value, json};
 
@@ -160,20 +160,20 @@ async fn v2_final_text_stays_private_across_keyed_message_and_tool_call_upserts(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_permission_read_is_auto_allowed_without_prompt() {
-    // Reads are auto-allowed: the agent's own allow option is selected at
-    // once, with no note, prompt or queue.
+async fn v2_permission_request_is_auto_allowed() {
+    // Permissions are not mediated (being redesigned): the agent's own allow
+    // option is selected at once, with no note, prompt or queue.
     let mut h = Harness::new().await;
     let bot = h
         .agent(
             "bot",
             v2(json!([{"steps": [
-                {"permission_kind": {"title": "List files", "kind": "read"}},
-                {"text": "Listed files."}
+                {"permission": "rm -rf build/"},
+                {"text": "Deleted build/."}
             ]}])),
         )
         .await;
-    let ping = h.say("@bot list the files").await;
+    let ping = h.say("@bot clean the build dir").await;
     h.until("batch settled", batches_in("settled", 1)).await;
     assert_eq!(
         h.obligation(bot.id, ping.id).await,
@@ -196,44 +196,6 @@ async fn v2_permission_read_is_auto_allowed_without_prompt() {
         outcomes[0]
     );
     assert!(outcomes[0].get("_meta").is_none(), "{}", outcomes[0]);
-    assert!(
-        !h.seen
-            .iter()
-            .any(|e| matches!(e, CoreEvent::ApprovalRequested(_))),
-        "reads must not ask"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn v2_permission_non_read_is_asked_and_not_auto_allowed() {
-    // Approval-required, non-read requests are surfaced through the approval
-    // broker; the agent is not answered without a user decision.
-    let mut h = Harness::new().await;
-    let bot = h
-        .agent(
-            "bot",
-            v2(json!([{"steps": [
-                {"permission": "rm -rf build/"},
-                {"text": "Deleted build/."}
-            ]}])),
-        )
-        .await;
-    let _ping = h.say("@bot clean the build dir").await;
-    let asked = h
-        .wait_for(
-            "approval asked",
-            |e| matches!(e, CoreEvent::ApprovalRequested(a) if a.agent == bot.id),
-        )
-        .await;
-    assert!(matches!(asked, CoreEvent::ApprovalRequested(_)));
-    let outcomes = h
-        .fake("bot")
-        .observed
-        .lock()
-        .unwrap()
-        .permission_outcomes
-        .clone();
-    assert!(outcomes.is_empty(), "nothing is auto-allowed: {outcomes:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

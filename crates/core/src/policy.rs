@@ -8,10 +8,9 @@
 //!   targets show "hop limit" presence).
 //! - **Ping-pong damper.** Counts agent-to-agent wakes between the same two
 //!   agents that alternate direction. The `max_alternations + 1`-th is
-//!   suppressed and the pair is paused silently: no message is posted, the
-//!   suppressed target's presence note says why. Plain human chatter does not
-//!   reset it (it does reset hops, which is exactly the case the damper exists
-//!   for); a human addressing either agent does.
+//!   suppressed, the pair is paused and one system line is posted. Plain human
+//!   chatter does not reset it (it does reset hops, which is exactly the case
+//!   the damper exists for); a human addressing either agent does.
 //! - **Rate limit.** A token bucket per agent per channel on agent posts.
 //! - **No broadcast tokens for agents.** `@everyone`/`@here`/`@channel` from an
 //!   agent are ignored with a note; a human's use wakes every agent without an
@@ -43,7 +42,7 @@ impl Default for Policy {
     fn default() -> Self {
         Policy {
             max_hops: 3,
-            max_alternations: 10,
+            max_alternations: 4,
             posts_per_minute: 6,
             join_backfill: 20,
             max_failures: 3,
@@ -64,7 +63,7 @@ impl Policy {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Damp {
     Allow,
-    /// This wake tripped the damper: suppress it and pause the pair.
+    /// This wake tripped the damper: suppress it and announce the pause.
     Trip,
     /// The pair is already paused: suppress quietly.
     Paused,
@@ -275,14 +274,14 @@ mod tests {
     }
 
     #[test]
-    fn damper_trips_after_ten_alternations_and_resets_on_human_address() {
+    fn damper_trips_after_four_alternations_and_resets_on_human_address() {
         let p = Policy::default();
         let mut s = PolicyState::default();
         let (c, a, b) = (ChannelId(1), MemberId(1), MemberId(2));
-        for i in 0..10 {
-            let (from, to) = if i % 2 == 0 { (a, b) } else { (b, a) };
-            assert_eq!(s.agent_wake(&p, c, from, to), Damp::Allow);
-        }
+        assert_eq!(s.agent_wake(&p, c, a, b), Damp::Allow);
+        assert_eq!(s.agent_wake(&p, c, b, a), Damp::Allow);
+        assert_eq!(s.agent_wake(&p, c, a, b), Damp::Allow);
+        assert_eq!(s.agent_wake(&p, c, b, a), Damp::Allow);
         assert_eq!(s.agent_wake(&p, c, a, b), Damp::Trip);
         assert_eq!(s.agent_wake(&p, c, b, a), Damp::Paused);
         s.human_addressed(c, b);

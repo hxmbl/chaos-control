@@ -80,7 +80,6 @@ fn centre_column(viewport: Pixels, left: Pixels, right: Pixels) -> (Pixels, Pixe
 }
 
 pub struct Workspace {
-    store: Entity<ChatStore>,
     panels: Entity<Panels>,
     pane: Entity<PaneHost>,
     search: Entity<Search>,
@@ -152,16 +151,6 @@ impl Workspace {
             )
         });
         let pane = cx.new(|cx| PaneHost::new(store.clone(), cx));
-        let approval_events = cx.subscribe_in(&store, window, {
-            let pane = pane.clone();
-            move |_, store, event, window, cx| {
-                if matches!(event, crate::store::StoreEvent::ApprovalRequested)
-                    && let Some(content) = store.read(cx).pending_approval()
-                {
-                    pane.update(cx, |pane, cx| pane.open(content, window, cx));
-                }
-            }
-        });
         // Mention and emoji usage, so suggestions remember picks across launches.
         let usage_path = crate::agents::data_dir().join("composer_suggestions.json");
         let composer = cx.new(|cx| Composer::new(store.clone(), window, cx, Some(usage_path)));
@@ -172,12 +161,6 @@ impl Workspace {
                     .update(cx, |c, cx| c.set_reply(reply.clone(), window, cx)),
                 PaneEvent::ClosedWithoutFocus => {
                     this.composer.update(cx, |c, cx| c.focus(window, cx))
-                }
-                PaneEvent::ApprovalClosed => {
-                    if let Some(content) = this.store.read(cx).pending_approval() {
-                        this.pane
-                            .update(cx, |pane, cx| pane.open(content, window, cx));
-                    }
                 }
                 // Attachments, reviews and drafts arrive with the agent runtime.
                 PaneEvent::Action(_) => {}
@@ -219,7 +202,6 @@ impl Workspace {
         let loaded_profile = profile::load(&data_dir);
 
         Self {
-            store: store.clone(),
             titlebar: cx.new(|cx| Titlebar::new(panels.clone(), search.clone(), window, cx)),
             panels,
             search,
@@ -245,7 +227,6 @@ impl Workspace {
                 pane_changed,
                 picker_changed,
                 picker_events,
-                approval_events,
             ]
             .into_iter()
             .chain(focus_subscriptions)

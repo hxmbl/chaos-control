@@ -117,22 +117,6 @@ impl Render for RightSidebar {
             })
             .collect();
         let can_add = self.store.read(cx).has_core();
-        // Blocked approvals (STRM-612): show the outcome instead of dropping it.
-        let notices: Vec<_> = self
-            .store
-            .read(cx)
-            .approval_notices()
-            .iter()
-            .map(|n| {
-                (
-                    n.label(),
-                    n.error
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .unwrap_or_default(),
-                )
-            })
-            .collect();
         let count = mention_rows.len();
         let open = self.mentions_open;
 
@@ -246,77 +230,6 @@ impl Render for RightSidebar {
                         )
                     }),
             )
-            // Blocked approvals: fail loudly in the sidebar (STRM-612). The
-            // core outcome used to be dropped after clearing the pending pane.
-            .when(!notices.is_empty(), |root| {
-                root.child(
-                    section(&t)
-                        .gap(space::X1)
-                        .px(space::X1_5)
-                        .py(space::X2)
-                        .child(
-                            div()
-                                .px(space::X2)
-                                .type_style(text::SMALL)
-                                .font_weight(text::MEDIUM)
-                                .text_color(t.ink_soft)
-                                .child(truncated("Blocked approvals")),
-                        )
-                        .child(
-                            div()
-                                .id("approval-notices")
-                                .flex()
-                                .flex_col()
-                                .gap(space::X0_5)
-                                .max_h(px(MENTION_ROW * 3.))
-                                .overflow_y_scroll()
-                                .children(notices.into_iter().enumerate().map(
-                                    |(i, (label, error))| {
-                                        let tip = if error.is_empty() {
-                                            label.to_string()
-                                        } else {
-                                            format!("{label}: {error}")
-                                        };
-                                        pill(("approval-notice", i), cx)
-                                            .h(size::ROW)
-                                            .gap(space::X2)
-                                            .px(space::X2)
-                                            .tooltip(Tooltip::text(tip))
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .ellipsis()
-                                                    .type_style(text::CAPTION)
-                                                    .text_color(t.ink)
-                                                    .child(truncated(SharedString::from(label))),
-                                            )
-                                            .when(!error.is_empty(), |row| {
-                                                row.child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .ellipsis()
-                                                        .type_style(text::CAPTION)
-                                                        .text_color(t.ink_soft)
-                                                        .child(truncated(SharedString::from(
-                                                            error,
-                                                        ))),
-                                                )
-                                            })
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .size(px(DOT))
-                                                    .rounded_full()
-                                                    .bg(t.status_unresponsive)
-                                                    .shadow(t.glow_shadow(t.status_unresponsive)),
-                                            )
-                                    },
-                                )),
-                        ),
-                )
-            })
             // Spare height sits here, so agent status stays at the bottom
             // like the left sidebar's settings row.
             .child(div().flex_1())

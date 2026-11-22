@@ -120,7 +120,6 @@ async fn open_replay(
                 }),
             },
             events: EventSink::new(|_| {}),
-            approval_broker: None,
         })
         .await;
     let frames = captured.lock().unwrap().clone();

@@ -7,7 +7,7 @@ A group chat for AI and humans. Each project gets a chat where its AI agents and
 
 Early days: a native desktop shell built with [GPUI](https://www.gpui.rs) (Zed's GPU-accelerated Rust UI framework). With agents set up it runs the chaos-core agent runtime in-process — a real SQLite-backed store, not sample data; without them it falls back to sample data.
 
-Permission mediation is being finished under STRM-612: native OpenCode v2 asks the user through a permission pane and records outcomes; on ACP, read/search/think requests are auto-allowed and other approval-required requests are surfaced to the user or denied. Agents otherwise run under their native settings. Coverage and unverified paths are listed in [docs/agents.md](docs/agents.md) ("Permission evidence matrix").
+Agent permissions are currently not mediated (the model is being redesigned): agents run under their own native settings, and a permission request from an agent is answered with its allow option. See [docs/agents.md](docs/agents.md).
 
 ## Develop
 

@@ -30,13 +30,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::acp::{ChatToolsPreference, Tracker, V2Open, choose_mcp, error_kind};
 use crate::adapter::*;
-use crate::approval::{
-    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
-    ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution,
-    ProviderOption,
-};
-use crate::types::{BatchId, ChannelId, MemberId};
-use std::time::{SystemTime, UNIX_EPOCH};
+use crate::types::BatchId;
 
 enum Cmd {
     Prompt {
@@ -124,199 +118,15 @@ fn kind(k: &v2::PermissionOptionKind) -> OptionKind {
     }
 }
 
-/// Permission requests whose tool kind is Read/Search/Think are answered at once
-/// (kind-based; MCP origin is NOT checked). Every other permission-required
-/// request is surfaced to the user through the approval broker. See STRM-612
-/// evidence matrix for the actual per-path classification.
-fn v2_is_read(req: &v2::RequestPermissionRequest) -> bool {
-    matches!(
-        &req.subject,
-        Some(v2::RequestPermissionSubject::ToolCall(s))
-            if matches!(
-                &s.tool_call.kind,
-                MaybeUndefined::Value(v2::ToolKind::Read | v2::ToolKind::Search | v2::ToolKind::Think)
-            )
-    )
-}
-
-fn select_allow_v2(req: &v2::RequestPermissionRequest) -> v2::RequestPermissionResponse {
+/// Answers a permission request with the agent's own allow option (see
+/// [`auto_allow`]).
+fn answer(req: &v2::RequestPermissionRequest) -> v2::RequestPermissionResponse {
     let opts: Vec<OptionKind> = req.options.iter().map(|o| kind(&o.kind)).collect();
     match auto_allow(&opts) {
         Some(ix) => v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
             v2::SelectedPermissionOutcome::new(req.options[ix].option_id.clone()),
         )),
-        None => v2_cancelled(),
-    }
-}
-
-fn v2_cancelled() -> v2::RequestPermissionResponse {
-    v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled)
-}
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// Surfaces an approval-required request to the user via [`ApprovalBroker`] and
-/// answers with the option the user picked. Fails closed when no user decision
-/// is available, so nothing approval-required is ever auto-allowed.
-async fn v2_broker_answer(
-    req: &v2::RequestPermissionRequest,
-    agent: MemberId,
-    channel: ChannelId,
-    broker: Arc<dyn ApprovalBroker>,
-) -> v2::RequestPermissionResponse {
-    let now = now_ms();
-    let cc_request_id = ApprovalId::from(format!("acp-v2:{}:{}", req.session_id.0, now));
-    let request = ApprovalRequest {
-        cc_request_id: cc_request_id.clone(),
-        provider: ApprovalProvider::Other(Arc::from("acp_v2")),
-        provider_request_ref: Arc::from(req.title.as_str()),
-        session_id: req.session_id.0.clone(),
-        agent,
-        channel,
-        turn: None,
-        operation: ApprovalOperation {
-            action: Arc::from("acp_permission"),
-            tool_name: None,
-            summary: Some(Arc::from(req.title.as_str())),
-            arguments: None,
-            raw: Some(serde_json::to_value(req).unwrap_or_default()),
-        },
-        choices: ApprovalChoices::ProviderOptions {
-            options: req
-                .options
-                .iter()
-                .map(|o| ProviderOption {
-                    id: o.option_id.0.clone(),
-                    label: None,
-                    kind: Some(Arc::from(match o.kind {
-                        v2::PermissionOptionKind::AllowOnce => "allow_once",
-                        v2::PermissionOptionKind::AllowAlways => "allow_always",
-                        v2::PermissionOptionKind::RejectOnce => "reject_once",
-                        v2::PermissionOptionKind::RejectAlways => "reject_always",
-                        _ => "other",
-                    })),
-                    raw: None,
-                })
-                .collect(),
-        },
-        requested_at: now,
-        context: None,
-    };
-    let decision = match broker.request_decision(request).await {
-        Ok(decision) => decision,
-        Err(_) => {
-            let _ = broker
-                .record_outcome(ApprovalOutcome {
-                    cc_request_id,
-                    state: ApprovalOutcomeState::Failed,
-                    provider_reply: None,
-                    execution_effect: None,
-                    error: Some(Arc::from("approval broker failed")),
-                    recorded_at: Some(now),
-                })
-                .await;
-            return v2_cancelled();
-        }
-    };
-    if decision.cc_request_id != cc_request_id {
-        eprintln!(
-            "acp-v2 approval correlation mismatch: expected {}, got {}; failing closed",
-            cc_request_id.as_str(),
-            decision.cc_request_id.as_str()
-        );
-        let _ = broker
-            .record_outcome(ApprovalOutcome {
-                cc_request_id,
-                state: ApprovalOutcomeState::Failed,
-                provider_reply: None,
-                execution_effect: None,
-                error: Some(Arc::from("approval decision correlation mismatch")),
-                recorded_at: Some(now),
-            })
-            .await;
-        return v2_cancelled();
-    }
-    match decision.decision {
-        ApprovalDecisionKind::Selected { choice } => {
-            if let Some(o) = req.options.iter().find(|o| o.option_id.0 == choice) {
-                let reply =
-                    v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
-                        v2::SelectedPermissionOutcome::new(o.option_id.clone()),
-                    ));
-                let _ = broker
-                    .record_outcome(ApprovalOutcome {
-                        cc_request_id: decision.cc_request_id,
-                        state: match o.kind {
-                            v2::PermissionOptionKind::AllowOnce
-                            | v2::PermissionOptionKind::AllowAlways => {
-                                ApprovalOutcomeState::Allowed
-                            }
-                            v2::PermissionOptionKind::RejectOnce
-                            | v2::PermissionOptionKind::RejectAlways => {
-                                ApprovalOutcomeState::Denied
-                            }
-                            _ => ApprovalOutcomeState::Sent,
-                        },
-                        provider_reply: Some(serde_json::to_value(&reply).unwrap_or_default()),
-                        execution_effect: None,
-                        error: None,
-                        recorded_at: Some(now),
-                    })
-                    .await;
-                reply
-            } else {
-                let _ = broker
-                    .record_outcome(ApprovalOutcome {
-                        cc_request_id: decision.cc_request_id,
-                        state: ApprovalOutcomeState::Failed,
-                        provider_reply: None,
-                        execution_effect: None,
-                        error: Some(Arc::from("invalid ACP v2 decision choice")),
-                        recorded_at: Some(now),
-                    })
-                    .await;
-                v2_cancelled()
-            }
-        }
-        ApprovalDecisionKind::NotResolved { resolution } => {
-            let resolution_name = match resolution {
-                ApprovalResolution::Lost => "lost",
-                ApprovalResolution::Timeout => "timeout",
-                ApprovalResolution::Disconnect => "disconnect",
-                ApprovalResolution::Cancelled => "cancelled",
-            };
-            let _ = broker
-                .record_outcome(ApprovalOutcome {
-                    cc_request_id: decision.cc_request_id,
-                    state: ApprovalOutcomeState::NotSent,
-                    provider_reply: None,
-                    execution_effect: None,
-                    error: Some(Arc::from(format!("approval unresolved: {resolution_name}"))),
-                    recorded_at: Some(now),
-                })
-                .await;
-            v2_cancelled()
-        }
-    }
-}
-
-async fn answer(
-    req: &v2::RequestPermissionRequest,
-    agent: MemberId,
-    channel: ChannelId,
-    approval_broker: Option<Arc<dyn ApprovalBroker>>,
-) -> v2::RequestPermissionResponse {
-    if v2_is_read(req) {
-        return select_allow_v2(req);
-    }
-    match approval_broker {
-        Some(broker) => v2_broker_answer(req, agent, channel, broker).await,
-        None => v2_cancelled(),
+        None => v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
     }
 }
 
@@ -373,22 +183,8 @@ pub(crate) async fn open(
     let events = req.events.clone();
     let cwd = req.cwd.clone();
     let endpoint = req.chat_tools.clone();
-    let approval_broker = req.approval_broker.clone();
-    let agent = req.agent;
-    let channel = req.channel;
     tokio::spawn(run(
-        transport,
-        cwd,
-        endpoint,
-        pref,
-        model,
-        tracker,
-        cmd_rx,
-        ready_tx,
-        events,
-        approval_broker,
-        agent,
-        channel,
+        transport, cwd, endpoint, pref, model, tracker, cmd_rx, ready_tx, events,
     ));
     match ready_rx.await {
         Ok(Ready::Session(info)) => Ok(Arc::new(V2Session { info, cmd: cmd_tx })),
@@ -412,9 +208,6 @@ async fn run(
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
     ready_tx: oneshot::Sender<Ready>,
     events: EventSink,
-    approval_broker: Option<Arc<dyn ApprovalBroker>>,
-    agent: MemberId,
-    channel: ChannelId,
 ) {
     let ready = Arc::new(Mutex::new(Some(ready_tx)));
     let ready_main = ready.clone();
@@ -527,13 +320,8 @@ async fn run(
             acp::on_receive_notification!(),
         )
         .on_receive_request(
-            {
-                let approval_broker = approval_broker.clone();
-                async move |r: v2::RequestPermissionRequest,
-                            responder,
-                            _cx: V2ConnectionTo<Agent>| {
-                    responder.respond(answer(&r, agent, channel, approval_broker.clone()).await)
-                }
+            async move |r: v2::RequestPermissionRequest, responder, _cx: V2ConnectionTo<Agent>| {
+                responder.respond(answer(&r))
             },
             acp::on_receive_request!(),
         )
@@ -709,7 +497,4 @@ async fn run(
         });
     }
     events.emit(AgentEvent::Exited { error: why });
-    if let Some(broker) = &approval_broker {
-        let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
-    }
 }
