@@ -163,6 +163,24 @@ pub enum PaneContent {
     /// The launch folder's `.chaos/project.toml` disagrees with what the app
     /// remembers about the folder. Nothing switches until the user answers.
     ProjectIdentity(ProjectQuestion),
+    /// An agent is waiting for a provider permission decision.
+    Approval(ApprovalQuestion),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalQuestion {
+    pub id: Arc<str>,
+    pub agent: Arc<str>,
+    pub action: Arc<str>,
+    pub summary: Option<Arc<str>>,
+    pub arguments: Option<Arc<str>>,
+    pub choices: Vec<ApprovalChoice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalChoice {
+    pub id: Arc<str>,
+    pub label: Arc<str>,
 }
 
 /// What the project-identity pane asks.
@@ -215,6 +233,10 @@ pub enum PaneActionKind {
     NewProject,
     /// Project identity: adopt the unclaimed pre-project history here.
     AdoptImported,
+    /// Resolve a provider permission with the supplied provider decision.
+    ApprovalChoice(Arc<str>),
+    /// Cancel a pending provider permission without replying to the provider.
+    CancelApproval,
 }
 
 /// A full-width row along the bottom of the pane.
@@ -261,6 +283,7 @@ impl PaneContent {
                 ProjectQuestionKind::CopiedFrom(_) => "This folder looks like a copy",
                 ProjectQuestionKind::Imported => "Earlier history found",
             }),
+            PaneContent::Approval(_) => Arc::from("Agent permission request"),
         }
     }
 
@@ -301,6 +324,18 @@ impl PaneContent {
                     PaneAction::new(KeepProject, "Start fresh"),
                 ],
             },
+            PaneContent::Approval(q) => q
+                .choices
+                .iter()
+                .map(|choice| PaneAction {
+                    kind: ApprovalChoice(choice.id.clone()),
+                    label: choice.label.clone(),
+                })
+                .chain(std::iter::once(PaneAction::new(
+                    CancelApproval,
+                    "Cancel without replying",
+                )))
+                .collect(),
             PaneContent::Search {
                 results,
                 highlighted,
@@ -398,6 +433,48 @@ mod tests {
         assert_eq!(actions[0].kind, PaneActionKind::AdoptImported);
         assert_eq!(actions[1].kind, PaneActionKind::KeepProject);
         assert_eq!(&*imported.title(&sample()), "Earlier history found");
+    }
+
+    #[test]
+    fn approval_pane_preserves_provider_choices_and_cancel() {
+        let pane = PaneContent::Approval(ApprovalQuestion {
+            id: Arc::from("approval-1"),
+            agent: Arc::from("OpenCode"),
+            action: Arc::from("shell"),
+            summary: Some(Arc::from("echo OK")),
+            arguments: Some(Arc::from(r#"{"command":"echo OK"}"#)),
+            choices: vec![
+                ApprovalChoice {
+                    id: Arc::from("reject"),
+                    label: Arc::from("Reject"),
+                },
+                ApprovalChoice {
+                    id: Arc::from("once"),
+                    label: Arc::from("Allow once"),
+                },
+            ],
+        });
+        assert_eq!(
+            pane.actions()
+                .into_iter()
+                .map(|action| (action.kind, action.label))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    PaneActionKind::ApprovalChoice(Arc::from("reject")),
+                    Arc::from("Reject")
+                ),
+                (
+                    PaneActionKind::ApprovalChoice(Arc::from("once")),
+                    Arc::from("Allow once")
+                ),
+                (
+                    PaneActionKind::CancelApproval,
+                    Arc::from("Cancel without replying")
+                ),
+            ]
+        );
+        assert_eq!(&*pane.title(&sample()), "Agent permission request");
     }
 
     #[test]

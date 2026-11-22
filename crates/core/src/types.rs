@@ -137,7 +137,7 @@ pub enum Origin {
     /// Legacy: the removed final-text fallback posted an agent's last turn text
     /// as its reply. Kept so old rows still parse; nothing writes it now.
     Fallback,
-    /// A runtime notice ("Pausing @a and @b ..."). Never wakes anyone.
+    /// A runtime notice ("Not sent: rate_limited"). Never wakes anyone.
     System,
     /// A member declined what a message asked of them (`chat_refuse`). A
     /// legitimate reply: it answers a reply obligation as `refused`. The

@@ -16,8 +16,7 @@ use gpui::{
 };
 use model::{Id, ReplyRef, pane::author_name};
 use ui::{
-    ActiveTheme, Elevation, Ellipsis, IconName, TextInput, TextInputEvent, Tooltip, TypeStyleExt,
-    icon,
+    ActiveTheme, Elevation, IconName, TextInput, TextInputEvent, Tooltip, TypeStyleExt, icon,
     tokens::{icon as icons, radius, size, space, text},
     truncated,
 };
@@ -103,7 +102,6 @@ const WORKING_WORDS: &[&str] = &[
     "channelling",
     "choreographing",
     "churning",
-    "clauding",
     "coalescing",
     "cogitating",
     "combobulating",
@@ -1501,7 +1499,6 @@ impl Composer {
             .child(
                 div()
                     .flex_1()
-                    .ellipsis()
                     .text_color(t.ink_soft)
                     .child(truncated(reply.quote.clone())),
             )
@@ -2307,7 +2304,7 @@ mod tests {
     #[test]
     fn working_indicator_cycles_every_five_seconds_through_word_bank() {
         assert_eq!(WORKING_WORD_INTERVAL, Duration::from_secs(5));
-        assert_eq!(WORKING_WORDS.len(), 186);
+        assert_eq!(WORKING_WORDS.len(), 185);
         assert_eq!(WORKING_WORDS[0], "accomplishing");
         assert_eq!(WORKING_WORDS[WORKING_WORDS.len() - 1], "zigzagging");
         let unique = WORKING_WORDS
