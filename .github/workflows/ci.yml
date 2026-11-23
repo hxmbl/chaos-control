@@ -25,67 +25,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install latest Minesweep
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          auth=(-H "Authorization: Bearer $GH_TOKEN")
-
-          release="$(curl -fsSL "${auth[@]}" https://api.github.com/repos/hxmbl/minesweep/releases/latest)"
-          tag="$(jq -er '.tag_name' <<< "$release")"
-          asset="$(jq -er 'first(.assets[] | select(.name | test("_Linux_x86_64\\.tar\\.gz$"))) | .name' <<< "$release")"
-
-          base="https://github.com/hxmbl/minesweep/releases/download/$tag"
-
-          curl -fsSL "${auth[@]}" "$base/$asset" -o "$RUNNER_TEMP/$asset"
-          curl -fsSL "${auth[@]}" "$base/checksums.txt" -o "$RUNNER_TEMP/checksums.txt"
-
-          cd "$RUNNER_TEMP"
-          awk -v asset="$asset" '$NF == asset { print; found=1 } END { if (!found) exit 1 }' \
-            checksums.txt | sha256sum -c -
-
-          tar -xzf "$asset"
-          mkdir -p "$RUNNER_TEMP/bin"
-          install -m 0755 minesweep "$RUNNER_TEMP/bin/minesweep"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-
       - name: Scan
         id: scan
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          set +e
-
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            minesweep --diff --diff-base "$BASE_REF" \
-              --config .minesweep.yml --fail-on high \
-              --sarif --no-pager . > "$RUNNER_TEMP/results.sarif"
-          else
-            minesweep --config .minesweep.yml --fail-on high \
-              --sarif --no-pager . > "$RUNNER_TEMP/results.sarif"
-          fi
-
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+        uses: hxmbl/minesweep@v2.5.0
+        with:
+          sarif: minesweep-results.sarif
+          args: ${{ github.event_name == 'pull_request' && format('--diff --diff-base {0} --config .minesweep.yml --fail-on high .', github.base_ref) || '--config .minesweep.yml --fail-on high .' }}
 
       - name: Enforce scan result
+        if: always()
         run: |
-          code="${{ steps.scan.outputs.exit_code }}"
-
-          case "$code" in
-            0) echo "No high-confidence findings." ;;
-            1) echo "::error::Secrets detected."; exit 1 ;;
-            2) echo "::error::Scan incomplete."; exit 2 ;;
-            *) echo "::error::Unexpected Minesweep exit code: $code"; exit 1 ;;
+          outcome="${{ steps.scan.outcome }}"
+          case "$outcome" in
+            success) echo "No high-confidence findings." ;;
+            failure) echo "::error::Minesweep reported findings or the scan did not complete."; exit 1 ;;
+            *) echo "::error::Unexpected Minesweep step outcome: $outcome"; exit 1 ;;
           esac
 
       - name: Upload SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v4
         with:
-          sarif_file: ${{ runner.temp }}/results.sarif
+          sarif_file: minesweep-results.sarif
         continue-on-error: true
 
   fmt:
