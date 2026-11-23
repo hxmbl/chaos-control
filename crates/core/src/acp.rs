@@ -56,9 +56,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::adapter::*;
 use crate::approval::{
-    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
-    ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution,
-    ApprovalScope, ProviderOption,
+    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalOperation, ApprovalOutcome,
+    ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution, ApprovalScope,
+    ProviderOption, next_request_id,
 };
 use crate::harness::ModelInfo;
 use crate::types::{BatchId, ChannelId, MemberId};
@@ -724,7 +724,7 @@ async fn v1_broker_answer(
     broker: Arc<dyn ApprovalBroker>,
 ) -> v1::RequestPermissionResponse {
     let now = v1_now_ms();
-    let cc_request_id = ApprovalId::from(format!("acp-v1:{}:{}", req.session_id.0, now));
+    let cc_request_id = next_request_id("acp-v1", req.session_id.0.as_ref());
     let request = ApprovalRequest {
         cc_request_id: cc_request_id.clone(),
         provider: ApprovalProvider::Other(Arc::from("acp_v1")),

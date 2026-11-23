@@ -13,7 +13,13 @@
 //! semantics. The per-path predicates and verification status are recorded in
 //! `docs/agents.md` under "Permission evidence matrix".
 
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
@@ -42,6 +48,21 @@ impl From<&str> for ApprovalId {
     fn from(value: &str) -> Self {
         ApprovalId(Arc::from(value))
     }
+}
+
+static NEXT_REQUEST_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// CC-owned request id for adapters that have no provider request reference of
+/// their own (ACP uses the session id as its provider ref). The nanosecond
+/// clock keeps ids distinct across restarts; the counter keeps them distinct
+/// when several requests arrive in the same instant.
+pub fn next_request_id(provider: &str, session_id: &str) -> ApprovalId {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let seq = NEXT_REQUEST_SEQ.fetch_add(1, Ordering::Relaxed);
+    ApprovalId::from(format!("{provider}:{session_id}:{nanos}:{seq}"))
 }
 
 /// The provider that raised an approval request.
@@ -270,3 +291,23 @@ impl std::fmt::Display for ApprovalBrokerError {
 }
 
 impl std::error::Error for ApprovalBrokerError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn concurrent_request_ids_do_not_collide() {
+        let tasks: Vec<_> = (0..256)
+            .map(|_| tokio::spawn(async { next_request_id("acp_v1", "s1") }))
+            .collect();
+        let mut ids = HashSet::new();
+        for task in tasks {
+            let id = task.await.unwrap();
+            assert!(id.as_str().starts_with("acp_v1:s1:"));
+            assert!(ids.insert(id), "duplicate approval request id");
+        }
+        assert_eq!(ids.len(), 256);
+    }
+}

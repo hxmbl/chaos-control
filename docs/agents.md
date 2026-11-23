@@ -407,7 +407,9 @@ stay pending and answerable.
   not check MCP origin**. Every other permission-required request goes to the
   approval broker, which replies with the user's provider-honored option ID or
   fails closed (no broker, error, correlation mismatch or unresolved decision
-  → `cancelled`, no execution claimed). ACP agents still run their own tools
+  → `cancelled`, no execution claimed). CC-owned ids use a nanosecond timestamp
+  plus an atomic counter, so concurrent requests on one session cannot collide.
+  ACP agents still run their own tools
   under their own settings; a protocol approval message is not proof that CC
   controls every operation.
 - **Chat tools are deliberately not gated.** The in-room `chat_*` tools have no

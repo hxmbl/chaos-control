@@ -31,9 +31,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::acp::{ChatToolsPreference, Tracker, V2Open, choose_mcp, error_kind};
 use crate::adapter::*;
 use crate::approval::{
-    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
-    ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution,
-    ApprovalScope, ProviderOption,
+    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalOperation, ApprovalOutcome,
+    ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution, ApprovalScope,
+    ProviderOption, next_request_id,
 };
 use crate::types::{BatchId, ChannelId, MemberId};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -170,7 +170,7 @@ async fn v2_broker_answer(
     broker: Arc<dyn ApprovalBroker>,
 ) -> v2::RequestPermissionResponse {
     let now = now_ms();
-    let cc_request_id = ApprovalId::from(format!("acp-v2:{}:{}", req.session_id.0, now));
+    let cc_request_id = next_request_id("acp-v2", req.session_id.0.as_ref());
     let request = ApprovalRequest {
         cc_request_id: cc_request_id.clone(),
         provider: ApprovalProvider::Other(Arc::from("acp_v2")),
