@@ -1153,6 +1153,194 @@ async fn opencode_v2_permission_replay_rejected_after_core_restart() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_v2_permission_replay_after_restart_is_rejected_at_provider() {
+    use axum::response::sse::{Event, Sse};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use chaos_core::{
+        host::{AgentSpec, Core, HostConfig, ManualClock},
+        opencode_v2::{OpenCodeV2Adapter, OpenCodeV2Config},
+    };
+    use futures::stream;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::mpsc;
+
+    let db_path = std::env::temp_dir().join(format!(
+        "cc-strm612-provider-restart-{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&db_path);
+
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let reply_count = Arc::new(AtomicUsize::new(0));
+    let reply_count_route = reply_count.clone();
+    let ask_count = Arc::new(AtomicUsize::new(0));
+    let ask_count_route = ask_count.clone();
+    let prompted = Arc::new(tokio::sync::Notify::new());
+    let sse_ready = prompted.clone();
+    let app = Router::new()
+        .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
+        .route(
+            "/api/experimental/mcp/chaos-control",
+            axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
+        )
+        .route(
+            "/api/session/s1/prompt",
+            post({
+                let prompted = prompted.clone();
+                move || {
+                    let prompted = prompted.clone();
+                    async move {
+                        prompted.notify_one();
+                        Json(serde_json::json!({ "data": {} }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/event",
+            get(move || {
+                let prompted = sse_ready.clone();
+                let ask_count = ask_count_route.clone();
+                async move {
+                    prompted.notified().await;
+                    ask_count.fetch_add(1, Ordering::SeqCst);
+                    let events = stream::iter(vec![Ok::<_, std::convert::Infallible>(
+                        Event::default().data(
+                            r#"{"type":"permission.asked","data":{"id":"p1","sessionID":"s1","action":"shell","resources":["echo SAFE"]}}"#,
+                        ),
+                    )]);
+                    Sse::new(events)
+                }
+            }),
+        )
+        .route(
+            "/api/session/s1/permission/p1/reply",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let reply_tx = reply_tx.clone();
+                let reply_count = reply_count_route.clone();
+                async move {
+                    reply_count.fetch_add(1, Ordering::SeqCst);
+                    let _ = reply_tx.send(body);
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let adapter = || {
+        Arc::new(OpenCodeV2Adapter::new(OpenCodeV2Config {
+            command: "opencode".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+            server_url: Some(format!("http://{addr}")),
+            server_password: None,
+            model: None,
+        }))
+    };
+    let agent_spec = || AgentSpec {
+        handle: "v2".into(),
+        name: "V2".into(),
+        adapter: adapter(),
+        cwd: Some(std::env::temp_dir()),
+        ping_answers: None,
+    };
+
+    let cfg = HostConfig {
+        db: Some(db_path.clone()),
+        ..HostConfig::default()
+    };
+    let (core, mut events) = Core::start(cfg, ManualClock::new(1_000_000)).await.unwrap();
+    let main = common::main_channel(&core).await.id;
+    let hx = core.human("hx", "Hx", main).await.unwrap();
+    let agent = core.add_agent(agent_spec(), main).await.unwrap();
+    let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let req = loop {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(CoreEvent::ApprovalRequested(req))) if req.agent == agent.id => break *req,
+            Ok(Some(_)) => {}
+            other => panic!("no approval request: {other:?}"),
+        }
+    };
+    core.resolve_approval(&req.cc_request_id, "reject").unwrap();
+    let _reply = tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+        .await
+        .expect("provider reply arrives")
+        .expect("reply channel open");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if core.approval_outcome(&req.cc_request_id).unwrap().is_some()
+            || tokio::time::Instant::now() > deadline
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let recorded = core.approval_outcome(&req.cc_request_id).unwrap().unwrap();
+    assert_eq!(recorded.state, ApprovalOutcomeState::Denied);
+    core.shutdown().await;
+
+    let cfg2 = HostConfig {
+        db: Some(db_path.clone()),
+        ..HostConfig::default()
+    };
+    let (core2, mut events2) = Core::start(cfg2, ManualClock::new(1_000_100))
+        .await
+        .unwrap();
+    let main2 = common::main_channel(&core2).await.id;
+    let hx2 = core2.human("hx", "Hx", main2).await.unwrap();
+    let agent2 = core2.add_agent(agent_spec(), main2).await.unwrap();
+    let _ping2 = core2
+        .post(hx2.id, main2, "@v2 run it again", None)
+        .await
+        .unwrap();
+
+    // The provider replays the same permission.asked id into a fresh Core on
+    // the same database. The recovered outcome must reject it: no ApprovalRequested
+    // event, no second provider reply, and the original Denied outcome stands.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout_at(deadline, events2.recv()).await {
+            Ok(Some(CoreEvent::ApprovalRequested(asked))) => {
+                assert_ne!(
+                    asked.cc_request_id, req.cc_request_id,
+                    "replayed provider ask reopened an already-resolved approval after restart"
+                );
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        ask_count.load(Ordering::SeqCst) >= 2,
+        "the provider must actually replay the permission ask after restart"
+    );
+    assert_eq!(
+        reply_count.load(Ordering::SeqCst),
+        1,
+        "restart replay must not send a second provider reply"
+    );
+    let recorded2 = core2.approval_outcome(&req.cc_request_id).unwrap().unwrap();
+    assert_eq!(recorded2.state, ApprovalOutcomeState::Denied);
+    let _ = agent2;
+    core2.shutdown().await;
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn opencode_v2_permission_edit_action_mediated_through_real_orchestrator() {
     use axum::response::sse::{Event, KeepAlive, Sse};
     use axum::{
