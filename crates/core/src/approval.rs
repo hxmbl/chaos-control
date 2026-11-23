@@ -62,6 +62,24 @@ impl ApprovalProvider {
     }
 }
 
+/// The provider session whose unresolved approvals a transport failure affects.
+/// An adapter must scope session-level fail-closed cleanup with this, so ending
+/// one agent's session cannot cancel another agent's pending requests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovalScope {
+    pub provider: ApprovalProvider,
+    pub session_id: Arc<str>,
+}
+
+impl ApprovalScope {
+    pub fn new(provider: ApprovalProvider, session_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            provider,
+            session_id: session_id.into(),
+        }
+    }
+}
+
 /// A provider-supplied selectable option (ACP-style).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderOption {
@@ -220,6 +238,15 @@ pub trait ApprovalBroker: Send + Sync {
         _resolution: ApprovalResolution,
     ) -> BoxFuture<'_, Result<(), ApprovalBrokerError>> {
         Box::pin(async { Ok(()) })
+    }
+
+    /// Fail closed only the unresolved requests of one provider session.
+    fn cancel_pending_for(
+        &self,
+        _scope: ApprovalScope,
+        resolution: ApprovalResolution,
+    ) -> BoxFuture<'_, Result<(), ApprovalBrokerError>> {
+        self.cancel_pending(resolution)
     }
 }
 

@@ -389,6 +389,10 @@ already have reached the provider), but no outcome event is published and
 nothing is recoverable after a restart — a replay after restart remains an open
 gap.
 
+Transport cleanup is session-scoped: interrupting, closing or losing one
+session fails only that session's pending approvals. Other agents' requests
+stay pending and answerable.
+
 - **Native OpenCode v2.** A `permission.asked` frame for our session becomes a
   CC-owned approval request with the provider's `reject|once|always` decision
   vocabulary. The pane holds the provider reply until the user chooses;

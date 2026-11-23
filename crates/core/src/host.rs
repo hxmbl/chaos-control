@@ -20,7 +20,7 @@ use crate::{
     adapter::*,
     approval::{
         ApprovalBroker, ApprovalBrokerError, ApprovalDecision, ApprovalDecisionKind, ApprovalId,
-        ApprovalRequest, ApprovalResolution,
+        ApprovalRequest, ApprovalResolution, ApprovalScope,
     },
     engine::{
         AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, Reacted,
@@ -251,6 +251,41 @@ impl RuntimeApprovalBroker {
         }
     }
 
+    /// Fail closed the pending requests accepted by `matches`. Called from
+    /// session-level cleanup, so a failing session cannot answer requests that
+    /// belong to another agent.
+    fn cancel_matching(
+        &self,
+        matches: impl Fn(&ApprovalRequest) -> bool,
+        resolution: ApprovalResolution,
+    ) -> Result<(), ApprovalBrokerError> {
+        let mut pending_map = self
+            .pending
+            .lock()
+            .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?;
+        let ids: Vec<ApprovalId> = pending_map
+            .iter()
+            .filter(|(_, entry)| matches(&entry.request))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let cancelled: Vec<_> = ids
+            .into_iter()
+            .filter_map(|id| pending_map.remove(&id).map(|entry| (id, entry.decision)))
+            .collect();
+        drop(pending_map);
+        for (id, decision) in cancelled {
+            decision
+                .send(ApprovalDecision {
+                    cc_request_id: id,
+                    decision: ApprovalDecisionKind::NotResolved { resolution },
+                    decided_at: SystemClock.now(),
+                    actor: None,
+                })
+                .map_err(|_| ApprovalBrokerError::new("approval request was already abandoned"))?;
+        }
+        Ok(())
+    }
+
     fn resolve(&self, id: &ApprovalId, choice: &str) -> Result<(), String> {
         let mut pending = self
             .pending
@@ -439,30 +474,21 @@ impl ApprovalBroker for RuntimeApprovalBroker {
         &self,
         resolution: ApprovalResolution,
     ) -> futures::future::BoxFuture<'_, Result<(), ApprovalBrokerError>> {
+        Box::pin(async move { self.cancel_matching(|_| true, resolution) })
+    }
+
+    fn cancel_pending_for(
+        &self,
+        scope: ApprovalScope,
+        resolution: ApprovalResolution,
+    ) -> futures::future::BoxFuture<'_, Result<(), ApprovalBrokerError>> {
         Box::pin(async move {
-            let mut pending_map = self
-                .pending
-                .lock()
-                .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?;
-            let pending = pending_map
-                .drain()
-                .map(|(id, entry)| {
-                    let decision = ApprovalDecision {
-                        cc_request_id: id,
-                        decision: ApprovalDecisionKind::NotResolved { resolution },
-                        decided_at: SystemClock.now(),
-                        actor: None,
-                    };
-                    entry.decision.send(decision)
-                })
-                .collect::<Vec<_>>();
-            drop(pending_map);
-            for sent in pending {
-                sent.map_err(|_| {
-                    ApprovalBrokerError::new("approval request was already abandoned")
-                })?;
-            }
-            Ok(())
+            self.cancel_matching(
+                |request| {
+                    request.provider == scope.provider && request.session_id == scope.session_id
+                },
+                resolution,
+            )
         })
     }
 }
@@ -472,7 +498,8 @@ impl ApprovalBroker for RuntimeApprovalBroker {
 mod approval_tests {
     use super::*;
     use crate::approval::{
-        ApprovalChoices, ApprovalOperation, ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider,
+        ApprovalChoices, ApprovalOperation, ApprovalOutcome, ApprovalOutcomeState,
+        ApprovalProvider, ApprovalScope,
     };
 
     fn request() -> ApprovalRequest {
@@ -660,6 +687,62 @@ mod approval_tests {
             replay.message
         );
         assert!(broker.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_session_leaves_other_sessions_pending() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+
+        let mut first_request = request();
+        first_request.cc_request_id = ApprovalId::from("opencode-v2:s1:p1");
+        first_request.session_id = Arc::from("s1");
+        let second_id = ApprovalId::from("opencode-v2:s2:p2");
+        let mut second_request = request();
+        second_request.cc_request_id = second_id.clone();
+        second_request.session_id = Arc::from("s2");
+        second_request.agent = MemberId(8);
+
+        let first_broker = broker.clone();
+        let first = tokio::spawn(async move { first_broker.request_decision(first_request).await });
+        let second_broker = broker.clone();
+        let second =
+            tokio::spawn(async move { second_broker.request_decision(second_request).await });
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalRequested(_))
+        ));
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalRequested(_))
+        ));
+
+        broker
+            .cancel_pending_for(
+                ApprovalScope::new(ApprovalProvider::OpenCodeV2, Arc::from("s1")),
+                ApprovalResolution::Disconnect,
+            )
+            .await
+            .unwrap();
+
+        let first_decision = first.await.unwrap().unwrap();
+        assert_eq!(
+            first_decision.decision,
+            ApprovalDecisionKind::NotResolved {
+                resolution: ApprovalResolution::Disconnect,
+            }
+        );
+
+        // The other session's request is still pending and answerable.
+        assert!(broker.pending.lock().unwrap().contains_key(&second_id));
+        broker.resolve(&second_id, "once").unwrap();
+        let second_decision = second.await.unwrap().unwrap();
+        assert_eq!(
+            second_decision.decision,
+            ApprovalDecisionKind::Selected {
+                choice: Arc::from("once")
+            }
+        );
     }
 
     #[tokio::test]
