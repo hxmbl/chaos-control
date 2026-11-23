@@ -5,7 +5,12 @@
 //! call is a message to the actor, every answer comes back on a channel, and UI
 //! updates arrive as [`CoreEvent`]s.
 
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use futures::future::BoxFuture;
 use serde_json::Value;
@@ -225,6 +230,10 @@ struct RuntimeApprovalBroker {
     engine_tx: Option<mpsc::UnboundedSender<Cmd>>,
     pending: std::sync::Mutex<HashMap<ApprovalId, PendingApproval>>,
     outcomes: std::sync::Mutex<HashMap<ApprovalId, crate::approval::ApprovalOutcome>>,
+    /// Ids whose outcome write failed. They still block replay in this
+    /// process, but are not published as recorded outcomes: a restart cannot
+    /// recover them, so nothing should claim they were stored.
+    unpersisted: std::sync::Mutex<HashSet<ApprovalId>>,
 }
 
 impl RuntimeApprovalBroker {
@@ -238,6 +247,7 @@ impl RuntimeApprovalBroker {
             engine_tx,
             pending: std::sync::Mutex::new(HashMap::new()),
             outcomes: std::sync::Mutex::new(outcomes),
+            unpersisted: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -318,14 +328,20 @@ impl ApprovalBroker for RuntimeApprovalBroker {
                     )));
                 }
                 // Replay guard: an id that already resolved — user decision,
-                // fail-closed cleanup, or an outcome recovered from the store —
-                // must never reopen as a new request.
-                if self
+                // fail-closed cleanup, an outcome recovered from the store, or
+                // one whose store write failed — must never reopen as a new
+                // request.
+                let recorded = self
                     .outcomes
                     .lock()
                     .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?
-                    .contains_key(&id)
-                {
+                    .contains_key(&id);
+                let unpersisted = self
+                    .unpersisted
+                    .lock()
+                    .map_err(|_| ApprovalBrokerError::new("approval broker lock poisoned"))?
+                    .contains(&id);
+                if recorded || unpersisted {
                     return Err(ApprovalBrokerError::new(format!(
                         "approval request {} is already resolved",
                         id.as_str()
@@ -365,6 +381,45 @@ impl ApprovalBroker for RuntimeApprovalBroker {
         outcome: crate::approval::ApprovalOutcome,
     ) -> futures::future::BoxFuture<'_, Result<(), ApprovalBrokerError>> {
         Box::pin(async move {
+            // Persist before publishing. Otherwise a failed write leaves this
+            // process believing in an outcome that a restart forgets, and the
+            // UI showing a decision that was never recorded.
+            let persisted = if let Some(tx) = &self.engine_tx {
+                let (reply, wait) = oneshot::channel();
+                let outcome_for_store = outcome.clone();
+                let f: EngineFn = Box::new(move |engine, _now| {
+                    let result = engine
+                        .record_approval_outcome(&outcome_for_store)
+                        .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                });
+                if tx.send(Cmd::Engine(f)).is_err() {
+                    Err("core runtime is gone".to_string())
+                } else {
+                    match wait.await {
+                        Ok(result) => result,
+                        Err(_) => Err("approval outcome store was abandoned".to_string()),
+                    }
+                }
+            } else {
+                Ok(())
+            };
+
+            if let Err(error) = persisted {
+                // The decision may already have reached the provider, so keep
+                // the id blocked for replay in this process. It is deliberately
+                // not added to `outcomes`: that map is the durable record.
+                self.unpersisted
+                    .lock()
+                    .map_err(|_| ApprovalBrokerError::new("approval outcome lock poisoned"))?
+                    .insert(outcome.cc_request_id.clone());
+                return Err(ApprovalBrokerError::new(error));
+            }
+
+            self.unpersisted
+                .lock()
+                .map_err(|_| ApprovalBrokerError::new("approval outcome lock poisoned"))?
+                .remove(&outcome.cc_request_id);
             self.outcomes
                 .lock()
                 .map_err(|_| ApprovalBrokerError::new("approval outcome lock poisoned"))?
@@ -375,21 +430,6 @@ impl ApprovalBroker for RuntimeApprovalBroker {
                 .is_err()
             {
                 return Err(ApprovalBrokerError::new("approval event receiver is gone"));
-            }
-            if let Some(tx) = &self.engine_tx {
-                let (reply, wait) = oneshot::channel();
-                let outcome_for_store = outcome.clone();
-                let f: EngineFn = Box::new(move |engine, _now| {
-                    let result = engine
-                        .record_approval_outcome(&outcome_for_store)
-                        .map_err(|error| error.to_string());
-                    let _ = reply.send(result);
-                });
-                tx.send(Cmd::Engine(f))
-                    .map_err(|_| ApprovalBrokerError::new("core runtime is gone"))?;
-                wait.await
-                    .map_err(|_| ApprovalBrokerError::new("approval outcome store was abandoned"))?
-                    .map_err(ApprovalBrokerError::new)?;
             }
             Ok(())
         })
@@ -620,6 +660,58 @@ mod approval_tests {
             replay.message
         );
         assert!(broker.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_approval_broker_does_not_publish_an_unpersisted_outcome() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        // Remove the outcome table so the engine write fails while the broker
+        // is otherwise live.
+        let store = Store::open_in_memory().unwrap();
+        store
+            .conn()
+            .execute_batch("DROP TABLE approval_outcomes")
+            .unwrap();
+        let mut engine = Engine::new(store, Policy::default(), 1).unwrap();
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+        let driver = tokio::spawn(async move {
+            while let Some(cmd) = engine_rx.recv().await {
+                if let Cmd::Engine(f) = cmd {
+                    f(&mut engine, 2);
+                }
+            }
+        });
+
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            Some(engine_tx),
+            HashMap::new(),
+        ));
+        let outcome = ApprovalOutcome {
+            cc_request_id: ApprovalId::from("opencode-v2:s1:p1"),
+            state: ApprovalOutcomeState::Allowed,
+            provider_reply: None,
+            execution_effect: None,
+            error: None,
+            recorded_at: Some(2),
+        };
+        assert!(broker.record_outcome(outcome).await.is_err());
+
+        // A store failure must not be published as a recorded outcome: the UI
+        // would show a decision that a restart cannot recover.
+        assert!(events_rx.try_recv().is_err());
+
+        // Fail closed: the decision may already have reached the provider, so
+        // a replay must not re-open the request in this process.
+        let replay = broker.request_decision(request()).await.unwrap_err();
+        assert!(
+            replay.message.as_ref().contains("already resolved"),
+            "unexpected replay error: {}",
+            replay.message
+        );
+
+        drop(broker);
+        driver.await.unwrap();
     }
 }
 

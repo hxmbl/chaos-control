@@ -383,6 +383,12 @@ There is no permission-mode API: `ask-all` and `accept-edits` are
 **unsupported/unverified**, are not offered, and no provider callback is
 auto-answered to imitate a mode.
 
+The approval broker persists an outcome before publishing it. A failed store
+write keeps the request ID blocked for replay in that process (the decision may
+already have reached the provider), but no outcome event is published and
+nothing is recoverable after a restart — a replay after restart remains an open
+gap.
+
 - **Native OpenCode v2.** A `permission.asked` frame for our session becomes a
   CC-owned approval request with the provider's `reject|once|always` decision
   vocabulary. The pane holds the provider reply until the user chooses;
