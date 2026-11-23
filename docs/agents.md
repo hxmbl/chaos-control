@@ -383,6 +383,16 @@ There is no permission-mode API: `ask-all` and `accept-edits` are
 **unsupported/unverified**, are not offered, and no provider callback is
 auto-answered to imitate a mode.
 
+The approval broker persists an outcome before publishing it. A failed store
+write keeps the request ID blocked for replay in that process (the decision may
+already have reached the provider), but no outcome event is published and
+nothing is recoverable after a restart — a replay after restart remains an open
+gap.
+
+Transport cleanup is session-scoped: interrupting, closing or losing one
+session fails only that session's pending approvals. Other agents' requests
+stay pending and answerable.
+
 - **Native OpenCode v2.** A `permission.asked` frame for our session becomes a
   CC-owned approval request with the provider's `reject|once|always` decision
   vocabulary. The pane holds the provider reply until the user chooses;
@@ -397,7 +407,9 @@ auto-answered to imitate a mode.
   not check MCP origin**. Every other permission-required request goes to the
   approval broker, which replies with the user's provider-honored option ID or
   fails closed (no broker, error, correlation mismatch or unresolved decision
-  → `cancelled`, no execution claimed). ACP agents still run their own tools
+  → `cancelled`, no execution claimed). CC-owned ids use a nanosecond timestamp
+  plus an atomic counter, so concurrent requests on one session cannot collide.
+  ACP agents still run their own tools
   under their own settings; a protocol approval message is not proof that CC
   controls every operation.
 - **Chat tools are deliberately not gated.** The in-room `chat_*` tools have no

@@ -31,9 +31,9 @@ use tokio::sync::{mpsc, oneshot};
 use crate::acp::{ChatToolsPreference, Tracker, V2Open, choose_mcp, error_kind};
 use crate::adapter::*;
 use crate::approval::{
-    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
-    ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution,
-    ProviderOption,
+    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalOperation, ApprovalOutcome,
+    ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution, ApprovalScope,
+    ProviderOption, next_request_id,
 };
 use crate::types::{BatchId, ChannelId, MemberId};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -170,7 +170,7 @@ async fn v2_broker_answer(
     broker: Arc<dyn ApprovalBroker>,
 ) -> v2::RequestPermissionResponse {
     let now = now_ms();
-    let cc_request_id = ApprovalId::from(format!("acp-v2:{}:{}", req.session_id.0, now));
+    let cc_request_id = next_request_id("acp-v2", req.session_id.0.as_ref());
     let request = ApprovalRequest {
         cc_request_id: cc_request_id.clone(),
         provider: ApprovalProvider::Other(Arc::from("acp_v2")),
@@ -423,6 +423,9 @@ async fn run(
     // Set once the session is handed out; only then do exits become events.
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_main = started.clone();
+    // Created inside the connect closure; kept for session-scoped cleanup.
+    let session_id_for_cleanup = Arc::new(Mutex::new(None::<Arc<str>>));
+    let session_id_for_connect = session_id_for_cleanup.clone();
     let send_ready = move |r: Ready| {
         if let Some(tx) = ready_main.lock().expect("lock").take() {
             if matches!(r, Ready::Session(_)) {
@@ -581,6 +584,7 @@ async fn run(
                 }
             };
             let session_id = new.session_id.clone();
+            *session_id_for_connect.lock().expect("lock") = Some(session_id.0.clone());
             let options = serde_json::to_value(&new.config_options).unwrap_or_default();
             let offered = crate::acp::model_option(&options);
             let (current, applied) = match crate::acp::plan_model(model.as_ref(), offered.as_ref())
@@ -710,6 +714,14 @@ async fn run(
     }
     events.emit(AgentEvent::Exited { error: why });
     if let Some(broker) = &approval_broker {
-        let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
+        let session_id = session_id_for_cleanup.lock().expect("lock").clone();
+        if let Some(session_id) = session_id {
+            let _ = broker
+                .cancel_pending_for(
+                    ApprovalScope::new(ApprovalProvider::Other(Arc::from("acp_v2")), session_id),
+                    ApprovalResolution::Disconnect,
+                )
+                .await;
+        }
     }
 }

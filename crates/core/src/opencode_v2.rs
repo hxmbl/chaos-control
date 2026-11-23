@@ -22,7 +22,7 @@ use crate::{
     approval::{
         ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
         ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest,
-        ApprovalResolution,
+        ApprovalResolution, ApprovalScope,
     },
     harness::ModelInfo,
     types::{BatchId, ChannelId, MemberId},
@@ -383,10 +383,8 @@ impl AgentSession for OpenCodeV2Session {
                 .map(|_| ());
             if result.is_ok() {
                 // The interrupted turn can no longer resolve later decisions;
-                // fail pending approvals closed.
-                if let Some(broker) = &self.inner.approval_broker {
-                    let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
-                }
+                // fail this session's pending approvals closed.
+                cancel_session_approvals(&self.inner, ApprovalResolution::Disconnect).await;
             }
             result
         })
@@ -401,10 +399,21 @@ impl AgentSession for OpenCodeV2Session {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
             }
-            if let Some(broker) = &self.inner.approval_broker {
-                let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
-            }
+            cancel_session_approvals(&self.inner, ApprovalResolution::Disconnect).await;
         })
+    }
+}
+
+/// Fail closed only this session's pending approvals. Other agents' requests
+/// stay pending and answerable when one session disconnects or is interrupted.
+async fn cancel_session_approvals(inner: &SessionInner, resolution: ApprovalResolution) {
+    if let Some(broker) = &inner.approval_broker {
+        let _ = broker
+            .cancel_pending_for(
+                ApprovalScope::new(ApprovalProvider::OpenCodeV2, inner.session_id.clone()),
+                resolution,
+            )
+            .await;
     }
 }
 
@@ -435,9 +444,7 @@ async fn stream_events(inner: Arc<SessionInner>) {
     let resp = match result {
         Ok(resp) => resp,
         Err(error) => {
-            if let Some(broker) = &inner.approval_broker {
-                let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
-            }
+            cancel_session_approvals(&inner, ApprovalResolution::Disconnect).await;
             fail_in_flight(&inner, &error);
             return;
         }
@@ -449,9 +456,7 @@ async fn stream_events(inner: Arc<SessionInner>) {
         let bytes = match chunk {
             Ok(bytes) => bytes,
             Err(e) => {
-                if let Some(broker) = &inner.approval_broker {
-                    let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
-                }
+                cancel_session_approvals(&inner, ApprovalResolution::Disconnect).await;
                 fail_in_flight(&inner, &transport_error(e));
                 return;
             }
@@ -472,9 +477,7 @@ async fn stream_events(inner: Arc<SessionInner>) {
         &inner,
         &AgentError::new(AgentErrorKind::Transport, "event stream closed"),
     );
-    if let Some(broker) = &inner.approval_broker {
-        let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
-    }
+    cancel_session_approvals(&inner, ApprovalResolution::Disconnect).await;
     inner.events.emit(AgentEvent::Exited {
         error: Some("opencode v2 event stream closed".into()),
     });
@@ -1506,6 +1509,7 @@ mod tests {
         pending:
             HashMap<ApprovalId, tokio::sync::oneshot::Sender<crate::approval::ApprovalDecision>>,
         cancels: Vec<ApprovalResolution>,
+        cancel_scopes: Vec<ApprovalScope>,
     }
 
     impl TestBroker {
@@ -1536,6 +1540,30 @@ mod tests {
         fn cancels(&self) -> Vec<ApprovalResolution> {
             self.state.lock().unwrap().cancels.clone()
         }
+
+        fn cancel_scopes(&self) -> Vec<ApprovalScope> {
+            self.state.lock().unwrap().cancel_scopes.clone()
+        }
+
+        fn drain_all(
+            state: std::sync::Arc<std::sync::Mutex<TestBrokerState>>,
+            resolution: ApprovalResolution,
+        ) -> Result<(), crate::approval::ApprovalBrokerError> {
+            let parked: Vec<_> = {
+                let mut state = state.lock().unwrap();
+                state.cancels.push(resolution);
+                state.pending.drain().collect()
+            };
+            for (id, tx) in parked {
+                let _ = tx.send(crate::approval::ApprovalDecision {
+                    cc_request_id: id,
+                    decision: ApprovalDecisionKind::NotResolved { resolution },
+                    decided_at: 1,
+                    actor: None,
+                });
+            }
+            Ok(())
+        }
     }
 
     impl ApprovalBroker for TestBroker {
@@ -1561,21 +1589,18 @@ mod tests {
             resolution: ApprovalResolution,
         ) -> BoxFuture<'_, Result<(), crate::approval::ApprovalBrokerError>> {
             let state = self.state.clone();
+            Box::pin(async move { TestBroker::drain_all(state, resolution) })
+        }
+
+        fn cancel_pending_for(
+            &self,
+            scope: ApprovalScope,
+            resolution: ApprovalResolution,
+        ) -> BoxFuture<'_, Result<(), crate::approval::ApprovalBrokerError>> {
+            let state = self.state.clone();
             Box::pin(async move {
-                let parked: Vec<_> = {
-                    let mut state = state.lock().unwrap();
-                    state.cancels.push(resolution);
-                    state.pending.drain().collect()
-                };
-                for (id, tx) in parked {
-                    let _ = tx.send(crate::approval::ApprovalDecision {
-                        cc_request_id: id,
-                        decision: ApprovalDecisionKind::NotResolved { resolution },
-                        decided_at: 1,
-                        actor: None,
-                    });
-                }
-                Ok(())
+                state.lock().unwrap().cancel_scopes.push(scope);
+                TestBroker::drain_all(state, resolution)
             })
         }
     }
@@ -1690,6 +1715,13 @@ mod tests {
             }
         ));
         assert_eq!(broker.cancels(), vec![ApprovalResolution::Disconnect]);
+        assert_eq!(
+            broker.cancel_scopes(),
+            vec![ApprovalScope::new(
+                ApprovalProvider::OpenCodeV2,
+                Arc::from("s1")
+            )]
+        );
     }
 
     #[tokio::test]

@@ -56,9 +56,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::adapter::*;
 use crate::approval::{
-    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalId, ApprovalOperation,
-    ApprovalOutcome, ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution,
-    ProviderOption,
+    ApprovalBroker, ApprovalChoices, ApprovalDecisionKind, ApprovalOperation, ApprovalOutcome,
+    ApprovalOutcomeState, ApprovalProvider, ApprovalRequest, ApprovalResolution, ApprovalScope,
+    ProviderOption, next_request_id,
 };
 use crate::harness::ModelInfo;
 use crate::types::{BatchId, ChannelId, MemberId};
@@ -724,7 +724,7 @@ async fn v1_broker_answer(
     broker: Arc<dyn ApprovalBroker>,
 ) -> v1::RequestPermissionResponse {
     let now = v1_now_ms();
-    let cc_request_id = ApprovalId::from(format!("acp-v1:{}:{}", req.session_id.0, now));
+    let cc_request_id = next_request_id("acp-v1", req.session_id.0.as_ref());
     let request = ApprovalRequest {
         cc_request_id: cc_request_id.clone(),
         provider: ApprovalProvider::Other(Arc::from("acp_v1")),
@@ -925,6 +925,9 @@ async fn run_v1(
     // Set once the session is handed out; only then do exits become events.
     let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started_main = started.clone();
+    // Created inside the connect closure; kept for session-scoped cleanup.
+    let session_id_for_cleanup = Arc::new(Mutex::new(None::<Arc<str>>));
+    let session_id_for_connect = session_id_for_cleanup.clone();
     let t_notif = tracker.clone();
     let t_perm = tracker.clone();
     let ev_notif = events.clone();
@@ -1026,6 +1029,7 @@ async fn run_v1(
                 }
             };
             let session_id = new.session_id.clone();
+            *session_id_for_connect.lock().expect("lock") = Some(session_id.0.clone());
             let options = serde_json::to_value(&new.config_options).unwrap_or_default();
             let offered = model_option(&options);
             let (current, applied) = match plan_model(model.as_ref(), offered.as_ref()) {
@@ -1165,7 +1169,15 @@ async fn run_v1(
     }
     events.emit(AgentEvent::Exited { error: why });
     if let Some(broker) = &approval_broker {
-        let _ = broker.cancel_pending(ApprovalResolution::Disconnect).await;
+        let session_id = session_id_for_cleanup.lock().expect("lock").clone();
+        if let Some(session_id) = session_id {
+            let _ = broker
+                .cancel_pending_for(
+                    ApprovalScope::new(ApprovalProvider::Other(Arc::from("acp_v1")), session_id),
+                    ApprovalResolution::Disconnect,
+                )
+                .await;
+        }
     }
 }
 
