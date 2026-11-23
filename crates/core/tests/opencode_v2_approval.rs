@@ -710,14 +710,14 @@ async fn v2_no_mode_setting_requests_sent() {
             }),
         )
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put({
                 move || {
                     let seen = seen_paths_mcp.clone();
                     async move {
                         seen.lock()
                             .unwrap()
-                            .push("/api/experimental/mcp/chaos-control".into());
+                            .push("/api/experimental/mcp/{server}".into());
                         Json(serde_json::json!({ "data": {} }))
                     }
                 }

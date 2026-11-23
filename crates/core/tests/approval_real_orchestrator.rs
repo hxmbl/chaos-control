@@ -361,7 +361,7 @@ async fn opencode_v2_permission_allow_through_real_orchestrator() {
             post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }),
         )
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -495,7 +495,7 @@ async fn opencode_v2_permission_deny_through_real_orchestrator() {
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -615,7 +615,7 @@ async fn opencode_v2_permission_replay_after_resolution_is_rejected() {
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -756,7 +756,7 @@ async fn opencode_v2_permission_interrupt_fails_closed_through_real_orchestrator
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -891,7 +891,7 @@ async fn opencode_v2_permission_disconnect_fails_closed_through_real_orchestrato
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1028,7 +1028,7 @@ async fn opencode_v2_permission_replay_rejected_after_core_restart() {
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1189,7 +1189,7 @@ async fn opencode_v2_permission_replay_after_restart_is_rejected_at_provider() {
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1361,7 +1361,7 @@ async fn opencode_v2_permission_edit_action_mediated_through_real_orchestrator()
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1489,7 +1489,7 @@ async fn opencode_v2_permission_write_action_mediated_through_real_orchestrator(
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1614,7 +1614,7 @@ async fn opencode_v2_permission_read_action_mediated_through_real_orchestrator()
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1737,7 +1737,7 @@ async fn opencode_v2_no_permission_asked_is_unmediated_no_approval_requested() {
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1835,7 +1835,7 @@ async fn opencode_v2_permission_mcp_action_mediated_through_real_orchestrator() 
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -1960,7 +1960,7 @@ async fn opencode_v2_permission_delete_action_mediated_through_real_orchestrator
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
@@ -2083,7 +2083,7 @@ async fn opencode_v2_permission_reply_delivery_failure_records_failed_through_re
     let app = Router::new()
         .route("/api/session", post(|| async { Json(serde_json::json!({"data":{"id":"s1"}})) }))
         .route(
-            "/api/experimental/mcp/chaos-control",
+            "/api/experimental/mcp/{server}",
             axum::routing::put(|| async { Json(serde_json::json!({ "data": {} })) }),
         )
         .route(
