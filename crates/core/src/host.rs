@@ -228,6 +228,7 @@ struct PendingApproval {
 struct RuntimeApprovalBroker {
     events: mpsc::UnboundedSender<CoreEvent>,
     engine_tx: Option<mpsc::UnboundedSender<Cmd>>,
+    clock: Arc<dyn Clock>,
     pending: std::sync::Mutex<HashMap<ApprovalId, PendingApproval>>,
     outcomes: std::sync::Mutex<HashMap<ApprovalId, crate::approval::ApprovalOutcome>>,
     /// Ids whose outcome write failed. They still block replay in this
@@ -240,11 +241,13 @@ impl RuntimeApprovalBroker {
     fn new(
         events: mpsc::UnboundedSender<CoreEvent>,
         engine_tx: Option<mpsc::UnboundedSender<Cmd>>,
+        clock: Arc<dyn Clock>,
         outcomes: HashMap<ApprovalId, crate::approval::ApprovalOutcome>,
     ) -> Self {
         Self {
             events,
             engine_tx,
+            clock,
             pending: std::sync::Mutex::new(HashMap::new()),
             outcomes: std::sync::Mutex::new(outcomes),
             unpersisted: std::sync::Mutex::new(HashSet::new()),
@@ -278,7 +281,7 @@ impl RuntimeApprovalBroker {
                 .send(ApprovalDecision {
                     cc_request_id: id,
                     decision: ApprovalDecisionKind::NotResolved { resolution },
-                    decided_at: SystemClock.now(),
+                    decided_at: self.clock.now(),
                     actor: None,
                 })
                 .map_err(|_| ApprovalBrokerError::new("approval request was already abandoned"))?;
@@ -316,7 +319,7 @@ impl RuntimeApprovalBroker {
                 decision: ApprovalDecisionKind::Selected {
                     choice: Arc::from(choice),
                 },
-                decided_at: SystemClock.now(),
+                decided_at: self.clock.now(),
                 actor: None,
             })
             .map_err(|_| format!("approval request {} was already abandoned", id.as_str()))
@@ -336,7 +339,7 @@ impl RuntimeApprovalBroker {
                 decision: ApprovalDecisionKind::NotResolved {
                     resolution: ApprovalResolution::Cancelled,
                 },
-                decided_at: SystemClock.now(),
+                decided_at: self.clock.now(),
                 actor: None,
             })
             .map_err(|_| format!("approval request {} was already abandoned", id.as_str()))
@@ -530,7 +533,12 @@ mod approval_tests {
     #[tokio::test]
     async fn runtime_approval_broker_emits_validates_and_records_decisions() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            None,
+            Arc::new(SystemClock),
+            HashMap::new(),
+        ));
         let pending_id = request().cc_request_id;
         let pending_broker = broker.clone();
         let pending = tokio::spawn(async move { pending_broker.request_decision(request()).await });
@@ -570,9 +578,39 @@ mod approval_tests {
     }
 
     #[tokio::test]
+    async fn approval_decisions_use_the_injected_clock() {
+        let (events_tx, mut events_rx) = mpsc::unbounded_channel();
+        let clock = ManualClock::new(1234);
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            None,
+            clock.clone(),
+            HashMap::new(),
+        ));
+        let pending_id = request().cc_request_id;
+        let pending_broker = broker.clone();
+        let pending = tokio::spawn(async move { pending_broker.request_decision(request()).await });
+        assert!(matches!(
+            events_rx.recv().await,
+            Some(CoreEvent::ApprovalRequested(_))
+        ));
+
+        clock.advance(50);
+        broker.cancel(&pending_id).unwrap();
+
+        let decision = pending.await.unwrap().unwrap();
+        assert_eq!(decision.decided_at, 1284);
+    }
+
+    #[tokio::test]
     async fn runtime_approval_broker_rejects_duplicate_requests_and_cancels_once() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            None,
+            Arc::new(SystemClock),
+            HashMap::new(),
+        ));
         let pending_id = request().cc_request_id;
 
         let first_broker = broker.clone();
@@ -600,7 +638,12 @@ mod approval_tests {
     async fn runtime_approval_broker_lost_event_callback_is_fail_closed() {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         drop(events_rx);
-        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            None,
+            Arc::new(SystemClock),
+            HashMap::new(),
+        ));
         let pending_id = request().cc_request_id;
 
         let result = broker.request_decision(request()).await;
@@ -621,7 +664,12 @@ mod approval_tests {
     #[tokio::test]
     async fn runtime_approval_broker_cancel_pending_resolves_as_disconnect() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            None,
+            Arc::new(SystemClock),
+            HashMap::new(),
+        ));
         let pending_id = request().cc_request_id;
         let pending_broker = broker.clone();
         let pending = tokio::spawn(async move { pending_broker.request_decision(request()).await });
@@ -649,7 +697,12 @@ mod approval_tests {
     #[tokio::test]
     async fn runtime_approval_broker_rejects_replays_after_resolution() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            None,
+            Arc::new(SystemClock),
+            HashMap::new(),
+        ));
         let pending_id = request().cc_request_id;
 
         let first_broker = broker.clone();
@@ -692,7 +745,13 @@ mod approval_tests {
     #[tokio::test]
     async fn cancelling_one_session_leaves_other_sessions_pending() {
         let (events_tx, mut events_rx) = mpsc::unbounded_channel();
-        let broker = Arc::new(RuntimeApprovalBroker::new(events_tx, None, HashMap::new()));
+        let clock = ManualClock::new(1000);
+        let broker = Arc::new(RuntimeApprovalBroker::new(
+            events_tx,
+            None,
+            clock.clone(),
+            HashMap::new(),
+        ));
 
         let mut first_request = request();
         first_request.cc_request_id = ApprovalId::from("opencode-v2:s1:p1");
@@ -717,6 +776,7 @@ mod approval_tests {
             Some(CoreEvent::ApprovalRequested(_))
         ));
 
+        clock.advance(25);
         broker
             .cancel_pending_for(
                 ApprovalScope::new(ApprovalProvider::OpenCodeV2, Arc::from("s1")),
@@ -732,6 +792,7 @@ mod approval_tests {
                 resolution: ApprovalResolution::Disconnect,
             }
         );
+        assert_eq!(first_decision.decided_at, 1025);
 
         // The other session's request is still pending and answerable.
         assert!(broker.pending.lock().unwrap().contains_key(&second_id));
@@ -768,6 +829,7 @@ mod approval_tests {
         let broker = Arc::new(RuntimeApprovalBroker::new(
             events_tx,
             Some(engine_tx),
+            Arc::new(SystemClock),
             HashMap::new(),
         ));
         let outcome = ApprovalOutcome {
@@ -826,6 +888,7 @@ impl Core {
         let approvals = Arc::new(RuntimeApprovalBroker::new(
             events_tx.clone(),
             Some(tx.clone()),
+            clock.clone(),
             approval_outcomes,
         ));
         let tokens = Arc::new(Tokens::default());
