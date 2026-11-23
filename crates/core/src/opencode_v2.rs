@@ -850,7 +850,8 @@ fn parse_block(block: &str) -> SseFrame {
 /// v2 OpenAPI document (`/openapi.json`, v2.3.2). Only what the adapter needs is
 /// read: streamed assistant text and execution boundaries. Unknown event types
 /// are ignored, so a server that grows new events cannot break a turn. Events
-/// for other sessions are dropped by `data.sessionID`.
+/// are accepted only when `data.sessionID` matches our session; a missing or
+/// foreign id is dropped, since a shared server streams every session's events.
 #[derive(Default)]
 struct EventMapper {
     turn: Option<BatchId>,
@@ -878,10 +879,10 @@ impl EventMapper {
         if kind != "session.tool.input.ended" && kind != "session.tool.called" {
             return;
         }
-        let data = value
-            .get("data")
-            .or_else(|| value.get("properties"))
-            .unwrap_or(&value);
+        let data = event_data(&value);
+        if !self.is_ours(data) {
+            return;
+        }
         let id = data
             .get("id")
             .or_else(|| data.get("toolCallId"))
@@ -913,10 +914,7 @@ impl EventMapper {
             .and_then(|k| k.as_str())
             .or(frame.event.as_deref())
             .unwrap_or_default();
-        let data = value
-            .get("data")
-            .or_else(|| value.get("properties"))
-            .unwrap_or(&value);
+        let data = event_data(&value);
         if !self.is_ours(data) || self.turn.is_none() {
             return Vec::new();
         }
@@ -974,14 +972,22 @@ impl EventMapper {
     }
 
     fn is_ours(&self, data: &serde_json::Value) -> bool {
-        match (
-            &self.session,
-            data.get("sessionID").and_then(|s| s.as_str()),
-        ) {
-            (Some(mine), Some(theirs)) => mine == theirs,
-            _ => true,
-        }
+        matches!(
+            (&self.session, session_id(data)),
+            (Some(mine), Some(theirs)) if mine == theirs
+        )
     }
+}
+
+fn event_data(value: &serde_json::Value) -> &serde_json::Value {
+    value
+        .get("data")
+        .or_else(|| value.get("properties"))
+        .unwrap_or(value)
+}
+
+fn session_id(data: &serde_json::Value) -> Option<&str> {
+    data.get("sessionID").and_then(|s| s.as_str())
 }
 
 async fn open_session(
@@ -1114,12 +1120,19 @@ async fn open_session(
 mod tests {
     use super::*;
 
+    fn mapper_for(session: &str) -> EventMapper {
+        EventMapper {
+            session: Some(session.into()),
+            ..EventMapper::default()
+        }
+    }
+
     #[test]
     fn tool_call_arguments_are_correlated_by_source_id() {
-        let mut mapper = EventMapper::default();
+        let mut mapper = mapper_for("s1");
         mapper.observe(&SseFrame {
             event: None,
-            data: r#"{"type":"session.tool.input.ended","data":{"id":"tool-call-1","input":{"command":"echo OK"}}}"#
+            data: r#"{"type":"session.tool.input.ended","data":{"sessionID":"s1","id":"tool-call-1","input":{"command":"echo OK"}}}"#
                 .into(),
         });
         assert_eq!(
@@ -1194,7 +1207,7 @@ mod tests {
 
     #[test]
     fn text_deltas_end_with_the_turn() {
-        let mut mapper = EventMapper::default();
+        let mut mapper = mapper_for("s1");
         mapper.begin(BatchId(9));
         let frame = |data: String| SseFrame { event: None, data };
         let delta = |text: &str| {
@@ -1229,6 +1242,80 @@ mod tests {
     }
 
     #[test]
+    fn observe_only_records_our_sessions_tool_arguments() {
+        let mut mapper = mapper_for("mine");
+        let frame = |session: &str| SseFrame {
+            event: None,
+            data: format!(
+                r#"{{"type":"session.tool.input.ended","data":{{"sessionID":"{session}","id":"tool-call-1","input":{{"command":"echo OK"}}}}}}"#
+            ),
+        };
+        mapper.observe(&frame("theirs"));
+        assert!(mapper.tool_arguments.is_empty(), "foreign tool args leaked");
+        mapper.observe(&SseFrame {
+            event: None,
+            data: r#"{"type":"session.tool.input.ended","data":{"id":"tool-call-2","input":{}}}"#
+                .into(),
+        });
+        assert!(
+            mapper.tool_arguments.is_empty(),
+            "session-less tool args leaked"
+        );
+        mapper.observe(&frame("mine"));
+        assert_eq!(
+            mapper.tool_arguments.get("tool-call-1"),
+            Some(&serde_json::json!({"command": "echo OK"}))
+        );
+    }
+
+    #[test]
+    fn session_less_events_do_not_advance_the_turn() {
+        let mut mapper = mapper_for("mine");
+        mapper.begin(BatchId(7));
+        let frame = |data: &str| SseFrame {
+            event: None,
+            data: data.into(),
+        };
+        for data in [
+            r#"{"type":"session.execution.succeeded","data":{}}"#,
+            r#"{"type":"session.execution.succeeded"}"#,
+            r#"{"type":"session.execution.succeeded","data":{"sessionID":"theirs"}}"#,
+        ] {
+            assert!(mapper.handle(&frame(data)).is_empty(), "data: {data}");
+        }
+        assert!(matches!(
+            mapper
+                .handle(&frame(
+                    r#"{"type":"session.execution.succeeded","data":{"sessionID":"mine"}}"#
+                ))
+                .as_slice(),
+            [AgentEvent::TurnEnded { turn, .. }] if *turn == BatchId(7)
+        ));
+    }
+
+    #[test]
+    fn foreign_text_deltas_do_not_enter_our_turn() {
+        let mut mapper = mapper_for("mine");
+        mapper.begin(BatchId(8));
+        let delta = |session: &str, text: &str| SseFrame {
+            event: None,
+            data: format!(
+                r#"{{"type":"session.text.delta","data":{{"sessionID":"{session}","delta":"{text}"}}}}"#
+            ),
+        };
+        assert!(mapper.handle(&delta("theirs", "leak")).is_empty());
+        assert!(mapper.handle(&delta("mine", "ours")).is_empty());
+        let done = SseFrame {
+            event: None,
+            data: r#"{"type":"session.execution.succeeded","data":{"sessionID":"mine"}}"#.into(),
+        };
+        match mapper.handle(&done).as_slice() {
+            [AgentEvent::TurnEnded { final_text, .. }] => assert_eq!(&**final_text, "ours"),
+            other => panic!("unexpected events: {other:?}"),
+        }
+    }
+
+    #[test]
     fn other_sessions_are_ignored() {
         let mut mapper = EventMapper {
             session: Some("mine".into()),
@@ -1250,7 +1337,7 @@ mod tests {
 
     #[test]
     fn failure_fails_the_turn_and_later_success_is_ignored() {
-        let mut mapper = EventMapper::default();
+        let mut mapper = mapper_for("s1");
         mapper.begin(BatchId(3));
         let failed = SseFrame {
             event: None,
@@ -1270,7 +1357,7 @@ mod tests {
 
     #[test]
     fn interruption_is_a_cancelled_turn() {
-        let mut mapper = EventMapper::default();
+        let mut mapper = mapper_for("s1");
         mapper.begin(BatchId(5));
         let interrupted = SseFrame {
             event: None,
@@ -1287,7 +1374,7 @@ mod tests {
 
     #[test]
     fn unknown_and_malformed_events_are_ignored() {
-        let mut mapper = EventMapper::default();
+        let mut mapper = mapper_for("s1");
         mapper.begin(BatchId(1));
         for data in [r#"{"type":"session.updated"}"#, "not json", "{}"] {
             let frame = SseFrame {
