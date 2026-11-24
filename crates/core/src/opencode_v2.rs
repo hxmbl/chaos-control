@@ -990,6 +990,20 @@ fn session_id(data: &serde_json::Value) -> Option<&str> {
     data.get("sessionID").and_then(|s| s.as_str())
 }
 
+/// A per-session name for the chat tools MCP entry. The experimental endpoint
+/// replaces an existing registration under the same name, so sessions sharing
+/// one server need names that do not collide.
+fn chat_tools_mcp_entry_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("chaos-control-{:x}-{:x}-{}", std::process::id(), now, seq)
+}
+
 async fn open_session(
     config: OpenCodeV2Config,
     req: OpenSession,
@@ -1018,7 +1032,7 @@ async fn open_session(
             );
         }
         http.put_json(
-            "/api/experimental/mcp/chaos-control",
+            &format!("/api/experimental/mcp/{}", chat_tools_mcp_entry_name()),
             &serde_json::json!({
                 "config": {
                     "type": "remote",
