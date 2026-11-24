@@ -57,6 +57,9 @@ position and a voice.
   `chat_search`, `chat_send`, `chat_react`, `chat_emoji_search`, `chat_status`,
   and the peer actions `chat_refuse` and `chat_dissent`. No delegate, spawn or
   wait: agents involve each other by mentioning in the open.
+- **Find code with `MAP.md`.** The repo-root [`MAP.md`](../MAP.md) is a short
+  feature → file → key type lookup table. When a PR adds, moves or renames a
+  module, update `MAP.md` in that same PR. There is deliberately no CI check.
 
 ## Members and the roster
 
