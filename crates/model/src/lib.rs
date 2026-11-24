@@ -61,6 +61,43 @@ pub struct Channel {
     pub project_wide: bool,
 }
 
+/// One chat row in the cross-project sidebar. Channel numbers are per project,
+/// so `id` only identifies the chat inside its `ChatProject`; use the project
+/// id too when keying a row or asking core anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatEntry {
+    pub channel: Id,
+    pub name: Arc<str>,
+    /// Position within its project (`::N`), stable across renames.
+    pub ordinal: Option<u32>,
+    /// The channel has messages the local human has not read.
+    pub unread: bool,
+}
+
+/// A project's chats in the sidebar, in the order its channels were created.
+/// `current` is the project open in the window; the others are listed so the
+/// workspace spans every project core knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChatProject {
+    /// Stable project id (the UUID in `project.toml`).
+    pub id: Arc<str>,
+    pub name: Arc<str>,
+    /// The badge shown for the project when no custom emoji exists: its first
+    /// letter (or `#`).
+    pub mark: Arc<str>,
+    /// The folder it was last opened from, as the header shows it.
+    pub path: Option<Arc<str>>,
+    /// This is the project open in the window.
+    pub current: bool,
+    pub chats: Vec<ChatEntry>,
+}
+
+impl ChatProject {
+    pub fn chat(&self, channel: Id) -> Option<&ChatEntry> {
+        self.chats.iter().find(|c| c.channel == channel)
+    }
+}
+
 /// Whether an agent can be talked to right now. Drawn as a coloured glow under
 /// its pill in Agent Status (colours come from the theme, see
 /// `ui::Theme::agent_state`):
@@ -311,5 +348,24 @@ mod tests {
         let a: Vec<_> = demo_history(50).map(|m| m.body).collect();
         let b: Vec<_> = demo_history(50).map(|m| m.body).collect();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_chat_project_finds_only_its_own_chats() {
+        let project = ChatProject {
+            id: Arc::from("p1"),
+            name: Arc::from("Proj"),
+            mark: Arc::from("P"),
+            path: None,
+            current: true,
+            chats: vec![ChatEntry {
+                channel: Id(7),
+                name: Arc::from("main"),
+                ordinal: Some(1),
+                unread: false,
+            }],
+        };
+        assert_eq!(project.chat(Id(7)).map(|c| c.name.as_ref()), Some("main"));
+        assert!(project.chat(Id(8)).is_none());
     }
 }

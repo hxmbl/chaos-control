@@ -1,7 +1,16 @@
-//! Floating, detached left sidebar: project picker, channels, quick links, settings.
+//! Floating, detached left sidebar: the cross-project chat list, quick links,
+//! settings.
+//!
+//! STRM-737 replaced "the open project's channels" with a chat list that spans
+//! every project core knows. Each row is one chat (a channel) annotated with
+//! its project badge and name; the open project's chats sit under **Active**,
+//! the rest under **Settled**. Opening a chat from another project switches the
+//! window to it without changing either project's folder identity.
 
-use gpui::{Context, Entity, SharedString, Window, div, prelude::*, px, uniform_list};
-use model::{Channel, PaneContent};
+use std::sync::Arc;
+
+use gpui::{Context, Entity, SharedString, Window, div, prelude::*, px};
+use model::{ChatEntry, ChatProject, PaneContent};
 use ui::{
     ActiveTheme, Elevation, Ellipsis, IconName, Tooltip, TypeStyleExt, brand_icon, icon, pill,
     tokens::{icon as icons, radius, size, space, text},
@@ -10,119 +19,146 @@ use ui::{
 
 use crate::{pane_host::PaneHost, store::ChatStore};
 
-/// Channel row height (`size::ROW`) plus the gap below it (`space::X1`);
-/// `uniform_list` needs one fixed row height.
-const CHANNEL_ROW: f32 = 36. + 4.;
-/// The channel list never shrinks below about three rows (or its content, if
-/// that is shorter).
-const CHANNELS_MIN_H: f32 = 3. * CHANNEL_ROW;
+/// One chat row: room for the name and the project caption, plus the gap
+/// below it.
+const CHAT_ROW: f32 = 48.;
+/// A section label ("Active", "Settled") or a quiet empty row.
+const SECTION_ROW: f32 = 32.;
 
-/// The section's padding (`space::X1_5` twice) plus the Archived row (`size::ROW`).
-const SECTION_CHROME: f32 = 2. * 6. + 36.;
+/// Stable row id for a chat: channel numbers repeat in every project, so the
+/// project id has to be part of the key or two `#main`s would share one
+/// element id.
+fn row_key(project: &str, channel: Option<model::Id>) -> usize {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let bytes = project
+        .bytes()
+        .chain(channel.into_iter().flat_map(|c| c.0.to_le_bytes()));
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash as usize
+}
 
 pub struct Sidebar {
     store: Entity<ChatStore>,
     pane: Entity<PaneHost>,
-    /// The project picker's list is showing.
-    picker_open: bool,
 }
 
 impl Sidebar {
     pub fn new(store: Entity<ChatStore>, pane: Entity<PaneHost>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        Self {
-            store,
-            pane,
-            picker_open: false,
-        }
+        Self { store, pane }
     }
 
-    /// The picker's list: every project (from core when it runs, else the
-    /// sample), the open one highlighted. A window shows the project of the
-    /// folder it was launched from, so the others are listed with their
-    /// folders rather than switched to here.
-    fn render_projects(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn section_label(label: &'static str, cx: &Context<Self>) -> impl IntoElement + use<> {
         let t = *cx.theme();
-        let entries = self.store.read(cx).workspace().projects.clone();
         div()
+            .h(px(SECTION_ROW))
             .flex()
-            .flex_col()
-            .gap(space::X1)
-            .p(space::X1_5)
-            .rounded(radius::LG)
-            .bg(t.sunken)
-            .children(entries.into_iter().enumerate().map(|(ix, entry)| {
-                let path = entry.path.clone();
-                pill(("project-entry", ix), cx)
-                    .h(size::ROW_LG)
-                    .px(space::X3)
-                    .flex_col()
-                    .items_start()
-                    .justify_center()
-                    .when(entry.current, |p| {
-                        p.bg(t.selected).font_weight(text::MEDIUM)
-                    })
-                    .when(!entry.current, |p| {
-                        p.tooltip(Tooltip::text(match &path {
-                            Some(path) => format!("Launch Chaos Control in {path} to open it"),
-                            None => "Not linked to a folder on this computer".to_string(),
-                        }))
-                    })
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.picker_open = false;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .w_full()
-                            .ellipsis()
-                            .type_style(text::SMALL)
-                            .child(truncated(SharedString::from(entry.name.clone()))),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .ellipsis()
-                            .type_style(text::CAPTION)
-                            .font_weight(text::REGULAR)
-                            .text_color(t.muted)
-                            .child(truncated(SharedString::from(
-                                path.unwrap_or_else(|| "No folder".into()),
-                            ))),
-                    )
-            }))
+            .items_end()
+            .pb(space::X1_5)
+            .px(space::X3)
+            .child(
+                div()
+                    .type_style(text::CAPTION)
+                    .font_weight(text::MEDIUM)
+                    .text_color(t.muted)
+                    .child(label),
+            )
     }
 
-    fn render_channel(
+    fn project_badge(mark: Arc<str>, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let t = *cx.theme();
+        div()
+            .size(px(18.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(radius::SM)
+            .bg(t.sunken)
+            .child(
+                div()
+                    .type_style(text::CAPTION)
+                    .font_weight(text::SEMIBOLD)
+                    .text_color(t.ink_soft)
+                    .child(SharedString::from(mark)),
+            )
+    }
+
+    /// One chat: its project badge, the channel name and the project it lives
+    /// in. Unread is a dot on the right, never colour text (colour means
+    /// status).
+    fn render_chat(
         &self,
-        channel: &Channel,
+        project: &ChatProject,
+        chat: &ChatEntry,
         selected: bool,
+        can_open: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let t = *cx.theme();
-        let id = channel.id;
-        let name = SharedString::from(channel.name.clone());
+        let channel = chat.channel;
+        let project_id = project.id.clone();
+        let key = row_key(&project.id, Some(channel));
+        let mark = project.mark.clone();
+        let name = SharedString::from(chat.name.clone());
+        let project_name = SharedString::from(project.name.clone());
+        let tooltip = match (&project.path, chat.ordinal) {
+            (Some(path), Some(ordinal)) => {
+                format!("{} in {} ::{ordinal}", project.name, path)
+            }
+            (Some(path), None) => format!("{} in {}", project.name, path),
+            (None, _) => format!("{} (no folder)", project.name),
+        };
+        let tooltip = if can_open {
+            tooltip
+        } else {
+            match &project.path {
+                Some(path) => format!("Launch Chaos Control in {path} to open it"),
+                None => "Not linked to a folder on this computer".to_string(),
+            }
+        };
 
-        // Selected: a filled row in medium weight. Unread: semibold plus the
-        // dot. One hash glyph throughout.
-        div().h(px(CHANNEL_ROW)).pb(space::X1).child(
-            pill(("channel", id.0 as usize), cx)
-                .h(size::ROW)
+        div().h(px(CHAT_ROW)).pb(space::X1).child(
+            pill(("chat", key), cx)
+                .h(size::ROW_LG)
                 .gap(space::X2)
                 .pl(space::X3)
                 .pr(space::X2)
                 .when(selected, |p| p.bg(t.selected).font_weight(text::MEDIUM))
-                .when(channel.unread, |p| p.font_weight(text::SEMIBOLD))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.store.update(cx, |store, cx| store.select(id, cx));
-                }))
-                .child(icon(
-                    IconName::Hash,
-                    icons::MD,
-                    if selected { t.ink } else { t.ink_soft },
-                ))
-                .child(div().flex_1().ellipsis().child(truncated(name)))
-                .when(channel.unread, |p| {
+                .tooltip(Tooltip::text(tooltip))
+                .when(can_open, |p| {
+                    p.on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |store, cx| {
+                            store.open_chat(project_id.clone(), Some(channel), cx)
+                        });
+                    }))
+                })
+                .child(Self::project_badge(mark, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .ellipsis()
+                                .type_style(text::SMALL)
+                                .when(chat.unread, |d| d.font_weight(text::SEMIBOLD))
+                                .child(truncated(name)),
+                        )
+                        .child(
+                            div()
+                                .ellipsis()
+                                .type_style(text::CAPTION)
+                                .text_color(t.muted)
+                                .child(truncated(project_name)),
+                        ),
+                )
+                .when(chat.unread, |p| {
                     p.child(
                         div()
                             .size(space::X1_5)
@@ -130,20 +166,55 @@ impl Sidebar {
                             .rounded_full()
                             .bg(t.accent),
                     )
-                })
-                .when_some(channel.linear_issue.clone(), |p, issue| {
-                    p.child(
-                        div()
-                            .id(("linear", id.0 as usize))
-                            .size(icons::LG)
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .tooltip(Tooltip::text(format!("Linked to Linear issue {issue}")))
-                            .child(icon(IconName::BrandLinear, icons::SM, t.muted)),
-                    )
                 }),
+        )
+    }
+
+    /// A project with no channels: still a way to open it, since
+    /// `view_project` gives it a #main if it is somehow missing.
+    fn render_empty_project(
+        &self,
+        project: &ChatProject,
+        can_open: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let t = *cx.theme();
+        let project_id = project.id.clone();
+        let key = row_key(&project.id, None);
+        let mark = project.mark.clone();
+        let project_name = SharedString::from(project.name.clone());
+        let tooltip = if can_open {
+            "Open this project".to_string()
+        } else {
+            match &project.path {
+                Some(path) => format!("Launch Chaos Control in {path} to open it"),
+                None => "Not linked to a folder on this computer".to_string(),
+            }
+        };
+        div().h(px(CHAT_ROW)).pb(space::X1).child(
+            pill(("empty-project", key), cx)
+                .h(size::ROW_LG)
+                .gap(space::X2)
+                .px(space::X3)
+                .tooltip(Tooltip::text(tooltip))
+                .when(can_open, |p| {
+                    p.on_click(cx.listener(move |this, _, _, cx| {
+                        this.store.update(cx, |store, cx| {
+                            store.open_chat(project_id.clone(), None, cx)
+                        });
+                    }))
+                })
+                .child(Self::project_badge(mark, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .ellipsis()
+                        .type_style(text::SMALL)
+                        .text_color(t.muted)
+                        .child(truncated(project_name)),
+                )
+                .child(icon(IconName::CaretRight, icons::SM, t.muted)),
         )
     }
 }
@@ -151,21 +222,102 @@ impl Sidebar {
 impl Render for Sidebar {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = *cx.theme();
-        let store = self.store.read(cx);
-        let ws = store.workspace();
-        let project_emoji = SharedString::from(ws.project.emoji.clone());
-        let project_name = SharedString::from(ws.project.name.clone());
-        let channel_count = ws.channels.len();
-        // Every channel plus the "+" row.
-        let list_h = (channel_count + 1) as f32 * CHANNEL_ROW;
-        let quick_links: Vec<_> = ws
+        // Clone the small catalogue so the store borrow ends before the rows
+        // borrow `cx` mutably (listeners and tooltips).
+        let (catalog, selected, project_count, can_open, has_source) = {
+            let store = self.store.read(cx);
+            (
+                store.chats().to_vec(),
+                store.selected(),
+                store.chats().len(),
+                store.has_core(),
+                store.has_chat_source(),
+            )
+        };
+        let quick_links: Vec<_> = self
+            .store
+            .read(cx)
+            .workspace()
             .quick_links
             .iter()
             .map(|l| (l.label.clone(), l.brand, l.url.clone()))
             .collect();
 
-        // A section is a background step only: no outline inside the panel's.
-        let section = || div().rounded(radius::LG).bg(t.sunken).p(space::X1_5);
+        let current: Vec<&ChatProject> = catalog.iter().filter(|p| p.current).collect();
+        let others: Vec<&ChatProject> = catalog.iter().filter(|p| !p.current).collect();
+        let mut rows: Vec<gpui::AnyElement> = Vec::new();
+
+        if catalog.is_empty() {
+            rows.push(
+                div()
+                    .px(space::X3)
+                    .py(space::X2)
+                    .type_style(text::SMALL)
+                    .text_color(t.muted)
+                    .child(if has_source {
+                        "Loading chats…"
+                    } else {
+                        "No projects yet"
+                    })
+                    .into_any_element(),
+            );
+        }
+        if !current.is_empty() {
+            rows.push(Self::section_label("Active", cx).into_any_element());
+            for project in &current {
+                if project.chats.is_empty() {
+                    rows.push(
+                        self.render_empty_project(project, can_open, cx)
+                            .into_any_element(),
+                    );
+                }
+                for chat in &project.chats {
+                    let is_selected = project.current && chat.channel == selected;
+                    rows.push(
+                        self.render_chat(project, chat, is_selected, can_open, cx)
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if !others.is_empty() {
+            rows.push(
+                Self::section_label(
+                    if current.is_empty() {
+                        "Projects"
+                    } else {
+                        "Settled"
+                    },
+                    cx,
+                )
+                .into_any_element(),
+            );
+            for project in &others {
+                if project.chats.is_empty() {
+                    rows.push(
+                        self.render_empty_project(project, can_open, cx)
+                            .into_any_element(),
+                    );
+                }
+                for chat in &project.chats {
+                    rows.push(
+                        self.render_chat(project, chat, false, can_open, cx)
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        if !can_open && !catalog.is_empty() {
+            rows.push(
+                div()
+                    .px(space::X3)
+                    .py(space::X2)
+                    .type_style(text::CAPTION)
+                    .text_color(t.muted)
+                    .child("Launch Chaos Control in a project's folder to open it.")
+                    .into_any_element(),
+            );
+        }
 
         div()
             .size_full()
@@ -179,88 +331,67 @@ impl Render for Sidebar {
             .border_color(t.line)
             .bg(t.surface)
             .shadow(t.elevation(Elevation::Float))
-            // Project picker
+            // Chats: the workspace's cross-project list.
             .child(
-                pill("project", cx)
+                div()
+                    .flex_none()
                     .h(size::ROW_LG)
+                    .flex()
+                    .items_center()
                     .gap(space::X2)
                     .px(space::X3)
-                    .font_weight(text::SEMIBOLD)
-                    .tooltip(Tooltip::text("Projects"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.picker_open = !this.picker_open;
-                        cx.notify();
-                    }))
-                    .child(div().type_style(text::BODY).child(project_emoji))
-                    .child(div().flex_1().ellipsis().child(truncated(project_name)))
-                    .child(icon(
-                        if self.picker_open {
-                            IconName::CaretUp
-                        } else {
-                            IconName::CaretDown
-                        },
-                        icons::SM,
-                        t.muted,
-                    )),
-            )
-            .when(self.picker_open, |this| {
-                this.child(self.render_projects(cx))
-            })
-            // Channels. Virtualized: a project can collect hundreds of issue channels.
-            // The section hugs its rows (channels, "+", then Archived), so it
-            // grows with every new channel; once it would run into the quick
-            // links it stops at the space left and the list scrolls inside it.
-            // Archived stays at the section's end.
-            .child(
-                section()
-                    .flex()
-                    .flex_col()
-                    .flex_shrink()
-                    // The section's padding plus Archived below the list.
-                    .min_h(px(list_h.min(CHANNELS_MIN_H) + SECTION_CHROME))
+                    .child(icon(IconName::ChatCircle, icons::MD, t.ink_soft))
                     .child(
-                        uniform_list(
-                            "channels",
-                            channel_count + 1,
-                            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                                let store = this.store.read(cx);
-                                let selected = store.selected();
-                                let channels = &store.workspace().channels;
-                                let rows: Vec<(Channel, bool)> = range
-                                    .clone()
-                                    .filter_map(|ix| channels.get(ix))
-                                    .map(|c| (c.clone(), c.id == selected))
-                                    .collect();
-                                let wants_new = range.end > channels.len();
-                                let mut items: Vec<gpui::AnyElement> = rows
-                                    .iter()
-                                    .map(|(c, sel)| {
-                                        this.render_channel(c, *sel, cx).into_any_element()
-                                    })
-                                    .collect();
-                                if wants_new {
-                                    items.push(new_channel_row(cx).into_any_element());
-                                }
-                                items
-                            }),
-                        )
-                        .h(px(list_h))
-                        .flex_shrink()
-                        .min_h(px(list_h.min(CHANNELS_MIN_H))),
+                        div()
+                            .flex_1()
+                            .type_style(text::SMALL)
+                            .font_weight(text::SEMIBOLD)
+                            .child("Chats"),
                     )
                     .child(
-                        pill("archived", cx)
-                            .h(size::ROW)
-                            .gap(space::X2)
-                            .pl(space::X3)
-                            .pr(space::X3)
-                            .child(icon(IconName::Archive, icons::MD, t.ink_soft))
-                            .child(div().flex_1().ellipsis().child(truncated("Archived")))
-                            .child(icon(IconName::CaretRight, icons::SM, t.muted)),
+                        div()
+                            .type_style(text::CAPTION)
+                            .text_color(t.muted)
+                            .child(project_count.to_string()),
+                    )
+                    .child(
+                        div()
+                            .id("refresh-chats")
+                            .size(size::BUTTON_SM)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(radius::MD)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.hover))
+                            .tooltip(Tooltip::text("Refresh chats"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.store.update(cx, |store, cx| store.refresh_chats(cx));
+                            }))
+                            .child(icon(IconName::ArrowClockwise, icons::SM, t.muted)),
                     ),
             )
-            // Spare height sits under the channels, above the quick links.
-            .child(div().flex_1())
+            .child(
+                div()
+                    .id("chats-list")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .children(rows),
+            )
+            .child(
+                pill("archived", cx)
+                    .flex_none()
+                    .h(size::ROW)
+                    .gap(space::X2)
+                    .pl(space::X3)
+                    .pr(space::X3)
+                    .child(icon(IconName::Archive, icons::MD, t.ink_soft))
+                    .child(div().flex_1().ellipsis().child(truncated("Archived")))
+                    .child(icon(IconName::CaretRight, icons::SM, t.muted)),
+            )
             // Quick links: straight on the panel surface, hover only.
             .child(
                 div()
@@ -282,6 +413,7 @@ impl Render for Sidebar {
             )
             .child(
                 pill("settings", cx)
+                    .flex_none()
                     .h(size::ROW_LG)
                     .gap(space::X2)
                     .px(space::X3)
@@ -293,15 +425,4 @@ impl Render for Sidebar {
                     .child("Settings"),
             )
     }
-}
-
-fn new_channel_row(cx: &Context<Sidebar>) -> impl IntoElement + use<> {
-    let t = *cx.theme();
-    div().h(px(CHANNEL_ROW)).pb(space::X1).child(
-        pill("new-channel", cx)
-            .h(size::ROW)
-            .justify_center()
-            .tooltip(Tooltip::text("New channel"))
-            .child(icon(IconName::Plus, icons::MD, t.ink_soft)),
-    )
 }
