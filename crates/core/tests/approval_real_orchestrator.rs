@@ -2185,3 +2185,308 @@ async fn opencode_v2_permission_reply_delivery_failure_records_failed_through_re
     );
     core.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_sessions_on_one_server_do_not_share_tool_calls_or_events() {
+    use axum::extract::Path;
+    use axum::response::sse::{Event, Sse};
+    use axum::{
+        Json, Router,
+        routing::{get, post},
+    };
+    use chaos_core::types::BatchState;
+    use chaos_core::{
+        host::{AgentSpec, Core, HostConfig, ManualClock},
+        opencode_v2::{OpenCodeV2Adapter, OpenCodeV2Config},
+    };
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let (events_tx, _events_rx) = tokio::sync::broadcast::channel::<String>(256);
+    let streams = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let next_session_id = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Each session registers chat tools on the shared server. Record the name
+    // and bearer token to prove the second session cannot replace the first.
+    let registrations: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route(
+            "/api/session",
+            post({
+                let next = next_session_id.clone();
+                move || async move {
+                    let n = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(json!({ "data": { "id": format!("s{}", n + 1) } }))
+                }
+            }),
+        )
+        .route(
+            "/api/experimental/mcp/{server}",
+            axum::routing::put({
+                let registrations = registrations.clone();
+                move |Path(server): Path<String>, Json(body): Json<serde_json::Value>| {
+                    let registrations = registrations.clone();
+                    async move {
+                        // The bearer token lives in the MCP config body; the
+                        // request's own Authorization is server basic auth.
+                        let token = body["config"]["headers"]["Authorization"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                        registrations.lock().unwrap().push((server, token));
+                        Json(json!({ "data": {} }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/event",
+            get({
+                let tx = events_tx.clone();
+                let streams = streams.clone();
+                move || {
+                    let rx = tx.subscribe();
+                    streams.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async move {
+                        Sse::new(futures::stream::unfold(rx, |mut rx| async move {
+                            match rx.recv().await {
+                                Ok(data) => Some((
+                                    Ok::<_, std::convert::Infallible>(Event::default().data(data)),
+                                    rx,
+                                )),
+                                Err(_) => None,
+                            }
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
+            "/api/session/{id}/prompt",
+            post(|| async { Json(json!({ "data": {} })) }),
+        )
+        .route(
+            "/api/session/{id}/permission/{permission}/reply",
+            post({
+                let reply_tx = reply_tx.clone();
+                move |Path((session, permission)): Path<(String, String)>,
+                      Json(body): Json<serde_json::Value>| {
+                    let reply_tx = reply_tx.clone();
+                    async move {
+                        let _ = reply_tx.send(json!({
+                            "session": session,
+                            "permission": permission,
+                            "body": body,
+                        }));
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+    let clock = ManualClock::new(1_000_000);
+    let (core, mut events) = Core::start(HostConfig::default(), clock.clone())
+        .await
+        .unwrap();
+    let main = common::main_channel(&core).await.id;
+    let hx = core.human("hx", "Hx", main).await.unwrap();
+    let adapter = Arc::new(OpenCodeV2Adapter::new(OpenCodeV2Config {
+        command: "opencode".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        server_url: Some(format!("http://{addr}")),
+        server_password: None,
+        model: None,
+    }));
+    let agent_a = core
+        .add_agent(
+            AgentSpec {
+                handle: "v2a".into(),
+                name: "V2A".into(),
+                adapter: adapter.clone(),
+                cwd: Some(std::env::temp_dir()),
+                ping_answers: None,
+            },
+            main,
+        )
+        .await
+        .unwrap();
+    let agent_b = core
+        .add_agent(
+            AgentSpec {
+                handle: "v2b".into(),
+                name: "V2B".into(),
+                adapter,
+                cwd: Some(std::env::temp_dir()),
+                ping_answers: None,
+            },
+            main,
+        )
+        .await
+        .unwrap();
+
+    let _ping_a = core.post(hx.id, main, "@v2a run it", None).await.unwrap();
+    let _ping_b = core.post(hx.id, main, "@v2b run it", None).await.unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while streams.load(std::sync::atomic::Ordering::SeqCst) < 2
+        || registrations.lock().unwrap().len() < 2
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both sessions should connect and register chat tools"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let registrations = registrations.lock().unwrap().clone();
+    assert_eq!(registrations.len(), 2);
+    assert!(
+        registrations
+            .iter()
+            .all(|(name, _)| name.starts_with("chaos-control-")),
+        "registrations: {registrations:?}"
+    );
+    assert_ne!(
+        registrations[0].0, registrations[1].0,
+        "the second session must not overwrite the first session's MCP registration"
+    );
+    assert!(
+        registrations
+            .iter()
+            .all(|(_, token)| token.starts_with("Bearer ") && token.len() > "Bearer ".len()),
+        "each session must carry its own chat-tools token: {registrations:?}"
+    );
+    assert_ne!(
+        registrations[0].1, registrations[1].1,
+        "sessions must not share a chat-tools token"
+    );
+
+    // One shared broadcast: both adapters must drop the other session's frames.
+    for data in [
+        r#"{"type":"session.tool.input.ended","data":{"sessionID":"s1","id":"tool-1","input":{"command":"echo SAFE"}}}"#,
+        r#"{"type":"session.tool.input.ended","data":{"sessionID":"s2","id":"tool-1","input":{"command":"echo OTHER"}}}"#,
+        r#"{"type":"permission.asked","data":{"id":"p1","sessionID":"s1","action":"shell","resources":["echo SAFE"],"source":{"type":"tool","messageID":"m1","id":"tool-1"}}}"#,
+        r#"{"type":"permission.asked","data":{"id":"p2","sessionID":"s2","action":"shell","resources":["echo OTHER"],"source":{"type":"tool","messageID":"m2","id":"tool-1"}}}"#,
+    ] {
+        events_tx.send(data.to_owned()).unwrap();
+    }
+
+    let mut got: Vec<chaos_core::approval::ApprovalRequest> = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while got.len() < 2 {
+        match tokio::time::timeout_at(deadline, events.recv()).await {
+            Ok(Some(CoreEvent::ApprovalRequested(r)))
+                if r.agent == agent_a.id || r.agent == agent_b.id =>
+            {
+                got.push(*r);
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("core stopped; got {got:?}"),
+            Err(_) => panic!("timed out waiting for approvals; got {got:?}"),
+        }
+    }
+    let req_s1 = got
+        .iter()
+        .find(|r| &*r.session_id == "s1")
+        .cloned()
+        .expect("approval for session s1");
+    let req_s2 = got
+        .iter()
+        .find(|r| &*r.session_id == "s2")
+        .cloned()
+        .expect("approval for session s2");
+    let turn_s1 = req_s1.turn.expect("session 1 approval carries its turn");
+    let turn_s2 = req_s2.turn.expect("session 2 approval carries its turn");
+
+    // No tool-call theft: each session's approval carries its own tool call,
+    // keyed by `tool-1` in both sessions, so an overwrite would show.
+    assert_eq!(req_s1.operation.summary.as_deref(), Some("echo SAFE"));
+    assert_eq!(
+        req_s1.operation.arguments,
+        Some(json!({ "command": "echo SAFE" }))
+    );
+    assert_eq!(req_s2.operation.summary.as_deref(), Some("echo OTHER"));
+    assert_eq!(
+        req_s2.operation.arguments,
+        Some(json!({ "command": "echo OTHER" }))
+    );
+
+    // Observe the exact turn each approval belongs to. A newer queued batch
+    // can already be in flight by the time the first one settles.
+    let batch_state = |turn: chaos_core::types::BatchId| {
+        core.with_engine(move |e, _| {
+            e.store()
+                .batch(turn)
+                .unwrap()
+                .map(|b| b.state)
+                .unwrap_or(BatchState::Settled)
+        })
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while batch_state(turn_s1).await.unwrap() != BatchState::Accepted
+        || batch_state(turn_s2).await.unwrap() != BatchState::Accepted
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both sessions should be in flight"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // Events don't cross: session 1's success settles only session 1;
+    // session 2's batch stays accepted until session 2's own event.
+    events_tx
+        .send(r#"{"type":"session.execution.succeeded","data":{"sessionID":"s1"}}"#.to_owned())
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while batch_state(turn_s1).await.unwrap() != BatchState::Settled {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session 1 should settle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        batch_state(turn_s2).await.unwrap(),
+        BatchState::Accepted,
+        "session 2 must not settle from session 1's events"
+    );
+
+    events_tx
+        .send(r#"{"type":"session.execution.succeeded","data":{"sessionID":"s2"}}"#.to_owned())
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while batch_state(turn_s2).await.unwrap() != BatchState::Settled {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session 2 should settle"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    core.resolve_approval(&req_s1.cc_request_id, "once")
+        .unwrap();
+    core.resolve_approval(&req_s2.cc_request_id, "once")
+        .unwrap();
+    let mut replies = Vec::new();
+    for _ in 0..2 {
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), reply_rx.recv())
+            .await
+            .expect("provider reply arrives")
+            .expect("reply channel open");
+        assert_eq!(reply["body"]["decision"], json!("once"));
+        replies.push((
+            reply["session"].as_str().unwrap().to_owned(),
+            reply["permission"].as_str().unwrap().to_owned(),
+        ));
+    }
+    replies.sort();
+    assert_eq!(
+        replies,
+        vec![("s1".into(), "p1".into()), ("s2".into(), "p2".into())]
+    );
+    core.shutdown().await;
+}
