@@ -12,8 +12,8 @@
 
 use gpui::{Context, Entity, SharedString, Window, div, prelude::*, px};
 use ui::{
-    ActiveTheme, Elevation, Ellipsis, IconName, Theme, Tooltip, TypeStyleExt, brand_icon, icon,
-    pill,
+    ActiveTheme, Elevation, Ellipsis, IconName, Theme, Tooltip, TooltipText, TypeStyleExt,
+    brand_icon, icon, pill,
     tokens::{icon as icons, radius, size, space, text},
     truncated,
 };
@@ -24,6 +24,9 @@ pub struct RightSidebar {
     store: Entity<ChatStore>,
     picker: Entity<ModelPicker>,
     mentions_open: bool,
+    /// The toggle tooltip follows the click, even while the pointer is still
+    /// over the button and the tooltip is on screen.
+    mentions_tip: Entity<TooltipText>,
     /// The Agent Status row under the pointer (shows its remove button).
     hovered_agent: Option<model::Id>,
 }
@@ -39,6 +42,7 @@ impl RightSidebar {
             store,
             picker,
             mentions_open: true,
+            mentions_tip: cx.new(|_| TooltipText::new("Collapse mentions")),
             hovered_agent: None,
         }
     }
@@ -166,13 +170,16 @@ impl Render for RightSidebar {
                             .justify_center()
                             .gap(space::X2)
                             .text_color(t.ink_soft)
-                            .tooltip(Tooltip::text(if open {
-                                "Collapse mentions"
-                            } else {
-                                "Expand mentions"
-                            }))
+                            .tooltip(Tooltip::dynamic(self.mentions_tip.clone()))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.mentions_open = !this.mentions_open;
+                                let open = !this.mentions_open;
+                                this.mentions_open = open;
+                                let label = if open {
+                                    "Collapse mentions"
+                                } else {
+                                    "Expand mentions"
+                                };
+                                this.mentions_tip.update(cx, |tip, cx| tip.set(label, cx));
                                 cx.notify();
                             }))
                             .when(!open, |p| {

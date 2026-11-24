@@ -22,7 +22,7 @@ pub use text::{Ellipsis, Truncated, truncated};
 pub use text_input::{TextInput, TextInputEvent};
 pub use theme::{ActiveTheme, Appearance, FONT_FAMILY, Theme};
 pub use tokens::{Elevation, TypeStyle, TypeStyleExt};
-pub use tooltip::Tooltip;
+pub use tooltip::{Tooltip, TooltipText};
 
 /// Registers globals and key bindings the components rely on. Call once at startup.
 pub fn init(cx: &mut gpui::App) {
