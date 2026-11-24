@@ -1051,6 +1051,28 @@ pub async fn switch_project(
     describe(&core, project).await
 }
 
+/// Opens a project that is already known to core (STRM-737): the chat list can
+/// switch to any project without treating the launch folder as that project's
+/// root. It grants the human and the agents membership of the project and its
+/// #main, so the chat is usable, but writes no `project.toml`: relaunching the
+/// folder still opens the folder's own project.
+pub async fn view_project(
+    core: Core,
+    id: ProjectId,
+    members: Vec<MemberId>,
+) -> Result<OpenProject, String> {
+    let project = core
+        .project(id)
+        .await?
+        .ok_or_else(|| "That project is no longer known".to_string())?;
+    let main = core.channel(&project.id, "main").await?;
+    for m in members {
+        core.join_project(&project.id, m).await?;
+        core.join(m, main.id).await?;
+    }
+    describe(&core, project).await
+}
+
 /// Adopts the unclaimed pre-project history (`target`) as this folder's
 /// project: core gives it the folder and `target`'s name (refusing if it has
 /// a folder or was claimed meanwhile), then it opens like any switch and the

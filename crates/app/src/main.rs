@@ -2,6 +2,7 @@
 
 mod agents;
 mod agents_file;
+mod chats;
 mod composer;
 mod conversation;
 #[cfg(target_os = "macos")]

@@ -27,7 +27,7 @@ use model::{
 
 use crate::{
     agents::{self, CoreLink, DormantMember, LinkedAgent, OpenProject},
-    agents_file,
+    agents_file, chats,
     project::{self, Confirm, Question, Target},
     project_context::{ProjectContext, ProjectLifecycle},
     recents,
@@ -141,6 +141,8 @@ pub enum StoreEvent {
     },
     /// A permission request arrived and should be shown to the user.
     ApprovalRequested,
+    /// The cross-project chat catalogue changed (STRM-737).
+    Chats,
 }
 
 /// Someone who has read up to a message (Slack/iMessage-style read marks).
@@ -175,6 +177,11 @@ pub struct ChatStore {
     no_project_core: Option<CoreLink>,
     /// Recent non-allowed approval outcomes, newest first, for the sidebar.
     approval_notices: Vec<ApprovalNotice>,
+    /// Every project with its chats, for the cross-project sidebar (STRM-737).
+    chat_catalog: Vec<model::ChatProject>,
+    /// Increments per catalogue request, so a slow answer cannot overwrite a
+    /// newer one after a project switch.
+    chat_catalog_seq: u64,
 }
 
 /// One emoji under a message: how many put it there and who.
@@ -450,6 +457,8 @@ impl ChatStore {
             core: None,
             no_project_core: None,
             approval_notices: Vec::new(),
+            chat_catalog: Vec::new(),
+            chat_catalog_seq: 0,
         }
     }
 
@@ -539,6 +548,149 @@ impl ChatStore {
             self.mark_main_read(cx);
             self.persist_recents(None);
         }
+    }
+
+    /// Every project with its chats, in sidebar order (the open project first,
+    /// then the others by recency). Empty until the first background answer
+    /// arrives, or when core is not running.
+    pub fn chats(&self) -> &[model::ChatProject] {
+        &self.chat_catalog
+    }
+
+    /// Reloads the cross-project chat list in the background. Cheap to call:
+    /// it only schedules core work and returns; a newer request wins over an
+    /// older answer (STRM-737).
+    pub fn refresh_chats(&mut self, cx: &mut Context<Self>) {
+        let Some(link) = self
+            .core
+            .as_ref()
+            .map(|a| &a.link)
+            .or(self.no_project_core.as_ref())
+        else {
+            return;
+        };
+        let core = link.core.clone();
+        self.chat_catalog_seq = self.chat_catalog_seq.wrapping_add(1);
+        let seq = self.chat_catalog_seq;
+        cx.spawn(async move |this, cx| {
+            if let Ok(catalog) = core.project_catalog().await {
+                this.update(cx, |store, cx| {
+                    if store.chat_catalog_seq == seq {
+                        store.apply_chat_catalog(catalog, cx);
+                    }
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// Folds core's project catalogue into the sidebar's groups. Unread marks
+    /// are only known for the open project's channels; the others show no dot
+    /// rather than a guess.
+    fn apply_chat_catalog(
+        &mut self,
+        catalog: Vec<(ct::Project, Vec<ct::Channel>)>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .core
+            .as_ref()
+            .and_then(|a| a.link.open.as_ref())
+            .map(|o| o.project.id.to_string());
+        let recents = recents::load(&crate::agents::data_dir());
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let unread: HashMap<Id, bool> = self
+            .workspace
+            .channels
+            .iter()
+            .map(|c| (c.id, c.unread))
+            .collect();
+        let sources = catalog
+            .into_iter()
+            .map(|(project, channels)| {
+                let id = project.id.to_string();
+                let last_opened = recents
+                    .projects
+                    .iter()
+                    .find(|recent| recent.id == id)
+                    .map_or(0, |recent| recent.last_opened);
+                chats::CatalogSource {
+                    id: Arc::from(id),
+                    name: project.name.clone(),
+                    path: project.root_path.as_deref().map(|root| {
+                        Arc::from(project::display_path(Path::new(root), home.as_deref()))
+                    }),
+                    chats: channels
+                        .into_iter()
+                        .map(|channel| chats::CatalogChat {
+                            channel: channel_id(channel.id),
+                            name: channel.name,
+                            ordinal: Some(channel.ordinal),
+                        })
+                        .collect(),
+                    last_opened,
+                }
+            })
+            .collect();
+        self.chat_catalog = chats::build(current.as_deref(), sources, &unread);
+        cx.emit(StoreEvent::Chats);
+        cx.notify();
+    }
+
+    /// Opens a chat from the cross-project list. In the open project this is a
+    /// channel selection; in another project it switches the window to that
+    /// project first, without rewriting either folder's `project.toml`
+    /// (STRM-737). `None` opens the project's #main.
+    pub fn open_chat(&mut self, project_id: Arc<str>, channel: Option<Id>, cx: &mut Context<Self>) {
+        let current = self
+            .core
+            .as_ref()
+            .and_then(|a| a.link.open.as_ref())
+            .map(|o| o.project.id.to_string());
+        if current.as_deref() == Some(project_id.as_ref()) {
+            if let Some(channel) = channel {
+                self.select(channel, cx);
+            }
+            return;
+        }
+        // Without a project open there is no human member to join the target
+        // project, so the list is read-only until the app starts in a folder.
+        let Some(link) = self.core.as_ref().map(|a| &a.link) else {
+            return;
+        };
+        let Some(id) = ct::ProjectId::parse(&project_id) else {
+            return;
+        };
+        let core = link.core.clone();
+        let members: Vec<ct::MemberId> = link
+            .human
+            .into_iter()
+            .chain(link.agents.iter().map(|a| a.member))
+            .collect();
+        self.project_context.lifecycle = ProjectLifecycle::Switching;
+        cx.spawn(async move |this, cx| {
+            let opened = agents::view_project(core.clone(), id, members).await;
+            match opened {
+                Ok(open) => {
+                    let _ = this.update(cx, |store, cx| {
+                        let (generation, main, project_id) = store.opened(open, cx);
+                        if let Some(channel) = channel {
+                            store.select(channel, cx);
+                        }
+                        store.load_project_history(core.clone(), generation, main, project_id, cx);
+                    });
+                }
+                Err(e) => {
+                    this.update(cx, |store, cx| {
+                        store.project_context.lifecycle = ProjectLifecycle::Open;
+                        store.system_note(&format!("Could not open that project: {e}"), cx)
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
     }
 
     /// Who has read up to (and no further than) the message at `index` of
@@ -928,6 +1080,7 @@ impl ChatStore {
             self.project_generation = self.project_context.generation;
             self.core = None;
             self.no_project_core = Some(link);
+            self.refresh_chats(cx);
             cx.emit(StoreEvent::Selected);
             cx.notify();
             return;
@@ -1135,6 +1288,7 @@ impl ChatStore {
             self.restore_last_selected_channel(&id, cx);
             self.persist_recents(None);
         }
+        self.refresh_chats(cx);
         cx.notify();
     }
 
@@ -1143,6 +1297,12 @@ impl ChatStore {
     /// Whether core runs (so members can be added and removed).
     pub fn has_core(&self) -> bool {
         self.core.is_some()
+    }
+
+    /// Core is running, with or without a project open, so the cross-project
+    /// chat list has something to ask.
+    pub fn has_chat_source(&self) -> bool {
+        self.core.is_some() || self.no_project_core.is_some()
     }
 
     /// Every usable harness's models, grouped by model (see
@@ -2113,7 +2273,7 @@ impl ChatStore {
                     agents::adopt_import(core.clone(), folder, target, members).await
                 }
             };
-            let (generation, main, project_id) = match opened {
+            let _ = match opened {
                 Ok(open) => {
                     if let Some(id) = forget.filter(|id| *id != open.project.id.to_string()) {
                         agents::forget_placeholder(&core, &id).await;
@@ -2123,19 +2283,42 @@ impl ChatStore {
                         Ok(all) => OpenProject { all, ..open },
                         Err(_) => open,
                     };
-                    match this.update(cx, |store, cx| store.opened(open, cx)) {
+                    match this.update(cx, |store, cx| {
+                        let out = store.opened(open, cx);
+                        store.load_project_history(core.clone(), out.0, out.1, out.2.clone(), cx);
+                        out
+                    }) {
                         Ok(v) => v,
                         Err(_) => return,
                     }
                 }
                 Err(e) => {
                     this.update(cx, |store, cx| {
+                        store.project_context.lifecycle = ProjectLifecycle::Open;
                         store.system_note(&format!("Could not open that project: {e}"), cx)
                     })
                     .ok();
                     return;
                 }
             };
+        })
+        .detach();
+    }
+
+    /// Loads the newly opened project's #main history, reactions, receipts and
+    /// member names in the background. Used after both a folder switch and a
+    /// switch from the cross-project chat list. Every answer is dropped unless
+    /// the generation and open project still match, so a fast second switch
+    /// cannot leak the first project's history into the second.
+    fn load_project_history(
+        &mut self,
+        core: chaos_core::host::Core,
+        generation: u64,
+        main: ct::ChannelId,
+        project_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
             if let Ok(history) = core.history(main, 200).await {
                 let after = history.first().map_or(0, |m| m.seq.saturating_sub(1));
                 this.update(cx, |store, cx| {
@@ -2236,8 +2419,14 @@ impl ChatStore {
         };
         let generation = self.bump_project_generation();
         let folder = attached.link.folder.clone();
+        let location = open
+            .project
+            .root_path
+            .as_deref()
+            .map(Path::new)
+            .unwrap_or(folder.as_path());
         self.project_context.identity = Some(open.project.id.clone());
-        self.project_context.location.path = Some(project::root_key(&folder));
+        self.project_context.location.path = Some(project::root_key(location));
         self.project_context.lifecycle = ProjectLifecycle::Open;
         attached.generation = generation;
         attached.channel = self.show_project(&open, &folder, cx);
@@ -2268,6 +2457,7 @@ impl ChatStore {
         self.load_former_project_agents_for(generation, project_id.clone(), cx);
         self.restore_last_selected_channel(&project_id.to_string(), cx);
         self.persist_recents(None);
+        self.refresh_chats(cx);
         (generation, main, project_id.to_string())
     }
 

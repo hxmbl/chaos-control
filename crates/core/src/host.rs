@@ -1087,6 +1087,15 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// Every project with its channels, oldest project first, each project's
+    /// channels in `::N` order. The cross-project chat list is built from this
+    /// one answer so a stale per-project loop cannot interleave (STRM-737).
+    pub async fn project_catalog(&self) -> Result<Vec<(Project, Vec<Channel>)>, String> {
+        self.with_engine(|e, _| e.store().project_catalog())
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     /// Renames a channel. Its id, `::N` and history stay.
     pub async fn rename_channel(&self, channel: ChannelId, name: &str) -> Result<(), String> {
         let name = name.to_string();

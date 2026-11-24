@@ -1184,6 +1184,19 @@ impl Store {
         channels_of_db(ws, member, project)
     }
 
+    /// Every project with its channels, for the cross-project chat list
+    /// (STRM-737). A project whose database cannot be read is still listed,
+    /// with no chats: hiding it would make projects disappear when one file
+    /// is broken, which is the opposite of what the sidebar should do.
+    pub fn project_catalog(&self) -> Result<Vec<(Project, Vec<Channel>)>> {
+        let mut out = Vec::new();
+        for project in self.projects()? {
+            let chats = self.channels_in_project(&project.id).unwrap_or_default();
+            out.push((project, chats));
+        }
+        Ok(out)
+    }
+
     pub fn search_messages(
         &self,
         channels: &[ChannelId],
