@@ -290,7 +290,7 @@ async fn fetch_models(http: &Http) -> Result<Vec<ModelInfo>, AgentError> {
 
 async fn list_models(config: OpenCodeV2Config, cwd: PathBuf) -> Result<Vec<ModelInfo>, AgentError> {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        let (base, generated, mut child) = start_server(&config, &cwd).await?;
+        let (base, generated, server) = start_server(&config, &cwd).await?;
         let password = config
             .server_password
             .clone()
@@ -302,10 +302,7 @@ async fn list_models(config: OpenCodeV2Config, cwd: PathBuf) -> Result<Vec<Model
             password,
         };
         let result = fetch_models(&http).await;
-        if let Some(child) = child.as_mut() {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-        }
+        server.kill().await;
         result
     })
     .await
@@ -709,15 +706,50 @@ fn fail_in_flight(inner: &SessionInner, error: &AgentError) {
     }
 }
 
+/// A server process started by us, owned until a live session takes it over.
+///
+/// Session startup has several fallible steps after the spawn. Dropping the
+/// child without killing it leaves `opencode serve` running, so every path
+/// either hands ownership to a session or kills the process explicitly.
+struct SpawnedServer(Option<tokio::process::Child>);
+
+impl SpawnedServer {
+    /// Kill and reap the server. Used when startup fails.
+    async fn kill(mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill().await;
+        }
+    }
+
+    /// Hand the process to a successfully opened session.
+    fn into_child(mut self) -> Option<tokio::process::Child> {
+        self.0.take()
+    }
+}
+
+impl Drop for SpawnedServer {
+    fn drop(&mut self) {
+        // `kill` cannot await in Drop; sending the signal is enough because
+        // tokio reaps the child when the handle is dropped.
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 /// Resolves the server URL, starting `opencode serve` when none was configured.
 /// When we start it, the URL and generated password are read from its stdout,
 /// since both are chosen at runtime.
 async fn start_server(
     config: &OpenCodeV2Config,
     cwd: &std::path::Path,
-) -> Result<(String, Option<String>, Option<tokio::process::Child>), AgentError> {
+) -> Result<(String, Option<String>, SpawnedServer), AgentError> {
     if let Some(url) = &config.server_url {
-        return Ok((url.trim_end_matches('/').to_owned(), None, None));
+        return Ok((
+            url.trim_end_matches('/').to_owned(),
+            None,
+            SpawnedServer(None),
+        ));
     }
     let mut command = tokio::process::Command::new(&config.command);
     if config.args.is_empty() {
@@ -731,15 +763,17 @@ async fn start_server(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = command.spawn().map_err(|e| {
+    let child = command.spawn().map_err(|e| {
         AgentError::new(
             AgentErrorKind::Transport,
             format!("could not start `{}`: {e}", config.command.display()),
         )
     })?;
-    let stdout = child
-        .stdout
-        .take()
+    let mut server = SpawnedServer(Some(child));
+    let stdout = server
+        .0
+        .as_mut()
+        .and_then(|child| child.stdout.take())
         .ok_or_else(|| AgentError::new(AgentErrorKind::Transport, "server stdout was not piped"))?;
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     let found = tokio::time::timeout(std::time::Duration::from_secs(20), async {
@@ -763,9 +797,9 @@ async fn start_server(
     })
     .await;
     match found {
-        Ok(Some((url, password))) => Ok((url, password, Some(child))),
+        Ok(Some((url, password))) => Ok((url, password, server)),
         _ => {
-            let _ = child.start_kill();
+            server.kill().await;
             Err(AgentError::new(
                 AgentErrorKind::Transport,
                 "`opencode serve` did not report a URL on stdout",
@@ -1008,81 +1042,95 @@ async fn open_session(
     config: OpenCodeV2Config,
     req: OpenSession,
 ) -> Result<Arc<dyn AgentSession>, AgentError> {
-    let (base, generated, child) = start_server(&config, &req.cwd).await?;
+    let (base, generated, server) = start_server(&config, &req.cwd).await?;
     let password = config
         .server_password
         .clone()
         .or_else(|| std::env::var("OPENCODE_SERVER_PASSWORD").ok())
         .or(generated);
-    let http = Http {
-        client: reqwest::Client::new(),
-        base,
-        password,
-    };
-
-    // Chat tools are a server-level MCP entry, so they are installed before the
-    // session exists and are available to its first turn.
     let chat_tools = req.chat_tools.url.trim();
-    if !chat_tools.is_empty() {
-        let mut headers = serde_json::Map::new();
-        if !req.chat_tools.token.is_empty() {
-            headers.insert(
-                "Authorization".into(),
-                format!("Bearer {}", req.chat_tools.token).into(),
-            );
-        }
-        http.put_json(
-            &format!("/api/experimental/mcp/{}", chat_tools_mcp_entry_name()),
-            &serde_json::json!({
-                "config": {
-                    "type": "remote",
-                    "url": chat_tools,
-                    "headers": headers,
-                },
-            }),
-        )
-        .await?;
-    }
 
-    let created = http
-        .post_json(
-            "/api/session",
-            &serde_json::json!({ "title": format!("chaos-control: {}", req.handle) }),
-        )
-        .await?;
-    let id = created
-        .get("data")
-        .and_then(|d| d.get("id"))
-        .or_else(|| created.get("id"))
-        .and_then(|id| id.as_str())
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| {
-            AgentError::new(
-                AgentErrorKind::Protocol,
-                "session.create returned no session id",
-            )
-        })?
-        .to_owned();
-
-    let mut applied_model = None;
-    if let Some(model) = config.model.as_deref() {
-        let native = model.strip_prefix("opencode/").unwrap_or(model);
-        let (provider_id, model_id) = match native.split_once('/') {
-            Some((provider, id)) if !provider.is_empty() && !id.is_empty() => (provider, id),
-            _ => ("opencode", native),
+    // Every fallible step before a live session owns the process must kill the
+    // server we spawned; `?` inside this block is funnelled through the guard.
+    let prepared = async {
+        let http = Http {
+            client: reqwest::Client::new(),
+            base,
+            password,
         };
-        http.post_json(
-            &format!("/api/session/{id}/model"),
-            &serde_json::json!({
-                "model": {
-                    "id": model_id,
-                    "providerID": provider_id,
-                }
-            }),
-        )
-        .await?;
-        applied_model = Some(Arc::from(model));
+
+        // Chat tools are a server-level MCP entry, so they are installed before
+        // the session exists and are available to its first turn.
+        if !chat_tools.is_empty() {
+            let mut headers = serde_json::Map::new();
+            if !req.chat_tools.token.is_empty() {
+                headers.insert(
+                    "Authorization".into(),
+                    format!("Bearer {}", req.chat_tools.token).into(),
+                );
+            }
+            http.put_json(
+                &format!("/api/experimental/mcp/{}", chat_tools_mcp_entry_name()),
+                &serde_json::json!({
+                    "config": {
+                        "type": "remote",
+                        "url": chat_tools,
+                        "headers": headers,
+                    },
+                }),
+            )
+            .await?;
+        }
+
+        let created = http
+            .post_json(
+                "/api/session",
+                &serde_json::json!({ "title": format!("chaos-control: {}", req.handle) }),
+            )
+            .await?;
+        let id = created
+            .get("data")
+            .and_then(|d| d.get("id"))
+            .or_else(|| created.get("id"))
+            .and_then(|id| id.as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                AgentError::new(
+                    AgentErrorKind::Protocol,
+                    "session.create returned no session id",
+                )
+            })?
+            .to_owned();
+
+        let mut applied_model = None;
+        if let Some(model) = config.model.as_deref() {
+            let native = model.strip_prefix("opencode/").unwrap_or(model);
+            let (provider_id, model_id) = match native.split_once('/') {
+                Some((provider, id)) if !provider.is_empty() && !id.is_empty() => (provider, id),
+                _ => ("opencode", native),
+            };
+            http.post_json(
+                &format!("/api/session/{id}/model"),
+                &serde_json::json!({
+                    "model": {
+                        "id": model_id,
+                        "providerID": provider_id,
+                    }
+                }),
+            )
+            .await?;
+            applied_model = Some(Arc::from(model));
+        }
+        Ok::<_, AgentError>((http, id, applied_model))
     }
+    .await;
+    let (http, id, applied_model) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            server.kill().await;
+            return Err(error);
+        }
+    };
 
     let mapper = EventMapper {
         session: Some(id.clone()),
@@ -1096,7 +1144,7 @@ async fn open_session(
         approval_broker: req.approval_broker,
         mapper: std::sync::Mutex::new(mapper),
         events: req.events.clone(),
-        child: tokio::sync::Mutex::new(child),
+        child: tokio::sync::Mutex::new(server.into_child()),
         sse: tokio::sync::Mutex::new(None),
     });
     let models = fetch_models(&inner.http).await.unwrap_or_default();
@@ -1900,5 +1948,116 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(broker.cancels(), vec![ApprovalResolution::Disconnect]);
+    }
+
+    /// Every failure after the spawn but before a live session takes ownership
+    /// must leave no `opencode serve` process behind (STRM-700).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_session_start_kills_spawned_server() {
+        use axum::{extract::Request, http::Method, response::IntoResponse};
+
+        #[derive(Clone, Copy, Debug)]
+        enum Failure {
+            Mcp,
+            Session,
+            Model,
+        }
+
+        for failure in [Failure::Mcp, Failure::Session, Failure::Model] {
+            let app = axum::Router::new().fallback(move |req: Request| async move {
+                let path = req.uri().path().to_owned();
+                let method = req.method().clone();
+                let should_fail = match failure {
+                    Failure::Mcp => {
+                        path.starts_with("/api/experimental/mcp/") && method == Method::PUT
+                    }
+                    Failure::Session => path == "/api/session" && method == Method::POST,
+                    Failure::Model => path == "/api/session/s1/model" && method == Method::POST,
+                };
+                if should_fail {
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response()
+                } else if path == "/api/session" {
+                    axum::Json(serde_json::json!({ "data": { "id": "s1" } })).into_response()
+                } else {
+                    axum::http::StatusCode::OK.into_response()
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let dir = std::env::temp_dir().join(format!(
+                "cc-strm-700-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let script = dir.join("opencode-fake");
+            let pid_file = dir.join("server.pid");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\necho $$ > \"$CC_TEST_PID_FILE\"\necho \"http://$CC_TEST_ADDR\"\necho \"server password test\"\nexec sleep 300\n",
+            )
+            .unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+            let adapter = OpenCodeV2Adapter::new(OpenCodeV2Config {
+                command: script,
+                args: Vec::new(),
+                env: vec![
+                    ("CC_TEST_PID_FILE".into(), pid_file.to_string_lossy().into()),
+                    ("CC_TEST_ADDR".into(), addr.to_string()),
+                ],
+                server_url: None,
+                server_password: Some("test".into()),
+                model: Some("provider/model".into()),
+            });
+            let result = adapter
+                .open(OpenSession {
+                    agent: MemberId(0),
+                    channel: ChannelId(0),
+                    handle: "tester".into(),
+                    cwd: dir.clone(),
+                    chat_tools: crate::adapter::ChatToolsEndpoint {
+                        url: "http://127.0.0.1:1/mcp".into(),
+                        token: String::new(),
+                        bridge: None,
+                    },
+                    events: EventSink::new(|_| {}),
+                    approval_broker: None,
+                })
+                .await;
+            assert!(result.is_err(), "startup should fail for {failure:?}");
+
+            let pid = std::fs::read_to_string(&pid_file)
+                .expect("fake server wrote its pid")
+                .trim()
+                .to_owned();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let alive = std::process::Command::new("kill")
+                    .arg("-0")
+                    .arg(&pid)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "spawned server survived failed startup for {failure:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

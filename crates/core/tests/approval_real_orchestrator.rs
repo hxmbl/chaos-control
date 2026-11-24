@@ -1009,7 +1009,7 @@ async fn opencode_v2_permission_replay_rejected_after_core_restart() {
         host::{AgentSpec, Core, HostConfig, ManualClock},
         opencode_v2::{OpenCodeV2Adapter, OpenCodeV2Config},
     };
-    use futures::stream;
+    use futures::{StreamExt, stream};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -1055,7 +1055,10 @@ async fn opencode_v2_permission_replay_rejected_after_core_restart() {
                             r#"{"type":"permission.asked","data":{"id":"p1","sessionID":"s1","action":"shell","resources":["echo SAFE"]}}"#,
                         ),
                     )]);
-                    Sse::new(events)
+                    // Keep the stream open: EOF is a provider disconnect and
+                    // would fail the pending approval closed before it can be
+                    // resolved by this test.
+                    Sse::new(events.chain(stream::pending()))
                 }
             }),
         )
@@ -1163,7 +1166,7 @@ async fn opencode_v2_permission_replay_after_restart_is_rejected_at_provider() {
         host::{AgentSpec, Core, HostConfig, ManualClock},
         opencode_v2::{OpenCodeV2Adapter, OpenCodeV2Config},
     };
-    use futures::stream;
+    use futures::{StreamExt, stream};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -1218,7 +1221,10 @@ async fn opencode_v2_permission_replay_after_restart_is_rejected_at_provider() {
                             r#"{"type":"permission.asked","data":{"id":"p1","sessionID":"s1","action":"shell","resources":["echo SAFE"]}}"#,
                         ),
                     )]);
-                    Sse::new(events)
+                    // Keep the stream open after the event. EOF is treated as
+                    // a provider disconnect, which fails the request closed
+                    // before this test can resolve it.
+                    Sse::new(events.chain(stream::pending()))
                 }
             }),
         )
