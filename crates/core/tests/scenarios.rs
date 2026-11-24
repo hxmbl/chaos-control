@@ -525,12 +525,13 @@ async fn hop_budget_stops_agent_chains_and_a_human_message_resets_it() {
             >= 5
     })
     .await;
+    // A dispatch is recorded before the prompt reaches the fake agent, so the
+    // message count can reach 5 before a has actually been woken the third
+    // time. Wait for the prompt itself before asserting on it.
+    let a_prompts = h.wait_prompts("a", 4).await;
     let b_posts = h.by(b.id).await;
     assert_eq!(b_posts[1].hop, 1, "reset by the human message");
-    assert!(
-        h.prompts("a").len() >= 4,
-        "mention, relay, broadcast, relay"
-    );
+    assert!(a_prompts.len() >= 4, "mention, relay, broadcast, relay");
     let _ = a;
 }
 
