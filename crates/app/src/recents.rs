@@ -63,12 +63,12 @@ pub fn load(data_dir: &Path) -> RecentsFile {
 }
 
 pub fn save(data_dir: &Path, recents: &RecentsFile) -> io::Result<()> {
-    fs::create_dir_all(data_dir)?;
+    chaos_core::permissions::ensure_private_dir(data_dir)?;
     let path = path(data_dir);
     let tmp = data_dir.join(format!("{FILE}.tmp"));
     let text = serde_json::to_string_pretty(recents)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(&tmp, format!("{text}\n"))?;
+    chaos_core::permissions::write_private_file(&tmp, format!("{text}\n").as_bytes())?;
     fs::rename(tmp, path)
 }
 

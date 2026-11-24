@@ -27,6 +27,8 @@ immediate-mode elements) instead of a webview.
 - `core` (`chaos-core`): the agent runtime. SQLite store, delivery engine,
   room policy, the ACP adapter and the chat MCP server. No GPUI: the app is one
   client of it. See [docs/agents.md](docs/agents.md).
+  Local files and their permissions are covered in
+  [docs/storage-security.md](docs/storage-security.md).
 
 ## Agent state
 

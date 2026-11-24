@@ -868,10 +868,8 @@ impl Core {
         clock: Arc<dyn Clock>,
     ) -> Result<(Core, mpsc::UnboundedReceiver<CoreEvent>), StartError> {
         let store = match &config.db {
-            Some(path) => {
-                let _ = std::fs::create_dir_all(path);
-                Store::open(path)
-            }
+            // `Store::open` creates the directory privately when needed.
+            Some(path) => Store::open(path),
             None => Store::open_in_memory(),
         }
         .map_err(|e| match e {

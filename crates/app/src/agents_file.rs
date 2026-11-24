@@ -87,7 +87,7 @@ fn edit(path: &Path, change: impl FnOnce(&mut Vec<Value>)) -> io::Result<()> {
     change(&mut members);
     obj.insert("members".into(), Value::Array(members));
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        chaos_core::permissions::ensure_private_dir(dir)?;
     }
     let mut text = serde_json::to_string_pretty(&root).map_err(io::Error::other)?;
     text.push('\n');

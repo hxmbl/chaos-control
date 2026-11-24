@@ -163,7 +163,7 @@ pub fn load(dir: &Path, harness: &str) -> Option<CachedModels> {
 /// Writes `cached` atomically: a temporary file in the same directory, then
 /// a rename over the old file.
 pub fn save(dir: &Path, cached: &CachedModels) -> io::Result<()> {
-    std::fs::create_dir_all(dir)?;
+    crate::permissions::ensure_private_dir(dir)?;
     let target = path(dir, &cached.harness);
     let text = serde_json::to_string_pretty(cached).map_err(io::Error::other)?;
     write_atomic(&target, text.as_bytes())
@@ -177,7 +177,7 @@ pub fn write_atomic(target: &Path, bytes: &[u8]) -> io::Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "file".to_string());
     let tmp = target.with_file_name(format!(".{name}.tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
+    crate::permissions::write_private_file(&tmp, bytes)?;
     match std::fs::rename(&tmp, target) {
         Ok(()) => Ok(()),
         Err(e) => {

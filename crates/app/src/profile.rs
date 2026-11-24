@@ -61,13 +61,14 @@ pub fn load(data_dir: &Path) -> Profile {
 pub fn save(data_dir: &Path, profile: &Profile) -> io::Result<()> {
     let path = path(data_dir);
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
+        chaos_core::permissions::ensure_private_dir(dir)?;
     }
     let mut text = serde_json::to_string_pretty(profile).map_err(io::Error::other)?;
     text.push('\n');
-    // Best-effort atomic-ish write.
+    // Best-effort atomic-ish write. The temp file is private from creation,
+    // so the rename cannot expose a world-readable profile.
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
+    chaos_core::permissions::write_private_file(&tmp, text.as_bytes())?;
     std::fs::rename(tmp, path)
 }
 
