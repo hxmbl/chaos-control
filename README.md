@@ -41,9 +41,10 @@ crates/model   plain data types and sample data, no UI dependencies
 crates/core    the agent runtime (chaos-core): store, delivery, ACP adapters, harness detection, chat MCP
 docs/          design notes (docs/agents.md: agents in the room; docs/agent-adapters.md: harnesses and models)
 assets/        fonts and SVG icons compiled into the binary, with their licences
+MAP.md         short lookup table: feature or concern → file → key type/function
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for how state and rendering are set up to stay fast with large histories and many agents.
+See [MAP.md](MAP.md) to find where things live. See [ARCHITECTURE.md](ARCHITECTURE.md) for how state and rendering are set up to stay fast with large histories and many agents.
 
 ## License
 
