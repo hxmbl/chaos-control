@@ -573,10 +573,16 @@ impl ChatStore {
         self.chat_catalog_seq = self.chat_catalog_seq.wrapping_add(1);
         let seq = self.chat_catalog_seq;
         cx.spawn(async move |this, cx| {
-            if let Ok(catalog) = core.project_catalog().await {
+            let result = async {
+                let chats = core.chats().await?;
+                let catalog = core.project_catalog().await?;
+                Ok::<_, String>((chats, catalog))
+            }
+            .await;
+            if let Ok((chats, catalog)) = result {
                 this.update(cx, |store, cx| {
                     if store.chat_catalog_seq == seq {
-                        store.apply_chat_catalog(catalog, cx);
+                        store.apply_chat_catalog(chats, catalog, cx);
                     }
                 })
                 .ok();
@@ -585,11 +591,11 @@ impl ChatStore {
         .detach();
     }
 
-    /// Folds core's project catalogue into the sidebar's groups. Unread marks
-    /// are only known for the open project's channels; the others show no dot
-    /// rather than a guess.
+    /// Folds workspace chats into sidebar groups. v1 maps one chat to one
+    /// channel target; unread marks are only known for the open project.
     fn apply_chat_catalog(
         &mut self,
+        chats: Vec<ct::Chat>,
         catalog: Vec<(ct::Project, Vec<ct::Channel>)>,
         cx: &mut Context<Self>,
     ) {
@@ -606,33 +612,51 @@ impl ChatStore {
             .iter()
             .map(|c| (c.id, c.unread))
             .collect();
-        let sources = catalog
+        let mut by_project: HashMap<String, (ct::Project, Vec<ct::Channel>)> = catalog
             .into_iter()
-            .map(|(project, channels)| {
-                let id = project.id.to_string();
-                let last_opened = recents
-                    .projects
-                    .iter()
-                    .find(|recent| recent.id == id)
-                    .map_or(0, |recent| recent.last_opened);
-                chats::CatalogSource {
-                    id: Arc::from(id),
-                    name: project.name.clone(),
-                    path: project.root_path.as_deref().map(|root| {
-                        Arc::from(project::display_path(Path::new(root), home.as_deref()))
-                    }),
-                    chats: channels
-                        .into_iter()
-                        .map(|channel| chats::CatalogChat {
-                            channel: channel_id(channel.id),
-                            name: channel.name,
-                            ordinal: Some(channel.ordinal),
-                        })
-                        .collect(),
-                    last_opened,
-                }
-            })
+            .map(|(p, c)| (p.id.to_string(), (p, c)))
             .collect();
+        let mut sources: Vec<chats::CatalogSource> = Vec::new();
+        // Build a source per project, but prefer chat entities (v1 1:1).
+        let mut project_chats: HashMap<String, Vec<chats::CatalogChat>> = HashMap::new();
+        for chat in chats {
+            let Some(target) = chat.targets.first() else {
+                continue;
+            };
+            let pid = target.project.to_string();
+            let (name, ordinal) = by_project
+                .get(&pid)
+                .and_then(|(_, chans)| chans.iter().find(|c| c.id == target.channel))
+                .map(|c| (c.name.clone(), Some(c.ordinal)))
+                .unwrap_or_else(|| (chat.title.clone(), None));
+            project_chats
+                .entry(pid)
+                .or_default()
+                .push(chats::CatalogChat {
+                    channel: channel_id(target.channel),
+                    name,
+                    ordinal,
+                });
+        }
+        for (pid, (project, _channels)) in by_project.drain() {
+            let last_opened = recents
+                .projects
+                .iter()
+                .find(|recent| recent.id == pid)
+                .map_or(0, |recent| recent.last_opened);
+            sources.push(chats::CatalogSource {
+                id: Arc::from(pid),
+                name: project.name.clone(),
+                path: project
+                    .root_path
+                    .as_deref()
+                    .map(|root| Arc::from(project::display_path(Path::new(root), home.as_deref()))),
+                chats: project_chats
+                    .remove(project.id.as_str())
+                    .unwrap_or_default(),
+                last_opened,
+            });
+        }
         self.chat_catalog = chats::build(current.as_deref(), sources, &unread);
         cx.emit(StoreEvent::Chats);
         cx.notify();

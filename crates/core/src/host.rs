@@ -1096,6 +1096,13 @@ impl Core {
             .map_err(|e| e.to_string())
     }
 
+    /// Workspace-level chats (STRM-745). v1: one chat per channel.
+    pub async fn chats(&self) -> Result<Vec<Chat>, String> {
+        self.with_engine(|e, _| e.store().chats())
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     /// Renames a channel. Its id, `::N` and history stay.
     pub async fn rename_channel(&self, channel: ChannelId, name: &str) -> Result<(), String> {
         let name = name.to_string();

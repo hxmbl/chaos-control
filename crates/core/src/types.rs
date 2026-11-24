@@ -126,6 +126,30 @@ pub struct Channel {
     pub ordinal: u32,
 }
 
+id_type!(
+    /// A workspace-level chat (STRM-745). v1: one chat per channel.
+    ChatId
+);
+
+/// A workspace-level chat target: one project channel backing a chat.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ChatTarget {
+    pub chat: ChatId,
+    pub ordinal: u32,
+    pub project: ProjectId,
+    pub channel: ChannelId,
+}
+
+/// A workspace-level chat. v1 keeps one target per chat; fan-out is later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Chat {
+    pub id: ChatId,
+    pub title: Arc<str>,
+    pub created_at: Millis,
+    pub archived_at: Option<Millis>,
+    pub targets: Vec<ChatTarget>,
+}
+
 /// Where a message came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
