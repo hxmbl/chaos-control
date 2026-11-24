@@ -3613,6 +3613,74 @@ mod apply_core_event_tests {
         assert_eq!(m.author, Author::System);
     }
 
+    /// Attach a real core link for `project` under `generation`. The async
+    /// guard has two layers (project generation and attached core), so a test
+    /// with `store.core == None` would pass even with both checks deleted.
+    fn attach_core_for_project(
+        store: &mut ChatStore,
+        generation: u64,
+        channel: Id,
+        project: ct::ProjectId,
+    ) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-gen-guard-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut link = crate::agents::start_with_in(
+            crate::agents::AgentsConfig::default(),
+            Vec::new(),
+            dir.join("agents.json"),
+            dir.join("data"),
+            dir.clone(),
+        )
+        .unwrap();
+        let main = ct::Channel {
+            id: ct::ChannelId(1),
+            project: project.clone(),
+            name: Arc::from("main"),
+            ordinal: 1,
+        };
+        link.open = Some(OpenProject {
+            project: ct::Project {
+                id: project,
+                name: Arc::from("A"),
+                root_path: None,
+                created_at: 0,
+            },
+            main: main.clone(),
+            channels: vec![main],
+            all: Vec::new(),
+        });
+        store.core = Some(Attached {
+            link,
+            generation,
+            channel,
+            seen: HashMap::new(),
+            by_seq: BTreeMap::new(),
+            receipts: HashMap::new(),
+            names: HashMap::new(),
+            reactions: HashMap::new(),
+            agent_statuses: HashMap::new(),
+            confirm: None,
+            pending_approvals: Vec::new(),
+            models: HashMap::new(),
+            discovering: HashSet::new(),
+            stale: HashSet::new(),
+            failed_at: HashMap::new(),
+            agent_ids: HashSet::new(),
+            former_tokens: Vec::new(),
+            ping_answers: None,
+            ping_answers_error: None,
+            member_ping_answers: HashMap::new(),
+            member_ping_answers_error: None,
+            nicknames: HashMap::new(),
+            nicknames_error: None,
+            _events: Task::ready(()),
+        });
+    }
+
     #[test]
     fn delayed_async_result_from_a_is_dropped_once_b_is_active() {
         use std::collections::HashMap as StdHashMap;
@@ -3625,6 +3693,9 @@ mod apply_core_event_tests {
         let project_a = ct::ProjectId::parse("0b7e4f0e-2a51-4c4b-9a6e-3f1d2c3b4a59").unwrap();
         store.project_context.identity = Some(project_a.clone());
         store.project_context.lifecycle = crate::project_context::ProjectLifecycle::Open;
+        attach_core_for_project(&mut store, gen_a, app_channel, project_a.clone());
+        // The guard's second layer must be live too: the core is attached for A.
+        assert!(store.core.is_some());
 
         // B becomes active before A's result is delivered.
         let gen_b = store.bump_project_generation();
@@ -3633,9 +3704,9 @@ mod apply_core_event_tests {
         assert!(store.is_current_generation(gen_b));
         assert!(!store.is_current_generation(gen_a));
 
-        // Deliver A's result through the real ChatStore guarded apply path
-        // (called by the async loader). Dropped at the generation check:
-        // removing that guard would let stale work proceed past it.
+        // Deliver A's result through the real ChatStore guarded apply path.
+        // With a core attached, dropping either the generation check or the
+        // attached-core generation/project check would apply it to B.
         let mut sink = Sink::default();
         store.apply_loaded_ping_answers_result(
             gen_a,
@@ -3646,6 +3717,25 @@ mod apply_core_event_tests {
         );
         assert_eq!(sink.notifies, 0, "stale A result dropped before apply");
         assert!(sink.events.is_empty());
-        assert!(store.core.is_none(), "no stale core mutation");
+        let attached = store.core.as_ref().unwrap();
+        assert_eq!(attached.ping_answers, None, "A's answers never reached B");
+        assert!(attached.ping_answers_error.is_none());
+        assert!(attached.member_ping_answers.is_empty());
+
+        // A result for the current project still applies, so the test would
+        // also catch a guard that dropped everything.
+        attach_core_for_project(&mut store, gen_b, app_channel, project_b.clone());
+        store.apply_loaded_ping_answers_result(
+            gen_b,
+            &project_b,
+            Ok(Some(vec!["👍".to_string()])),
+            StdHashMap::new(),
+            &mut sink,
+        );
+        assert_eq!(sink.notifies, 1, "current B result applies");
+        assert_eq!(
+            store.core.as_ref().unwrap().ping_answers,
+            Some(vec!["👍".to_string()])
+        );
     }
 }
