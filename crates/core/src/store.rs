@@ -1407,7 +1407,18 @@ impl Store {
         let Some(project) = self.project_for_channel(id) else {
             return Ok(false);
         };
-        rename_channel_db(self.project_workspace(&project)?, id, name)
+        let changed = rename_channel_db(self.project_workspace(&project)?, id, name)?;
+        if changed {
+            let clean = name.strip_prefix('#').unwrap_or(name);
+            self.core.execute(
+                "UPDATE chats SET title = ?3
+                 WHERE id IN (
+                     SELECT chat_id FROM chat_members WHERE project_id = ?1 AND channel_id = ?2
+                 )",
+                params![project.as_str(), id.0, clean],
+            )?;
+        }
+        Ok(changed)
     }
     pub fn is_member(&self, channel: ChannelId, member: MemberId) -> Result<bool> {
         let Some(project) = self.project_for_channel(channel) else {
@@ -6588,5 +6599,33 @@ mod tests {
         // idempotent
         s.ensure_channel(&p.id, "main", 20).unwrap();
         assert_eq!(s.chats().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forgetting_project_cleans_up_chat_members() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.ensure_project(&pid(P1), "Alpha", None, 1).unwrap();
+        let _ch = s.ensure_channel(&p.id, "main", 10).unwrap();
+        assert_eq!(s.chats().unwrap().len(), 1);
+        let gone = s.forget_empty_project(&p.id).unwrap();
+        assert!(gone.is_some());
+        assert!(s.chats().unwrap().is_empty());
+        let members: i64 = s
+            .core()
+            .query_row("SELECT COUNT(*) FROM chat_members", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(members, 0);
+    }
+
+    #[test]
+    fn rename_channel_updates_chat_title() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s
+            .ensure_project(&pid(P1), "Alpha", Some("/tmp/alpha"), 1)
+            .unwrap();
+        let ch = s.ensure_channel(&p.id, "main", 10).unwrap();
+        assert!(s.rename_channel(ch.id, "general").unwrap());
+        let chats = s.chats().unwrap();
+        assert_eq!(chats[0].title.as_ref(), "general");
     }
 }
