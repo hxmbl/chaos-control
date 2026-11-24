@@ -683,6 +683,7 @@ impl ChatStore {
                 }
                 Err(e) => {
                     this.update(cx, |store, cx| {
+                        store.project_context.lifecycle = ProjectLifecycle::Open;
                         store.system_note(&format!("Could not open that project: {e}"), cx)
                     })
                     .ok();
@@ -2293,6 +2294,7 @@ impl ChatStore {
                 }
                 Err(e) => {
                     this.update(cx, |store, cx| {
+                        store.project_context.lifecycle = ProjectLifecycle::Open;
                         store.system_note(&format!("Could not open that project: {e}"), cx)
                     })
                     .ok();
