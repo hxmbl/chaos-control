@@ -366,16 +366,7 @@ pub fn display_model_label(harness_id: Option<&str>, model: Option<&str>, name: 
         return Arc::from(name);
     }
 
-    let harness_display = match harness_id {
-        "opencode" => "OpenCode",
-        "claude-code" => "Claude-Code",
-        "copilot" => "GitHub-Copilot-CLI",
-        "cursor" => "Cursor-Agent",
-        "vibe" => "Mistral-Vibe",
-        _ => harness::preset(harness_id).map_or(harness_id, |p| p.name),
-    };
-    // Normalize harness display spaces to dashes for segment consistency.
-    let harness_display = harness_display.replace(' ', "-");
+    let harness_display = harness::preset(harness_id).map_or(harness_id, |p| p.display_name);
 
     let (provider_display, model_segment) = match harness_id {
         "opencode" => opencode_provider_and_model(model, name),
@@ -389,19 +380,11 @@ pub fn display_model_label(harness_id: Option<&str>, model: Option<&str>, name: 
 }
 
 fn looks_formatted_label(harness_id: &str, name: &str) -> bool {
-    let prefix = match harness_id {
-        "opencode" => "OpenCode/",
-        "codex" => "Codex/",
-        "fx" => "fx/",
-        "vibe" => "Mistral-Vibe/",
-        "claude-code" => "Claude-Code/",
-        "copilot" => "GitHub-Copilot-CLI/",
-        "devin" => "Devin/",
-        "cursor" => "Cursor-Agent/",
-        "gemini" => "Gemini-CLI/",
-        _ => return false,
+    let Some(preset) = harness::preset(harness_id) else {
+        return false;
     };
-    name.starts_with(prefix) && name.matches('/').count() >= 1
+    let prefix = format!("{}/", preset.display_name);
+    name.starts_with(&prefix) && name.matches('/').count() >= 1
 }
 
 fn opencode_provider_and_model(model: Option<&str>, name: &str) -> (Option<String>, String) {

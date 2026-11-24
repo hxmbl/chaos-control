@@ -77,6 +77,8 @@ pub struct HarnessPreset {
     /// Stable id, stored with every member ("codex", "fx", "vibe", ...).
     pub id: &'static str,
     pub name: &'static str,
+    /// Display name used in formatted agent labels (e.g. "OpenCode", "Claude-Code").
+    pub display_name: &'static str,
     /// Brand mark id (`model::Brand` names it on the app side).
     pub icon: &'static str,
     pub transport: Transport,
@@ -119,6 +121,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "codex",
         name: "Codex",
+        display_name: "Codex",
         icon: "openai",
         transport: Transport::Acp,
         // Native Codex integration removed (STRM-542): Codex is supported via ACP.
@@ -135,6 +138,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "fx",
         name: "fx",
+        display_name: "fx",
         icon: "vercel",
         transport: Transport::Acp,
         detect: &["fx"],
@@ -150,6 +154,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "vibe",
         name: "Mistral Vibe",
+        display_name: "Mistral-Vibe",
         icon: "mistral",
         transport: Transport::Acp,
         detect: &["vibe-acp", "vibe"],
@@ -169,6 +174,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "claude-code",
         name: "Claude Code",
+        display_name: "Claude-Code",
         icon: "claude",
         transport: Transport::Acp,
         detect: &["claude", "claude-agent-acp"],
@@ -205,6 +211,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "copilot",
         name: "GitHub Copilot CLI",
+        display_name: "GitHub-Copilot-CLI",
         icon: "copilot",
         transport: Transport::Acp,
         detect: &["copilot"],
@@ -220,6 +227,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "opencode",
         name: "opencode",
+        display_name: "OpenCode",
         icon: "opencode",
         transport: Transport::Acp,
         detect: &["opencode"],
@@ -235,6 +243,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "devin",
         name: "Devin",
+        display_name: "Devin",
         icon: "devin",
         transport: Transport::Acp,
         detect: &["devin"],
@@ -250,6 +259,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "cursor",
         name: "Cursor Agent",
+        display_name: "Cursor-Agent",
         icon: "cursor",
         transport: Transport::Acp,
         detect: &["cursor-agent"],
@@ -265,6 +275,7 @@ pub static PRESETS: &[HarnessPreset] = &[
     HarnessPreset {
         id: "gemini",
         name: "Gemini CLI",
+        display_name: "Gemini-CLI",
         icon: "gemini",
         transport: Transport::Acp,
         detect: &["gemini"],
