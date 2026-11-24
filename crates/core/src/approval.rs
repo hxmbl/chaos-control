@@ -210,7 +210,7 @@ pub enum ApprovalOutcomeState {
     Allowed,
     /// Provider reply sent indicating deny/reject/decline.
     Denied,
-    /// Provider reply sent but request/operation failed or outcome is unknown-failed.
+    /// Provider reply was sent; the operation's outcome is unknown.
     Sent,
     /// No provider reply was sent (fail-closed); operation must not be treated as approved.
     NotSent,

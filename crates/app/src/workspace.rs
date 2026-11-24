@@ -155,10 +155,17 @@ impl Workspace {
         let approval_events = cx.subscribe_in(&store, window, {
             let pane = pane.clone();
             move |_, store, event, window, cx| {
-                if matches!(event, crate::store::StoreEvent::ApprovalRequested)
-                    && let Some(content) = store.read(cx).pending_approval()
-                {
-                    pane.update(cx, |pane, cx| pane.open(content, window, cx));
+                if matches!(
+                    event,
+                    crate::store::StoreEvent::ApprovalRequested
+                        | crate::store::StoreEvent::ApprovalResolved
+                ) {
+                    if let Some(content) = store.read(cx).pending_approval() {
+                        pane.update(cx, |pane, cx| pane.open(content, window, cx));
+                    } else {
+                        // The displayed approval was resolved outside the pane.
+                        pane.update(cx, |pane, cx| pane.close_resolved_approval(window, cx));
+                    }
                 }
             }
         });

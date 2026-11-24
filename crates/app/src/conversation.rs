@@ -127,7 +127,10 @@ impl Conversation {
                 cx.notify();
             }
             StoreEvent::Receipts { .. } | StoreEvent::Reactions { .. } => {}
-            StoreEvent::SendFailed { .. } | StoreEvent::ApprovalRequested | StoreEvent::Chats => {}
+            StoreEvent::SendFailed { .. }
+            | StoreEvent::ApprovalRequested
+            | StoreEvent::ApprovalResolved
+            | StoreEvent::Chats => {}
         });
         Self {
             store,
