@@ -165,6 +165,8 @@ pub enum PaneContent {
     ProjectIdentity(ProjectQuestion),
     /// An agent is waiting for a provider permission decision.
     Approval(ApprovalQuestion),
+    /// The working-tree changes in the open project, as a unified diff.
+    Diff { title: Arc<str>, text: Arc<str> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -284,6 +286,7 @@ impl PaneContent {
                 ProjectQuestionKind::Imported => "Earlier history found",
             }),
             PaneContent::Approval(_) => Arc::from("Agent permission request"),
+            PaneContent::Diff { title, .. } => title.clone(),
         }
     }
 
@@ -336,6 +339,7 @@ impl PaneContent {
                     "Cancel without replying",
                 )))
                 .collect(),
+            PaneContent::Diff { .. } => Vec::new(),
             PaneContent::Search {
                 results,
                 highlighted,
@@ -560,6 +564,17 @@ mod tests {
         assert_eq!(&*content.title(&ws), "Claude Code in #main");
         let kinds: Vec<_> = content.actions().into_iter().map(|a| a.kind).collect();
         assert_eq!(kinds, vec![PaneActionKind::Reply, PaneActionKind::Copy]);
+    }
+
+    #[test]
+    fn diff_pane_has_a_title_and_no_quick_actions() {
+        let ws = sample();
+        let pane = PaneContent::Diff {
+            title: Arc::from("Working tree diff"),
+            text: Arc::from(" M crates/app/src/store.rs"),
+        };
+        assert_eq!(&*pane.title(&ws), "Working tree diff");
+        assert!(pane.actions().is_empty());
     }
 
     #[test]

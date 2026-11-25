@@ -75,7 +75,7 @@
 //! naming each bad entry, and the agent uses the project's list.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -377,6 +377,54 @@ pub fn display_model_label(harness_id: Option<&str>, model: Option<&str>, name: 
         Some(provider) => Arc::from(format!("{harness_display}/{provider}/{model_segment}")),
         None => Arc::from(format!("{harness_display}/{model_segment}")),
     }
+}
+
+/// Short, stable words for telling apart agents of the same harness and model.
+const SHORT_ID_WORDS: [&str; 24] = [
+    "otter", "heron", "marten", "falcon", "badger", "lynx", "finch", "moth", "whale", "raven",
+    "beaver", "mink", "wren", "seal", "crane", "hare", "ibis", "stoat", "dove", "pike", "quail",
+    "rook", "shrike", "vole",
+];
+
+/// Display labels for a project's agents, with a short suffix on the ones that
+/// would otherwise read identically (STRM-753). The suffix is derived from the
+/// member's unique handle, so it is stable across restarts; the word list is
+/// walked on collision so two agents never end up with the same identifier.
+pub fn unique_display_labels(agents: &[LinkedAgent]) -> Vec<Arc<str>> {
+    let bases: Vec<Arc<str>> = agents
+        .iter()
+        .map(|a| display_model_label(a.harness_id.as_deref(), a.model.as_deref(), &a.name))
+        .collect();
+
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for base in &bases {
+        *counts.entry(base.as_ref()).or_default() += 1;
+    }
+
+    let mut used: HashMap<&str, HashSet<String>> = HashMap::new();
+    bases
+        .iter()
+        .zip(agents)
+        .map(|(base, agent)| {
+            if counts.get(base.as_ref()).copied().unwrap_or_default() < 2 {
+                return base.clone();
+            }
+            let seen = used.entry(base.as_ref()).or_default();
+            let start = (fnv1a(agent.handle.as_ref()) as usize) % SHORT_ID_WORDS.len();
+            let word = (0..SHORT_ID_WORDS.len())
+                .map(|step| SHORT_ID_WORDS[(start + step) % SHORT_ID_WORDS.len()])
+                .find(|word| seen.insert((*word).to_string()))
+                .unwrap_or("agent");
+            Arc::from(format!("{base}/{word}"))
+        })
+        .collect()
+}
+
+/// FNV-1a: small, deterministic hash; uniqueness comes from the walk above.
+fn fnv1a(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
 }
 
 fn looks_formatted_label(harness_id: &str, name: &str) -> bool {
@@ -1119,6 +1167,47 @@ mod tests {
         let stored = "OpenCode/OpenCode-Zen/Big-Pickle";
         let label = display_model_label(Some("opencode"), Some("opencode/big-pickle"), stored);
         assert_eq!(&*label, stored);
+    }
+
+    fn linked(member: i64, handle: &str, name: &str) -> LinkedAgent {
+        LinkedAgent {
+            member: MemberId(member),
+            handle: Arc::from(handle),
+            name: Arc::from(name),
+            brand: Brand::Opencode,
+            harness: Some(Arc::from("OpenCode")),
+            harness_id: Some(Arc::from("opencode")),
+            model: Some(Arc::from("opencode/big-pickle")),
+            removable: true,
+        }
+    }
+
+    #[test]
+    fn same_type_agents_get_distinct_stable_short_ids() {
+        let agents = vec![
+            linked(1, "big-pickle", "Big Pickle"),
+            linked(2, "big-pickle-opencode-2", "Big Pickle"),
+            linked(3, "big-pickle-opencode-3", "Big Pickle"),
+        ];
+        let labels = unique_display_labels(&agents);
+        assert_eq!(labels.len(), 3);
+        for label in &labels {
+            assert!(
+                label.starts_with("OpenCode/OpenCode-Zen/Big-Pickle/"),
+                "{label}"
+            );
+        }
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(unique.len(), 3, "{labels:?}");
+        // Same roster, same labels: identifiers do not churn on restart.
+        assert_eq!(labels, unique_display_labels(&agents));
+        // An unrelated model keeps the plain label.
+        let mut other = linked(4, "iceman-free", "Iceman Free");
+        other.model = Some(Arc::from("opencode/iceman-free"));
+        assert_eq!(
+            &*unique_display_labels(&[other])[0],
+            "OpenCode/OpenCode-Zen/Iceman-Free"
+        );
     }
 
     #[test]

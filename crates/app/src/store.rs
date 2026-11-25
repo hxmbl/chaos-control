@@ -453,6 +453,64 @@ impl ChatStore {
         self.project_context.is_current(generation)
     }
 
+    /// The open project's working-tree changes as a pane (STRM-628). Read from git
+    /// on demand so what shows is the working tree right now, not a snapshot
+    /// captured when an agent's message arrived.
+    pub fn diff_pane(&self) -> PaneContent {
+        let title = Arc::from("Working tree diff");
+        let Some(root) = self.project_context.location.path.as_deref() else {
+            return PaneContent::Diff {
+                title,
+                text: Arc::from("No project folder is open."),
+            };
+        };
+        let run = |args: &[&str]| -> String {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        // `HEAD` includes staged changes too; on a repo with no commit yet the
+        // plain form still shows the working tree against the index.
+        let stat = {
+            let s = run(&["diff", "HEAD", "--stat"]);
+            if s.is_empty() {
+                run(&["diff", "--stat"])
+            } else {
+                s
+            }
+        };
+        let patch = {
+            let p = run(&["diff", "HEAD", "--unified=3"]);
+            if p.is_empty() {
+                run(&["diff", "--unified=3"])
+            } else {
+                p
+            }
+        };
+        let text = if stat.is_empty() && patch.is_empty() {
+            "No working-tree changes in this project.".to_string()
+        } else {
+            let combined = format!("{stat}\n{patch}");
+            const LIMIT: usize = 20_000;
+            if combined.chars().count() > LIMIT {
+                let cut: String = combined.chars().take(LIMIT).collect();
+                format!("{cut}\n\n… diff truncated …")
+            } else {
+                combined
+            }
+        };
+        PaneContent::Diff {
+            title,
+            text: Arc::from(text),
+        }
+    }
+
     pub fn new(workspace: Workspace) -> Self {
         let selected = workspace.channels[0].id;
         let logs = workspace
@@ -1124,7 +1182,7 @@ impl ChatStore {
         }
         // Agent Status is the project's members now, not the sample cast
         // (and the sample mentions name sample agents).
-        self.workspace.agents = link.agents.iter().map(status_agent).collect();
+        self.workspace.agents = status_agents(&link.agents);
         self.workspace.mentions.clear();
         // Each harness starts on its cached list when there is one (shown at
         // once, even if stale), else its preset list. Missing or stale lists
@@ -1635,8 +1693,8 @@ impl ChatStore {
         }
         attached.names.insert(linked.member, linked.name.clone());
         attached.agent_ids.insert(linked.member);
-        self.workspace.agents.push(status_agent(&linked));
         attached.link.agents.push(linked);
+        self.workspace.agents = status_agents(&attached.link.agents);
         // A re-added member keeps its own ping-answer list and nicknames.
         self.load_ping_answers(cx);
         self.load_nicknames(cx);
@@ -2483,7 +2541,7 @@ impl ChatStore {
         // Agents removed from the last project mean nothing in this one.
         attached.former_tokens.clear();
         // Refresh workspace agent/member views for the new project context.
-        self.workspace.agents = attached.link.agents.iter().map(status_agent).collect();
+        self.workspace.agents = status_agents(&attached.link.agents);
         self.workspace.mentions.clear();
         let main = open.main.id;
         let project_id = open.project.id.clone();
@@ -2832,20 +2890,26 @@ fn monogram(name: &str) -> String {
 }
 
 /// How a linked agent shows in Agent Status (sleeping until core says).
-fn status_agent(a: &LinkedAgent) -> Agent {
+fn status_agent(a: &LinkedAgent, name: Arc<str>) -> Agent {
     Agent {
         id: agent_id(a.member),
-        name: crate::agents::display_model_label(
-            a.harness_id.as_deref(),
-            a.model.as_deref(),
-            &a.name,
-        ),
+        name,
         brand: a.brand,
         state: AgentState::Sleeping,
         presence: None,
         harness: a.harness.clone(),
         removable: a.removable,
     }
+}
+
+/// The project's agents as Agent Status shows them. Labels are made unique
+/// across agents of the same harness and model (STRM-753).
+fn status_agents(agents: &[LinkedAgent]) -> Vec<Agent> {
+    crate::agents::unique_display_labels(agents)
+        .into_iter()
+        .zip(agents)
+        .map(|(name, a)| status_agent(a, name))
+        .collect()
 }
 
 /// A harness's model list with "the harness default" first: it is always a
