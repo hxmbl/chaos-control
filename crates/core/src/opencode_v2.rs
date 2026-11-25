@@ -374,13 +374,25 @@ fn disambiguate_model_names(models: &mut [ModelInfo]) {
 /// - A top-level array of model objects
 ///
 /// Each model object should have at least a `name` field (see `model_info_from_value`).
+///
+/// A freshly started server may report an empty model list while providers are
+/// still loading, so an empty result is retried a few times before being
+/// accepted.
 async fn fetch_models(http: &Http) -> Result<Vec<ModelInfo>, AgentError> {
-    let value = http.get_json("/api/model").await?;
-    let models = parse_model_list(value);
-    if models.is_empty() {
-        eprintln!("opencode-v2: /api/model returned no parsable models");
+    const ATTEMPTS: usize = 6;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
+    for attempt in 0..ATTEMPTS {
+        let value = http.get_json("/api/model").await?;
+        let models = parse_model_list(value);
+        if !models.is_empty() {
+            return Ok(models);
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(DELAY).await;
+        }
     }
-    Ok(models)
+    eprintln!("opencode-v2: /api/model returned no parsable models");
+    Ok(Vec::new())
 }
 
 async fn list_models(config: OpenCodeV2Config, cwd: PathBuf) -> Result<Vec<ModelInfo>, AgentError> {
@@ -882,11 +894,30 @@ async fn start_server(
 
     let mut lines = tokio::io::BufReader::new(stdout).lines();
     let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
-    let mut seen_output = Vec::new();
+    let mut seen_output: Vec<String> = Vec::new();
+    let mut url: Option<String> = None;
+    let mut password: Option<String> = None;
 
-    let found = tokio::time::timeout(std::time::Duration::from_secs(20), async {
-        let (mut url, mut password) = (None, None);
-        while let Ok(Some(line)) = lines.next_line().await {
+    // Scan stdout for the server URL and optional password. The password may
+    // arrive before or after the URL; once we have the URL we keep reading
+    // briefly so we don't miss a password that follows it, but we don't require
+    // it. A missing password is fine (the server may run without one).
+    let scan = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut url_deadline: Option<tokio::time::Instant> = None;
+        loop {
+            let line = if let Some(deadline) = url_deadline {
+                match tokio::time::timeout_at(deadline, lines.next_line()).await {
+                    Ok(Ok(Some(line))) => line,
+                    // Grace period elapsed, EOF, or read error: proceed with
+                    // whatever we have.
+                    Ok(Ok(None)) | Ok(Err(_)) | Err(_) => break,
+                }
+            } else {
+                match lines.next_line().await {
+                    Ok(Some(line)) => line,
+                    Ok(None) | Err(_) => break,
+                }
+            };
             seen_output.push(line.clone());
             if url.is_none()
                 && let Some(found) = line
@@ -894,44 +925,66 @@ async fn start_server(
                     .find(|word| word.starts_with("http://") || word.starts_with("https://"))
             {
                 url = Some(found.trim_end_matches('/').to_owned());
+                // Give the password line a short grace period if it hasn't
+                // arrived yet; many servers print it immediately after the URL.
+                if password.is_none() {
+                    url_deadline =
+                        Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+                }
             }
-            if let Some(rest) = line.strip_prefix("server password ") {
+            if password.is_none()
+                && let Some(rest) = line.strip_prefix("server password ")
+            {
                 password = Some(rest.trim().to_owned());
             }
             if url.is_some() && password.is_some() {
                 break;
             }
+            // URL found and grace period already expired by the timeout_at above.
+            if url.is_some() && url_deadline.is_some() && password.is_none() {
+                // Keep looping; timeout_at enforces the grace period.
+            }
         }
-        url.map(|url| (url, password))
+    })
+    .await;
+    let _ = scan; // timeout means we proceed with whatever we found
+
+    if let Some(url) = url {
+        // The server is still running; drain stdout/stderr in the background so
+        // a chatty server can't block on a full pipe buffer.
+        tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+        tokio::spawn(async move { while let Ok(Some(_)) = stderr_lines.next_line().await {} });
+        return Ok((url, password, server));
+    }
+
+    // Capture stderr for debugging (bounded so a noisy server can't hang us).
+    let mut stderr_output = String::new();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Ok(Some(line)) = stderr_lines.next_line().await {
+            stderr_output.push_str(&line);
+            stderr_output.push('\n');
+            if stderr_output.len() > 8_192 {
+                stderr_output.push_str("...(truncated)\n");
+                break;
+            }
+        }
     })
     .await;
 
-    // Capture stderr for debugging
-    let mut stderr_output = String::new();
-    while let Ok(Some(line)) = stderr_lines.next_line().await {
-        stderr_output.push_str(&line);
-        stderr_output.push('\n');
-    }
-
-    match found {
-        Ok(Some((url, password))) => Ok((url, password, server)),
-        _ => {
-            server.kill().await;
-            let error_msg = if seen_output.is_empty() && stderr_output.is_empty() {
-                String::from("`opencode serve` produced no output")
-            } else {
-                let mut msg = String::from("`opencode serve` did not report a URL on stdout");
-                if !seen_output.is_empty() {
-                    msg.push_str(&format!("\n  stdout: {}", seen_output.join(" | ")));
-                }
-                if !stderr_output.is_empty() {
-                    msg.push_str(&format!("\n  stderr: {}", stderr_output.trim()));
-                }
-                msg
-            };
-            Err(AgentError::new(AgentErrorKind::Transport, error_msg))
+    server.kill().await;
+    let error_msg = if seen_output.is_empty() && stderr_output.is_empty() {
+        String::from("`opencode serve` produced no output")
+    } else {
+        let mut msg = String::from("`opencode serve` did not report a URL on stdout");
+        if !seen_output.is_empty() {
+            msg.push_str(&format!("\n  stdout: {}", seen_output.join(" | ")));
         }
-    }
+        if !stderr_output.is_empty() {
+            msg.push_str(&format!("\n  stderr: {}", stderr_output.trim()));
+        }
+        msg
+    };
+    Err(AgentError::new(AgentErrorKind::Transport, error_msg))
 }
 
 /// One dispatched server-sent event, after the framing has been removed.
