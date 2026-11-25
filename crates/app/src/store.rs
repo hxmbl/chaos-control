@@ -3249,6 +3249,67 @@ mod tests {
     }
 
     #[test]
+    fn changed_files_lists_tracked_edits_and_untracked_files() {
+        let mut store = ChatStore::new(Workspace {
+            project: model::Project {
+                id: Id(1),
+                name: Arc::from("test"),
+                emoji: Arc::from("🧪"),
+                path: None,
+            },
+            projects: Vec::new(),
+            channels: vec![model::Channel {
+                id: Id(1),
+                name: Arc::from("main"),
+                ordinal: Some(1),
+                linear_issue: None,
+                unread: false,
+                project_wide: true,
+            }],
+            quick_links: Vec::new(),
+            agents: Vec::new(),
+            mentions: Vec::new(),
+        });
+        assert!(store.changed_files().is_empty());
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-changed-files-{nanos}"));
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("tracked.txt"), "before\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "initial"]);
+        store.project_context.location.path = Some(project::root_key(&dir));
+
+        assert!(store.changed_files().is_empty());
+        std::fs::write(dir.join("tracked.txt"), "before\nafter\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let files = store.changed_files();
+        assert_eq!(files.len(), 2, "{files:?}");
+        let tracked = files.iter().find(|f| f.path == "tracked.txt").unwrap();
+        assert!(tracked.stat.contains('+'), "{tracked:?}");
+        let new = files.iter().find(|f| f.path == "new.txt").unwrap();
+        assert_eq!(new.stat, "untracked");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn diff_pane_shows_the_working_tree_and_handles_an_absent_project() {
         let mut store = ChatStore::new(Workspace {
             project: model::Project {
