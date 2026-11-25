@@ -788,6 +788,100 @@ impl ChatStore {
         .detach();
     }
 
+    /// A fresh channel name for a new chat: `new-chat`, then `new-chat-2`,
+    /// skipping names the project already has (STRM-750).
+    fn new_chat_name(taken: &HashSet<String>) -> String {
+        let mut n = 1;
+        loop {
+            let candidate = if n == 1 {
+                "new-chat".to_string()
+            } else {
+                format!("new-chat-{n}")
+            };
+            if !taken.contains(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Starts a new chat in the open project (STRM-750).
+    ///
+    /// In v1 one chat is one channel, so this asks core for a new channel and
+    /// shows it in the sidebar. Core streams only #main into the app, so a new
+    /// chat is read-only for now: the composer's existing unwired note says so.
+    /// That is the minimal flow the issue asks for, not a promise of a live
+    /// multi-channel session.
+    pub fn create_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = self.core.as_ref() else {
+            return;
+        };
+        let Some(open) = attached.link.open.as_ref() else {
+            return;
+        };
+        let project = open.project.id.clone();
+        let project_key = project.to_string();
+        let taken: HashSet<String> = open.channels.iter().map(|c| c.name.to_string()).collect();
+        let generation = attached.generation;
+        let core = attached.link.core.clone();
+
+        cx.spawn(async move |this, cx| {
+            let name = ChatStore::new_chat_name(&taken);
+            let Ok(channel) = core.channel(&project, &name).await else {
+                return;
+            };
+            this.update(cx, |store, cx| {
+                if store.add_new_channel(channel, generation, &project_key, cx) {
+                    store.refresh_chats(cx);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Folds a newly created channel into the open project's views (STRM-750).
+    /// Returns false if the project changed while core was working, so a stale
+    /// answer cannot leak into a different project.
+    fn add_new_channel(
+        &mut self,
+        channel: ct::Channel,
+        generation: u64,
+        project_key: &str,
+        cx: &mut impl EventSink,
+    ) -> bool {
+        let Some(attached) = self.core.as_mut() else {
+            return false;
+        };
+        if attached.generation != generation {
+            return false;
+        }
+        let Some(open) = attached.link.open.as_mut() else {
+            return false;
+        };
+        if open.project.id.as_str() != project_key {
+            return false;
+        }
+        open.channels.push(channel.clone());
+        open.channels.sort_by_key(|c| c.ordinal);
+
+        let id = channel_id(channel.id);
+        self.workspace.channels.push(model::Channel {
+            id,
+            name: channel.name.clone(),
+            ordinal: Some(channel.ordinal),
+            linear_issue: None,
+            unread: false,
+            project_wide: false,
+        });
+        self.workspace.channels.sort_by_key(|c| c.ordinal);
+        self.logs.entry(id).or_default();
+        self.selected = id;
+        cx.emit(StoreEvent::Selected);
+        true
+    }
+
     /// Who has read up to (and no further than) the message at `index` of
     /// `channel`, oldest read first. Only core channels have receipts.
     pub fn readers(&self, channel: Id, index: usize) -> Vec<Reader> {
@@ -3150,6 +3244,16 @@ mod tests {
     }
 
     #[test]
+    fn new_chat_name_skips_channels_the_project_already_has() {
+        let taken: HashSet<String> = ["main", "new-chat", "new-chat-2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(ChatStore::new_chat_name(&taken), "new-chat-3");
+        assert_eq!(ChatStore::new_chat_name(&HashSet::new()), "new-chat");
+    }
+
+    #[test]
     fn only_an_agent_removed_from_this_project_reads_as_previous_agent() {
         let (codex, claude, gemini) = (ct::MemberId(1), ct::MemberId(2), ct::MemberId(3));
         // What core lists for this project: codex was in #main and was
@@ -3974,6 +4078,48 @@ mod apply_core_event_tests {
         );
         let m = store.log(app_channel).unwrap().get(0).unwrap();
         assert_eq!(m.author, Author::System);
+    }
+
+    #[test]
+    fn a_new_chat_is_added_to_the_open_project_and_selected() {
+        let main = channel_id(ct::ChannelId(1));
+        let mut store = store_with_main(main);
+        let project = ct::ProjectId::parse("00000000-0000-0000-0000-000000000001").unwrap();
+        attach_core_for_project(&mut store, 7, main, project.clone());
+        let channel = ct::Channel {
+            id: ct::ChannelId(2),
+            project: project.clone(),
+            name: Arc::from("new-chat"),
+            ordinal: 2,
+        };
+
+        let mut sink = Sink::default();
+        assert!(store.add_new_channel(channel.clone(), 7, project.as_str(), &mut sink));
+        assert_eq!(store.selected, channel_id(channel.id));
+        assert!(store.logs.contains_key(&channel_id(channel.id)));
+        assert_eq!(store.workspace.channels.len(), 2);
+        assert_eq!(store.workspace.channels[1].name.as_ref(), "new-chat");
+        assert_eq!(
+            store
+                .core
+                .as_ref()
+                .and_then(|a| a.link.open.as_ref())
+                .map(|o| o.channels.len()),
+            Some(2)
+        );
+        assert!(matches!(sink.events.last(), Some(StoreEvent::Selected)));
+
+        // A late answer from a previous project must change nothing.
+        let stale = ct::Channel {
+            id: ct::ChannelId(3),
+            project: project.clone(),
+            name: Arc::from("new-chat-2"),
+            ordinal: 3,
+        };
+        let mut sink = Sink::default();
+        assert!(!store.add_new_channel(stale, 6, project.as_str(), &mut sink));
+        assert_eq!(store.workspace.channels.len(), 2);
+        assert!(sink.events.is_empty());
     }
 
     /// Attach a real core link for `project` under `generation`. The async

@@ -1,7 +1,7 @@
 //! Floating, detached activity panel mirroring the left sidebar: mentions and
 //! agent status. Hidden below 1200px.
 //!
-//! Agent Status is a list of the project's members: each row is a model's
+//! The Agents section lists the project's members: each row is a model's
 //! name with its harness's mark and its status dot (green active, blue
 //! sleeping, red missing or unresponsive), and a remove button on hover for
 //! roster members. The last row, "Add a model", opens the model picker.
@@ -27,7 +27,7 @@ pub struct RightSidebar {
     /// The toggle tooltip follows the click, even while the pointer is still
     /// over the button and the tooltip is on screen.
     mentions_tip: Entity<TooltipText>,
-    /// The Agent Status row under the pointer (shows its remove button).
+    /// The Agents row under the pointer (shows its remove button).
     hovered_agent: Option<model::Id>,
 }
 
@@ -327,7 +327,7 @@ impl Render for RightSidebar {
             // Spare height sits here, so agent status stays at the bottom
             // like the left sidebar's settings row.
             .child(div().flex_1())
-            // Agent status. Marks are monochrome: colour here only means
+            // Agents. Marks are monochrome: colour here only means
             // state (the dot).
             .child(
                 section(&t)
@@ -343,7 +343,7 @@ impl Render for RightSidebar {
                             .type_style(text::SMALL)
                             .font_weight(text::MEDIUM)
                             .text_color(t.ink_soft)
-                            .child(truncated("Agent status")),
+                            .child(truncated("Agents")),
                     )
                     .child(
                         div()
