@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use gpui::{
     AnyView, Context, CursorStyle, Decorations, DispatchPhase, Entity, FocusHandle, Focusable,
-    MouseButton, MouseExitEvent, MouseMoveEvent, Pixels, ResizeEdge, StyleRefinement, Subscription,
-    Window, canvas, div, prelude::*, px,
+    MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, ResizeEdge,
+    StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
 };
 use ui::{
     ActiveTheme, Elevation, FONT_FAMILY, IconName, TextInput, Theme, Tooltip, TypeStyleExt, icon,
@@ -19,7 +19,7 @@ use crate::{
     model_picker::{ModelPicker, ModelPickerEvent},
     pane_host::{PaneEvent, PaneHost, pane_frame},
     panels::{
-        GUTTER, LEFT_WIDTH, Panels, RIGHT_WIDTH, SIDE_INSET, Side, SideFrame, ToggleLeftSidebar,
+        GUTTER, Panels, RESIZE_HANDLE, SIDE_INSET, Side, SideFrame, ToggleLeftSidebar,
         ToggleRightSidebar,
     },
     profile,
@@ -278,8 +278,10 @@ impl Render for Workspace {
             window.request_animation_frame();
         }
 
-        let left_space = (SIDE_INSET + LEFT_WIDTH) * left.reserve;
-        let right_space = (RIGHT_WIDTH + SIDE_INSET) * right.reserve;
+        let left_w = self.panels.read(cx).width(Side::Left);
+        let right_w = self.panels.read(cx).width(Side::Right);
+        let left_space = (SIDE_INSET + left_w) * left.reserve;
+        let right_space = (right_w + SIDE_INSET) * right.reserve;
         let (pad_l, pad_r, column_w) = centre_column(viewport.width, left_space, right_space);
 
         let decorations = window.window_decorations();
@@ -377,12 +379,13 @@ impl Render for Workspace {
                     // Collapsed sidebars slide off their edge and fade; a peek
                     // slides one back over the content.
                     .when(left.shown > 0., |this| {
-                        this.child(self.side_slot(Side::Left, left, cached(&self.sidebar), cx))
+                        this.child(self.side_slot(Side::Left, left, left_w, cached(&self.sidebar), cx))
                     })
                     .when(right.shown > 0., |this| {
                         this.child(self.side_slot(
                             Side::Right,
                             right,
+                            right_w,
                             cached(&self.right_sidebar),
                             cx,
                         ))
@@ -546,7 +549,8 @@ impl Workspace {
             return None;
         }
         let t = *cx.theme();
-        let offset = SIDE_INSET - (Side::Right.width() + SIDE_INSET) * (1. - right_frame.shown);
+        let right_w = self.panels.read(cx).width(Side::Right);
+        let offset = SIDE_INSET - (right_w + SIDE_INSET) * (1. - right_frame.shown);
         let monogram = self.profile.monogram();
         let seed = self.profile.color_seed();
         let hue = (seed % 360) as f32 / 360.0;
@@ -560,7 +564,7 @@ impl Workspace {
                 .id("profile-editor-overlay")
                 .absolute()
                 .right(offset)
-                .w(Side::Right.width())
+                .w(right_w)
                 .top(SIDE_TOP)
                 .bottom(SIDE_INSET)
                 .occlude()
@@ -745,11 +749,34 @@ impl Workspace {
         &self,
         side: Side,
         frame: SideFrame,
+        width: Pixels,
         view: AnyView,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let t = *cx.theme();
-        let offset = SIDE_INSET - (side.width() + SIDE_INSET) * (1. - frame.shown);
+        let offset = SIDE_INSET - (width + SIDE_INSET) * (1. - frame.shown);
+        let panels = self.panels.clone();
+        let handle = div()
+            .id(match side {
+                Side::Left => "left-sidebar-resize",
+                Side::Right => "right-sidebar-resize",
+            })
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .w(RESIZE_HANDLE)
+            .cursor(CursorStyle::ResizeLeftRight)
+            .map(|d| match side {
+                Side::Left => d.right(px(-3.)),
+                Side::Right => d.left(px(-3.)),
+            })
+            .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                cx.stop_propagation();
+                panels.update(cx, |p, cx| {
+                    p.start_resize(side, event.position.x);
+                    cx.notify();
+                });
+            });
         div()
             .id(match side {
                 Side::Left => "left-sidebar",
@@ -760,7 +787,7 @@ impl Workspace {
                 Side::Left => d.left(offset),
                 Side::Right => d.right(offset),
             })
-            .w(side.width())
+            .w(width)
             .top(SIDE_TOP)
             .bottom(SIDE_INSET)
             .opacity(frame.shown)
@@ -776,10 +803,11 @@ impl Workspace {
                     .shadow(t.elevation(Elevation::Overlay))
             })
             .child(view)
+            .child(handle)
     }
 
     /// An invisible full-window canvas that feeds pointer moves and window
-    /// exits to `Panels` for the edge peek.
+    /// exits to `Panels` for the edge peek and sidebar resize drags.
     fn pointer_watcher(&self, _: &Context<Self>) -> impl IntoElement {
         let panels = self.panels.clone();
         canvas(
@@ -791,10 +819,22 @@ impl Workspace {
                         return;
                     }
                     on_move.update(cx, |p, cx| {
-                        let opened =
+                        let changed =
                             p.pointer(Some(e.position), e.pressed_button.is_some(), Instant::now());
                         p.schedule_poll(cx);
-                        if opened {
+                        if changed {
+                            cx.notify();
+                        }
+                    });
+                });
+                let on_up = panels.clone();
+                window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
+                    if phase != DispatchPhase::Capture {
+                        return;
+                    }
+                    on_up.update(cx, |p, cx| {
+                        if p.resizing() {
+                            p.end_resize();
                             cx.notify();
                         }
                     });
@@ -805,8 +845,12 @@ impl Workspace {
                         return;
                     }
                     on_exit.update(cx, |p, cx| {
+                        if p.resizing() {
+                            p.end_resize();
+                        }
                         p.pointer(None, false, Instant::now());
                         p.schedule_poll(cx);
+                        cx.notify();
                     });
                 });
             },

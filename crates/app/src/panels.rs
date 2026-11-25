@@ -17,6 +17,12 @@ actions!(chaos_control, [ToggleLeftSidebar, ToggleRightSidebar]);
 
 pub const LEFT_WIDTH: Pixels = px(258.);
 pub const RIGHT_WIDTH: Pixels = px(320.);
+/// Smallest a sidebar can be dragged to.
+pub const MIN_SIDEBAR_WIDTH: f32 = 200.;
+/// Largest a sidebar can be dragged to before it crowds the column.
+pub const MAX_SIDEBAR_WIDTH: f32 = 520.;
+/// Width of the invisible drag handle at a sidebar's inner edge.
+pub const RESIZE_HANDLE: Pixels = px(6.);
 /// Gap between the window edge and a floating panel. The sidebars use it on the
 /// sides and the bottom; the composer uses it at the bottom.
 pub const SIDE_INSET: Pixels = ui::tokens::space::X3;
@@ -62,20 +68,16 @@ impl Side {
         self as usize
     }
 
-    /// Horizontal space a docked sidebar takes from its edge, gutter included.
-    fn docked_reserve(self) -> f32 {
-        let width = match self {
-            Side::Left => LEFT_WIDTH,
-            Side::Right => RIGHT_WIDTH,
-        };
-        f32::from(SIDE_INSET + width + GUTTER)
-    }
-
-    pub fn width(self) -> Pixels {
+    pub fn default_width(self) -> Pixels {
         match self {
             Side::Left => LEFT_WIDTH,
             Side::Right => RIGHT_WIDTH,
         }
+    }
+
+    /// Horizontal space a docked sidebar takes from its edge, gutter included.
+    fn docked_reserve(self, width: Pixels) -> f32 {
+        f32::from(SIDE_INSET + width + GUTTER)
     }
 }
 
@@ -91,10 +93,10 @@ pub enum Mode {
 }
 
 /// Width left for the centre column with the given sidebars docked.
-fn column_width(viewport: f32, docked: [bool; 2]) -> f32 {
+fn column_width(viewport: f32, docked: [bool; 2], widths: [f32; 2]) -> f32 {
     let reserve = |side: Side| {
         if docked[side.ix()] {
-            side.docked_reserve()
+            side.docked_reserve(px(widths[side.ix()]))
         } else {
             f32::from(GUTTER)
         }
@@ -113,6 +115,7 @@ pub fn plan(
     modes: [Mode; 2],
     pin_seq: [u64; 2],
     was_docked: [bool; 2],
+    widths: [f32; 2],
 ) -> [bool; 2] {
     let mut docked = [false; 2];
     let mut pinned: Vec<Side> = Side::BOTH
@@ -122,7 +125,7 @@ pub fn plan(
     pinned.sort_by_key(|s| std::cmp::Reverse(pin_seq[s.ix()]));
     for side in pinned {
         docked[side.ix()] = true;
-        if column_width(viewport, docked) < FLOOR_COLUMN {
+        if column_width(viewport, docked, widths) < FLOOR_COLUMN {
             docked[side.ix()] = false;
         }
     }
@@ -137,7 +140,7 @@ pub fn plan(
                 HYSTERESIS
             };
         docked[side.ix()] = true;
-        if column_width(viewport, docked) < need {
+        if column_width(viewport, docked, widths) < need {
             docked[side.ix()] = false;
         }
     }
@@ -280,6 +283,7 @@ struct SidebarState {
     mode: Mode,
     /// Bumped each time this sidebar is pinned; the newest pin wins for space.
     pin_seq: u64,
+    width: Pixels,
     docked: bool,
     dock: Slide,
     /// Docked straight from a peek: the panel is already in place, so only
@@ -289,10 +293,11 @@ struct SidebarState {
 }
 
 impl SidebarState {
-    fn new() -> Self {
+    fn new(side: Side) -> Self {
         Self {
             mode: Mode::Auto,
             pin_seq: 0,
+            width: side.default_width(),
             docked: true,
             dock: Slide::new(true, DOCK_SLIDE),
             docked_from_peek: false,
@@ -318,6 +323,8 @@ pub struct Panels {
     sides: [SidebarState; 2],
     next_pin: u64,
     viewport: Size<Pixels>,
+    /// Active width drag: (side, pointer x at start, width at start).
+    resizing: Option<(Side, f32, f32)>,
     /// The close the grace timer is armed for, so pointer moves don't re-arm it.
     armed: Option<Instant>,
     _grace_timer: Option<Task<()>>,
@@ -326,9 +333,10 @@ pub struct Panels {
 impl Panels {
     pub fn new() -> Self {
         Self {
-            sides: [SidebarState::new(), SidebarState::new()],
+            sides: [SidebarState::new(Side::Left), SidebarState::new(Side::Right)],
             next_pin: 1,
             viewport: Size::default(),
+            resizing: None,
             armed: None,
             _grace_timer: None,
         }
@@ -346,9 +354,17 @@ impl Panels {
         self.side(side).mode
     }
 
+    pub fn width(&self, side: Side) -> Pixels {
+        self.side(side).width
+    }
+
     /// Docked beside the chat right now (after resize rules).
     pub fn docked(&self, side: Side) -> bool {
         self.side(side).docked
+    }
+
+    pub fn resizing(&self) -> bool {
+        self.resizing.is_some()
     }
 
     #[cfg(test)]
@@ -368,6 +384,13 @@ impl Panels {
         [self.sides[0].docked, self.sides[1].docked]
     }
 
+    fn widths_f32(&self) -> [f32; 2] {
+        [
+            f32::from(self.sides[0].width),
+            f32::from(self.sides[1].width),
+        ]
+    }
+
     /// Re-applies the rules for a window size. Returns whether either sidebar
     /// docked or collapsed.
     pub fn layout(&mut self, viewport: Size<Pixels>, now: Instant) -> bool {
@@ -377,6 +400,7 @@ impl Panels {
             self.modes(),
             self.pin_seqs(),
             self.docked_now(),
+            self.widths_f32(),
         );
         let mut changed = false;
         for side in Side::BOTH {
@@ -416,7 +440,13 @@ impl Panels {
             let mut was = self.docked_now();
             // An explicit request needs no hysteresis margin.
             was[side.ix()] = true;
-            let fits = plan(f32::from(self.viewport.width), modes, self.pin_seqs(), was)[side.ix()];
+            let fits = plan(
+                f32::from(self.viewport.width),
+                modes,
+                self.pin_seqs(),
+                was,
+                self.widths_f32(),
+            )[side.ix()];
             if fits {
                 self.side_mut(side).mode = Mode::Auto;
             } else {
@@ -439,6 +469,12 @@ impl Panels {
         pressed: bool,
         now: Instant,
     ) -> bool {
+        if self.resizing.is_some() {
+            if let Some(position) = position {
+                return self.drag_resize(f32::from(position.x), now);
+            }
+            return false;
+        }
         let width = self.viewport.width;
         let mut changed = false;
         for side in Side::BOTH {
@@ -449,7 +485,7 @@ impl Panels {
                 None => (false, false),
                 Some(p) if p.y < TITLEBAR_HEIGHT => (false, false),
                 Some(p) => {
-                    let reach = SIDE_INSET + side.width() + PEEK_SLACK;
+                    let reach = SIDE_INSET + self.width(side) + PEEK_SLACK;
                     match side {
                         Side::Left => (p.x < EDGE_ZONE, p.x < reach),
                         Side::Right => (p.x >= width - EDGE_ZONE, p.x >= width - reach),
@@ -462,6 +498,46 @@ impl Panels {
                 .pointer(in_zone, in_panel, pressed, now);
         }
         changed
+    }
+
+    pub fn start_resize(&mut self, side: Side, x: Pixels) {
+        let width = f32::from(self.width(side));
+        self.resizing = Some((side, f32::from(x), width));
+    }
+
+    pub fn end_resize(&mut self) {
+        self.resizing = None;
+    }
+
+    fn drag_resize(&mut self, x: f32, now: Instant) -> bool {
+        let Some((side, start_x, start_width)) = self.resizing else {
+            return false;
+        };
+        let delta = match side {
+            Side::Left => x - start_x,
+            Side::Right => start_x - x,
+        };
+        let viewport = f32::from(self.viewport.width);
+        let other = match side {
+            Side::Left => Side::Right,
+            Side::Right => Side::Left,
+        };
+        let other_reserve = if self.docked(other) {
+            other.docked_reserve(self.width(other))
+        } else {
+            f32::from(GUTTER)
+        };
+        let max_by_viewport = viewport - other_reserve - f32::from(SIDE_INSET + GUTTER) - FLOOR_COLUMN;
+        let max_width = MAX_SIDEBAR_WIDTH.min(max_by_viewport.max(MIN_SIDEBAR_WIDTH));
+        let next = (start_width + delta).clamp(MIN_SIDEBAR_WIDTH, max_width);
+        let next_px = px(next.round());
+        if self.width(side) == next_px {
+            return false;
+        }
+        self.side_mut(side).width = next_px;
+        let viewport_size = self.viewport;
+        self.layout(viewport_size, now);
+        true
     }
 
     /// Something inside the sidebar holds the peek open (keyboard focus, an
@@ -540,9 +616,10 @@ mod tests {
     use Mode::*;
 
     const NONE: [u64; 2] = [0, 0];
+    const WIDTHS: [f32; 2] = [258., 320.];
 
     fn at(w: f32, modes: [Mode; 2]) -> [bool; 2] {
-        plan(w, modes, NONE, [true, true])
+        plan(w, modes, NONE, [true, true], WIDTHS)
     }
 
     #[test]
@@ -563,12 +640,18 @@ mod tests {
     fn auto_needs_a_margin_to_come_back() {
         let was_collapsed = [true, false];
         assert_eq!(
-            plan(1210., [Auto, Auto], NONE, was_collapsed),
+            plan(1210., [Auto, Auto], NONE, was_collapsed, WIDTHS),
             [true, false]
         );
-        assert_eq!(plan(1226., [Auto, Auto], NONE, was_collapsed), [true, true]);
+        assert_eq!(
+            plan(1226., [Auto, Auto], NONE, was_collapsed, WIDTHS),
+            [true, true]
+        );
         // Already docked: stays docked right down to the breakpoint.
-        assert_eq!(plan(1210., [Auto, Auto], NONE, [true, true]), [true, true]);
+        assert_eq!(
+            plan(1210., [Auto, Auto], NONE, [true, true], WIDTHS),
+            [true, true]
+        );
     }
 
     #[test]
@@ -584,16 +667,16 @@ mod tests {
         assert_eq!(at(1000., [Auto, Pinned]), [false, true]);
         // Both pinned and no room for both: the newest pin wins.
         assert_eq!(
-            plan(900., [Pinned, Pinned], [1, 2], [true, true]),
+            plan(900., [Pinned, Pinned], [1, 2], [true, true], WIDTHS),
             [false, true]
         );
         assert_eq!(
-            plan(900., [Pinned, Pinned], [3, 2], [true, true]),
+            plan(900., [Pinned, Pinned], [3, 2], [true, true], WIDTHS),
             [true, false]
         );
         // With room for both at the floor, both dock.
         assert_eq!(
-            plan(1100., [Pinned, Pinned], [1, 2], [true, true]),
+            plan(1100., [Pinned, Pinned], [1, 2], [true, true], WIDTHS),
             [true, true]
         );
     }
