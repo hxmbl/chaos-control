@@ -1,5 +1,6 @@
 //! Floating, detached activity panel mirroring the left sidebar: mentions and
-//! agent status. Hidden below 1200px.
+//! agent status. It docks, collapses, or peeks based on window width and
+//! sidebar mode (see `panels.rs`).
 //!
 //! The Agents section lists the project's members: each row is a model's
 //! name with its harness's mark and its status dot (green active, blue
