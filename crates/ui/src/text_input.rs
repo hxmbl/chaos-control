@@ -755,6 +755,7 @@ impl TextInput {
         match event.click_count {
             // Double click selects the word under the pointer, triple the line.
             2 => {
+                self.is_selecting = true;
                 let word = editing::word_range_at(&self.content, index);
                 self.move_to(word.start, cx);
                 self.select_to(word.end, cx);
