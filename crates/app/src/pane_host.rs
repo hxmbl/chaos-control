@@ -334,6 +334,7 @@ impl PaneHost {
             PaneContent::Search { .. } => pane,
             PaneContent::ProjectIdentity(q) => pane.children(paragraphs(&identity_text(q))),
             PaneContent::Approval(q) => pane.children(paragraphs(&approval_text(q))),
+            PaneContent::Diff { text, .. } => pane.children(diff_lines(text, cx.theme())),
         };
         Some(pane.into_any_element())
     }
@@ -740,6 +741,31 @@ impl PaneHost {
             .child(column)
             .into_any_element()
     }
+}
+
+/// One element per diff line, keeping indentation and colouring added, removed
+/// and header lines. Diff text is not prose: wrapping it would lose the shape
+/// of the patch.
+fn diff_lines(text: &str, t: &ui::Theme) -> Vec<AnyElement> {
+    text.lines()
+        .map(|line| {
+            let color = if line.starts_with('+') && !line.starts_with("+++") {
+                t.status_active
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                t.status_unresponsive
+            } else if line.starts_with("@@") || line.starts_with("diff ") {
+                t.accent
+            } else {
+                t.ink_soft
+            };
+            div()
+                .w_full()
+                .whitespace_nowrap()
+                .text_color(color)
+                .child(SharedString::from(line.to_string()))
+                .into_any_element()
+        })
+        .collect()
 }
 
 /// One element per line, with a small gap for blank lines, so bullet lists and

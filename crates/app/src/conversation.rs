@@ -46,6 +46,8 @@ struct MessageMenu {
     body: Arc<str>,
     reply: ReplyRef,
     can_react: bool,
+    /// Diffs are offered on an agent's work, not on the human's own messages.
+    from_agent: bool,
     position: Point<Pixels>,
 }
 
@@ -220,6 +222,7 @@ impl Conversation {
             body: message.body.clone(),
             reply: ReplyRef::to(message),
             can_react,
+            from_agent: matches!(message.author, Author::Agent(_)),
             position,
         });
         cx.notify();
@@ -238,6 +241,14 @@ impl Conversation {
         self.menu = None;
         cx.notify();
         self.composer.update(cx, |c, cx| c.focus(window, cx));
+    }
+
+    /// Opens the open project's working-tree diff in the pane (STRM-628).
+    fn view_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let content = self.store.read(cx).diff_pane();
+        self.menu = None;
+        self.pane.update(cx, |p, cx| p.open(content, window, cx));
+        cx.notify();
     }
 
     fn toggle_reaction_for(
@@ -597,6 +608,18 @@ impl Conversation {
                     })
                 },
             ));
+
+        if menu.from_agent {
+            items = items.child(menu_item(
+                "menu-diff",
+                IconName::Square,
+                "View diff",
+                t,
+                cx.listener(move |this, _, window, cx| {
+                    this.view_diff(window, cx);
+                }),
+            ));
+        }
 
         if menu.can_react {
             items = items.child(div().h(px(1.)).mx(space::X1).bg(t.line)).child(

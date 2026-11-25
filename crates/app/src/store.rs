@@ -453,6 +453,64 @@ impl ChatStore {
         self.project_context.is_current(generation)
     }
 
+    /// The open project's working-tree changes as a pane (STRM-628). Read from git
+    /// on demand so what shows is the working tree right now, not a snapshot
+    /// captured when an agent's message arrived.
+    pub fn diff_pane(&self) -> PaneContent {
+        let title = Arc::from("Working tree diff");
+        let Some(root) = self.project_context.location.path.as_deref() else {
+            return PaneContent::Diff {
+                title,
+                text: Arc::from("No project folder is open."),
+            };
+        };
+        let run = |args: &[&str]| -> String {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        // `HEAD` includes staged changes too; on a repo with no commit yet the
+        // plain form still shows the working tree against the index.
+        let stat = {
+            let s = run(&["diff", "HEAD", "--stat"]);
+            if s.is_empty() {
+                run(&["diff", "--stat"])
+            } else {
+                s
+            }
+        };
+        let patch = {
+            let p = run(&["diff", "HEAD", "--unified=3"]);
+            if p.is_empty() {
+                run(&["diff", "--unified=3"])
+            } else {
+                p
+            }
+        };
+        let text = if stat.is_empty() && patch.is_empty() {
+            "No working-tree changes in this project.".to_string()
+        } else {
+            let combined = format!("{stat}\n{patch}");
+            const LIMIT: usize = 20_000;
+            if combined.chars().count() > LIMIT {
+                let cut: String = combined.chars().take(LIMIT).collect();
+                format!("{cut}\n\n… diff truncated …")
+            } else {
+                combined
+            }
+        };
+        PaneContent::Diff {
+            title,
+            text: Arc::from(text),
+        }
+    }
+
     pub fn new(workspace: Workspace) -> Self {
         let selected = workspace.channels[0].id;
         let logs = workspace
@@ -1124,7 +1182,7 @@ impl ChatStore {
         }
         // Agent Status is the project's members now, not the sample cast
         // (and the sample mentions name sample agents).
-        self.workspace.agents = link.agents.iter().map(status_agent).collect();
+        self.workspace.agents = status_agents(&link.agents);
         self.workspace.mentions.clear();
         // Each harness starts on its cached list when there is one (shown at
         // once, even if stale), else its preset list. Missing or stale lists
@@ -1635,8 +1693,8 @@ impl ChatStore {
         }
         attached.names.insert(linked.member, linked.name.clone());
         attached.agent_ids.insert(linked.member);
-        self.workspace.agents.push(status_agent(&linked));
         attached.link.agents.push(linked);
+        self.workspace.agents = status_agents(&attached.link.agents);
         // A re-added member keeps its own ping-answer list and nicknames.
         self.load_ping_answers(cx);
         self.load_nicknames(cx);
@@ -2483,7 +2541,7 @@ impl ChatStore {
         // Agents removed from the last project mean nothing in this one.
         attached.former_tokens.clear();
         // Refresh workspace agent/member views for the new project context.
-        self.workspace.agents = attached.link.agents.iter().map(status_agent).collect();
+        self.workspace.agents = status_agents(&attached.link.agents);
         self.workspace.mentions.clear();
         let main = open.main.id;
         let project_id = open.project.id.clone();
@@ -2832,20 +2890,26 @@ fn monogram(name: &str) -> String {
 }
 
 /// How a linked agent shows in Agent Status (sleeping until core says).
-fn status_agent(a: &LinkedAgent) -> Agent {
+fn status_agent(a: &LinkedAgent, name: Arc<str>) -> Agent {
     Agent {
         id: agent_id(a.member),
-        name: crate::agents::display_model_label(
-            a.harness_id.as_deref(),
-            a.model.as_deref(),
-            &a.name,
-        ),
+        name,
         brand: a.brand,
         state: AgentState::Sleeping,
         presence: None,
         harness: a.harness.clone(),
         removable: a.removable,
     }
+}
+
+/// The project's agents as Agent Status shows them. Labels are made unique
+/// across agents of the same harness and model (STRM-753).
+fn status_agents(agents: &[LinkedAgent]) -> Vec<Agent> {
+    crate::agents::unique_display_labels(agents)
+        .into_iter()
+        .zip(agents)
+        .map(|(name, a)| status_agent(a, name))
+        .collect()
 }
 
 /// A harness's model list with "the harness default" first: it is always a
@@ -3003,6 +3067,77 @@ fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diff_pane_shows_the_working_tree_and_handles_an_absent_project() {
+        let mut store = ChatStore::new(Workspace {
+            project: model::Project {
+                id: Id(1),
+                name: Arc::from("test"),
+                emoji: Arc::from("🧪"),
+                path: None,
+            },
+            projects: Vec::new(),
+            channels: vec![model::Channel {
+                id: Id(1),
+                name: Arc::from("main"),
+                ordinal: Some(1),
+                linear_issue: None,
+                unread: false,
+                project_wide: true,
+            }],
+            quick_links: Vec::new(),
+            agents: Vec::new(),
+            mentions: Vec::new(),
+        });
+        // No folder open: no git command should run.
+        let empty = store.diff_pane();
+        let PaneContent::Diff { text, .. } = empty else {
+            panic!("expected a diff pane");
+        };
+        assert_eq!(&*text, "No project folder is open.");
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-diff-pane-{nanos}"));
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("file.txt"), "before\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-qm", "initial"]);
+
+        // With no changes the pane explains itself instead of showing a blank.
+        store.project_context.location.path = Some(project::root_key(&dir));
+        let PaneContent::Diff { text, .. } = store.diff_pane() else {
+            panic!("expected a diff pane");
+        };
+        assert_eq!(&*text, "No working-tree changes in this project.");
+
+        // An agent's edit shows up as a unified diff, with the changed line.
+        std::fs::write(dir.join("file.txt"), "before\nafter\n").unwrap();
+        let PaneContent::Diff { title, text } = store.diff_pane() else {
+            panic!("expected a diff pane");
+        };
+        assert_eq!(&*title, "Working tree diff");
+        assert!(text.contains("file.txt"), "{text}");
+        assert!(text.contains("+after"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn only_cores_channel_sends_while_core_is_attached() {
