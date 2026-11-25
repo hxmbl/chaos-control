@@ -260,9 +260,10 @@ impl PaneHost {
                     _ => action.label.into(),
                 };
                 let kind = action.kind;
+                let action_kind = kind.clone();
                 let this = cx.entity();
                 let mut quick = QuickAction::new(("pane-action", ix), label, move |window, cx| {
-                    this.update(cx, |this, cx| this.run(kind.clone(), window, cx))
+                    this.update(cx, |this, cx| this.run(action_kind.clone(), window, cx))
                 });
                 quick = match kind {
                     PaneActionKind::Reply => quick.icon(IconName::ArrowBendUpLeft),

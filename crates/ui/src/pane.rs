@@ -27,7 +27,7 @@ use gpui::{
 
 use crate::{
     ActiveTheme, Ellipsis, IconName, TypeStyleExt, icon,
-    tokens::{radius, size, space, text},
+    tokens::{icon as icon_tokens, radius, size, space, text},
     truncated,
 };
 
@@ -444,7 +444,7 @@ impl RenderOnce for Pane {
                 .flex_none()
                 .items_center()
                 .justify_center()
-                .size(size::CONTROL)
+                .size(size::BUTTON)
                 .rounded(px(999.))
                 .bg(glass.well)
                 .hover(|s| s.bg(glass.well_hover))
@@ -453,8 +453,8 @@ impl RenderOnce for Pane {
                     d.cursor_pointer()
                         .on_click(move |_, window, cx| on_click(window, cx))
                 })
-                .child(icon(icon_name).size(size::ICON_SM).text_color(t.ink))
-                .tooltip(move |window, cx| crate::Tooltip::text(label.clone()).build(window, cx))
+                .child(icon(icon_name, icon_tokens::SM, t.ink))
+                .tooltip(crate::Tooltip::text(label.clone()))
         });
         let text_rows = text_actions.into_iter().map(|a| {
             let on_click = a.on_click.clone();
