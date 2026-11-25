@@ -893,16 +893,22 @@ fn save_suggestion_usage(
         "emoji": usage_map_to_json(emoji),
     });
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = chaos_core::permissions::ensure_private_dir(parent);
     }
     let Ok(text) = serde_json::to_string_pretty(&root) else {
         return;
     };
-    // Atomic-ish write: write temp then rename to avoid truncating a valid file on failure.
+    // Atomic-ish write: private temp then rename, so neither a crash nor a
+    // permissive umask leaves a readable copy behind.
     let tmp = path.with_extension(format!("json.tmp.{}.{}", std::process::id(), now_secs()));
     let write_ok = (|| -> std::io::Result<()> {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
+        chaos_core::permissions::create_private_file(&tmp)?;
+        chaos_core::permissions::restrict_file(&tmp)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
         f.write_all(text.as_bytes())?;
         f.flush()?;
         f.sync_all()?;

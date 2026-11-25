@@ -648,7 +648,7 @@ impl Store {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name != "core.db" {
                 let dir = path.parent().unwrap_or(Path::new("."));
-                std::fs::create_dir_all(dir)
+                crate::permissions::ensure_private_dir(dir)
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
                 let core_sqlite = dir.join("core.sqlite");
                 let backup = dir.join("core.sqlite.pre-split");
@@ -692,7 +692,7 @@ impl Store {
             }
         }
         let data_dir = path;
-        std::fs::create_dir_all(data_dir)
+        crate::permissions::ensure_private_dir(data_dir)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         maybe_migrate_from_legacy(data_dir)?;
         let core_path = data_dir.join("core.db");
@@ -723,7 +723,7 @@ impl Store {
                 .as_nanos(),
             n
         ));
-        std::fs::create_dir_all(&dir)
+        crate::permissions::ensure_private_dir(&dir)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let mut store = Self::open(&dir)?;
         store.data_dir = dir;
@@ -787,7 +787,7 @@ impl Store {
             return Ok(());
         }
         let dir = self.project_dir(project);
-        std::fs::create_dir_all(&dir)
+        crate::permissions::ensure_private_dir(&dir)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let ws_path = dir.join("workspace.db");
         let ag_path = dir.join("agents.db");
@@ -1922,7 +1922,12 @@ fn core_project_ids(core: &Connection) -> Result<Vec<ProjectId>> {
 }
 
 fn open_db(path: &Path, migrations: &[&str]) -> std::result::Result<Connection, OpenError> {
+    // Create the file private before SQLite sees it: WAL/SHM sidecars inherit
+    // the database's mode. Tighten an existing file and any old sidecars too.
+    // Best effort — a read-only database must still be openable.
+    let _ = crate::permissions::create_private_file(path);
     let conn = Connection::open(path)?;
+    let _ = crate::permissions::restrict_database(path);
     let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     let known = migrations.len() as i64;
     if version > known {
@@ -2335,7 +2340,7 @@ fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), Ope
     let projects_dir = data_dir.join("Projects");
     for pid in project_ids {
         let dir = projects_dir.join(pid.as_str());
-        std::fs::create_dir_all(&dir)
+        crate::permissions::ensure_private_dir(&dir)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         let ws_path = dir.join("workspace.db");
         let ag_path = dir.join("agents.db");
@@ -4668,6 +4673,61 @@ mod tests {
 
     fn pid(s: &str) -> ProjectId {
         ProjectId::parse(s).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_store_tightens_its_data_dir_and_every_database() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn mode(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-store-perms-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        // An install from before the policy: loose dir, loose pre-existing DB.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let existing = dir.join("core.db");
+        {
+            let conn = rusqlite::Connection::open(&existing).unwrap();
+            conn.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE old (x INTEGER);")
+                .unwrap();
+        }
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut store = Store::open(&dir).unwrap();
+        assert_eq!(mode(&dir), 0o700, "data directory");
+        assert_eq!(mode(&dir.join("core.db")), 0o600, "core database");
+
+        // Opening a project creates its private directory and two databases.
+        store
+            .ensure_project(&pid(P1), "Starpoint", None, 0)
+            .unwrap();
+        let project = dir.join("Projects").join(P1);
+        assert_eq!(mode(&dir.join("Projects")), 0o700, "projects directory");
+        assert_eq!(mode(&project), 0o700, "project directory");
+        assert_eq!(mode(&project.join("workspace.db")), 0o600);
+        assert_eq!(mode(&project.join("agents.db")), 0o600);
+
+        // SQLite creates WAL/SHM lazily; they inherit the database's mode.
+        for path in [
+            dir.join("core.db-wal"),
+            dir.join("core.db-shm"),
+            project.join("workspace.db-wal"),
+            project.join("workspace.db-shm"),
+        ] {
+            if path.exists() {
+                assert_eq!(mode(&path), 0o600, "{}", path.display());
+            }
+        }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn setup() -> (Store, Channel, Member, Member) {
