@@ -224,12 +224,11 @@ impl Render for Sidebar {
         let t = *cx.theme();
         // Clone the small catalogue so the store borrow ends before the rows
         // borrow `cx` mutably (listeners and tooltips).
-        let (catalog, selected, project_count, can_open, has_source) = {
+        let (catalog, selected, can_open, has_source) = {
             let store = self.store.read(cx);
             (
                 store.chats().to_vec(),
                 store.selected(),
-                store.chats().len(),
                 store.has_core(),
                 store.has_chat_source(),
             )
@@ -331,44 +330,28 @@ impl Render for Sidebar {
             .border_color(t.line)
             .bg(t.surface)
             .shadow(t.elevation(Elevation::Float))
-            // Chats: the workspace's cross-project list.
+            // STRM-750: one clear way to start a chat. The list below is
+            // self-evident, so the "Chats" label, its count and the reload
+            // button are gone (STRM-748).
             .child(
-                div()
+                pill("new-chat", cx)
                     .flex_none()
-                    .h(size::ROW_LG)
-                    .flex()
-                    .items_center()
+                    .h(size::ROW)
                     .gap(space::X2)
                     .px(space::X3)
-                    .child(icon(IconName::ChatCircle, icons::MD, t.ink_soft))
-                    .child(
-                        div()
-                            .flex_1()
-                            .type_style(text::SMALL)
-                            .font_weight(text::SEMIBOLD)
-                            .child("Chats"),
-                    )
-                    .child(
-                        div()
-                            .type_style(text::CAPTION)
-                            .text_color(t.muted)
-                            .child(project_count.to_string()),
-                    )
-                    .child(
-                        div()
-                            .id("refresh-chats")
-                            .size(size::BUTTON_SM)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(radius::MD)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.hover))
-                            .tooltip(Tooltip::text("Refresh chats"))
+                    .when(can_open, |p| {
+                        p.tooltip(Tooltip::text("Start a new chat in this project"))
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.store.update(cx, |store, cx| store.refresh_chats(cx));
+                                this.store.update(cx, |store, cx| store.create_chat(cx));
                             }))
-                            .child(icon(IconName::ArrowClockwise, icons::SM, t.muted)),
+                    })
+                    .when(!can_open, |p| p.text_color(t.muted))
+                    .child(icon(IconName::Plus, icons::MD, t.ink_soft))
+                    .child(
+                        div()
+                            .type_style(text::SMALL)
+                            .font_weight(text::MEDIUM)
+                            .child("New chat"),
                     ),
             )
             .child(
@@ -392,37 +375,40 @@ impl Render for Sidebar {
                     .child(div().flex_1().ellipsis().child(truncated("Archived")))
                     .child(icon(IconName::CaretRight, icons::SM, t.muted)),
             )
-            // Quick links: straight on the panel surface, hover only.
+            // Bottom row (STRM-749): Settings is a small control in the
+            // bottom-left corner, quick links sit beside it, and Archived is
+            // the row above them.
             .child(
                 div()
                     .flex()
                     .flex_none()
+                    .items_center()
                     .gap(space::X1)
                     .px(space::X1_5)
+                    .child(
+                        pill("settings", cx)
+                            .w(size::BUTTON_SM)
+                            .h(size::BUTTON_SM)
+                            .flex_none()
+                            .justify_center()
+                            .tooltip(Tooltip::text("Settings"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.pane
+                                    .update(cx, |p, cx| p.open(PaneContent::Settings, window, cx));
+                            }))
+                            .child(icon(IconName::GearSix, icons::MD, t.ink_soft)),
+                    )
                     .children(quick_links.into_iter().enumerate().map(
                         |(ix, (label, brand, url))| {
                             pill(("quick-link", ix), cx)
                                 .flex_1()
-                                .h(size::ROW_LG)
+                                .h(size::ROW)
                                 .justify_center()
                                 .tooltip(Tooltip::text(SharedString::from(label)))
                                 .on_click(move |_, _, cx| cx.open_url(&url))
-                                .child(icon(brand_icon(brand), icons::LG, t.ink_soft))
+                                .child(icon(brand_icon(brand), icons::MD, t.ink_soft))
                         },
                     )),
-            )
-            .child(
-                pill("settings", cx)
-                    .flex_none()
-                    .h(size::ROW_LG)
-                    .gap(space::X2)
-                    .px(space::X3)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.pane
-                            .update(cx, |p, cx| p.open(PaneContent::Settings, window, cx));
-                    }))
-                    .child(icon(IconName::GearSix, icons::MD, t.ink_soft))
-                    .child("Settings"),
             )
     }
 }

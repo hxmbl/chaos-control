@@ -730,6 +730,85 @@ impl ChatStore {
         .detach();
     }
 
+    /// A fresh channel name for a new chat: `new-chat`, then `new-chat-2`,
+    /// skipping names the project already has (STRM-750).
+    fn new_chat_name(taken: &HashSet<String>) -> String {
+        let mut n = 1;
+        loop {
+            let candidate = if n == 1 {
+                "new-chat".to_string()
+            } else {
+                format!("new-chat-{n}")
+            };
+            if !taken.contains(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Starts a new chat in the open project (STRM-750).
+    ///
+    /// In v1 one chat is one channel, so this asks core for a new channel and
+    /// shows it in the sidebar. Core streams only #main into the app, so a new
+    /// chat is read-only for now: the composer's existing unwired note says so.
+    /// That is the minimal flow the issue asks for, not a promise of a live
+    /// multi-channel session.
+    pub fn create_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(attached) = self.core.as_ref() else {
+            return;
+        };
+        let Some(open) = attached.link.open.as_ref() else {
+            return;
+        };
+        let project = open.project.id.clone();
+        let project_key = project.to_string();
+        let taken: HashSet<String> = open.channels.iter().map(|c| c.name.to_string()).collect();
+        let generation = attached.generation;
+        let core = attached.link.core.clone();
+
+        cx.spawn(async move |this, cx| {
+            let name = ChatStore::new_chat_name(&taken);
+            let Ok(channel) = core.channel(&project, &name).await else {
+                return;
+            };
+            this.update(cx, |store, cx| {
+                let Some(attached) = store.core.as_mut() else {
+                    return;
+                };
+                if attached.generation != generation {
+                    return;
+                }
+                let Some(open) = attached.link.open.as_mut() else {
+                    return;
+                };
+                if open.project.id.to_string() != project_key {
+                    return;
+                }
+                open.channels.push(channel.clone());
+                open.channels.sort_by_key(|c| c.ordinal);
+
+                let id = channel_id(channel.id);
+                store.workspace.channels.push(model::Channel {
+                    id,
+                    name: channel.name.clone(),
+                    ordinal: Some(channel.ordinal),
+                    linear_issue: None,
+                    unread: false,
+                    project_wide: false,
+                });
+                store.workspace.channels.sort_by_key(|c| c.ordinal);
+                store.logs.entry(id).or_default();
+                store.selected = id;
+                cx.emit(StoreEvent::Selected);
+                store.refresh_chats(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// Who has read up to (and no further than) the message at `index` of
     /// `channel`, oldest read first. Only core channels have receipts.
     pub fn readers(&self, channel: Id, index: usize) -> Vec<Reader> {
@@ -3012,6 +3091,16 @@ mod tests {
         // Sample data, no core: every channel echoes locally.
         assert_eq!(send_route(None, main), SendRoute::Local);
         assert_eq!(send_route(None, design), SendRoute::Local);
+    }
+
+    #[test]
+    fn new_chat_name_skips_channels_the_project_already_has() {
+        let taken: HashSet<String> = ["main", "new-chat", "new-chat-2"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(ChatStore::new_chat_name(&taken), "new-chat-3");
+        assert_eq!(ChatStore::new_chat_name(&HashSet::new()), "new-chat");
     }
 
     #[test]
