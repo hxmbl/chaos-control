@@ -1,113 +1,280 @@
 {
   "version": "1",
   "findings": {
-    "0a180c80eaa9a65178ad955ceca14f3d1a025269b080e99de56a2abc8c8d93b4": "crates/core/src/host.rs:531",
-    "0dd3486f28c3eb31efeee841d6c5a326c274bc234200aeba987307d844157366": "crates/app/src/project_context.rs:111",
-    "0e06e54977a1fa07f9827ef869b94ffdf76ebfe458a4a4bbcfb0cf3683225866": "crates/core/src/host.rs:719",
-    "11a19a5d0f4f639c9e2f222bfc88f68f7257c42d0cf4351bb13f12b03b86c051": "crates/core/src/store.rs:630",
-    "13f912fa80bda1b66b764f79b58eefae2afcb32f247d48d28f45324c72d839a1": "crates/core/src/store.rs:683",
-    "1e75551da2661ba2ef526a8b0faefe50a2a3aa9b9b4d587a13785910c5db4665": "crates/app/src/project_context.rs:98",
-    "20f1b53fffd5a10f44481057ec4a63d6e387d45deec2d7cc26a95dda233c8ccd": "crates/app/src/agents.rs:919",
-    "22480bbff12e5c05172ab25ee1a76a6a117e44d1d8d13f3c95526b573017e65d": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:12",
-    "2447d0b13a28ec1b3ac141cdda046092866845b2a8cc9a581475646cf868a4bb": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:4",
-    "278ddfc2e6ff2a41821a9942b11273209642e606d7e616a1b82ffb43cc3a9213": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:13",
-    "2a5fec801ffbf8ec9b2c5ecffd3327894a51fc83a0b35bb349f58bb5c9e4984a": "crates/core/tests/mentions.rs:15",
-    "2bd2bf97ec941ac692b8a2fd41c29c7afacd71ae1ced7bc5d981bcebe4a2d68a": "crates/core/tests/common/mod.rs:32",
-    "2c27b3ce45fdefffd4ad3dfb448045166d4a7d280d2ae474f5cb200822598b31": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:2",
-    "2ea2d9ac19c2c9d52accb961c237299396e046a4fd188aec3bb0efa1e2e7a187": "crates/core/src/store.rs:703",
-    "3027bd3bc32a2390575587140ef0192a732f3aafdc02523ae1030602669a90fd": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:15",
-    "31e33c7cb1e7a5597ff94122f73adc592f417a26698b0f4368449a644008809d": "crates/model/src/lib.rs:198",
-    "339ee06e629731671da96cdbee5d39d77902f3f1d1a101914747370e04384fcb": "crates/core/src/store.rs:916",
-    "3497af5d6609723bee3f78691ad0035615fe89cdba396ed8e903e7ad13348e8a": "crates/app/src/project.rs:493",
-    "3acd6cb29a2ed95b97de8ca7585be1c21a237e2205a472b819e3eeb6691f675f": "crates/core/src/store.rs:3436",
-    "3b2b95044dfa201ee8f1354bb2be4d69adc5f74c3c0d33677a4d45dc44775dfc": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:23",
-    "3bdd5f0b88a922b7c919abf5aa62e8c30507fe21bf3e051b77012561d7ece379": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:10",
-    "3cfd601c8a5e06c681acba8cef9366874498bbc92d5e7fb35924453883288464": "crates/core/tests/reactions.rs:390",
-    "3e1605f04a8181fa71d54da8167aa2f39408ae7389ae0b52aba65e405219a52f": "crates/core/tests/reactions.rs:377",
-    "3e5d695f02fbcbe654c06c3a5ac4664a71a83d0d934b76e1af4783fa4b223421": "crates/core/src/host.rs:706",
-    "4012cfb6b5b92aa1f6e8150514cc502f64e07e6c6d7f7c01af89cd92fe8570a6": "crates/core/src/store.rs:684",
-    "41878f76ff121bace24580d90373285003ca17f773ea3ad1e346294384af32b9": "crates/core/src/host.rs:419",
-    "4250e98a30665405ada8d2aa3459b1c575a09fb922c666ef8a20d039464f1dc3": "crates/core/src/store.rs:4543",
-    "471742ffee4317234bd5aaeb8af8b885d076473da0631ee7738aabedaf0b7ac7": "crates/core/src/store.rs:5100",
-    "4ad1b1767e9d206f125cb64943988a9814fae1f2bdde75dce05f7a172a85fc77": "crates/core/tests/mcp.rs:184",
-    "4f2676c43121455188cc54e9710e0e478cf252a85d38b3a984e3e4309557a12c": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:14",
-    "52945e5fa22b091fcb97245343ee59ef71f0e29ffcc7e585851991d5e5c9af21": "assets/app/AppIcon.icns:1",
-    "52c5fa129e27c54990dbd8c54fa5ff09d43d5c13114e54be15e5da67e4783268": "crates/core/src/host.rs:401",
-    "56d2de92a95321f26018340ad8ab2b544ae0b330d084198e044eefed375707b1": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:17",
-    "56d7809cfbfa781dd96ee8eace2f3f83e6f736fcc90d5ad46bed110fa8b61c0b": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:4",
-    "56efcd383fd3bfb4156743b65d5c1ce9afc7c7408962a770095a7bc879976a3e": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:10",
-    "59133f774c56432a5059c6fee326488c87c44fb5e027cdc66f4342587ed1e6e2": "crates/core/src/store.rs:3439",
-    "5caf8c86c8b649635b9316e0e56c53d61c3b45f23a5719067acd41d0a31159e1": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:17",
-    "5deeceb1781a8b39ce485ad9e975b41a2fe400803a08bc5d00641aa71755a679": "crates/core/src/store.rs:807",
-    "5f17ba6d722814a61fad1688aa7893f0d4bed69b8930f5a5f7166b05a512e0c1": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:19",
-    "607bb03756de96dd1a9d0fca62885ddfdacdf97720cea927387827484e29bcaa": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:15",
-    "659847312247435292fc2f7c4ba9804099a46f3c143804f9f85fc1d46aa09b6b": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:13",
-    "67286984d27c84e237c5469f3d94488089a631b1840b1174aad817798233c884": "crates/app/themes/tokyonight_night.tmTheme:1374",
-    "67ca85d595147c9bc24a7f9d698984f2d42e811ae5262efe7c6312874e8b686c": "crates/app/src/project_context.rs:129",
-    "6daf87c23187a60c9cfb9a0e5c62ae8f1ff4ae170c65851e08854a6bb5ef7172": "crates/core/src/store.rs:628",
-    "6f9a141eb935d4b6ce3453c7a58226dab20ac89e273b53df6c563b2a85b692ef": "crates/app/src/store.rs:3394",
-    "700539d504d56fd6494babf402ce7234c18707a0def79f1a4888318af61b2f45": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:20",
-    "753b6fb007c334c542f2759bbf186e6998c993e50ed593070f6a89209ce5ec02": "crates/app/src/project.rs:457",
-    "7545c75e5a277f0f8d8cba46d2d9bd5ccddc776716e6a2919e0c826308780d43": "crates/core/src/host.rs:153",
-    "770ba75f77ab91e9c18a18fa395a729ef135e340fcd17668a9c78e98a12591f2": "crates/core/src/store.rs:796",
-    "78d6050397c93dcb9f34aefc329b8c0906749828e6918d5fe82edc604ecaee5a": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:21",
-    "7a13cb4c89aa606a07c692e137dee4bc0b97f8ec55076cc7be0507b2079f6dcb": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:17",
-    "7bffc7f21bd2283df48bf456750ea0177c8c3c0ebd4c99279d8f08e67fc9628b": "crates/app/src/agents.rs:363",
-    "8188ef34fbf9813a04191151d064df9431ecf012d7e96f6fac85c6cc34c09e09": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:18",
-    "8344c4ae4a55b6765531f9c32c09ff490aaadb769f875816561a3c4a12788f95": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:22",
-    "83839893370b0026067c928415b57fbbeeddcb7b44db7ce98a220f369022db1c": "crates/core/src/store.rs:5252",
-    "89eea0028b8c31a57074667377638e5ccd37b7457175bd16e66c4f9766890cde": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:7",
-    "8a06e7070fb41fa024400d29cb264b54ccb8c8c88437d9194c843cb2b2e76ff2": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:20",
-    "8a7cc4c326177285acc0e3b924cb98fdba96943775294fd2454e52af78dd0871": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:18",
-    "8acf739d6183b9cde72b24b7ee7565f4fc7120f1d8b29c6f7ea18bb0452a257c": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:22",
-    "8b1af269365c033e7c0900661e38200eec1d30f2b632296c557b34819ac5fe2a": "crates/core/tests/fixtures/claude-agent-acp-0.97.0.ndjson:5",
-    "8d66649d59be6afd7f9b3784b544ca949e92b1f621be08190a32e5ed508dabc1": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:3",
-    "8d9e101948f58297a1123975e6248e00078c17bdcefd54ac376b3fddbfa4ffb7": "crates/app/src/project.rs:456",
-    "90bc84b2577a8a7bc82f7e6b5e8be6bea5e942a9f742a3fbc8ddd907df90034b": "crates/core/src/store.rs:682",
-    "9117035e3f8a5621433ddad48a3d73a8f517be7c3f4b5eb9369d8784f7e2e993": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:16",
-    "9237e1d2cde3dce6ef1fcb97d9dee49cb496624fdc1b28ed3f6f109224727d12": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:14",
-    "955e4af0f86fbdea824788ebc0404a067911b76b60ab2b39102f286399521d58": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:1",
-    "961b6a100d439f1a35e74e76d4e94d20a01bc23e9dedc61864282a3a5b0f41dc": "crates/core/src/store.rs:5102",
-    "98d313e26b35915bf90a5b657b72d299e3cae6fce17a4147e7bb601315009075": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:7",
-    "9a0e8b5e867046301a6ec8e0ec02d30867749c90be3c7a9fcb7a9e27671fd4d7": ".chaos/project.toml:4",
-    "9b96316562b7374bd2658f72918133a967ffe6de69dc04a46f84e4c295792451": "crates/core/src/host.rs:544",
-    "a05e28eb951037874d59729e5fe3498d4900187f2261a99c4aa40741c8b553fe": "crates/core/src/store.rs:821",
-    "a13a0116497f049b0bccd1e129cf5ee4fff0e7d5b8b8d77523a719b504051278": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:5",
-    "a4da42b83c72e09aadd0409c372325fa42731b7df47cb5eecd4c56e4537f55d3": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:19",
-    "a68426915c5a409c7cad959e51d6f2793b69c39b85053bf5c8ce2763eca0bccc": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:6",
-    "a84cfd720bfc3e0b9dbc4fab75d8648aae8bd27ac3eac43f86f535d3df1883fe": "crates/core/tests/replay.rs:157",
-    "a888da94b5e6e33e49963fab70c7af1fb006e9b40b0510c5d6b5a4cfef7ef14e": "crates/core/src/store.rs:702",
-    "aa340c1b222667e21e80b0be3930a97a45e7e9b86cc555bfe6a3601fc5b33ebd": "crates/app/src/project.rs:458",
-    "ace6c4943990e80027c8c043a3b712391dbdda020b04c0dd2dfa34e31d07a5e3": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:5",
-    "b2b7db2b3b8718eb73e3fe9be3dd64374ebc0c4b8bc32e8b0bca4fcfd3c8b5a8": "crates/core/src/store.rs:701",
-    "b45f659fc2dcff4a68b45b2853ff00399f379a1f5431081c9bfb5805034107c0": "crates/app/themes/tokyonight_day.tmTheme:1374",
-    "b5247c7cf2cda084546fcc8244be52a77bea78df404f24036d7ce0e44ea4145f": "crates/core/tests/fixtures/claude-agent-acp-0.97.0.ndjson:6",
-    "b5b104c4fcd0f70a7db236e9dede1b75eeac260186401caee6fa8f0579bd8cf7": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:6",
-    "b9bf8e5aab8edf9894aebdf143ec06a8de4eb65b923cfb96bb2fa58d917e9277": "crates/core/tests/models.rs:307",
-    "b9f2c68165981c6f98a0a8460fec4db5bc8fb4895806cb5c6c700d89856fcccd": "crates/core/src/store.rs:632",
-    "ba5fa6a186dde2b1836683546e2242c57b23a0d086fd7b8f2aa173e9e62a3669": "crates/model/src/sample.rs:54",
-    "baebe5c1a4a15c25fd31e9099db9cacc4c17468ca4b7c08f2c9b10d8a2f085bc": "crates/core/src/roster.rs:233",
-    "bccb383a5db5564e1037e49e6720f6b99be6fac84764b04255c77bd5c1823189": "crates/core/src/store.rs:920",
-    "bd94d84a03815ccd60635dfdfac743b24b5c794d06dce51c7ca548b0c5ea2152": "crates/app/src/project_context.rs:112",
-    "c3af8a1512ea6d01cdfe994c0a20e6652fcf669c4c1e25c3c033254b00d9c8f4": "crates/core/src/host.rs:553",
-    "cc36bad0a8ec5ab6bcdb9665d9e05e63367f8436098c814c70a82d558d90ba85": "crates/core/src/harness.rs:484",
-    "d2fe1b4db876270a4f21ba2847e769ebb185715289527299fed2c29c4ae55b27": "crates/core/src/store.rs:4544",
-    "d3980cd0f930e1eb77b035ef0f56e0e808902e1b2252c3f6feda3de27dfcb58f": "crates/core/tests/fixtures/claude-agent-acp-0.97.0.ndjson:6",
-    "d4037a2e81f07430db97744bbddfb42a2291d192903fbb846180e62f39160adc": "crates/core/src/store.rs:5254",
-    "da4fc6ae9877bbf31f254537b6062e70d61d0c86973da34ed5b8de90438f1401": "crates/core/src/store.rs:912",
-    "db9645966e220b2fdaf9d7a8c5e304e60776208fbf3e16ee49ae40d3e95af853": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:16",
-    "e0fb57f175fb7422affc572a3ac8b2798348c6a072bbf64bc560205b51537e38": "crates/core/src/store.rs:5169",
-    "e115b22670012d9f570b52dc25a9e02449a783e496cb026345851fcac9dc825f": "crates/core/src/store.rs:5167",
-    "ec9b725bf19c46862db89153b782673aca9cddff20a37f2efd6903a6ae32ca26": "crates/app/src/store.rs:3388",
-    "ef192786b45628e0e5c91fccad7783fb53c93633fcc6fdf739e35b91ea8e1d67": "crates/core/src/types.rs:122",
-    "ef809b1802382d219f6de28a8bd3ddc50adcb692420f2b7eb87d260a3b1e53db": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:22",
-    "f201c71a6394ad61139278340b17a5d9f54d4d07a043c2187d7d3381950d3178": "crates/model/src/pane.rs:368",
-    "f461a3c356ea6d68596512cd69a932cf3a99e22afcbf98926fdfa0d9b9730c09": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:17",
-    "f890570880dfb7259fcfd7a9d35a6f07f7ee5cb363bb45db8bdb0a3c8943ff51": "crates/core/src/host.rs:655",
-    "fa3c1cf7270d18982f509a8963becfb912990d9d82df71af52abb6615f2c1fa2": "crates/core/src/harness.rs:484",
-    "fad93b3850296bd4eddaa48f6d7b3fea03efbd20ef4fd62afcf55f24b24d7e1b": "crates/core/tests/mcp.rs:266",
-    "fbd181fd152e8b8f78bec5c0b440c5ca5f02e8eb429d4448bac8026215a5805b": "crates/core/src/store.rs:96",
-    "fc87becbf4c1bfc08d2f772a04bcfe3e00e4efbb7c79b4e5541f0db7f01727de": "crates/core/src/store.rs:611",
-    "ffc2d3441d8f31f88ef2306dd050f76e139033774d159bdd7e07ab71b282623f": "crates/core/tests/fixtures/claude-agent-acp-0.97.0-v2-live.ndjson:12"
+    "52945e5fa22b091fcb97245343ee59ef71f0e29ffcc7e585851991d5e5c9af21": {
+      "file": "assets/app/AppIcon.icns",
+      "line": 1,
+      "rule_id": "",
+      "reason": "Binary app icon; value-less entry silences the direct-file binary warning."
+    },
+    "67286984d27c84e237c5469f3d94488089a631b1840b1174aad817798233c884": {
+      "file": "crates/app/themes/tokyonight_night.tmTheme",
+      "line": 1374,
+      "rule_id": "",
+      "reason": "Fixed UUID in a colour theme, not an Azure tenant ID."
+    },
+    "b3:181b8ab0eb919af1de8899e38667e760329026482136d425c331b7db36f4d4cd": {
+      "file": "crates/core/src/harness.rs",
+      "line": 495,
+      "rule_id": "generic-password",
+      "value_token": "sha256:3a5663d1d78d",
+      "reason": "Local variable name `server_password`, not a password value."
+    },
+    "b3:1a5e2b808b915f921838cb887a1dabe604d6c1be04b0a3644f424038dc1031f7": {
+      "file": "crates/model/src/lib.rs",
+      "line": 235,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:985959785319",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:216779255bda0bb25313bc6d46348dc4583194c54e1fc8e240b0d0dc47e4c291": {
+      "file": "crates/core/src/store.rs",
+      "line": 687,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:253af0659a920b82192f6ed22525872ed5030a0c5b6c5c99f30bf6d2ab748872": {
+      "file": "crates/core/src/host.rs",
+      "line": 1416,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:27e2dde04308cd01cf1b0abd72cb6d2a0afb10312bc850496a5885411426674f": {
+      "file": "crates/core/src/store.rs",
+      "line": 900,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:28c92a3925a08622a4d15431ae53216ab59c6ca333ddb30c7b92f39a06c8fec4": {
+      "file": "crates/core/src/host.rs",
+      "line": 1352,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:415461e30afbe25cc21707ccc771e1b9a940e4f78b8fcc50929f83c1b7e11b8f": {
+      "file": "crates/core/src/store.rs",
+      "line": 686,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:41b861097d4d38f6b6ada5d35397a05536cff0e0c007dcdd2079adb35582009d": {
+      "file": "crates/core/src/host.rs",
+      "line": 1403,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:4ed7b9f4175e2149c5b537423be3dcbb424462b399c3ca0f9df79633e604ef16": {
+      "file": "crates/core/src/host.rs",
+      "line": 1241,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:5224a53cffdb53485437582a501bbbe2e5220ed656cf0d094a6556620288bd16": {
+      "file": "crates/core/src/store.rs",
+      "line": 99,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:5815c68f68a6b6190f8bccd800883d18bac0809ff33ade00920373aa3d89f6a3": {
+      "file": "crates/core/src/store.rs",
+      "line": 1094,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:64bc146b58948c12cbe45e4d456344efbe655e7bf09b3c1d11366a69243d1b15": {
+      "file": "crates/core/src/store.rs",
+      "line": 614,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:65aadd1c6739c656a39bf109634c202204618f448744d8eacf186c63768e6e4e": {
+      "file": "crates/core/src/store.rs",
+      "line": 685,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:6b4da8bd15c6d1e01f8cb4f67ab4244dfe8629caefe0751759b912289d76fbc3": {
+      "file": "crates/app/src/agents.rs",
+      "line": 1006,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:985959785319",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:6f43beb8374077996a1856f681b18cb1991a22218ed448f3604d7695c6bcf8e2": {
+      "file": "crates/core/src/store.rs",
+      "line": 635,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:73d14c530720d800bca769fc5a8802d0be7fb5f4d90715c3157c030952990564": {
+      "file": "crates/core/src/store.rs",
+      "line": 1086,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:7912339b63cbf7447ffeb240aa0503e1e171c49f131baa8fd989ec47f3b00cd1": {
+      "file": "crates/core/src/host.rs",
+      "line": 1250,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:823308b450da04fd6d670a0f3f7aa130f0210b965f230d9e436fa7d83ee0a513": {
+      "file": "crates/core/src/store.rs",
+      "line": 631,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:91d05d818c1a4e8fba5186039f7d9235880e94767d72827c5ea9dbc10f2b2293": {
+      "file": "crates/core/src/harness.rs",
+      "line": 495,
+      "rule_id": "env-password",
+      "value_token": "sha256:3a5663d1d78d",
+      "reason": "Local variable name `server_password`, not a password value."
+    },
+    "b3:ae53630a96166190073848f665d63ab72e3843bb95699d0e606b393379b268d3": {
+      "file": "crates/core/src/host.rs",
+      "line": 162,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:af4d550343643dfd0e504981a3f6e99d1b8a2e7f056d19b211ee68543afef8c7": {
+      "file": "crates/core/src/store.rs",
+      "line": 707,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:b534328bd3ccfb503dd541512556cf4efaaba0c991052c58dfa3bcc8d3b6b8ce": {
+      "file": "crates/core/src/types.rs",
+      "line": 139,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:b8eb669594b3a1c6454b3363d872fc188079733ad8533abc1c8d604114c5d1c3": {
+      "file": "crates/core/src/host.rs",
+      "line": 1228,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:ba9e29466c59884368bbff919e4472f126279aef5aa0f2c1058d267de15f828c": {
+      "file": "crates/core/src/host.rs",
+      "line": 1082,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:c1d76d1a8103c6001b6d5b51b0fb6f28e0d8ef0a82cfbb28dd7a139a35b02633": {
+      "file": "crates/core/src/store.rs",
+      "line": 1090,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:c43c6608d78829c61b63c4592fbbcf124213c3ef670b917ea87908210deeafc7": {
+      "file": "crates/core/src/store.rs",
+      "line": 875,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:c8d297d305abae34ef639a73a1b4ba10fa254455a9530a38839f00ad844b1c96": {
+      "file": "crates/core/src/host.rs",
+      "line": 1116,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:c9952c54f73ecfe304b3ff65bb22613c4b3888f516b28020c377b9b2d35cc614": {
+      "file": "crates/core/src/store.rs",
+      "line": 886,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:244210e48437",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:cb98b1e4112316525171bf407d6f2faf9a0152a104a05b5fd2d38c247eaa46e1": {
+      "file": "crates/core/src/store.rs",
+      "line": 3736,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:b2ef230e7f4f",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:ddcd9bb0355f90b628d03c3869f5c6457b35753a2a2ca40872045d1700f81fbd": {
+      "file": "crates/core/src/store.rs",
+      "line": 705,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:e0a9996359a513fbe3990067fb8a48d2a9fce02b4679aed5b291d0f136096cfb": {
+      "file": "crates/core/src/store.rs",
+      "line": 3739,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:999055cef23c",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:e74b3b3586bc4e90d6622181e780172fc5ba94d38bd48ff3daaa21facad47778": {
+      "file": "crates/app/src/agents.rs",
+      "line": 450,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:985959785319",
+      "reason": "Rust identifier or type name (`Project`/`ProjectId`/local variable), not a cloud project ID."
+    },
+    "b3:f08b83f2c6ee2846950bdc1f065a957d23b23eda15009964727bf31b884eb361": {
+      "file": "crates/core/src/store.rs",
+      "line": 633,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:f14e9e889a1f60239e11fc3116c2447c4fa0643ceaee0422bbf9257b6eb63a4e": {
+      "file": "crates/core/src/store.rs",
+      "line": 706,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b3:f3e258b9b9bd5e493bf1f34590589be8c0741bb3520c764e9d052d0ad9128254": {
+      "file": "crates/app/src/store.rs",
+      "line": 628,
+      "rule_id": "gcp-project-id",
+      "value_token": "sha256:774aac068808",
+      "reason": "Rust `HashMap` type name, not a cloud project ID."
+    },
+    "b45f659fc2dcff4a68b45b2853ff00399f379a1f5431081c9bfb5805034107c0": {
+      "file": "crates/app/themes/tokyonight_day.tmTheme",
+      "line": 1374,
+      "rule_id": "",
+      "reason": "Fixed UUID in a colour theme, not an Azure tenant ID."
+    },
+    "ba5fa6a186dde2b1836683546e2242c57b23a0d086fd7b8f2aa173e9e62a3669": {
+      "file": "crates/model/src/sample.rs",
+      "line": 54,
+      "rule_id": "",
+      "reason": "Rust type/struct name, not a cloud project ID."
+    },
+    "ef192786b45628e0e5c91fccad7783fb53c93633fcc6fdf739e35b91ea8e1d67": {
+      "file": "crates/core/src/types.rs",
+      "line": 122,
+      "rule_id": "",
+      "reason": "Rust type/struct name, not a cloud project ID."
+    }
   }
 }
