@@ -333,7 +333,10 @@ pub struct Panels {
 impl Panels {
     pub fn new() -> Self {
         Self {
-            sides: [SidebarState::new(Side::Left), SidebarState::new(Side::Right)],
+            sides: [
+                SidebarState::new(Side::Left),
+                SidebarState::new(Side::Right),
+            ],
             next_pin: 1,
             viewport: Size::default(),
             resizing: None,
@@ -527,7 +530,8 @@ impl Panels {
         } else {
             f32::from(GUTTER)
         };
-        let max_by_viewport = viewport - other_reserve - f32::from(SIDE_INSET + GUTTER) - FLOOR_COLUMN;
+        let max_by_viewport =
+            viewport - other_reserve - f32::from(SIDE_INSET + GUTTER) - FLOOR_COLUMN;
         let max_width = MAX_SIDEBAR_WIDTH.min(max_by_viewport.max(MIN_SIDEBAR_WIDTH));
         let next = (start_width + delta).clamp(MIN_SIDEBAR_WIDTH, max_width);
         let next_px = px(next.round());

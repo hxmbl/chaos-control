@@ -5,8 +5,8 @@ use std::time::Instant;
 
 use gpui::{
     AnyView, Context, CursorStyle, Decorations, DispatchPhase, Entity, FocusHandle, Focusable,
-    MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, ResizeEdge,
-    StyleRefinement, Subscription, Window, canvas, div, prelude::*, px,
+    MouseButton, MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, ResizeEdge, StyleRefinement,
+    Subscription, Window, canvas, div, prelude::*, px,
 };
 use ui::{
     ActiveTheme, Elevation, FONT_FAMILY, IconName, TextInput, Theme, Tooltip, TypeStyleExt, icon,
@@ -379,7 +379,13 @@ impl Render for Workspace {
                     // Collapsed sidebars slide off their edge and fade; a peek
                     // slides one back over the content.
                     .when(left.shown > 0., |this| {
-                        this.child(self.side_slot(Side::Left, left, left_w, cached(&self.sidebar), cx))
+                        this.child(self.side_slot(
+                            Side::Left,
+                            left,
+                            left_w,
+                            cached(&self.sidebar),
+                            cx,
+                        ))
                     })
                     .when(right.shown > 0., |this| {
                         this.child(self.side_slot(
