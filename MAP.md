@@ -49,7 +49,7 @@ Rendering model and perf context: [ARCHITECTURE.md#state](ARCHITECTURE.md#state)
 | Project identity and `.chaos/project.toml` | `crates/app/src/project.rs`, `crates/app/src/project_context.rs` | `decide`, `Confirm`, `ProjectContext`, `ProjectLifecycle` |
 | Recents and profile persistence | `crates/app/src/{recents,profile}.rs` | `RecentsFile`, `Profile` |
 | Approval notices in the sidebar | `crates/app/src/right_sidebar.rs` | `ApprovalNotice::label` |
-| Working-tree changes for the sidebar | `crates/app/src/store.rs` | `ChatStore::changed_files`, `ChangedFile`, `parse_diff_stat` |
+| Working-tree changes for the sidebar | `crates/app/src/store.rs` | `ChatStore::changed_files`, `changed_files_for`, `ensure_baseline`, `ChangedFile`, `ChatBaseline`, `parse_diff_stat` |
 
 Core-side counterpart: [ARCHITECTURE.md#crates](ARCHITECTURE.md#crates),
 [ARCHITECTURE.md#state](ARCHITECTURE.md#state).

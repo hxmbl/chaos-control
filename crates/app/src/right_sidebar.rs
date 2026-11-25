@@ -22,7 +22,7 @@ use ui::{
 use crate::{
     model_picker::ModelPicker,
     pane_host::PaneHost,
-    store::{ChangedFile, ChatStore},
+    store::{ChangedFile, ChatStore, StoreEvent},
 };
 
 pub struct RightSidebar {
@@ -34,9 +34,12 @@ pub struct RightSidebar {
     /// The toggle tooltip follows the click, even while the pointer is still
     /// over the button and the tooltip is on screen.
     mentions_tip: Entity<TooltipText>,
-    /// Snapshot for the Changes section. Git is read here and on the refresh
-    /// button, never from `render` (which can run many times a second).
+    /// Snapshot for the Changes section. Git is read here, on chat selection
+    /// and on the refresh button, never from `render` (which can run many
+    /// times a second).
     changes: Vec<ChangedFile>,
+    /// Changes already in the project before this chat was first viewed.
+    older_changes: usize,
     /// The Agents row under the pointer (shows its remove button).
     hovered_agent: Option<model::Id>,
 }
@@ -49,7 +52,20 @@ impl RightSidebar {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        let changes = store.read(cx).changed_files();
+        let channel = store.read(cx).selected();
+        store.update(cx, |s, _| s.ensure_baseline(channel));
+        let changes = store.read(cx).changed_files_for(channel);
+        let older_changes = store.read(cx).baseline_len(channel);
+        cx.subscribe(&store, |this, store, event, cx| {
+            if matches!(event, StoreEvent::Selected) {
+                let channel = store.read(cx).selected();
+                store.update(cx, |s, _| s.ensure_baseline(channel));
+                this.changes = store.read(cx).changed_files_for(channel);
+                this.older_changes = store.read(cx).baseline_len(channel);
+                cx.notify();
+            }
+        })
+        .detach();
         Self {
             store,
             picker,
@@ -57,6 +73,7 @@ impl RightSidebar {
             mentions_open: true,
             mentions_tip: cx.new(|_| TooltipText::new("Collapse mentions")),
             changes,
+            older_changes,
             hovered_agent: None,
         }
     }
@@ -154,6 +171,7 @@ impl Render for RightSidebar {
         let count = mention_rows.len();
         let open = self.mentions_open;
         let changes = self.changes.clone();
+        let older = self.older_changes;
 
         div()
             .size_full()
@@ -356,7 +374,7 @@ impl Render for RightSidebar {
                             .type_style(text::SMALL)
                             .font_weight(text::MEDIUM)
                             .text_color(t.ink_soft)
-                            .child(truncated("Changes"))
+                            .child(truncated("Changes in this chat"))
                             .child(
                                 div()
                                     .flex_1()
@@ -376,8 +394,13 @@ impl Render for RightSidebar {
                                     .hover(|s| s.bg(t.selected))
                                     .tooltip(Tooltip::text("Refresh changes"))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        let changes = this.store.read(cx).changed_files();
+                                        let channel = this.store.read(cx).selected();
+                                        this.store.update(cx, |s, _| s.ensure_baseline(channel));
+                                        let changes =
+                                            this.store.read(cx).changed_files_for(channel);
                                         this.changes = changes;
+                                        this.older_changes =
+                                            this.store.read(cx).baseline_len(channel);
                                         cx.notify();
                                     }))
                                     .child(icon(IconName::ArrowClockwise, icons::SM, t.ink_soft)),
@@ -389,7 +412,14 @@ impl Render for RightSidebar {
                                 .px(space::X2)
                                 .type_style(text::CAPTION)
                                 .text_color(t.muted)
-                                .child(truncated("No changes in this project")),
+                                .child(if older == 0 {
+                                    truncated("No new changes in this chat").into_any_element()
+                                } else {
+                                    truncated(format!(
+                                        "No new changes · {older} older in this project"
+                                    ))
+                                    .into_any_element()
+                                }),
                         )
                     })
                     .when(!changes.is_empty(), |s| {

@@ -190,6 +190,8 @@ pub struct ChatStore {
     no_project_core: Option<CoreLink>,
     /// Recent non-allowed approval outcomes, newest first, for the sidebar.
     approval_notices: Vec<ApprovalNotice>,
+    /// Per-chat working-tree baselines, parallel to `logs` (STRM-762).
+    baselines: HashMap<Id, ChatBaseline>,
     /// Every project with its chats, for the cross-project sidebar (STRM-737).
     chat_catalog: Vec<model::ChatProject>,
     /// Increments per catalogue request, so a slow answer cannot overwrite a
@@ -438,6 +440,15 @@ pub struct ChangedFile {
     pub stat: String,
 }
 
+/// The working-tree snapshot a chat started from. Core has no session-open
+/// event, so a chat's first view is the honest boundary (STRM-762).
+#[derive(Clone, Debug)]
+struct ChatBaseline {
+    generation: u64,
+    root: String,
+    files: Vec<ChangedFile>,
+}
+
 /// Turn the file rows of `git diff --stat` into sidebar rows. The trailing
 /// `N files changed, …` line has no ` | ` separator, so it falls out.
 fn parse_diff_stat(text: &str) -> Vec<ChangedFile> {
@@ -588,6 +599,60 @@ impl ChatStore {
         files
     }
 
+    /// Capture a chat's working-tree baseline on first view (or after a project
+    /// switch). Refreshing never overwrites it: the baseline is what makes a
+    /// change "this chat's work" rather than an old project change.
+    pub fn ensure_baseline(&mut self, channel: Id) {
+        let Some(root) = self.project_context.location.path.clone() else {
+            return;
+        };
+        let generation = self.project_context.generation;
+        let stale = self
+            .baselines
+            .get(&channel)
+            .is_some_and(|b| b.generation != generation || b.root != root);
+        if self.baselines.contains_key(&channel) && !stale {
+            return;
+        }
+        let files = self.changed_files();
+        self.baselines.insert(
+            channel,
+            ChatBaseline {
+                generation,
+                root,
+                files,
+            },
+        );
+    }
+
+    /// Working-tree changes made since `channel`'s baseline. A file counts as
+    /// new when its path is new or its git summary changed (more edits).
+    pub fn changed_files_for(&self, channel: Id) -> Vec<ChangedFile> {
+        let Some(baseline) = self.baselines.get(&channel) else {
+            return Vec::new();
+        };
+        if baseline.generation != self.project_context.generation
+            || Some(&baseline.root) != self.project_context.location.path.as_ref()
+        {
+            return Vec::new();
+        }
+        self.changed_files()
+            .into_iter()
+            .filter(|f| {
+                baseline
+                    .files
+                    .iter()
+                    .all(|b| b.path != f.path || b.stat != f.stat)
+            })
+            .collect()
+    }
+
+    /// Changes already present when this chat was first viewed, so the sidebar's
+    /// empty state can point at them instead of silently hiding them.
+    pub fn baseline_len(&self, channel: Id) -> usize {
+        self.baselines.get(&channel).map_or(0, |b| b.files.len())
+    }
+
     pub fn new(workspace: Workspace) -> Self {
         let selected = workspace.channels[0].id;
         let logs = workspace
@@ -605,6 +670,7 @@ impl ChatStore {
             core: None,
             no_project_core: None,
             approval_notices: Vec::new(),
+            baselines: HashMap::new(),
             chat_catalog: Vec::new(),
             chat_catalog_seq: 0,
         }
@@ -1322,6 +1388,7 @@ impl ChatStore {
             self.workspace.mentions.clear();
             self.workspace.channels.clear();
             self.logs.clear();
+            self.baselines.clear();
             let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
             let shown_path = |root: Option<&str>| {
                 root.map(|r| Arc::from(project::display_path(Path::new(r), home.as_deref())))
@@ -2367,6 +2434,7 @@ impl ChatStore {
         // Atomic project-context swap for channel state: drop all previous logs and
         // create fresh empty logs only for the new project's channels.
         self.logs.clear();
+        self.baselines.clear();
         for c in &self.workspace.channels {
             self.logs.insert(c.id, ChannelLog::default());
         }
@@ -3244,8 +3312,20 @@ mod tests {
         let stat = " crates/app/src/a.rs | 3 ++-\n b.txt | 1 +\n 2 files changed, 3 insertions(+), 1 deletion(-)\n";
         let files = parse_diff_stat(stat);
         assert_eq!(files.len(), 2);
-        assert_eq!(files[0], ChangedFile { path: "crates/app/src/a.rs".into(), stat: "3 ++-".into() });
-        assert_eq!(files[1], ChangedFile { path: "b.txt".into(), stat: "1 +".into() });
+        assert_eq!(
+            files[0],
+            ChangedFile {
+                path: "crates/app/src/a.rs".into(),
+                stat: "3 ++-".into()
+            }
+        );
+        assert_eq!(
+            files[1],
+            ChangedFile {
+                path: "b.txt".into(),
+                stat: "1 +".into()
+            }
+        );
     }
 
     #[test]
@@ -3305,6 +3385,77 @@ mod tests {
         assert!(tracked.stat.contains('+'), "{tracked:?}");
         let new = files.iter().find(|f| f.path == "new.txt").unwrap();
         assert_eq!(new.stat, "untracked");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_baseline_scopes_changes_and_resets_on_generation_change() {
+        let mut store = ChatStore::new(Workspace {
+            project: model::Project {
+                id: Id(1),
+                name: Arc::from("test"),
+                emoji: Arc::from("🧪"),
+                path: None,
+            },
+            projects: Vec::new(),
+            channels: vec![model::Channel {
+                id: Id(1),
+                name: Arc::from("main"),
+                ordinal: Some(1),
+                linear_issue: None,
+                unread: false,
+                project_wide: true,
+            }],
+            quick_links: Vec::new(),
+            agents: Vec::new(),
+            mentions: Vec::new(),
+        });
+        let channel = Id(1);
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-chat-baseline-{nanos}"));
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("tracked.txt"), "before\n").unwrap();
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-qm", "initial"]);
+        store.project_context.location.path = Some(project::root_key(&dir));
+
+        store.ensure_baseline(channel);
+        assert_eq!(store.baseline_len(channel), 0);
+        assert!(store.changed_files_for(channel).is_empty());
+
+        std::fs::write(dir.join("tracked.txt"), "before\nafter\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "new\n").unwrap();
+        let files = store.changed_files_for(channel);
+        assert_eq!(files.len(), 2, "{files:?}");
+
+        // Refreshing updates the view but must not move the baseline.
+        store.ensure_baseline(channel);
+        assert_eq!(store.baseline_len(channel), 0);
+        assert_eq!(store.changed_files_for(channel).len(), 2);
+
+        // A project switch starts a fresh baseline from the current tree.
+        store.bump_project_generation();
+        store.ensure_baseline(channel);
+        assert_eq!(store.baseline_len(channel), 2);
+        assert!(store.changed_files_for(channel).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

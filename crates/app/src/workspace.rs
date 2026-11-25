@@ -231,9 +231,8 @@ impl Workspace {
             panels,
             search,
             sidebar: cx.new(|cx| Sidebar::new(store.clone(), pane.clone(), cx)),
-            right_sidebar: cx.new(|cx| {
-                RightSidebar::new(store.clone(), model_picker.clone(), pane.clone(), cx)
-            }),
+            right_sidebar: cx
+                .new(|cx| RightSidebar::new(store.clone(), model_picker.clone(), pane.clone(), cx)),
             model_picker,
             conversation: cx
                 .new(|cx| Conversation::new(store.clone(), pane.clone(), composer.clone(), cx)),
