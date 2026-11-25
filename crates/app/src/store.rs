@@ -85,7 +85,7 @@ impl ApprovalNotice {
         match self.state {
             ApprovalOutcomeState::Allowed => "Allowed",
             ApprovalOutcomeState::Denied => "Blocked: denied",
-            ApprovalOutcomeState::Sent => "Blocked: failed after reply",
+            ApprovalOutcomeState::Sent => "Blocked: outcome unknown after reply",
             ApprovalOutcomeState::NotSent => "Blocked: no reply sent",
             ApprovalOutcomeState::Failed => "Blocked: request failed",
         }
@@ -94,6 +94,16 @@ impl ApprovalNotice {
 
 /// How many recent blocked approvals the sidebar keeps.
 const MAX_APPROVAL_NOTICES: usize = 8;
+
+/// Drops a resolved request from the queue. Returns true when it was the one
+/// being shown, so the pane must advance or close.
+fn drop_pending_approval(pending: &mut Vec<ApprovalRequest>, id: &ApprovalId) -> bool {
+    let displayed = pending
+        .first()
+        .is_some_and(|request| request.cc_request_id == *id);
+    pending.retain(|request| request.cc_request_id != *id);
+    displayed
+}
 
 /// Where a composer message in the selected channel goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,6 +153,9 @@ pub enum StoreEvent {
     ApprovalRequested,
     /// The cross-project chat catalogue changed (STRM-737).
     Chats,
+    /// The approval shown in the pane was resolved elsewhere (for example on
+    /// disconnect): advance to the next queued request or close the pane.
+    ApprovalResolved,
 }
 
 /// Someone who has read up to a message (Slack/iMessage-style read marks).
@@ -2483,10 +2496,11 @@ impl ChatStore {
         }
         if let CoreEvent::ApprovalOutcome(ref outcome) = event
             && let Some(attached) = &mut self.core
+            && drop_pending_approval(&mut attached.pending_approvals, &outcome.cc_request_id)
         {
-            attached
-                .pending_approvals
-                .retain(|pending| pending.cc_request_id != outcome.cc_request_id);
+            // Removing a resolved request does not by itself refresh the pane;
+            // tell it to show the next queued request or close.
+            cx.emit(StoreEvent::ApprovalResolved);
             // Fall through so apply_core_event_state records the visible notice.
         }
         // Models has side effects (cache write, harness lookup) that need the
@@ -3927,5 +3941,60 @@ mod apply_core_event_tests {
             store.core.as_ref().unwrap().ping_answers,
             Some(vec!["👍".to_string()])
         );
+    }
+
+    #[test]
+    fn sent_outcome_does_not_claim_failure() {
+        let notice = ApprovalNotice {
+            state: ApprovalOutcomeState::Sent,
+            error: None,
+        };
+        assert_eq!(notice.label(), "Blocked: outcome unknown after reply");
+    }
+
+    #[test]
+    fn resolving_the_displayed_approval_advances_the_queue() {
+        use chaos_core::approval::{
+            ApprovalChoices, ApprovalId, ApprovalOperation, ApprovalProvider, ApprovalRequest,
+        };
+
+        let request = |id: &str| ApprovalRequest {
+            cc_request_id: ApprovalId(Arc::from(id)),
+            provider: ApprovalProvider::OpenCodeV2,
+            provider_request_ref: Arc::from(id),
+            session_id: Arc::from("s1"),
+            agent: ct::MemberId(2),
+            channel: ct::ChannelId(1),
+            turn: None,
+            operation: ApprovalOperation {
+                action: Arc::from("shell"),
+                tool_name: None,
+                summary: None,
+                arguments: None,
+                raw: None,
+            },
+            choices: ApprovalChoices::DecisionVocabulary {
+                decisions: vec![Arc::from("once"), Arc::from("reject")],
+                raw: None,
+            },
+            requested_at: 1,
+            context: None,
+        };
+
+        let mut pending = vec![request("first"), request("second")];
+        assert!(drop_pending_approval(
+            &mut pending,
+            &ApprovalId(Arc::from("first"))
+        ));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(&*pending[0].cc_request_id.0, "second");
+
+        // A queued request resolving elsewhere must not disturb the displayed one.
+        assert!(!drop_pending_approval(
+            &mut pending,
+            &ApprovalId(Arc::from("missing"))
+        ));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(&*pending[0].cc_request_id.0, "second");
     }
 }

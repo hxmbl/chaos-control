@@ -158,6 +158,14 @@ impl PaneHost {
         }
     }
 
+    /// Close an approval that was already resolved elsewhere. Leaves other
+    /// pane content (long messages, project identity) alone.
+    pub fn close_resolved_approval(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.visible_approval().is_some() {
+            self.close(window, cx);
+        }
+    }
+
     fn visible_approval(&self) -> Option<model::ApprovalQuestion> {
         match self.state.content() {
             Some(PaneContent::Approval(request)) => Some(request.clone()),
