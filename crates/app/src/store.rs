@@ -3069,6 +3069,77 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diff_pane_shows_the_working_tree_and_handles_an_absent_project() {
+        let mut store = ChatStore::new(Workspace {
+            project: model::Project {
+                id: Id(1),
+                name: Arc::from("test"),
+                emoji: Arc::from("🧪"),
+                path: None,
+            },
+            projects: Vec::new(),
+            channels: vec![model::Channel {
+                id: Id(1),
+                name: Arc::from("main"),
+                ordinal: Some(1),
+                linear_issue: None,
+                unread: false,
+                project_wide: true,
+            }],
+            quick_links: Vec::new(),
+            agents: Vec::new(),
+            mentions: Vec::new(),
+        });
+        // No folder open: no git command should run.
+        let empty = store.diff_pane();
+        let PaneContent::Diff { text, .. } = empty else {
+            panic!("expected a diff pane");
+        };
+        assert_eq!(&*text, "No project folder is open.");
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-diff-pane-{nanos}"));
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&dir)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("file.txt"), "before\n").unwrap();
+        git(&["add", "file.txt"]);
+        git(&["commit", "-qm", "initial"]);
+
+        // With no changes the pane explains itself instead of showing a blank.
+        store.project_context.location.path = Some(project::root_key(&dir));
+        let PaneContent::Diff { text, .. } = store.diff_pane() else {
+            panic!("expected a diff pane");
+        };
+        assert_eq!(&*text, "No working-tree changes in this project.");
+
+        // An agent's edit shows up as a unified diff, with the changed line.
+        std::fs::write(dir.join("file.txt"), "before\nafter\n").unwrap();
+        let PaneContent::Diff { title, text } = store.diff_pane() else {
+            panic!("expected a diff pane");
+        };
+        assert_eq!(&*title, "Working tree diff");
+        assert!(text.contains("file.txt"), "{text}");
+        assert!(text.contains("+after"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn only_cores_channel_sends_while_core_is_attached() {
         let (main, design) = (Id(1), Id(2));
         assert_eq!(send_route(Some(main), main), SendRoute::Core);
