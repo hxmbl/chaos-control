@@ -11,5 +11,8 @@ fail_on: high
 # Test files are skipped by default.
 include_test_files: false
 
-# Known, triaged findings (generated with `minesweep --update-baseline`).
+# Known, triaged findings. Regenerate and prune explicitly, with MineSweep 2.5.0:
+#   minesweep --config .minesweep.yml --update-baseline --baseline .minesweep-baseline.json .
+#   minesweep prune-baseline --baseline .minesweep-baseline.json .
+# Every entry must carry a short `reason` explaining why the finding is a false positive.
 baseline_file: .minesweep-baseline.json
