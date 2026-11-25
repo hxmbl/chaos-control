@@ -26,7 +26,7 @@ use gpui::{
 };
 
 use crate::{
-    ActiveTheme, Ellipsis, TypeStyleExt,
+    ActiveTheme, Ellipsis, IconName, TypeStyleExt, icon,
     tokens::{radius, size, space, text},
     truncated,
 };
@@ -206,6 +206,7 @@ type Handler = Rc<dyn Fn(&mut Window, &mut App)>;
 pub struct QuickAction {
     id: ElementId,
     label: SharedString,
+    icon: Option<IconName>,
     on_click: Handler,
 }
 
@@ -218,8 +219,15 @@ impl QuickAction {
         Self {
             id: id.into(),
             label: label.into(),
+            icon: None,
             on_click: Rc::new(on_click),
         }
+    }
+
+    /// Shows the action as a round icon button instead of a full-width row.
+    pub fn icon(mut self, icon: IconName) -> Self {
+        self.icon = Some(icon);
+        self
     }
 }
 
@@ -423,7 +431,32 @@ impl RenderOnce for Pane {
         };
 
         let has_actions = !self.actions.is_empty();
-        let rows = self.actions.into_iter().map(|a| {
+        let (icon_actions, text_actions): (Vec<_>, Vec<_>) =
+            self.actions.into_iter().partition(|a| a.icon.is_some());
+        let has_icon_actions = !icon_actions.is_empty();
+        let icon_rows = icon_actions.into_iter().map(|a| {
+            let on_click = a.on_click.clone();
+            let label = a.label.clone();
+            let icon_name = a.icon.unwrap();
+            div()
+                .id(a.id)
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(size::CONTROL)
+                .rounded(px(999.))
+                .bg(glass.well)
+                .hover(|s| s.bg(glass.well_hover))
+                .text_color(t.ink)
+                .when(!closing, |d| {
+                    d.cursor_pointer()
+                        .on_click(move |_, window, cx| on_click(window, cx))
+                })
+                .child(icon(icon_name).size(size::ICON_SM).text_color(t.ink))
+                .tooltip(move |window, cx| crate::Tooltip::text(label.clone()).build(window, cx))
+        });
+        let text_rows = text_actions.into_iter().map(|a| {
             let on_click = a.on_click.clone();
             div()
                 .id(a.id)
@@ -510,7 +543,18 @@ impl RenderOnce for Pane {
                         .gap(space::X1_5)
                         // A hairline, not a bar.
                         .child(div().mb(space::X0_5).h(size::HAIRLINE).bg(glass.divider))
-                        .children(rows),
+                        .when(has_icon_actions, |d| {
+                            d.child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_end()
+                                    .gap(space::X1_5)
+                                    .children(icon_rows),
+                            )
+                        })
+                        .children(text_rows),
                 )
             });
 
