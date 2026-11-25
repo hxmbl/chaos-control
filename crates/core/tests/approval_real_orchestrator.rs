@@ -2449,10 +2449,14 @@ async fn two_sessions_on_one_server_do_not_share_tool_calls_or_events() {
         .unwrap();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     while batch_state(turn_s1).await.unwrap() != BatchState::Settled {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "session 1 should settle"
-        );
+        if tokio::time::Instant::now() > deadline {
+            println!(
+                "dbg: TIMED OUT turn_s1={:?} turn_s2={:?}",
+                batch_state(turn_s1).await.unwrap(),
+                batch_state(turn_s2).await.unwrap()
+            );
+            panic!("session 1 should settle");
+        }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
