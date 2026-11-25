@@ -23,7 +23,7 @@ Start at `crates/app/src/main.rs` (window creation) and
 | --- | --- | --- |
 | Root layout and panels | `crates/app/src/workspace.rs`, `crates/app/src/panels.rs` | `Workspace`, `Side`, `Mode`, `plan`, `Panels` |
 | Left sidebar (projects, channels, quick links) | `crates/app/src/sidebar.rs` | `Sidebar` |
-| Right sidebar (agent status, blocked approvals) | `crates/app/src/right_sidebar.rs` | `RightSidebar`, `ApprovalNotice` |
+| Right sidebar (mentions, blocked approvals, working-tree changes, agent status) | `crates/app/src/right_sidebar.rs` | `RightSidebar`, `ApprovalNotice`, `ChangedFile` rows |
 | Conversation / message list | `crates/app/src/conversation.rs` | `Conversation`, `MessageMenu` |
 | Composer (input, mentions, emoji, slash commands) | `crates/app/src/composer.rs` | `Composer`, `Draft`, `bindings` |
 | Pane (long messages, approvals, project questions) | `crates/app/src/pane_host.rs` | `PaneHost`, `PaneEvent`, `pane_frame` |
@@ -49,6 +49,7 @@ Rendering model and perf context: [ARCHITECTURE.md#state](ARCHITECTURE.md#state)
 | Project identity and `.chaos/project.toml` | `crates/app/src/project.rs`, `crates/app/src/project_context.rs` | `decide`, `Confirm`, `ProjectContext`, `ProjectLifecycle` |
 | Recents and profile persistence | `crates/app/src/{recents,profile}.rs` | `RecentsFile`, `Profile` |
 | Approval notices in the sidebar | `crates/app/src/right_sidebar.rs` | `ApprovalNotice::label` |
+| Working-tree changes for the sidebar | `crates/app/src/store.rs` | `ChatStore::changed_files`, `ChangedFile`, `parse_diff_stat` |
 
 Core-side counterpart: [ARCHITECTURE.md#crates](ARCHITECTURE.md#crates),
 [ARCHITECTURE.md#state](ARCHITECTURE.md#state).

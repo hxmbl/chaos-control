@@ -19,15 +19,24 @@ use ui::{
     truncated,
 };
 
-use crate::{model_picker::ModelPicker, store::ChatStore};
+use crate::{
+    model_picker::ModelPicker,
+    pane_host::PaneHost,
+    store::{ChangedFile, ChatStore},
+};
 
 pub struct RightSidebar {
     store: Entity<ChatStore>,
     picker: Entity<ModelPicker>,
+    /// Opens the working-tree diff when a Changes row is clicked.
+    pane: Entity<PaneHost>,
     mentions_open: bool,
     /// The toggle tooltip follows the click, even while the pointer is still
     /// over the button and the tooltip is on screen.
     mentions_tip: Entity<TooltipText>,
+    /// Snapshot for the Changes section. Git is read here and on the refresh
+    /// button, never from `render` (which can run many times a second).
+    changes: Vec<ChangedFile>,
     /// The Agents row under the pointer (shows its remove button).
     hovered_agent: Option<model::Id>,
 }
@@ -36,14 +45,18 @@ impl RightSidebar {
     pub fn new(
         store: Entity<ChatStore>,
         picker: Entity<ModelPicker>,
+        pane: Entity<PaneHost>,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        let changes = store.read(cx).changed_files();
         Self {
             store,
             picker,
+            pane,
             mentions_open: true,
             mentions_tip: cx.new(|_| TooltipText::new("Collapse mentions")),
+            changes,
             hovered_agent: None,
         }
     }
@@ -140,6 +153,7 @@ impl Render for RightSidebar {
             .collect();
         let count = mention_rows.len();
         let open = self.mentions_open;
+        let changes = self.changes.clone();
 
         div()
             .size_full()
@@ -325,6 +339,99 @@ impl Render for RightSidebar {
                         ),
                 )
             })
+            // Changes (STRM-762): the open project's working tree, with a
+            // click-through to the full diff in the pane. This is deliberately
+            // project-wide — there is no per-session file list to scope to yet.
+            .child(
+                section(&t)
+                    .gap(space::X1)
+                    .px(space::X1_5)
+                    .py(space::X2)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(space::X2)
+                            .px(space::X2)
+                            .type_style(text::SMALL)
+                            .font_weight(text::MEDIUM)
+                            .text_color(t.ink_soft)
+                            .child(truncated("Changes"))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .type_style(text::CAPTION)
+                                    .text_color(t.muted)
+                                    .child(truncated(format!("{}", changes.len()))),
+                            )
+                            .child(
+                                div()
+                                    .id("changes-refresh")
+                                    .flex_none()
+                                    .size(size::CHIP)
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(radius::SM)
+                                    .hover(|s| s.bg(t.selected))
+                                    .tooltip(Tooltip::text("Refresh changes"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let changes = this.store.read(cx).changed_files();
+                                        this.changes = changes;
+                                        cx.notify();
+                                    }))
+                                    .child(icon(IconName::ArrowClockwise, icons::SM, t.ink_soft)),
+                            ),
+                    )
+                    .when(changes.is_empty(), |s| {
+                        s.child(
+                            div()
+                                .px(space::X2)
+                                .type_style(text::CAPTION)
+                                .text_color(t.muted)
+                                .child(truncated("No changes in this project")),
+                        )
+                    })
+                    .when(!changes.is_empty(), |s| {
+                        s.child(
+                            div()
+                                .id("change-rows")
+                                .flex()
+                                .flex_col()
+                                .gap(space::X0_5)
+                                .max_h(px(MENTION_ROW * 4.))
+                                .overflow_y_scroll()
+                                .children(changes.into_iter().enumerate().map(|(ix, change)| {
+                                    pill(("change", ix), cx)
+                                        .h(size::ROW)
+                                        .gap(space::X2)
+                                        .px(space::X2)
+                                        .tooltip(Tooltip::text("Open the working-tree diff"))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            let content = this.store.read(cx).diff_pane();
+                                            this.pane
+                                                .update(cx, |p, cx| p.open(content, window, cx));
+                                        }))
+                                        .child(icon(IconName::Square, icons::SM, t.ink_soft))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .ellipsis()
+                                                .type_style(text::CAPTION)
+                                                .child(truncated(SharedString::from(change.path))),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .type_style(text::CAPTION)
+                                                .text_color(t.ink_soft)
+                                                .child(truncated(SharedString::from(change.stat))),
+                                        )
+                                })),
+                        )
+                    }),
+            )
             // Spare height sits here, so agent status stays at the bottom
             // like the left sidebar's settings row.
             .child(div().flex_1())

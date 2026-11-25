@@ -429,6 +429,30 @@ pub struct HarnessChip {
 
 impl EventEmitter<StoreEvent> for ChatStore {}
 
+/// One file in the open project's working tree, as shown in the right
+/// sidebar's Changes section (STRM-762). `stat` is git's own short
+/// summary, e.g. `3 ++-`, or a status word for an untracked file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChangedFile {
+    pub path: String,
+    pub stat: String,
+}
+
+/// Turn the file rows of `git diff --stat` into sidebar rows. The trailing
+/// `N files changed, …` line has no ` | ` separator, so it falls out.
+fn parse_diff_stat(text: &str) -> Vec<ChangedFile> {
+    text.lines()
+        .filter_map(|line| {
+            let (path, stat) = line.split_once(" | ")?;
+            let path = path.trim();
+            (!path.is_empty()).then(|| ChangedFile {
+                path: path.to_string(),
+                stat: stat.trim().to_string(),
+            })
+        })
+        .collect()
+}
+
 impl ChatStore {
     /// Current active project-context generation. Async results must match this
     /// generation before being applied to avoid stale cross-project writes.
@@ -509,6 +533,59 @@ impl ChatStore {
             title,
             text: Arc::from(text),
         }
+    }
+
+    /// The open project's changed files, for the right sidebar. Like
+    /// `diff_pane` this reads git on demand — views call it on construction and
+    /// on an explicit refresh, never from `render`. Rename targets are
+    /// normalised to the new path and duplicate rows are dropped.
+    pub fn changed_files(&self) -> Vec<ChangedFile> {
+        let Some(root) = self.project_context.location.path.as_deref() else {
+            return Vec::new();
+        };
+        let run = |args: &[&str]| -> String {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        let stat = {
+            let s = run(&["diff", "HEAD", "--stat"]);
+            if s.is_empty() {
+                run(&["diff", "--stat"])
+            } else {
+                s
+            }
+        };
+        let mut files = parse_diff_stat(&stat);
+        // `--stat` does not include untracked files, but they are changes the
+        // user still wants to see and open a diff for.
+        for line in run(&["status", "--porcelain=v1", "--untracked-files=normal"]).lines() {
+            let status = line.get(..2).unwrap_or("");
+            let path = line.get(3..).unwrap_or("").trim();
+            let path = path.split(" -> ").last().unwrap_or(path);
+            if path.is_empty() || files.iter().any(|f| f.path == path) {
+                continue;
+            }
+            let label = match status.trim() {
+                "??" => "untracked",
+                "A" | "AM" => "added",
+                "D" | "DM" => "deleted",
+                "M" | "MM" => "modified",
+                "R" | "RM" => "renamed",
+                _ => "changed",
+            };
+            files.push(ChangedFile {
+                path: path.to_string(),
+                stat: label.to_string(),
+            });
+        }
+        files
     }
 
     pub fn new(workspace: Workspace) -> Self {
@@ -3161,6 +3238,15 @@ fn row_at(by_seq: &BTreeMap<ct::Seq, usize>, seq: ct::Seq) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_diff_stat_reads_file_rows_and_skips_the_summary() {
+        let stat = " crates/app/src/a.rs | 3 ++-\n b.txt | 1 +\n 2 files changed, 3 insertions(+), 1 deletion(-)\n";
+        let files = parse_diff_stat(stat);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0], ChangedFile { path: "crates/app/src/a.rs".into(), stat: "3 ++-".into() });
+        assert_eq!(files[1], ChangedFile { path: "b.txt".into(), stat: "1 +".into() });
+    }
 
     #[test]
     fn diff_pane_shows_the_working_tree_and_handles_an_absent_project() {
