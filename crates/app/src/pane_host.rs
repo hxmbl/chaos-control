@@ -260,10 +260,17 @@ impl PaneHost {
                     _ => action.label.into(),
                 };
                 let kind = action.kind;
+                let action_kind = kind.clone();
                 let this = cx.entity();
-                QuickAction::new(("pane-action", ix), label, move |window, cx| {
-                    this.update(cx, |this, cx| this.run(kind.clone(), window, cx))
-                })
+                let mut quick = QuickAction::new(("pane-action", ix), label, move |window, cx| {
+                    this.update(cx, |this, cx| this.run(action_kind.clone(), window, cx))
+                });
+                quick = match kind {
+                    PaneActionKind::Reply => quick.icon(IconName::ArrowBendUpLeft),
+                    PaneActionKind::Copy => quick.icon(IconName::CopySimple),
+                    _ => quick,
+                };
+                quick
             });
         let close = cx.entity();
         let pane = Pane::new(("pane", self.state.generation() as usize))
