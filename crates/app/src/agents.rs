@@ -380,10 +380,12 @@ pub fn display_model_label(harness_id: Option<&str>, model: Option<&str>, name: 
 }
 
 /// Short, stable words for telling apart agents of the same harness and model.
-const SHORT_ID_WORDS: [&str; 24] = [
+const SHORT_ID_WORDS: [&str; 48] = [
     "otter", "heron", "marten", "falcon", "badger", "lynx", "finch", "moth", "whale", "raven",
     "beaver", "mink", "wren", "seal", "crane", "hare", "ibis", "stoat", "dove", "pike", "quail",
-    "rook", "shrike", "vole",
+    "rook", "shrike", "vole", "newt", "gecko", "tern", "swift", "skink", "koala", "okapi", "tapir",
+    "bison", "moose", "egret", "kite", "lark", "puffin", "gull", "eel", "trout", "perch", "carp",
+    "bream", "orca", "dingo", "lemur", "civet",
 ];
 
 /// Display labels for a project's agents, with a short suffix on the ones that
