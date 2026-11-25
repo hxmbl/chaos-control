@@ -258,10 +258,31 @@ impl Conversation {
 
     fn render_message(&self, ix: usize, window: &mut Window, cx: &mut App) -> AnyElement {
         let t = *cx.theme();
-        let (message, avatar, name, can_react, chips, readers, display, known, is_long) = {
+        let (
+            message,
+            avatar,
+            name,
+            can_react,
+            chips,
+            readers,
+            display,
+            known,
+            is_long,
+            show_header,
+        ) = {
             let store = self.store.read(cx);
             let Some(message) = store.log(self.channel).and_then(|l| l.get(ix)).cloned() else {
                 return div().into_any_element();
+            };
+            let prev = ix
+                .checked_sub(1)
+                .and_then(|p| store.log(self.channel).and_then(|l| l.get(p)));
+            let show_header = match prev {
+                None => true,
+                Some(prev) => {
+                    prev.author != message.author
+                        || message.sent_at.saturating_sub(prev.sent_at) > 300
+                }
             };
             let (avatar, name): (AnyElement, SharedString) = match message.author {
                 Author::Agent(id) => match store.workspace().agent(id) {
@@ -296,7 +317,16 @@ impl Conversation {
             let display = shown_body(store, &message.body);
             let known = known_mentions(store);
             (
-                message, avatar, name, can_react, chips, readers, display, known, is_long,
+                message,
+                avatar,
+                name,
+                can_react,
+                chips,
+                readers,
+                display,
+                known,
+                is_long,
+                show_header,
             )
         };
         let this = self.this.clone();
@@ -353,7 +383,7 @@ impl Conversation {
                     .flex()
                     .gap(space::X3)
                     .px(space::X2)
-                    .py(space::X2)
+                    .py(if show_header { space::X2 } else { space::X1 })
                     .rounded(radius::MD)
                     .when(
                         {
@@ -373,15 +403,31 @@ impl Conversation {
                     .when(self.highlighted == Some(ix), |row| row.bg(t.selected))
                     .child(
                         div()
-                            .size(size::BUTTON)
+                            .w(size::BUTTON)
                             .flex_none()
                             .flex()
+                            .flex_col()
                             .items_center()
-                            .justify_center()
-                            .rounded_full()
-                            .bg(t.sunken)
-                            .text_color(t.ink)
-                            .child(avatar),
+                            .gap(space::X1)
+                            .when(show_header, |d| {
+                                d.child(
+                                    div()
+                                        .size(size::BUTTON)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_full()
+                                        .bg(t.sunken)
+                                        .text_color(t.ink)
+                                        .child(avatar),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .type_style(text::CAPTION)
+                                    .text_color(t.muted)
+                                    .child(clock(message.sent_at)),
+                            ),
                     )
                     .child(
                         div()
@@ -389,38 +435,33 @@ impl Conversation {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_baseline()
-                                    .gap(space::X2)
-                                    .min_w_0()
-                                    .child(
-                                        div()
-                                            .flex_shrink()
-                                            .ellipsis()
-                                            .type_style(text::SMALL)
-                                            .font_weight(text::SEMIBOLD)
-                                            .child(truncated(name)),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .type_style(text::CAPTION)
-                                            .text_color(t.muted)
-                                            .child(clock(message.sent_at)),
-                                    )
-                                    .when_some(message.stance, |d, stance| {
-                                        d.child(
+                            .when(show_header, |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .items_baseline()
+                                        .gap(space::X2)
+                                        .min_w_0()
+                                        .child(
                                             div()
-                                                .flex_none()
-                                                .type_style(text::CAPTION)
-                                                .font_weight(text::MEDIUM)
-                                                .text_color(t.muted)
-                                                .child(stance.label()),
+                                                .flex_shrink()
+                                                .ellipsis()
+                                                .type_style(text::SMALL)
+                                                .font_weight(text::SEMIBOLD)
+                                                .child(truncated(name)),
                                         )
-                                    }),
-                            )
+                                        .when_some(message.stance, |d, stance| {
+                                            d.child(
+                                                div()
+                                                    .flex_none()
+                                                    .type_style(text::CAPTION)
+                                                    .font_weight(text::MEDIUM)
+                                                    .text_color(t.muted)
+                                                    .child(stance.label()),
+                                            )
+                                        }),
+                                )
+                            })
                             .when_some(message.reply_to.as_ref(), |d, reply| {
                                 let store = self.store.read(cx);
                                 d.child(
