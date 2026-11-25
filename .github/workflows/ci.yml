@@ -28,7 +28,7 @@ jobs:
       - name: Scan
         id: scan
         continue-on-error: true
-        uses: hxmbl/minesweep@v2.5.0
+        uses: hxmbl/minesweep@v2.6.0
         with:
           sarif: minesweep-results.sarif
           args: ${{ github.event_name == 'pull_request' && format('--diff --diff-base {0} --config .minesweep.yml --fail-on high .', github.base_ref) || '--config .minesweep.yml --fail-on high .' }}
