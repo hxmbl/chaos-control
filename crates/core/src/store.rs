@@ -688,6 +688,7 @@ impl Store {
                     project_errors: Vec::new(),
                 };
                 store.load_projects()?;
+                store.ensure_chat_backfill()?;
                 return Ok(store);
             }
         }
@@ -707,6 +708,7 @@ impl Store {
             project_errors: Vec::new(),
         };
         store.load_projects()?;
+        store.ensure_chat_backfill()?;
         Ok(store)
     }
 
@@ -776,6 +778,80 @@ impl Store {
             }
         }
         Ok(())
+    }
+
+    /// v1 STRM-745: ensure every existing channel has a workspace-level chat
+    /// (one channel per chat). Idempotent; safe to run after migrations/load.
+    fn ensure_chat_backfill(&mut self) -> Result<()> {
+        let project_ids: Vec<ProjectId> = self.projects.keys().cloned().collect();
+        for project_id in project_ids {
+            let channels: Vec<(i64, String, i64)> = {
+                let Some(pc) = self.projects.get(&project_id) else {
+                    continue;
+                };
+                let mut stmt = pc
+                    .workspace
+                    .prepare("SELECT id, name, created_at FROM channels ORDER BY ordinal, id")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r?);
+                }
+                out
+            };
+            for (channel_id, title, created_at) in channels {
+                self.ensure_chat_for_channel_row(&project_id, channel_id, &title, created_at)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_chat_for_channel_row(
+        &mut self,
+        project: &ProjectId,
+        channel_id: i64,
+        title: &str,
+        created_at: i64,
+    ) -> Result<i64> {
+        if let Some(chat_id) = self
+            .core
+            .query_row(
+                "SELECT chat_id FROM chat_members WHERE project_id = ?1 AND channel_id = ?2",
+                params![project.as_str(), channel_id],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            return Ok(chat_id);
+        }
+        let chat_id = self.allocate_id("chat")?;
+        let tx = self
+            .core
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO chats (id, title, created_at, archived_at) VALUES (?1, ?2, ?3, NULL)",
+            params![chat_id, title, created_at],
+        )?;
+        tx.execute(
+            "INSERT INTO chat_members (chat_id, ordinal, project_id, channel_id) VALUES (?1, 1, ?2, ?3)",
+            params![chat_id, project.as_str(), channel_id],
+        )?;
+        tx.commit()?;
+        Ok(chat_id)
+    }
+
+    fn ensure_chat_for_channel(
+        &mut self,
+        project: &ProjectId,
+        channel: &Channel,
+        created_at: Millis,
+    ) -> Result<i64> {
+        self.ensure_chat_for_channel_row(
+            project,
+            channel.id.0,
+            channel.name.as_ref(),
+            created_at as i64,
+        )
     }
 
     fn project_dir(&self, project: &ProjectId) -> PathBuf {
@@ -1151,11 +1227,13 @@ impl Store {
         }
         let clean = name.strip_prefix('#').unwrap_or(name);
         if let Some(ch) = self.channel_in_project(project, clean)? {
+            self.ensure_chat_for_channel(project, &ch, now)?;
             return Ok(ch);
         }
         let id = ChannelId(self.allocate_id("channel")?);
         let ch = ensure_channel_db(self.project_workspace(project)?, project, clean, id, now)?;
         self.note_channel(project.clone(), ch.id);
+        self.ensure_chat_for_channel(project, &ch, now)?;
         Ok(ch)
     }
     pub fn channel(&self, id: ChannelId) -> Result<Option<Channel>> {
@@ -1193,6 +1271,63 @@ impl Store {
         for project in self.projects()? {
             let chats = self.channels_in_project(&project.id).unwrap_or_default();
             out.push((project, chats));
+        }
+        Ok(out)
+    }
+
+    /// Workspace-level chats (STRM-745, v1: one channel per chat).
+    pub fn chats(&self) -> Result<Vec<Chat>> {
+        let mut stmt = self.core.prepare(
+            "SELECT id, title, created_at, archived_at FROM chats ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                ChatId(r.get(0)?),
+                Arc::<str>::from(r.get::<_, String>(1)?),
+                r.get::<_, i64>(2)? as Millis,
+                r.get::<_, Option<i64>>(3)?.map(|v| v as Millis),
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, title, created_at, archived_at) = row?;
+            let targets = self.chat_targets(id)?;
+            out.push(Chat {
+                id,
+                title,
+                created_at,
+                archived_at,
+                targets,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn chat_targets(&self, chat: ChatId) -> Result<Vec<ChatTarget>> {
+        let mut stmt = self.core.prepare(
+            "SELECT chat_id, ordinal, project_id, channel_id FROM chat_members WHERE chat_id = ?1 ORDER BY ordinal, chat_id",
+        )?;
+        let rows = stmt.query_map([chat.0], |r| {
+            let project_raw: String = r.get(2)?;
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                project_raw,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (chat_id, ordinal, project_raw, channel_id) = row?;
+            let Some(project) = ProjectId::parse(&project_raw) else {
+                continue;
+            };
+            out.push(ChatTarget {
+                chat: ChatId(chat_id),
+                ordinal: ordinal as u32,
+                project,
+                channel: ChannelId(channel_id),
+            });
         }
         Ok(out)
     }
@@ -1272,7 +1407,18 @@ impl Store {
         let Some(project) = self.project_for_channel(id) else {
             return Ok(false);
         };
-        rename_channel_db(self.project_workspace(&project)?, id, name)
+        let changed = rename_channel_db(self.project_workspace(&project)?, id, name)?;
+        if changed {
+            let clean = name.strip_prefix('#').unwrap_or(name);
+            self.core.execute(
+                "UPDATE chats SET title = ?3
+                 WHERE id IN (
+                     SELECT chat_id FROM chat_members WHERE project_id = ?1 AND channel_id = ?2
+                 )",
+                params![project.as_str(), id.0, clean],
+            )?;
+        }
+        Ok(changed)
     }
     pub fn is_member(&self, channel: ChannelId, member: MemberId) -> Result<bool> {
         let Some(project) = self.project_for_channel(channel) else {
@@ -2051,6 +2197,24 @@ CREATE TABLE approval_outcomes (
     recorded_at      INTEGER
 );
 "#,
+    r#"
+CREATE TABLE chats (
+    id          INTEGER PRIMARY KEY,
+    title       TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    archived_at INTEGER
+);
+CREATE TABLE chat_members (
+    chat_id     INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    ordinal     INTEGER NOT NULL CHECK (ordinal > 0),
+    project_id  TEXT NOT NULL,
+    channel_id  INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, project_id, channel_id),
+    UNIQUE (chat_id, ordinal)
+);
+CREATE INDEX chat_members_by_project_channel ON chat_members (project_id, channel_id);
+INSERT OR IGNORE INTO id_counters (name, next_id) VALUES ('chat', 1);
+"#,
 ];
 
 const WORKSPACE_MIGRATIONS: &[&str] = &[r#"
@@ -2750,6 +2914,14 @@ fn forget_empty_project_core(
     core.execute(
         "DELETE FROM roster_seeded WHERE project_id = ?1",
         [project.as_str()],
+    )?;
+    core.execute(
+        "DELETE FROM chat_members WHERE project_id = ?1",
+        [project.as_str()],
+    )?;
+    core.execute(
+        "DELETE FROM chats WHERE NOT EXISTS (SELECT 1 FROM chat_members cm WHERE cm.chat_id = chats.id)",
+        [],
     )?;
     core.execute("DELETE FROM projects WHERE id = ?1", [project.as_str()])?;
     Ok(Some(_channels.to_vec()))
@@ -6469,5 +6641,51 @@ mod tests {
         assert_eq!(setting.as_deref(), Some("v"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v1_chat_backfill_creates_one_chat_per_channel() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s
+            .ensure_project(&pid(P1), "Alpha", Some("/tmp/alpha"), 1)
+            .unwrap();
+        let ch = s.ensure_channel(&p.id, "main", 10).unwrap();
+        let chats = s.chats().unwrap();
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].title.as_ref(), "main");
+        assert_eq!(chats[0].targets.len(), 1);
+        assert_eq!(chats[0].targets[0].project, p.id);
+        assert_eq!(chats[0].targets[0].channel, ch.id);
+        // idempotent
+        s.ensure_channel(&p.id, "main", 20).unwrap();
+        assert_eq!(s.chats().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forgetting_project_cleans_up_chat_members() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s.ensure_project(&pid(P1), "Alpha", None, 1).unwrap();
+        let _ch = s.ensure_channel(&p.id, "main", 10).unwrap();
+        assert_eq!(s.chats().unwrap().len(), 1);
+        let gone = s.forget_empty_project(&p.id).unwrap();
+        assert!(gone.is_some());
+        assert!(s.chats().unwrap().is_empty());
+        let members: i64 = s
+            .core()
+            .query_row("SELECT COUNT(*) FROM chat_members", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(members, 0);
+    }
+
+    #[test]
+    fn rename_channel_updates_chat_title() {
+        let mut s = Store::open_in_memory().unwrap();
+        let p = s
+            .ensure_project(&pid(P1), "Alpha", Some("/tmp/alpha"), 1)
+            .unwrap();
+        let ch = s.ensure_channel(&p.id, "main", 10).unwrap();
+        assert!(s.rename_channel(ch.id, "general").unwrap());
+        let chats = s.chats().unwrap();
+        assert_eq!(chats[0].title.as_ref(), "general");
     }
 }
