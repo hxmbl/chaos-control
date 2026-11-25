@@ -7,6 +7,43 @@
 //! Status: initial slice for the STRM-612 ship-today window. Capabilities and
 //! enforcement guarantees must be reported honestly; unsupported or unverified
 //! behavior must not be presented as protected.
+//!
+//! # OpenCode Server Requirements
+//!
+//! The adapter expects `opencode serve` to:
+//!
+//! 1. **Output server details on stdout** (for auto-discovery):
+//!    - A URL (word starting with `http://` or `https://`)
+//!    - A password line prefixed with "server password "
+//!
+//! 2. **Provide HTTP endpoints**:
+//!    - `POST /api/session` - Create a new session (returns JSON with session id)
+//!    - `GET /api/event` - Server-sent events stream for session events
+//!    - `GET /api/model` - List available models (see below)
+//!    - `POST /api/session/{id}/prompt` - Send a prompt to the session
+//!    - `POST /api/session/{id}/interrupt` - Interrupt the running turn
+//!    - `PUT /api/experimental/mcp/{name}` - Register an MCP server
+//!
+//! 3. **Model list format** (`GET /api/model`):
+//!    Returns JSON with either a `data` array or a top-level array. Each model
+//!    object should have:
+//!    - `name` (required): Display name
+//!    - `providerID` (optional): Provider identifier (e.g., "openrouter")
+//!    - `modelID` (optional): Model identifier from the provider
+//!    - `id` (fallback): Full model ID if providerID/modelID are absent
+//!
+//!    Example:
+//!    ```json
+//!    {
+//!      "data": [
+//!        {
+//!          "name": "GPT-4",
+//!          "providerID": "openrouter",
+//!          "modelID": "openai/gpt-4"
+//!        }
+//!      ]
+//!    }
+//!    ```
 
 use std::collections::HashMap;
 use std::{path::PathBuf, sync::Arc};
@@ -76,11 +113,27 @@ impl AgentAdapter for OpenCodeV2Adapter {
                 // are selectable.
                 return Probe::Plausible;
             }
-            if crate::acp::resolve_command(&config.command).is_some() {
+            // Check if the command exists and is executable (not just a file).
+            // This matches the harness detection logic in harness::detect_one.
+            let is_executable = if config.command.components().count() > 1 {
+                config.command.is_file() && is_executable_file(&config.command)
+            } else {
+                std::env::var_os("PATH")
+                    .map(|p| {
+                        std::env::split_paths(&p)
+                            .map(|dir| dir.join(&config.command))
+                            .any(|p| p.is_file() && is_executable_file(&p))
+                    })
+                    .unwrap_or(false)
+            };
+            if is_executable {
                 Probe::Plausible
             } else {
                 Probe::Missing {
-                    why: Arc::from(format!("`{}` not found on PATH", config.command.display())),
+                    why: Arc::from(format!(
+                        "`{}` not found or not executable on PATH",
+                        config.command.display()
+                    )),
                 }
             }
         })
@@ -194,6 +247,25 @@ fn transport_error(e: reqwest::Error) -> AgentError {
     AgentError::new(AgentErrorKind::Transport, e.to_string())
 }
 
+/// Checks if a file is executable (Unix: has execute bit; Windows: any file).
+fn is_executable_file(p: &std::path::Path) -> bool {
+    let Ok(meta) = std::fs::metadata(p) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn model_id_from_parts(provider_id: &str, model_id: &str) -> String {
     if provider_id == "opencode" {
         format!("opencode/{model_id}")
@@ -202,6 +274,18 @@ fn model_id_from_parts(provider_id: &str, model_id: &str) -> String {
     }
 }
 
+/// Parses a model from the OpenCode v2 `/api/model` response.
+///
+/// Expected JSON format (per model entry):
+/// - `name` (required): Display name of the model
+/// - `providerID` (optional): Provider identifier (e.g., "openrouter", "huggingface")
+/// - `modelID` (optional): Model identifier from the provider
+/// - `id` (fallback): Full model ID if providerID/modelID are not present
+///
+/// The model ID is constructed as:
+/// - `opencode/<providerID>/<modelID>` when both providerID and modelID are present
+/// - `opencode/<id>` when only id is present (and doesn't already start with "opencode/")
+/// - `<id>` when id already starts with "opencode/"
 fn model_info_from_value(value: &serde_json::Value) -> Option<ModelInfo> {
     let name = value
         .get("name")
@@ -283,9 +367,20 @@ fn disambiguate_model_names(models: &mut [ModelInfo]) {
     }
 }
 
+/// Fetches the model list from the OpenCode v2 server's `/api/model` endpoint.
+///
+/// The endpoint should return JSON with either:
+/// - A `data` array of model objects
+/// - A top-level array of model objects
+///
+/// Each model object should have at least a `name` field (see `model_info_from_value`).
 async fn fetch_models(http: &Http) -> Result<Vec<ModelInfo>, AgentError> {
     let value = http.get_json("/api/model").await?;
-    Ok(parse_model_list(value))
+    let models = parse_model_list(value);
+    if models.is_empty() {
+        eprintln!("opencode-v2: /api/model returned no parsable models");
+    }
+    Ok(models)
 }
 
 async fn list_models(config: OpenCodeV2Config, cwd: PathBuf) -> Result<Vec<ModelInfo>, AgentError> {
@@ -740,6 +835,10 @@ impl Drop for SpawnedServer {
 /// Resolves the server URL, starting `opencode serve` when none was configured.
 /// When we start it, the URL and generated password are read from its stdout,
 /// since both are chosen at runtime.
+///
+/// Expected stdout format:
+/// - A URL (word starting with `http://` or `https://`)
+/// - A password line prefixed with "server password "
 async fn start_server(
     config: &OpenCodeV2Config,
     cwd: &std::path::Path,
@@ -762,7 +861,7 @@ async fn start_server(
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     let child = command.spawn().map_err(|e| {
         AgentError::new(
             AgentErrorKind::Transport,
@@ -775,10 +874,20 @@ async fn start_server(
         .as_mut()
         .and_then(|child| child.stdout.take())
         .ok_or_else(|| AgentError::new(AgentErrorKind::Transport, "server stdout was not piped"))?;
+    let stderr = server
+        .0
+        .as_mut()
+        .and_then(|child| child.stderr.take())
+        .ok_or_else(|| AgentError::new(AgentErrorKind::Transport, "server stderr was not piped"))?;
+
     let mut lines = tokio::io::BufReader::new(stdout).lines();
+    let mut stderr_lines = tokio::io::BufReader::new(stderr).lines();
+    let mut seen_output = Vec::new();
+
     let found = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let (mut url, mut password) = (None, None);
         while let Ok(Some(line)) = lines.next_line().await {
+            seen_output.push(line.clone());
             if url.is_none()
                 && let Some(found) = line
                     .split_whitespace()
@@ -796,14 +905,31 @@ async fn start_server(
         url.map(|url| (url, password))
     })
     .await;
+
+    // Capture stderr for debugging
+    let mut stderr_output = String::new();
+    while let Ok(Some(line)) = stderr_lines.next_line().await {
+        stderr_output.push_str(&line);
+        stderr_output.push('\n');
+    }
+
     match found {
         Ok(Some((url, password))) => Ok((url, password, server)),
         _ => {
             server.kill().await;
-            Err(AgentError::new(
-                AgentErrorKind::Transport,
-                "`opencode serve` did not report a URL on stdout",
-            ))
+            let error_msg = if seen_output.is_empty() && stderr_output.is_empty() {
+                String::from("`opencode serve` produced no output")
+            } else {
+                let mut msg = String::from("`opencode serve` did not report a URL on stdout");
+                if !seen_output.is_empty() {
+                    msg.push_str(&format!("\n  stdout: {}", seen_output.join(" | ")));
+                }
+                if !stderr_output.is_empty() {
+                    msg.push_str(&format!("\n  stderr: {}", stderr_output.trim()));
+                }
+                msg
+            };
+            Err(AgentError::new(AgentErrorKind::Transport, error_msg))
         }
     }
 }
@@ -2059,5 +2185,116 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn model_info_from_value_parses_various_formats() {
+        // Full format with providerID and modelID
+        let full = serde_json::json!({
+            "name": "GPT-4",
+            "providerID": "openrouter",
+            "modelID": "openai/gpt-4"
+        });
+        let info = model_info_from_value(&full).expect("should parse full format");
+        assert_eq!(info.id.as_deref(), Some("opencode/openrouter/openai/gpt-4"));
+        assert_eq!(info.name.as_ref(), "GPT-4");
+
+        // Fallback to id field
+        let fallback = serde_json::json!({
+            "name": "Claude Opus",
+            "id": "anthropic/claude-opus"
+        });
+        let info = model_info_from_value(&fallback).expect("should parse fallback format");
+        assert_eq!(info.id.as_deref(), Some("opencode/anthropic/claude-opus"));
+        assert_eq!(info.name.as_ref(), "Claude Opus");
+
+        // id already prefixed with opencode/
+        let prefixed = serde_json::json!({
+            "name": "Devstral",
+            "id": "opencode/devstral"
+        });
+        let info = model_info_from_value(&prefixed).expect("should parse prefixed id");
+        assert_eq!(info.id.as_deref(), Some("opencode/devstral"));
+        assert_eq!(info.name.as_ref(), "Devstral");
+
+        // Only name (no id fields) - should fail
+        let only_name = serde_json::json!({
+            "name": "Model"
+        });
+        assert!(
+            model_info_from_value(&only_name).is_none(),
+            "should require id fields"
+        );
+
+        // Empty name - should fail
+        let empty_name = serde_json::json!({
+            "name": "",
+            "id": "some-model"
+        });
+        assert!(
+            model_info_from_value(&empty_name).is_none(),
+            "should require non-empty name"
+        );
+    }
+
+    #[test]
+    fn parse_model_list_handles_different_response_shapes() {
+        // Response with data array
+        let with_data = serde_json::json!({
+            "data": [
+                {"name": "Model A", "id": "model-a"},
+                {"name": "Model B", "id": "model-b"}
+            ]
+        });
+        let models = parse_model_list(with_data);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name.as_ref(), "Model A");
+        assert_eq!(models[1].name.as_ref(), "Model B");
+
+        // Response as top-level array
+        let as_array = serde_json::json!([
+            {"name": "Model C", "id": "model-c"},
+            {"name": "Model D", "id": "model-d"}
+        ]);
+        let models = parse_model_list(as_array);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name.as_ref(), "Model C");
+        assert_eq!(models[1].name.as_ref(), "Model D");
+
+        // Empty response
+        let empty = serde_json::json!({"data": []});
+        let models = parse_model_list(empty);
+        assert!(models.is_empty());
+
+        // Invalid entries are skipped
+        let mixed = serde_json::json!({
+            "data": [
+                {"name": "Valid", "id": "valid"},
+                {"name": ""},  // Invalid: empty name
+                {"id": "no-name"},  // Invalid: missing name
+                {"name": "Also Valid", "id": "also-valid"}
+            ]
+        });
+        let models = parse_model_list(mixed);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].name.as_ref(), "Valid");
+        assert_eq!(models[1].name.as_ref(), "Also Valid");
+    }
+
+    #[test]
+    fn disambiguate_model_names_adds_suffixes_for_duplicates() {
+        // Models with the same name and provider should be disambiguated
+        let mut models = vec![
+            ModelInfo::new(Some("opencode/provider/model-a"), "Model A"),
+            ModelInfo::new(Some("opencode/provider/model-a-2"), "Model A"),
+            ModelInfo::new(Some("opencode/provider/model-b"), "Model B"),
+        ];
+        disambiguate_model_names(&mut models);
+        // First occurrence keeps original name
+        assert_eq!(models[0].name.as_ref(), "Model A");
+        // Second occurrence gets :2 suffix
+        assert_eq!(models[1].name.as_ref(), "Model A :2");
+        // Unique name stays unchanged
+        assert_eq!(models[2].name.as_ref(), "Model B");
     }
 }
