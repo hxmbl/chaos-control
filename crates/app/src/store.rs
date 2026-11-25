@@ -773,40 +773,55 @@ impl ChatStore {
                 return;
             };
             this.update(cx, |store, cx| {
-                let Some(attached) = store.core.as_mut() else {
-                    return;
-                };
-                if attached.generation != generation {
-                    return;
+                if store.add_new_channel(channel, generation, &project_key, cx) {
+                    store.refresh_chats(cx);
+                    cx.notify();
                 }
-                let Some(open) = attached.link.open.as_mut() else {
-                    return;
-                };
-                if open.project.id.to_string() != project_key {
-                    return;
-                }
-                open.channels.push(channel.clone());
-                open.channels.sort_by_key(|c| c.ordinal);
-
-                let id = channel_id(channel.id);
-                store.workspace.channels.push(model::Channel {
-                    id,
-                    name: channel.name.clone(),
-                    ordinal: Some(channel.ordinal),
-                    linear_issue: None,
-                    unread: false,
-                    project_wide: false,
-                });
-                store.workspace.channels.sort_by_key(|c| c.ordinal);
-                store.logs.entry(id).or_default();
-                store.selected = id;
-                cx.emit(StoreEvent::Selected);
-                store.refresh_chats(cx);
-                cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Folds a newly created channel into the open project's views (STRM-750).
+    /// Returns false if the project changed while core was working, so a stale
+    /// answer cannot leak into a different project.
+    fn add_new_channel(
+        &mut self,
+        channel: ct::Channel,
+        generation: u64,
+        project_key: &str,
+        cx: &mut impl EventSink,
+    ) -> bool {
+        let Some(attached) = self.core.as_mut() else {
+            return false;
+        };
+        if attached.generation != generation {
+            return false;
+        }
+        let Some(open) = attached.link.open.as_mut() else {
+            return false;
+        };
+        if open.project.id.as_str() != project_key {
+            return false;
+        }
+        open.channels.push(channel.clone());
+        open.channels.sort_by_key(|c| c.ordinal);
+
+        let id = channel_id(channel.id);
+        self.workspace.channels.push(model::Channel {
+            id,
+            name: channel.name.clone(),
+            ordinal: Some(channel.ordinal),
+            linear_issue: None,
+            unread: false,
+            project_wide: false,
+        });
+        self.workspace.channels.sort_by_key(|c| c.ordinal);
+        self.logs.entry(id).or_default();
+        self.selected = id;
+        cx.emit(StoreEvent::Selected);
+        true
     }
 
     /// Who has read up to (and no further than) the message at `index` of
@@ -3928,6 +3943,48 @@ mod apply_core_event_tests {
         );
         let m = store.log(app_channel).unwrap().get(0).unwrap();
         assert_eq!(m.author, Author::System);
+    }
+
+    #[test]
+    fn a_new_chat_is_added_to_the_open_project_and_selected() {
+        let main = channel_id(ct::ChannelId(1));
+        let mut store = store_with_main(main);
+        let project = ct::ProjectId::parse("00000000-0000-0000-0000-000000000001").unwrap();
+        attach_core_for_project(&mut store, 7, main, project.clone());
+        let channel = ct::Channel {
+            id: ct::ChannelId(2),
+            project: project.clone(),
+            name: Arc::from("new-chat"),
+            ordinal: 2,
+        };
+
+        let mut sink = Sink::default();
+        assert!(store.add_new_channel(channel.clone(), 7, project.as_str(), &mut sink));
+        assert_eq!(store.selected, channel_id(channel.id));
+        assert!(store.logs.contains_key(&channel_id(channel.id)));
+        assert_eq!(store.workspace.channels.len(), 2);
+        assert_eq!(store.workspace.channels[1].name.as_ref(), "new-chat");
+        assert_eq!(
+            store
+                .core
+                .as_ref()
+                .and_then(|a| a.link.open.as_ref())
+                .map(|o| o.channels.len()),
+            Some(2)
+        );
+        assert!(matches!(sink.events.last(), Some(StoreEvent::Selected)));
+
+        // A late answer from a previous project must change nothing.
+        let stale = ct::Channel {
+            id: ct::ChannelId(3),
+            project: project.clone(),
+            name: Arc::from("new-chat-2"),
+            ordinal: 3,
+        };
+        let mut sink = Sink::default();
+        assert!(!store.add_new_channel(stale, 6, project.as_str(), &mut sink));
+        assert_eq!(store.workspace.channels.len(), 2);
+        assert!(sink.events.is_empty());
     }
 
     /// Attach a real core link for `project` under `generation`. The async
