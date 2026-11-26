@@ -152,6 +152,9 @@ impl Render for RightSidebar {
             })
             .collect();
         let can_add = self.store.read(cx).has_core();
+        // Pending permission requests (STRM-757) are the thing to notice, so
+        // they sit above the historic blocked outcomes rather than behind them.
+        let pending = self.store.read(cx).pending_approval_rows();
         // Blocked approvals (STRM-612): show the outcome instead of dropping it.
         let notices: Vec<_> = self
             .store
@@ -286,6 +289,82 @@ impl Render for RightSidebar {
                         )
                     }),
             )
+            // Permission requests at a glance (STRM-757): who asked, for what,
+            // and where it applies. The pane still owns the actual decision.
+            .when(!pending.is_empty(), |root| {
+                let count = pending.len();
+                root.child(
+                    section(&t)
+                        .gap(space::X1)
+                        .px(space::X1_5)
+                        .py(space::X2)
+                        .child(
+                            div()
+                                .px(space::X2)
+                                .type_style(text::SMALL)
+                                .font_weight(text::MEDIUM)
+                                .text_color(t.ink_soft)
+                                .child(truncated(SharedString::from(format!(
+                                    "Permission requests · {count}"
+                                )))),
+                        )
+                        .child(
+                            div()
+                                .id("permission-requests")
+                                .flex()
+                                .flex_col()
+                                .gap(space::X0_5)
+                                .max_h(px(MENTION_ROW * 3.))
+                                .overflow_y_scroll()
+                                .children(pending.into_iter().enumerate().map(|(i, row)| {
+                                    let tip = format!(
+                                        "{} asked to {} in {}{}",
+                                        row.agent,
+                                        row.action,
+                                        row.channel,
+                                        if row.detail.is_empty() {
+                                            String::new()
+                                        } else {
+                                            format!(": {}", row.detail)
+                                        }
+                                    );
+                                    pill(("permission-request", i), cx)
+                                        .h(size::ROW)
+                                        .gap(space::X2)
+                                        .px(space::X2)
+                                        .tooltip(Tooltip::text(tip))
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .type_style(text::CAPTION)
+                                                .font_weight(text::MEDIUM)
+                                                .text_color(t.ink)
+                                                .child(truncated(SharedString::from(
+                                                    row.agent.clone(),
+                                                ))),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .ellipsis()
+                                                .type_style(text::CAPTION)
+                                                .text_color(t.ink)
+                                                .child(truncated(SharedString::from(row.action))),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .ellipsis()
+                                                .type_style(text::CAPTION)
+                                                .text_color(t.ink_soft)
+                                                .child(truncated(SharedString::from(row.detail))),
+                                        )
+                                })),
+                        ),
+                )
+            })
             // Blocked approvals: fail loudly in the sidebar (STRM-612). The
             // core outcome used to be dropped after clearing the pending pane.
             .when(!notices.is_empty(), |root| {

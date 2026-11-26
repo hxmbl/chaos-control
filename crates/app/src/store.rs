@@ -95,6 +95,48 @@ impl ApprovalNotice {
 /// How many recent blocked approvals the sidebar keeps.
 const MAX_APPROVAL_NOTICES: usize = 8;
 
+/// A pending permission request as the right sidebar shows it: what was asked
+/// for, which agent asked, and what it affects (the channel). The full choices
+/// stay in the pane; this row exists so a request is hard to miss at a glance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingApprovalRow {
+    pub id: Arc<str>,
+    pub agent: Arc<str>,
+    pub action: Arc<str>,
+    pub channel: Arc<str>,
+    pub detail: Arc<str>,
+}
+
+/// Turns a provider request into a compact sidebar row without leaking the
+/// core's approval types into the view. Falls back through the fields that
+/// actually describe the operation when the provider gave no summary.
+fn pending_approval_row(
+    request: &ApprovalRequest,
+    agent: Arc<str>,
+    channel: Arc<str>,
+) -> PendingApprovalRow {
+    let detail = request
+        .operation
+        .summary
+        .clone()
+        .or_else(|| request.operation.tool_name.clone())
+        .or_else(|| {
+            request
+                .operation
+                .arguments
+                .as_ref()
+                .map(|value| Arc::from(value.to_string()))
+        })
+        .unwrap_or_default();
+    PendingApprovalRow {
+        id: request.cc_request_id.as_str().into(),
+        agent,
+        action: request.operation.action.clone(),
+        channel,
+        detail,
+    }
+}
+
 /// Drops a resolved request from the queue. Returns true when it was the one
 /// being shown, so the pane must advance or close.
 fn drop_pending_approval(pending: &mut Vec<ApprovalRequest>, id: &ApprovalId) -> bool {
@@ -683,6 +725,37 @@ impl ChatStore {
     /// Recent approvals that blocked an operation, newest first (STRM-612).
     pub fn approval_notices(&self) -> &[ApprovalNotice] {
         &self.approval_notices
+    }
+
+    /// Pending permission requests, oldest first, for the right sidebar's
+    /// at-a-glance surface (STRM-757).
+    pub fn pending_approval_rows(&self) -> Vec<PendingApprovalRow> {
+        let Some(attached) = &self.core else {
+            return Vec::new();
+        };
+        attached
+            .pending_approvals
+            .iter()
+            .map(|request| {
+                let agent = attached
+                    .link
+                    .agents
+                    .iter()
+                    .find(|agent| agent.member == request.agent)
+                    .map_or_else(|| Arc::from("Agent"), |agent| agent.name.clone());
+                let channel = attached
+                    .link
+                    .open
+                    .as_ref()
+                    .and_then(|open| {
+                        open.channels
+                            .iter()
+                            .find(|channel| channel.id == request.channel)
+                    })
+                    .map_or_else(|| Arc::from("this channel"), |channel| channel.name.clone());
+                pending_approval_row(request, agent, channel)
+            })
+            .collect()
     }
 
     pub fn selected(&self) -> Id {
@@ -4553,6 +4626,50 @@ mod apply_core_event_tests {
             error: None,
         };
         assert_eq!(notice.label(), "Blocked: outcome unknown after reply");
+    }
+
+    #[test]
+    fn pending_approval_row_shows_who_what_and_where() {
+        use chaos_core::approval::{
+            ApprovalChoices, ApprovalId, ApprovalOperation, ApprovalProvider, ApprovalRequest,
+        };
+
+        let request = ApprovalRequest {
+            cc_request_id: ApprovalId(Arc::from("req-1")),
+            provider: ApprovalProvider::OpenCodeV2,
+            provider_request_ref: Arc::from("p-1"),
+            session_id: Arc::from("s1"),
+            agent: ct::MemberId(2),
+            channel: ct::ChannelId(1),
+            turn: None,
+            operation: ApprovalOperation {
+                action: Arc::from("shell"),
+                tool_name: Some(Arc::from("Bash")),
+                summary: Some(Arc::from("delete ./build")),
+                arguments: None,
+                raw: None,
+            },
+            choices: ApprovalChoices::DecisionVocabulary {
+                decisions: vec![Arc::from("once"), Arc::from("reject")],
+                raw: None,
+            },
+            requested_at: 1,
+            context: None,
+        };
+        let row = pending_approval_row(&request, Arc::from("Hy4"), Arc::from("main"));
+        assert_eq!(&*row.id, "req-1");
+        assert_eq!(&*row.agent, "Hy4");
+        assert_eq!(&*row.action, "shell");
+        assert_eq!(&*row.channel, "main");
+        assert_eq!(
+            &*row.detail, "delete ./build",
+            "summary wins over tool name"
+        );
+
+        let mut without_summary = request.clone();
+        without_summary.operation.summary = None;
+        let row = pending_approval_row(&without_summary, Arc::from("Hy4"), Arc::from("main"));
+        assert_eq!(&*row.detail, "Bash", "tool name is the next honest detail");
     }
 
     #[test]
