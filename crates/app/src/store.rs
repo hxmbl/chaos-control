@@ -1315,12 +1315,11 @@ impl ChatStore {
         if attached.link.human == Some(member) {
             return Arc::from("You");
         }
-        attached
-            .link
-            .agents
-            .iter()
-            .find(|a| a.member == member)
-            .map(|a| a.name.clone())
+        crate::agents::unique_display_labels(&attached.link.agents)
+            .into_iter()
+            .zip(&attached.link.agents)
+            .find(|(_, a)| a.member == member)
+            .map(|(label, _)| label)
             .or_else(|| attached.names.get(&member).cloned())
             .unwrap_or_else(|| Arc::from("Someone"))
     }

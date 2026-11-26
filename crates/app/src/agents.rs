@@ -352,31 +352,26 @@ pub struct LinkedAgent {
     pub removable: bool,
 }
 
-/// Display label for a model member: `Harness/Provider/Model-With-Dashes`.
+/// Display label for a model member: `harness/model` (STRM-718).
 ///
-/// `harness_id` is the preset id (e.g. `opencode`), `model` is the full model
-/// id as stored (e.g. `opencode/iceman-free` or
-/// `opencode/openrouter/tencent/hy4-flash`), and `name` is the member's
-/// current/base name. If `name` already looks formatted, it is returned as-is.
+/// `harness_id` is the preset id (e.g. `opencode`) and `model` is the stored
+/// model id (`opencode/iceman-free` or
+/// `opencode/openrouter/tencent/hy4-flash`). Only the model's own id is used,
+/// so the label stays short enough for the sidebar; the provider tier lives in
+/// the harness tooltip. `name` is the fallback when there is no model id.
 pub fn display_model_label(harness_id: Option<&str>, model: Option<&str>, name: &str) -> Arc<str> {
     let Some(harness_id) = harness_id else {
         return Arc::from(name);
     };
-    if looks_formatted_label(harness_id, name) {
-        return Arc::from(name);
+    let raw = model
+        .and_then(|id| id.rsplit('/').next())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| name.rsplit('/').next().unwrap_or(name));
+    let segment = raw.trim().to_lowercase().replace(' ', "-");
+    if segment.is_empty() {
+        return Arc::from(harness_id);
     }
-
-    let harness_display = harness::preset(harness_id).map_or(harness_id, |p| p.display_name);
-
-    let (provider_display, model_segment) = match harness_id {
-        "opencode" => opencode_provider_and_model(model, name),
-        _ => (None, name.replace(' ', "-")),
-    };
-
-    match provider_display {
-        Some(provider) => Arc::from(format!("{harness_display}/{provider}/{model_segment}")),
-        None => Arc::from(format!("{harness_display}/{model_segment}")),
-    }
+    Arc::from(format!("{harness_id}/{segment}"))
 }
 
 /// Short, stable words for telling apart agents of the same harness and model.
@@ -427,55 +422,6 @@ fn fnv1a(text: &str) -> u64 {
     text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
     })
-}
-
-fn looks_formatted_label(harness_id: &str, name: &str) -> bool {
-    let Some(preset) = harness::preset(harness_id) else {
-        return false;
-    };
-    let prefix = format!("{}/", preset.display_name);
-    name.starts_with(&prefix) && name.matches('/').count() >= 1
-}
-
-fn opencode_provider_and_model(model: Option<&str>, name: &str) -> (Option<String>, String) {
-    let model_segment = name.replace(' ', "-");
-    let Some(model) = model else {
-        return (Some("OpenCode-Zen".to_string()), model_segment);
-    };
-    let parts: Vec<&str> = model.split('/').collect();
-    // opencode/<model> => OpenCode-Zen
-    // opencode/<provider>/... => provider display, model name from end/name
-    if parts.first().copied() != Some("opencode") {
-        return (Some("OpenCode-Zen".to_string()), model_segment);
-    }
-    if parts.len() == 2 {
-        return (Some("OpenCode-Zen".to_string()), model_segment);
-    }
-    let provider_id = parts.get(1).copied().unwrap_or("opencode");
-    let provider = match provider_id {
-        "openrouter" => "OpenRouter".to_string(),
-        "huggingface" => "HuggingFace".to_string(),
-        "opencode" => "OpenCode-Zen".to_string(),
-        other => other
-            .split(['-', '_'])
-            .filter(|s| !s.is_empty())
-            .map(capitalize_segment)
-            .collect::<Vec<_>>()
-            .join("-"),
-    };
-    (Some(provider), model_segment)
-}
-
-fn capitalize_segment(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(first) => {
-            let mut out = first.to_uppercase().collect::<String>();
-            out.extend(chars);
-            out
-        }
-    }
 }
 
 impl LinkedAgent {
@@ -1148,27 +1094,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn display_model_label_builds_three_segments_and_dashes() {
+    fn display_model_label_is_harness_model() {
         let label = display_model_label(
             Some("opencode"),
             Some("opencode/openrouter/tencent/hy4-flash"),
             "Hy4 Flash",
         );
-        assert_eq!(&*label, "OpenCode/OpenRouter/Hy4-Flash");
+        assert_eq!(&*label, "opencode/hy4-flash");
     }
 
     #[test]
-    fn display_model_label_defaults_bare_opencode_models_to_zen() {
+    fn display_model_label_uses_the_canonical_model_id() {
         let label =
             display_model_label(Some("opencode"), Some("opencode/big-pickle"), "Big Pickle");
-        assert_eq!(&*label, "OpenCode/OpenCode-Zen/Big-Pickle");
+        assert_eq!(&*label, "opencode/big-pickle");
     }
 
     #[test]
-    fn display_model_label_leaves_stored_labels_alone() {
+    fn display_model_label_shortens_legacy_stored_labels() {
         let stored = "OpenCode/OpenCode-Zen/Big-Pickle";
         let label = display_model_label(Some("opencode"), Some("opencode/big-pickle"), stored);
-        assert_eq!(&*label, stored);
+        assert_eq!(&*label, "opencode/big-pickle");
+    }
+
+    #[test]
+    fn display_model_label_without_an_id_normalizes_the_name() {
+        let label = display_model_label(Some("codex"), None, "GPT-6.1 Sol");
+        assert_eq!(&*label, "codex/gpt-6.1-sol");
     }
 
     fn linked(member: i64, handle: &str, name: &str) -> LinkedAgent {
@@ -1194,10 +1146,7 @@ mod tests {
         let labels = unique_display_labels(&agents);
         assert_eq!(labels.len(), 3);
         for label in &labels {
-            assert!(
-                label.starts_with("OpenCode/OpenCode-Zen/Big-Pickle/"),
-                "{label}"
-            );
+            assert!(label.starts_with("opencode/big-pickle/"), "{label}");
         }
         let unique: std::collections::HashSet<_> = labels.iter().collect();
         assert_eq!(unique.len(), 3, "{labels:?}");
@@ -1206,10 +1155,7 @@ mod tests {
         // An unrelated model keeps the plain label.
         let mut other = linked(4, "iceman-free", "Iceman Free");
         other.model = Some(Arc::from("opencode/iceman-free"));
-        assert_eq!(
-            &*unique_display_labels(&[other])[0],
-            "OpenCode/OpenCode-Zen/Iceman-Free"
-        );
+        assert_eq!(&*unique_display_labels(&[other])[0], "opencode/iceman-free");
     }
 
     #[test]
