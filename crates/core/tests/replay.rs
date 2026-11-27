@@ -223,7 +223,7 @@ async fn claude_agent_acp_selects_v2_and_a_signed_out_turn_goes_red() {
         )
         .await
         .unwrap();
-        activate_agent(&core, claude.id).await;
+    activate_agent(&core, claude.id).await;
     let ping = core.post(hx.id, main, "@claude hello", None).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -315,7 +315,7 @@ async fn codex_acp_auth_required_turns_the_agent_red() {
         )
         .await
         .unwrap();
-        activate_agent(&core, codex.id).await;
+    activate_agent(&core, codex.id).await;
     core.post(hx.id, main, "@codex hello", None).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
@@ -391,7 +391,7 @@ async fn fake_agent_binary_over_real_stdio() {
         )
         .await
         .unwrap();
-        activate_agent(&core, bot.id).await;
+    activate_agent(&core, bot.id).await;
     let ping = core
         .post(hx.id, main, "@bin are you a real process?", None)
         .await
@@ -466,7 +466,7 @@ async fn live_acp_agent_handshake_and_first_turn() {
         )
         .await
         .unwrap();
-        activate_agent(&core, agent.id).await;
+    activate_agent(&core, agent.id).await;
     core.post(
         hx.id,
         main,

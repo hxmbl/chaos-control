@@ -1174,11 +1174,7 @@ impl Store {
 
     /// Whether this chat membership was put to sleep by an explicit user
     /// action. An explicit ping wakes it and clears the flag.
-    pub fn chat_membership_forced_sleep(
-        &self,
-        chat: ChatId,
-        member: MemberId,
-    ) -> Result<bool> {
+    pub fn chat_membership_forced_sleep(&self, chat: ChatId, member: MemberId) -> Result<bool> {
         let forced: Option<i64> = self
             .core
             .query_row(
@@ -6875,9 +6871,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let agent = {
             let mut s = Store::open(&dir).unwrap();
-            let agent = s
-                .ensure_member(MemberKind::Agent, "bot", "Bot")
-                .unwrap();
+            let agent = s.ensure_member(MemberKind::Agent, "bot", "Bot").unwrap();
             // A new agent has no row: globally Sleeping.
             assert_eq!(
                 s.agent_lifecycle(agent.id).unwrap(),
@@ -6885,9 +6879,7 @@ mod tests {
             );
             assert!(!s.agent_forced_sleep(agent.id).unwrap());
 
-            let p = s
-                .ensure_project(&pid(P1), "Alpha", None, 1)
-                .unwrap();
+            let p = s.ensure_project(&pid(P1), "Alpha", None, 1).unwrap();
             let ch = s.ensure_channel(&p.id, "main", 10).unwrap();
             s.join_project(&p.id, agent.id, 1).unwrap();
             s.join(ch.id, &agent, 0, 1).unwrap();

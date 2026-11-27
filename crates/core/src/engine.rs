@@ -1286,11 +1286,7 @@ impl Engine {
     }
 
     /// Last Stop-and-check-chat instruction for this agent in this chat.
-    pub fn context_refresh(
-        &self,
-        member: MemberId,
-        channel: ChannelId,
-    ) -> Option<&ContextRefresh> {
+    pub fn context_refresh(&self, member: MemberId, channel: ChannelId) -> Option<&ContextRefresh> {
         self.refresh.get(&(member, channel))
     }
 
@@ -1526,12 +1522,7 @@ impl Engine {
     /// followed immediately by a runtime instruction on the same session, and
     /// adapters that track one turn at a time drop that late response. Pending
     /// work must still resume after the instruction.
-    pub fn settle_interrupted(
-        &mut self,
-        now: Millis,
-        agent: MemberId,
-        channel: ChannelId,
-    ) {
+    pub fn settle_interrupted(&mut self, now: Millis, agent: MemberId, channel: ChannelId) {
         let Ok(Some(batch)) = self.store.in_flight_batch(agent, channel) else {
             return;
         };

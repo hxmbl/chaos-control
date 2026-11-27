@@ -11,14 +11,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use chaos_core::{
     acp::{AcpAdapter, FnTransport},
-    adapter::{
-        AgentAdapter, AgentError, AgentSession, Caps, OpenSession, Probe, SessionInfo,
-    },
+    adapter::{AgentAdapter, AgentError, AgentSession, Caps, OpenSession, Probe, SessionInfo},
     fake::{self, FakeAgent, Script},
     host::{AgentSpec, Core, HostConfig, ManualClock},
-    lifecycle::{
-        InterruptOutcome, LifecycleScope, LifecycleState, MembershipState, SleepApplied,
-    },
+    lifecycle::{InterruptOutcome, LifecycleScope, LifecycleState, MembershipState, SleepApplied},
     types::*,
 };
 use common::*;
@@ -51,11 +47,7 @@ async fn stop_confirms_interruption_without_changing_lifecycle() {
     h.say("@bot work on it").await;
     h.wait_prompts("bot", 1).await;
 
-    let outcome = h
-        .core
-        .stop(bot.id, LifecycleScope::Global)
-        .await
-        .unwrap();
+    let outcome = h.core.stop(bot.id, LifecycleScope::Global).await.unwrap();
     assert_eq!(outcome.sleep, None, "Stop never writes lifecycle state");
     assert!(
         outcome.all_interrupted(),
@@ -77,16 +69,15 @@ async fn stop_with_no_session_reports_no_active_turn() {
     let mut h = Harness::new().await;
     let bot = h.agent("bot", slow_turn()).await;
     // No message yet, so there is no live session to interrupt.
-    let outcome = h
-        .core
-        .stop(bot.id, LifecycleScope::Global)
-        .await
-        .unwrap();
+    let outcome = h.core.stop(bot.id, LifecycleScope::Global).await.unwrap();
     assert_eq!(
         outcome.interruptions,
         vec![(h.main, InterruptOutcome::NoActiveTurn)]
     );
-    assert!(outcome.all_interrupted(), "nothing to cancel is not a failure");
+    assert!(
+        outcome.all_interrupted(),
+        "nothing to cancel is not a failure"
+    );
     assert_eq!(cancels(&h, "bot"), 0);
 }
 
@@ -127,16 +118,18 @@ async fn force_sleep_at_chat_scope_only_sleeps_that_chat() {
         Some(SleepApplied::Chat(side_chat.id, MembershipState::Sleeping))
     );
     assert_eq!(
-        h.core.chat_membership_lifecycle(side_chat.id, bot.id)
+        h.core
+            .chat_membership_lifecycle(side_chat.id, bot.id)
             .await
             .unwrap(),
         MembershipState::Sleeping
     );
-    assert!(h
-        .core
-        .chat_membership_forced_sleep(side_chat.id, bot.id)
-        .await
-        .unwrap());
+    assert!(
+        h.core
+            .chat_membership_forced_sleep(side_chat.id, bot.id)
+            .await
+            .unwrap()
+    );
     assert_eq!(
         h.core.agent_lifecycle(bot.id).await.unwrap(),
         LifecycleState::Active,
@@ -166,7 +159,12 @@ async fn force_sleep_globally_interrupts_every_chat() {
         .await
         .unwrap();
     assert_eq!(outcome.interruptions.len(), 2, "every joined channel");
-    assert!(outcome.interruptions.iter().all(|(_, o)| *o == InterruptOutcome::Confirmed));
+    assert!(
+        outcome
+            .interruptions
+            .iter()
+            .all(|(_, o)| *o == InterruptOutcome::Confirmed)
+    );
     assert_eq!(
         outcome.sleep,
         Some(SleepApplied::Global(LifecycleState::Sleeping))
@@ -196,7 +194,10 @@ impl AgentAdapter for NoInterruptAdapter {
             let session = inner.open(req).await?;
             let mut info = session.info().clone();
             info.caps = Caps::empty();
-            Ok(Arc::new(NoInterruptSession { inner: session, info }) as Arc<dyn AgentSession>)
+            Ok(Arc::new(NoInterruptSession {
+                inner: session,
+                info,
+            }) as Arc<dyn AgentSession>)
         })
     }
 }
@@ -257,7 +258,10 @@ async fn unsupported_interrupt_is_reported_and_the_session_is_closed() {
         .unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while fake.observed.lock().unwrap().prompts.is_empty() {
-        assert!(tokio::time::Instant::now() < deadline, "session never opened");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session never opened"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -265,7 +269,10 @@ async fn unsupported_interrupt_is_reported_and_the_session_is_closed() {
     assert_eq!(outcome.interruptions.len(), 1);
     assert_eq!(outcome.interruptions[0].0, main);
     let InterruptOutcome::FallbackClosed { reason } = &outcome.interruptions[0].1 else {
-        panic!("expected a fallback close, got {:?}", outcome.interruptions[0].1);
+        panic!(
+            "expected a fallback close, got {:?}",
+            outcome.interruptions[0].1
+        );
     };
     assert!(reason.contains("capabilities"), "reason: {reason}");
     assert!(
@@ -277,7 +284,11 @@ async fn unsupported_interrupt_is_reported_and_the_session_is_closed() {
         LifecycleState::Active,
         "Stop leaves lifecycle alone"
     );
-    assert_eq!(fake.observed.lock().unwrap().cancels, 0, "no cancel was sent");
+    assert_eq!(
+        fake.observed.lock().unwrap().cancels,
+        0,
+        "no cancel was sent"
+    );
     core.shutdown().await;
 }
 

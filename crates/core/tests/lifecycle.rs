@@ -46,7 +46,10 @@ async fn global_sleeping_blocks_even_an_explicit_ping() {
 
     h.say("@bot are you there?").await;
     h.quiesce().await;
-    assert!(h.prompts("bot").is_empty(), "global Sleeping wins over ping");
+    assert!(
+        h.prompts("bot").is_empty(),
+        "global Sleeping wins over ping"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -94,12 +97,7 @@ async fn chat_sleeping_blocks_only_that_chat_and_a_ping_wakes_it() {
         .unwrap();
 
     h.core
-        .set_chat_membership_lifecycle(
-            side_chat.id,
-            bot.id,
-            MembershipState::Sleeping,
-            true,
-        )
+        .set_chat_membership_lifecycle(side_chat.id, bot.id, MembershipState::Sleeping, true)
         .await
         .unwrap();
     assert_eq!(
@@ -109,11 +107,12 @@ async fn chat_sleeping_blocks_only_that_chat_and_a_ping_wakes_it() {
             .unwrap(),
         MembershipState::Sleeping
     );
-    assert!(h
-        .core
-        .chat_membership_forced_sleep(side_chat.id, bot.id)
-        .await
-        .unwrap());
+    assert!(
+        h.core
+            .chat_membership_forced_sleep(side_chat.id, bot.id)
+            .await
+            .unwrap()
+    );
 
     // Ordinary messages in the sleeping chat are dropped.
     h.core
@@ -149,12 +148,16 @@ async fn chat_sleeping_blocks_only_that_chat_and_a_ping_wakes_it() {
             .unwrap(),
         MembershipState::Active
     );
-    assert!(!h
-        .core
-        .chat_membership_forced_sleep(side_chat.id, bot.id)
-        .await
-        .unwrap());
-    assert_eq!(h.core.agent_lifecycle(bot.id).await.unwrap(), LifecycleState::Active);
+    assert!(
+        !h.core
+            .chat_membership_forced_sleep(side_chat.id, bot.id)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        h.core.agent_lifecycle(bot.id).await.unwrap(),
+        LifecycleState::Active
+    );
     assert_eq!(h.prompts("bot").len(), 2);
 }
 

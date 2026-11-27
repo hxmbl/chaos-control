@@ -8,9 +8,7 @@ mod common;
 
 use std::time::Duration;
 
-use chaos_core::lifecycle::{
-    InterruptOutcome, LifecycleScope, RefreshOutcome,
-};
+use chaos_core::lifecycle::{InterruptOutcome, LifecycleScope, RefreshOutcome};
 use chaos_core::types::ObligationState;
 use common::*;
 use serde_json::json;
@@ -86,7 +84,10 @@ async fn interrupt_precedes_instruction_and_creates_no_chat_work() {
 
     // Nothing was posted, batched or made into an obligation by the control.
     assert_eq!(h.history().await.len(), history_before);
-    assert_eq!(h.count("SELECT COUNT(*) FROM batches").await, batches_before);
+    assert_eq!(
+        h.count("SELECT COUNT(*) FROM batches").await,
+        batches_before
+    );
     assert_eq!(
         h.count("SELECT COUNT(*) FROM obligations").await,
         obligations_before
@@ -173,13 +174,20 @@ async fn chat_scope_only_refreshes_that_chat() {
     assert_eq!(outcome.interruptions[0].0, side.id);
     assert_eq!(outcome.instructed.len(), 1);
     assert_eq!(outcome.instructed[0].0, side_chat.id);
-    assert!(h.core.context_refresh(bot.id, h.main).await.unwrap().is_none());
-    assert!(h
-        .core
-        .context_refresh(bot.id, side.id)
-        .await
-        .unwrap()
-        .is_some());
+    assert!(
+        h.core
+            .context_refresh(bot.id, h.main)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        h.core
+            .context_refresh(bot.id, side.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -195,10 +203,11 @@ async fn no_live_session_reports_no_instruction() {
     assert!(outcome.instructed.is_empty());
     assert_eq!(outcome.no_session.len(), 1);
     assert!(h.prompts("bot").is_empty());
-    assert!(h
-        .core
-        .context_refresh(bot.id, h.main)
-        .await
-        .unwrap()
-        .is_none());
+    assert!(
+        h.core
+            .context_refresh(bot.id, h.main)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

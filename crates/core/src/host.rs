@@ -169,6 +169,14 @@ enum Cmd {
         fallback_close: bool,
         reply: oneshot::Sender<Vec<(ChannelId, InterruptOutcome)>>,
     },
+    /// A session was closed as the fallback for an interrupt the integration
+    /// could not confirm. Drop the owned slot and settle the killed turn so a
+    /// later message can reconnect instead of waiting on a dead session.
+    SlotClosed {
+        agent: MemberId,
+        channel: ChannelId,
+        epoch: u64,
+    },
     /// A high-priority runtime instruction, sent straight to a live session.
     /// It deliberately bypasses the message graph: no batch, no obligation, no
     /// chat message, and no claim that the agent complied.
@@ -1700,7 +1708,8 @@ impl Core {
     ) -> Result<Vec<ChannelId>, String> {
         let scope = scope.clone();
         self.with_engine(move |e, _| {
-            let is_agent = matches!(e.store().member(member), Ok(Some(m)) if m.kind == MemberKind::Agent);
+            let is_agent =
+                matches!(e.store().member(member), Ok(Some(m)) if m.kind == MemberKind::Agent);
             if !is_agent {
                 return Err("no such agent".to_string());
             }
@@ -1780,6 +1789,30 @@ impl Core {
         wait.await.map_err(|_| "runtime stopped".to_string())?
     }
 
+    /// A confirmed cancel ended the turn; settle it even if the adapter drops
+    /// the late response, so pending work is not stranded behind a dead batch.
+    /// Unsupported/failed results are left alone: the turn may still run.
+    async fn settle_confirmed(
+        &self,
+        agent: MemberId,
+        interruptions: &[(ChannelId, InterruptOutcome)],
+    ) -> Result<(), String> {
+        let confirmed: Vec<ChannelId> = interruptions
+            .iter()
+            .filter(|(_, outcome)| *outcome == InterruptOutcome::Confirmed)
+            .map(|(channel, _)| *channel)
+            .collect();
+        if confirmed.is_empty() {
+            return Ok(());
+        }
+        self.with_engine(move |e, now| {
+            for channel in confirmed {
+                e.settle_interrupted(now, agent, channel);
+            }
+        })
+        .await
+    }
+
     /// Stop: interrupt the running turn at the selected scope. Wake preference
     /// and lifecycle state are unchanged. The report says per channel whether
     /// cancellation was confirmed, unsupported, failed, or fell back to
@@ -1791,6 +1824,7 @@ impl Core {
     ) -> Result<ControlOutcome, String> {
         let channels = self.channels_for_scope(member, &scope).await?;
         let interruptions = self.interrupt_scoped(member, channels, true).await?;
+        self.settle_confirmed(member, &interruptions).await?;
         Ok(ControlOutcome {
             interruptions,
             sleep: None,
@@ -1814,16 +1848,15 @@ impl Core {
                 SleepApplied::Global(LifecycleState::Sleeping)
             }
             LifecycleScope::Chat(chat) => {
-                self.set_chat_membership_lifecycle(
-                    chat,
-                    member,
-                    MembershipState::Sleeping,
-                    true,
-                )
-                .await?;
+                self.set_chat_membership_lifecycle(chat, member, MembershipState::Sleeping, true)
+                    .await?;
                 SleepApplied::Chat(chat, MembershipState::Sleeping)
             }
         };
+        // Settle after the sleep is persisted: a confirmed cancel must not
+        // let pending work pump into a freshly opened turn before the wake
+        // preference is written.
+        self.settle_confirmed(member, &interruptions).await?;
         Ok(ControlOutcome {
             interruptions,
             sleep: Some(sleep),
@@ -1855,7 +1888,9 @@ impl Core {
         let channels = self.channels_for_scope(member, &scope).await?;
         // Do not close the session as a fallback here: we still need it to
         // receive the instruction. Unsupported/failed interrupts are reported.
-        let interruptions = self.interrupt_scoped(member, channels.clone(), false).await?;
+        let interruptions = self
+            .interrupt_scoped(member, channels.clone(), false)
+            .await?;
 
         let points = self
             .with_engine(move |e, now| {
@@ -1871,7 +1906,10 @@ impl Core {
                     let Some(chat) = chats.into_iter().next() else {
                         continue;
                     };
-                    let cursor = e.store().cursor(member, channel).map_err(|e| e.to_string())?;
+                    let cursor = e
+                        .store()
+                        .cursor(member, channel)
+                        .map_err(|e| e.to_string())?;
                     let head = e.store().head_seq(channel).map_err(|e| e.to_string())?;
                     points.push((now, chat, channel, cursor.read_through, head));
                 }
@@ -1886,9 +1924,17 @@ impl Core {
                 .iter()
                 .find(|(c, _)| *c == channel)
                 .map(|(_, o)| o);
-            if interrupted == Some(&InterruptOutcome::NoActiveTurn) || interrupted.is_none() {
-                no_session.push(chat);
-                continue;
+            match interrupted {
+                Some(InterruptOutcome::Confirmed) => {}
+                Some(InterruptOutcome::NoActiveTurn) | None => {
+                    no_session.push(chat);
+                    continue;
+                }
+                // A rejected or unsupported cancel leaves the turn running.
+                // Do not prompt the same session again or settle its batch:
+                // engine state and the live session must agree on which turn
+                // is active. The failure stays visible in `interruptions`.
+                Some(_) => continue,
             }
             let unread = head.saturating_sub(read_through);
             let prompt: Arc<str> = Arc::from(format!(
@@ -1901,7 +1947,10 @@ impl Core {
                 head,
                 unread
             ));
-            let delivered = self.deliver_instruction(member, channel, prompt).await.is_ok();
+            let delivered = self
+                .deliver_instruction(member, channel, prompt)
+                .await
+                .is_ok();
             // The cancel notification was sent before the instruction. Some
             // adapters track one turn at a time and can drop the cancelled
             // turn's late response, so settle it here instead of waiting for
@@ -2044,6 +2093,23 @@ impl Actor {
                     self.tokens.revoke(&slot.token);
                 }
             }
+            Cmd::SlotClosed {
+                agent,
+                channel,
+                epoch,
+            } => {
+                if self.slots.get(&(agent, channel)).map(|s| s.epoch) == Some(epoch) {
+                    if let Some(slot) = self.slots.remove(&(agent, channel)) {
+                        self.tokens.revoke(&slot.token);
+                    }
+                    self.engine.session_closed(agent, channel);
+                    // Closing the owned session killed the turn even when the
+                    // adapter could not confirm a cancel. Settle it so pending
+                    // work can run on a fresh session; completed side effects
+                    // are not undone by this bookkeeping.
+                    self.engine.settle_interrupted(now, agent, channel);
+                }
+            }
             Cmd::DeliverFailed {
                 agent,
                 channel,
@@ -2080,38 +2146,55 @@ impl Actor {
                 fallback_close,
                 reply,
             } => {
-                let mut outcomes = Vec::new();
+                // One slot per input channel keeps the report in the caller's
+                // order even when cancellations complete out of order.
+                let tx = self.tx.clone();
+                let mut outcomes: Vec<Option<(ChannelId, InterruptOutcome)>> =
+                    channels.iter().map(|_| None).collect();
                 let mut targets = Vec::new();
-                for channel in channels {
+                for (index, channel) in channels.iter().enumerate() {
+                    let channel = *channel;
                     match self.slots.get(&(agent, channel)) {
-                        None => outcomes.push((channel, InterruptOutcome::NoActiveTurn)),
+                        None => outcomes[index] = Some((channel, InterruptOutcome::NoActiveTurn)),
                         Some(Slot {
+                            epoch,
                             state: SlotState::Ready { session, .. },
                             ..
                         }) => {
+                            let epoch = *epoch;
                             if !session.info().caps.contains(Caps::INTERRUPT) {
                                 if fallback_close {
                                     // Best effort: closing reports no result, so
                                     // say exactly that rather than claiming a
                                     // confirmed cancellation.
                                     let session = session.clone();
-                                    tokio::spawn(async move { session.close().await });
-                                    outcomes.push((
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        session.close().await;
+                                        let _ = tx.send(Cmd::SlotClosed {
+                                            agent,
+                                            channel,
+                                            epoch,
+                                        });
+                                    });
+                                    outcomes[index] = Some((
                                         channel,
                                         InterruptOutcome::FallbackClosed {
-                                            reason:
-                                                "interrupt unsupported by session capabilities"
-                                                    .into(),
+                                            reason: "interrupt unsupported by session capabilities"
+                                                .into(),
                                         },
                                     ));
                                 } else {
-                                    outcomes.push((channel, InterruptOutcome::Unsupported));
+                                    outcomes[index] =
+                                        Some((channel, InterruptOutcome::Unsupported));
                                 }
                                 continue;
                             }
-                            targets.push((channel, session.clone()));
+                            targets.push((index, channel, epoch, session.clone()));
                         }
-                        Some(_) => outcomes.push((channel, InterruptOutcome::NoActiveTurn)),
+                        Some(_) => {
+                            outcomes[index] = Some((channel, InterruptOutcome::NoActiveTurn));
+                        }
                     }
                 }
                 // Do not hold the actor while integrations answer. A late
@@ -2119,32 +2202,36 @@ impl Actor {
                 // epoch, which `Cmd::Event` drops, so it cannot look like a
                 // new turn or overwrite newer state.
                 tokio::spawn(async move {
-                    for (channel, session) in targets {
+                    for (index, channel, epoch, session) in targets {
                         let outcome = match session.interrupt().await {
                             Ok(()) => InterruptOutcome::Confirmed,
                             Err(e) => InterruptOutcome::Failed(e.message.to_string()),
                         };
-                        let outcome = if fallback_close
-                            && !matches!(outcome, InterruptOutcome::Confirmed)
-                        {
-                            session.close().await;
-                            InterruptOutcome::FallbackClosed {
-                                reason: match outcome {
-                                    InterruptOutcome::Unsupported => {
-                                        "interrupt unsupported by session capabilities".into()
-                                    }
-                                    InterruptOutcome::Failed(e) => {
-                                        format!("interrupt failed: {e}")
-                                    }
-                                    other => format!("{other:?}"),
-                                },
-                            }
-                        } else {
-                            outcome
-                        };
-                        outcomes.push((channel, outcome));
+                        let outcome =
+                            if fallback_close && !matches!(outcome, InterruptOutcome::Confirmed) {
+                                session.close().await;
+                                let _ = tx.send(Cmd::SlotClosed {
+                                    agent,
+                                    channel,
+                                    epoch,
+                                });
+                                InterruptOutcome::FallbackClosed {
+                                    reason: match outcome {
+                                        InterruptOutcome::Unsupported => {
+                                            "interrupt unsupported by session capabilities".into()
+                                        }
+                                        InterruptOutcome::Failed(e) => {
+                                            format!("interrupt failed: {e}")
+                                        }
+                                        other => format!("{other:?}"),
+                                    },
+                                }
+                            } else {
+                                outcome
+                            };
+                        outcomes[index] = Some((channel, outcome));
                     }
-                    let _ = reply.send(outcomes);
+                    let _ = reply.send(outcomes.into_iter().flatten().collect());
                 });
             }
             Cmd::DeliverInstruction {
