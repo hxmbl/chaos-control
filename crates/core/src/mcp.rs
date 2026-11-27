@@ -40,7 +40,7 @@ use rmcp::{
 use serde_json::{Value, json};
 
 use crate::{
-    engine::{Engine, PostError, PostRequest, StanceRequest},
+    engine::{Engine, PostError, PostRequest, SettingError, StanceRequest},
     reaction,
     types::*,
 };
@@ -107,7 +107,7 @@ fn random_token() -> String {
 
 // ---------- tools ----------
 
-pub const TOOL_NAMES: [&str; 9] = [
+pub const TOOL_NAMES: [&str; 10] = [
     "chat_context",
     "chat_read",
     "chat_search",
@@ -117,6 +117,7 @@ pub const TOOL_NAMES: [&str; 9] = [
     "chat_refuse",
     "chat_dissent",
     "chat_status",
+    "chat_set_wake_preference",
 ];
 
 fn schema(v: Value) -> Arc<serde_json::Map<String, Value>> {
@@ -217,6 +218,15 @@ pub fn tools() -> Vec<Tool> {
             schema(
                 json!({"type": "object", "required": ["text"], "properties": {
                     "text": {"type": ["string", "null"]}
+                }}),
+            ),
+        ),
+        Tool::new(
+            "chat_set_wake_preference",
+            "Set whether you receive normal (non-mention/reply/everyone) broadcast messages. true = receive normal messages (default behavior when active); false = only wake on explicit pings (mentions, replies to you, @everyone).",
+            schema(
+                json!({"type": "object", "required": ["normal_messages"], "properties": {
+                    "normal_messages": {"type": "boolean"}
                 }}),
             ),
         ),
@@ -682,6 +692,19 @@ pub fn call_tool(
             let text = args.get("text").and_then(Value::as_str);
             engine.set_agent_status(scope.agent, scope.channel, text);
             Ok(json!({"ok": true}))
+        }
+        "chat_set_wake_preference" => {
+            let normal_messages = args
+                .get("normal_messages")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| ToolError("normal_messages (boolean) is required".into()))?;
+            match engine.set_member_wake_normal_messages(scope.agent, normal_messages) {
+                Ok(()) => Ok(json!({"ok": true, "normal_messages": normal_messages})),
+                Err(SettingError::NotModelMember) => Err(ToolError(
+                    "wake preference can only be set for roster model members".into(),
+                )),
+                Err(e) => Err(ToolError(e.to_string())),
+            }
         }
         other => Err(ToolError(format!("unknown tool {other}"))),
     }

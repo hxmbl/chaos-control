@@ -1257,10 +1257,33 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether an agent receives normal (non-ping) broadcasts. Overridden in
-    /// the wake path by STRM-657's per-agent preference once that lands.
-    pub fn wake_preference_allows(&self, _member: MemberId) -> Result<bool, SettingError> {
-        Ok(true)
+    /// Whether an agent receives normal (non-ping) broadcasts (STRM-657).
+    /// An agent with no stored preference (not a roster model member) keeps
+    /// the default: broadcasts deliver.
+    pub fn wake_preference_allows(&self, member: MemberId) -> Result<bool, SettingError> {
+        Ok(self.member_wake_normal_messages(member)?.unwrap_or(true))
+    }
+
+    /// Whether a model member receives normal (broadcast) messages. `None` if
+    /// not a model member.
+    pub fn member_wake_normal_messages(
+        &self,
+        member: MemberId,
+    ) -> Result<Option<bool>, rusqlite::Error> {
+        crate::roster::wake_normal_messages(self.conn(), member)
+    }
+
+    /// Sets whether a model member receives normal (broadcast) messages.
+    /// Err if not a model member.
+    pub fn set_member_wake_normal_messages(
+        &mut self,
+        member: MemberId,
+        enabled: bool,
+    ) -> Result<(), SettingError> {
+        if !crate::roster::set_wake_normal_messages(self.conn(), member, enabled)? {
+            return Err(SettingError::NotModelMember);
+        }
+        Ok(())
     }
 
     /// Full precedence check for a candidate wake: Unresponsive > global

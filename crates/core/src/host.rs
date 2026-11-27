@@ -1518,6 +1518,31 @@ impl Core {
         .await?
     }
 
+    /// Whether a roster model member receives normal (broadcast) messages
+    /// (STRM-657). `None` when the agent has no preference stored.
+    pub async fn member_wake_normal_messages(
+        &self,
+        member: MemberId,
+    ) -> Result<Option<bool>, String> {
+        self.with_engine(move |e, _| e.member_wake_normal_messages(member))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Sets whether a roster model member receives normal (broadcast)
+    /// messages (STRM-657). Err when the agent is not a roster model member.
+    pub async fn set_member_wake_normal_messages(
+        &self,
+        member: MemberId,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, _| {
+            e.set_member_wake_normal_messages(member, enabled)
+                .map_err(|e| e.to_string())
+        })
+        .await?
+    }
+
     // --- Agent lifecycle (STRM-686) -------------------------------------
 
     /// Global lifecycle of an agent. With no stored state it is Sleeping.

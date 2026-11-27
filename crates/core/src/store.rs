@@ -2387,6 +2387,15 @@ CREATE TABLE chat_member_lifecycle (
     PRIMARY KEY (chat_id, member_id)
 );
 "#,
+    r#"
+-- STRM-657: an agent's own normal-message preference. It is deliberately an
+-- appended migration (and not part of the fresh-install CREATE TABLE above):
+-- existing databases are already past that migration, and adding the column in
+-- both places would fail a fresh install. Default 1 keeps today's behaviour:
+-- active members receive ordinary broadcasts. The preference only ever gates
+-- broadcasts; an explicit ping and a user-forced sleep outrank it.
+ALTER TABLE model_members ADD COLUMN wake_normal_messages INTEGER NOT NULL DEFAULT 1;
+"#,
 ];
 
 const WORKSPACE_MIGRATIONS: &[&str] = &[r#"

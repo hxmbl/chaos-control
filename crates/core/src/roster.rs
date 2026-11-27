@@ -29,17 +29,22 @@ pub struct ModelMember {
     /// The harness's model id; `None` is its default model.
     pub model: Option<Arc<str>>,
     pub model_name: Arc<str>,
+    /// Whether this agent receives normal (non-ping) broadcast messages.
+    pub wake_normal_messages: bool,
 }
 
-const COLS: &str = "m.id, m.kind, m.handle, m.name, x.harness, x.model, x.model_name";
+const COLS: &str =
+    "m.id, m.kind, m.handle, m.name, x.harness, x.model, x.model_name, x.wake_normal_messages";
 
 fn from_row(r: &rusqlite::Row<'_>) -> Result<ModelMember> {
     let model: String = r.get(5)?;
+    let wake_normal_messages: i64 = r.get(7)?;
     Ok(ModelMember {
         member: member_from_row(r)?,
         harness: Arc::from(r.get::<_, String>(4)?),
         model: (!model.is_empty()).then(|| Arc::from(model)),
         model_name: Arc::from(r.get::<_, String>(6)?),
+        wake_normal_messages: wake_normal_messages != 0,
     })
 }
 
@@ -73,6 +78,24 @@ pub fn set_ping_answers(c: &Connection, member: MemberId, value: Option<&str>) -
     Ok(c.execute(
         "UPDATE model_members SET ping_answer_reactions = ?2 WHERE member_id = ?1",
         params![member.0, value],
+    )? == 1)
+}
+
+/// Whether a model member receives normal broadcast messages. `None` if not a model member.
+pub fn wake_normal_messages(c: &Connection, member: MemberId) -> Result<Option<bool>> {
+    c.query_row(
+        "SELECT wake_normal_messages FROM model_members WHERE member_id = ?1",
+        [member.0],
+        |r| r.get::<_, i64>(0).map(|v| v != 0),
+    )
+    .optional()
+}
+
+/// Sets whether a model member receives normal broadcast messages. False if not a model member.
+pub fn set_wake_normal_messages(c: &Connection, member: MemberId, enabled: bool) -> Result<bool> {
+    Ok(c.execute(
+        "UPDATE model_members SET wake_normal_messages = ?2 WHERE member_id = ?1",
+        params![member.0, enabled as i64],
     )? == 1)
 }
 
