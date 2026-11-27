@@ -34,7 +34,8 @@ async fn add(
     name: &str,
     adapter: Arc<dyn AgentAdapter>,
 ) -> ModelMember {
-    h.core
+    let added = h
+        .core
         .add_model_member(
             MemberSpec {
                 harness: harness.into(),
@@ -46,7 +47,10 @@ async fn add(
             h.main,
         )
         .await
-        .unwrap()
+        .unwrap();
+    // Tests here are about roster/settings, not lifecycle activation.
+    activate_agent(&h.core, added.member.id).await;
+    added
 }
 
 fn models_script() -> serde_json::Value {
@@ -250,6 +254,7 @@ async fn devin_folders_are_trusted_before_discovery_and_sessions() {
         )
         .await
         .unwrap();
+    activate_agent(&h.core, m.member.id).await;
     h.say(&format!("@{} hello", m.member.handle)).await;
     h.until("turn settled", |c| {
         c.query_row(

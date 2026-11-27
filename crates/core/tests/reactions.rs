@@ -712,7 +712,8 @@ async fn model_member(h: &Harness, name: &str, script: fake::Script) -> Member {
         format!("fake:{name}"),
         move || fake::in_process(agent.clone()),
     ))));
-    h.core
+    let added = h
+        .core
         .add_model_member(
             MemberSpec {
                 harness: "fx".into(),
@@ -724,8 +725,10 @@ async fn model_member(h: &Harness, name: &str, script: fake::Script) -> Member {
             h.main,
         )
         .await
-        .unwrap()
-        .member
+        .unwrap();
+    // These tests are about reactions/broadcasts, not lifecycle activation.
+    activate_agent(&h.core, added.member.id).await;
+    added.member
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

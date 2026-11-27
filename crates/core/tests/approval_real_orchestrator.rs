@@ -437,6 +437,7 @@ async fn opencode_v2_permission_allow_through_real_orchestrator() {
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
 
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
@@ -559,6 +560,7 @@ async fn opencode_v2_permission_deny_through_real_orchestrator() {
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -690,6 +692,7 @@ async fn opencode_v2_permission_replay_after_resolution_is_rejected() {
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -831,6 +834,7 @@ async fn opencode_v2_permission_interrupt_fails_closed_through_real_orchestrator
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -963,6 +967,7 @@ async fn opencode_v2_permission_disconnect_fails_closed_through_real_orchestrato
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1105,6 +1110,7 @@ async fn opencode_v2_permission_replay_rejected_after_core_restart() {
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1270,6 +1276,7 @@ async fn opencode_v2_permission_replay_after_restart_is_rejected_at_provider() {
     let main = common::main_channel(&core).await.id;
     let hx = core.human("hx", "Hx", main).await.unwrap();
     let agent = core.add_agent(agent_spec(), main).await.unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1308,6 +1315,7 @@ async fn opencode_v2_permission_replay_after_restart_is_rejected_at_provider() {
     let main2 = common::main_channel(&core2).await.id;
     let hx2 = core2.human("hx", "Hx", main2).await.unwrap();
     let agent2 = core2.add_agent(agent_spec(), main2).await.unwrap();
+    activate_agent(&core2, agent2.id).await;
     let _ping2 = core2
         .post(hx2.id, main2, "@v2 run it again", None)
         .await
@@ -1443,6 +1451,7 @@ async fn opencode_v2_permission_edit_action_mediated_through_real_orchestrator()
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 edit it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1568,6 +1577,7 @@ async fn opencode_v2_permission_write_action_mediated_through_real_orchestrator(
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 write it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1693,6 +1703,7 @@ async fn opencode_v2_permission_read_action_mediated_through_real_orchestrator()
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 read it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1805,6 +1816,7 @@ async fn opencode_v2_no_permission_asked_is_unmediated_no_approval_requested() {
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1914,6 +1926,7 @@ async fn opencode_v2_permission_mcp_action_mediated_through_real_orchestrator() 
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 use mcp", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2039,6 +2052,7 @@ async fn opencode_v2_permission_delete_action_mediated_through_real_orchestrator
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 delete it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2156,6 +2170,7 @@ async fn opencode_v2_permission_reply_delivery_failure_records_failed_through_re
         )
         .await
         .unwrap();
+    activate_agent(&core, agent.id).await;
     let _ping = core.post(hx.id, main, "@v2 run it", None).await.unwrap();
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2321,6 +2336,7 @@ async fn two_sessions_on_one_server_do_not_share_tool_calls_or_events() {
         )
         .await
         .unwrap();
+    activate_agent(&core, agent_a.id).await;
     let agent_b = core
         .add_agent(
             AgentSpec {
@@ -2334,6 +2350,7 @@ async fn two_sessions_on_one_server_do_not_share_tool_calls_or_events() {
         )
         .await
         .unwrap();
+    activate_agent(&core, agent_b.id).await;
 
     let _ping_a = core.post(hx.id, main, "@v2a run it", None).await.unwrap();
     let _ping_b = core.post(hx.id, main, "@v2b run it", None).await.unwrap();

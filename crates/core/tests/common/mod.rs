@@ -11,10 +11,19 @@ use chaos_core::{
     engine::CoreEvent,
     fake::{self, FakeAgent, Script},
     host::{AgentSpec, Core, HostConfig, ManualClock},
+    lifecycle::LifecycleState,
     store,
     types::*,
 };
 use tokio::sync::mpsc;
+
+/// Activate an agent explicitly in tests whose subject is delivery, not
+/// lifecycle. New agents start globally Sleeping (STRM-670).
+pub async fn activate_agent(core: &Core, member: MemberId) {
+    core.set_agent_lifecycle(member, LifecycleState::Active, false)
+        .await
+        .unwrap();
+}
 
 pub struct Harness {
     pub core: Core,
@@ -102,6 +111,12 @@ impl Harness {
                 },
                 self.main,
             )
+            .await
+            .unwrap();
+        // New agents start globally Sleeping (STRM-670). These tests are about
+        // delivery, not activation, so wake the agent explicitly here.
+        self.core
+            .set_agent_lifecycle(member.id, LifecycleState::Active, false)
             .await
             .unwrap();
         self.agents

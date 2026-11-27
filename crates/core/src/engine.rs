@@ -15,6 +15,9 @@ use rusqlite::Connection;
 use crate::{
     adapter::{AgentError, AgentErrorKind, AgentEvent, Probe, SessionInfo, TurnOutcome},
     approval::{ApprovalOutcome, ApprovalRequest},
+    lifecycle::{
+        self, ContextRefresh, DeliveryDecision, LifecycleState, MembershipState, delivery_decision,
+    },
     notify,
     policy::{self, Damp, Policy, PolicyState},
     reaction::{self, PingAnswers, PingAnswersError},
@@ -121,6 +124,8 @@ pub enum SettingError {
     /// Only roster model members have their own list in the app; an
     /// `agents.json` agent sets it in that file.
     NotModelMember,
+    /// No such agent, or no such chat membership.
+    UnknownAgent,
     Store(String),
 }
 
@@ -132,6 +137,7 @@ impl std::fmt::Display for SettingError {
             SettingError::NotModelMember => f.write_str(
                 "not a roster model member (an agents.json agent sets ping_answer_reactions there)",
             ),
+            SettingError::UnknownAgent => f.write_str("no such agent or chat membership"),
             SettingError::Store(e) => write!(f, "store error: {e}"),
         }
     }
@@ -266,6 +272,10 @@ pub struct Engine {
     /// Per-agent ping-answer lists from `agents.json`; absent means the
     /// project's setting, then the default (see [`Engine::ping_answers`]).
     ping_answers: HashMap<MemberId, PingAnswers>,
+    /// Chat-specific context-refresh requests. Runtime-only: delivery of an
+    /// instruction is not proof of compliance, so this is never persisted as
+    /// a claim that the agent actually read the conversation.
+    refresh: HashMap<(MemberId, ChannelId), ContextRefresh>,
 }
 
 /// What [`Engine::react`] did.
@@ -287,6 +297,7 @@ impl Engine {
             rt: HashMap::new(),
             effects: Vec::new(),
             ping_answers: HashMap::new(),
+            refresh: HashMap::new(),
         };
         let pending = engine.store.recover(now)?;
         for (agent, channel) in pending {
@@ -838,6 +849,19 @@ impl Engine {
             } else {
                 WakeReason::Broadcast
             };
+            match self
+                .effective_delivery(target.id, channel, reason)
+                .map_err(|e| PostError::Store(e.to_string()))?
+            {
+                lifecycle::DeliveryDecision::Deliver => {}
+                lifecycle::DeliveryDecision::Skip => continue,
+                lifecycle::DeliveryDecision::WakeMembership => {
+                    // An explicit ping wakes only the chat membership; global
+                    // activation is a separate, explicit user action.
+                    self.wake_channel_memberships(target.id, channel)
+                        .map_err(|e| PostError::Store(e.to_string()))?;
+                }
+            }
             let id = TriggerId {
                 agent: target.id,
                 channel,
@@ -1117,6 +1141,167 @@ impl Engine {
         Ok(parsed.unwrap_or_default())
     }
 
+    // --- Agent lifecycle (STRM-686) -------------------------------------
+
+    fn lifecycle_err(e: rusqlite::Error) -> SettingError {
+        match e {
+            rusqlite::Error::QueryReturnedNoRows => SettingError::UnknownAgent,
+            e => e.into(),
+        }
+    }
+
+    /// Global lifecycle of an agent. Agents with no stored state are Sleeping,
+    /// which is how newly added agents start (STRM-670).
+    pub fn agent_lifecycle(&self, member: MemberId) -> Result<LifecycleState, SettingError> {
+        self.store
+            .agent_lifecycle(member)
+            .map_err(Self::lifecycle_err)
+    }
+
+    /// Set global lifecycle. `forced_sleep` records an explicit user action;
+    /// activating always clears it. A preference change does not touch this.
+    pub fn set_agent_lifecycle(
+        &mut self,
+        member: MemberId,
+        state: LifecycleState,
+        forced_sleep: bool,
+    ) -> Result<(), SettingError> {
+        self.store
+            .set_agent_lifecycle(member, state, forced_sleep)
+            .map_err(Self::lifecycle_err)
+    }
+
+    /// Whether this agent was put to sleep by an explicit user action.
+    pub fn agent_forced_sleep(&self, member: MemberId) -> Result<bool, SettingError> {
+        self.store
+            .agent_forced_sleep(member)
+            .map_err(Self::lifecycle_err)
+    }
+
+    /// One agent's participation state in one chat.
+    pub fn chat_membership_lifecycle(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+    ) -> Result<MembershipState, SettingError> {
+        self.store
+            .chat_membership_lifecycle(chat, member)
+            .map_err(Self::lifecycle_err)
+    }
+
+    /// Set one chat membership's state. The chat and agent must already exist;
+    /// lifecycle never invents either.
+    pub fn set_chat_membership_lifecycle(
+        &mut self,
+        chat: ChatId,
+        member: MemberId,
+        state: MembershipState,
+        forced_sleep: bool,
+    ) -> Result<(), SettingError> {
+        self.store
+            .set_chat_membership_lifecycle(chat, member, state, forced_sleep)
+            .map_err(Self::lifecycle_err)
+    }
+
+    /// Whether this chat membership was explicitly force-slept by the user.
+    pub fn chat_membership_forced_sleep(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+    ) -> Result<bool, SettingError> {
+        self.store
+            .chat_membership_forced_sleep(chat, member)
+            .map_err(Self::lifecycle_err)
+    }
+
+    /// Every chat membership that applies to a wake in this channel. A channel
+    /// normally maps to one chat, but fan-out means we must not assume that.
+    fn channel_memberships(
+        &self,
+        member: MemberId,
+        channel: ChannelId,
+    ) -> Result<Vec<(ChatId, MembershipState)>, SettingError> {
+        let Some(project) = self.store.project_for_channel(channel) else {
+            return Ok(Vec::new());
+        };
+        let chats = self
+            .store
+            .chats_for_channel(&project, channel)
+            .map_err(Self::lifecycle_err)?;
+        chats
+            .into_iter()
+            .map(|chat| {
+                let state = self
+                    .store
+                    .chat_membership_lifecycle(chat, member)
+                    .map_err(Self::lifecycle_err)?;
+                Ok((chat, state))
+            })
+            .collect()
+    }
+
+    /// An explicit ping wakes sleeping memberships, but only those whose chat
+    /// targets this channel. Global state is never changed here.
+    fn wake_channel_memberships(
+        &mut self,
+        member: MemberId,
+        channel: ChannelId,
+    ) -> Result<(), SettingError> {
+        for (chat, state) in self.channel_memberships(member, channel)? {
+            if state == MembershipState::Sleeping {
+                self.store
+                    .set_chat_membership_lifecycle(chat, member, MembershipState::Active, false)
+                    .map_err(Self::lifecycle_err)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether an agent receives normal (non-ping) broadcasts. Overridden in
+    /// the wake path by STRM-657's per-agent preference once that lands.
+    pub fn wake_preference_allows(&self, _member: MemberId) -> Result<bool, SettingError> {
+        Ok(true)
+    }
+
+    /// Full precedence check for a candidate wake: Unresponsive > global
+    /// Sleeping > chat Sleeping, then the wake preference for broadcasts.
+    pub fn effective_delivery(
+        &self,
+        member: MemberId,
+        channel: ChannelId,
+        reason: WakeReason,
+    ) -> Result<DeliveryDecision, SettingError> {
+        let global = self.agent_lifecycle(member)?;
+        let membership = self
+            .channel_memberships(member, channel)?
+            .into_iter()
+            .find(|(_, state)| *state == MembershipState::Sleeping)
+            .map_or(MembershipState::Active, |(_, state)| state);
+        Ok(delivery_decision(
+            global,
+            membership,
+            reason,
+            self.wake_preference_allows(member)?,
+        ))
+    }
+
+    /// Last Stop-and-check-chat instruction for this agent in this chat.
+    pub fn context_refresh(&self, member: MemberId, channel: ChannelId) -> Option<&ContextRefresh> {
+        self.refresh.get(&(member, channel))
+    }
+
+    /// Record what the runtime knew when it issued a context-refresh
+    /// instruction. Callers must not present `instruction_delivered` as proof
+    /// that the agent read anything.
+    pub fn record_context_refresh(
+        &mut self,
+        member: MemberId,
+        channel: ChannelId,
+        refresh: ContextRefresh,
+    ) {
+        self.refresh.insert((member, channel), refresh);
+    }
+
     /// A member refuses or dissents from `target`: posts `reason` as a reply
     /// to it (origin `refusal` / `dissent`) and records the stance with who,
     /// what, the model and the runtime. Goes through [`Engine::post`], so
@@ -1330,6 +1515,23 @@ impl Engine {
         rt.status = None;
         rt.idle_since = None;
         self.publish_status(agent, channel);
+    }
+
+    /// A runtime control cancelled the in-flight turn. Settle it as cancelled
+    /// without waiting for the transport's late response: a cancel can be
+    /// followed immediately by a runtime instruction on the same session, and
+    /// adapters that track one turn at a time drop that late response. Pending
+    /// work must still resume after the instruction.
+    pub fn settle_interrupted(&mut self, now: Millis, agent: MemberId, channel: ChannelId) {
+        let Ok(Some(batch)) = self.store.in_flight_batch(agent, channel) else {
+            return;
+        };
+        self.accepted(now, agent, channel, batch.id);
+        if let Err(e) = self.settle(now, agent, channel, batch.id, &TurnOutcome::Cancelled, "") {
+            self.rt.entry((agent, channel)).or_default().note =
+                Some(Arc::from(format!("internal error: {e}")));
+        }
+        self.pump(now, agent, channel);
     }
 
     /// The batch could not be handed over (session failed to open, or the
