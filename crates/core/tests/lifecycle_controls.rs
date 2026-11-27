@@ -316,3 +316,115 @@ async fn ordinary_messages_do_not_requeue_a_sleeping_membership() {
         MembershipState::Active
     );
 }
+
+/// STRM-687 reconnect: a session that had a live integration but cannot be
+/// interrupted is closed (`FallbackClosed`); when the agent reconnects on a
+/// later turn the fresh session starts clean - no re-sent cancel, no requeued
+/// pre-stop work, lifecycle scope preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_after_fallback_close_starts_clean_without_requeue() {
+    let clock = ManualClock::new(T0);
+    let (core, _events) = Core::start(HostConfig::default(), clock.clone())
+        .await
+        .unwrap();
+    let main = main_channel(&core).await.id;
+    let hx = core.human("hx", "Hx", main).await.unwrap();
+
+    // A quick turn: the first session finishes before we close it, so
+    // reconnect behaviour is isolated from cancellation-failure semantics.
+    let fake = FakeAgent::new(script(json!({"turns": [{"steps": []}]})));
+    let f = fake.clone();
+    let acp = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
+        "fake:nointerrupt".into(),
+        move || fake::in_process(f.clone()),
+    ))));
+    let bot = core
+        .add_agent(
+            AgentSpec {
+                handle: "nointerrupt".into(),
+                name: "NoInterrupt".into(),
+                adapter: Arc::new(NoInterruptAdapter(acp)),
+                cwd: Some(PathBuf::from("/tmp")),
+                ping_answers: None,
+            },
+            main,
+        )
+        .await
+        .unwrap();
+    core.set_agent_lifecycle(bot.id, LifecycleState::Active, false)
+        .await
+        .unwrap();
+
+    // First turn on the original session, allowed to finish.
+    core.post(hx.id, main, "@nointerrupt work", None)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while fake.observed.lock().unwrap().prompts.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session never opened"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let prompts_before = fake.observed.lock().unwrap().prompts.len();
+    let sessions_before = fake.observed.lock().unwrap().sessions.len();
+
+    // Unsupported interrupt -> owned session closed as a fallback. No turn is
+    // in flight, so nothing is retried or requeued.
+    let outcome = core.stop(bot.id, LifecycleScope::Global).await.unwrap();
+    assert!(matches!(
+        outcome.interruptions[0].1,
+        InterruptOutcome::FallbackClosed { .. }
+    ));
+    // The owned session is closed best-effort; give the close event a moment
+    // to drop the slot before reconnecting.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        fake.observed.lock().unwrap().cancels,
+        0,
+        "no cancel was sent"
+    );
+    assert_eq!(
+        core.agent_lifecycle(bot.id).await.unwrap(),
+        LifecycleState::Active,
+        "Stop leaves lifecycle alone across reconnect"
+    );
+
+    // Reconnect: a later turn opens a fresh session.
+    core.post(hx.id, main, "again", None).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (prompts, sessions) = {
+            let o = fake.observed.lock().unwrap();
+            (o.prompts.len(), o.sessions.len())
+        };
+        if prompts > prompts_before {
+            // The fresh session received exactly the new prompt; the
+            // pre-stop work was not requeued.
+            assert_eq!(prompts, prompts_before + 1, "no requeued pre-stop work");
+            assert!(
+                sessions > sessions_before,
+                "reconnect opened a fresh session: {sessions} vs {sessions_before}"
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "reconnect never redelivered"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        fake.observed.lock().unwrap().cancels,
+        0,
+        "no cancel on reconnect"
+    );
+    assert_eq!(
+        core.agent_lifecycle(bot.id).await.unwrap(),
+        LifecycleState::Active,
+        "lifecycle state survives reconnect"
+    );
+    core.shutdown().await;
+}
