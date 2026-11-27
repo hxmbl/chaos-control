@@ -26,6 +26,10 @@ use crate::{
         AgentStatus, CoreEvent, Dispatch, Effect, Engine, PostError, PostRequest, Reacted,
         StanceRequest,
     },
+    lifecycle::{
+        ContextRefresh, ControlOutcome, DeliveryDecision, InterruptOutcome, LifecycleScope,
+        LifecycleState, MembershipState, RefreshOutcome, SleepApplied,
+    },
     mcp::{self, Scope, Tokens},
     policy::Policy,
     reaction::PingAnswers,
@@ -157,6 +161,22 @@ enum Cmd {
     Interrupt {
         agent: MemberId,
         channel: ChannelId,
+    },
+    /// Scoped interruption with an observable per-session result.
+    InterruptScoped {
+        agent: MemberId,
+        channels: Vec<ChannelId>,
+        fallback_close: bool,
+        reply: oneshot::Sender<Vec<(ChannelId, InterruptOutcome)>>,
+    },
+    /// A high-priority runtime instruction, sent straight to a live session.
+    /// It deliberately bypasses the message graph: no batch, no obligation, no
+    /// chat message, and no claim that the agent complied.
+    DeliverInstruction {
+        agent: MemberId,
+        channel: ChannelId,
+        prompt: Arc<str>,
+        reply: oneshot::Sender<Result<(), String>>,
     },
     RemoveMember {
         project: ProjectId,
@@ -1490,6 +1510,84 @@ impl Core {
         .await?
     }
 
+    // --- Agent lifecycle (STRM-686) -------------------------------------
+
+    /// Global lifecycle of an agent. With no stored state it is Sleeping.
+    pub async fn agent_lifecycle(&self, member: MemberId) -> Result<LifecycleState, String> {
+        self.with_engine(move |e, _| e.agent_lifecycle(member))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Set global lifecycle. `forced_sleep` records an explicit user action;
+    /// activation clears it. Sleeping memberships are left untouched.
+    pub async fn set_agent_lifecycle(
+        &self,
+        member: MemberId,
+        state: LifecycleState,
+        forced_sleep: bool,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, _| e.set_agent_lifecycle(member, state, forced_sleep))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Whether an agent was put to sleep by an explicit user action.
+    pub async fn agent_forced_sleep(&self, member: MemberId) -> Result<bool, String> {
+        self.with_engine(move |e, _| e.agent_forced_sleep(member))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// One agent's participation state in one chat.
+    pub async fn chat_membership_lifecycle(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+    ) -> Result<MembershipState, String> {
+        self.with_engine(move |e, _| e.chat_membership_lifecycle(chat, member))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Set one chat membership's state. The chat and agent must exist.
+    pub async fn set_chat_membership_lifecycle(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+        state: MembershipState,
+        forced_sleep: bool,
+    ) -> Result<(), String> {
+        self.with_engine(move |e, _| {
+            e.set_chat_membership_lifecycle(chat, member, state, forced_sleep)
+        })
+        .await?
+        .map_err(|e| e.to_string())
+    }
+
+    /// Whether this chat membership was explicitly force-slept by the user.
+    pub async fn chat_membership_forced_sleep(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+    ) -> Result<bool, String> {
+        self.with_engine(move |e, _| e.chat_membership_forced_sleep(chat, member))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
+    /// Precedence check for a candidate wake, exposed for UI/tests.
+    pub async fn effective_delivery(
+        &self,
+        member: MemberId,
+        channel: ChannelId,
+        reason: WakeReason,
+    ) -> Result<DeliveryDecision, String> {
+        self.with_engine(move |e, _| e.effective_delivery(member, channel, reason))
+            .await?
+            .map_err(|e| e.to_string())
+    }
+
     /// Reactions on the messages of `channel` after `after_seq`, oldest first
     /// (load them with the history they belong to).
     pub async fn reactions(
@@ -1591,6 +1689,247 @@ impl Core {
 
     pub fn interrupt(&self, agent: MemberId, channel: ChannelId) {
         let _ = self.tx.send(Cmd::Interrupt { agent, channel });
+    }
+
+    /// Channels the control applies to. Global covers every channel the agent
+    /// has joined; Chat covers only that chat's targets.
+    async fn channels_for_scope(
+        &self,
+        member: MemberId,
+        scope: &LifecycleScope,
+    ) -> Result<Vec<ChannelId>, String> {
+        let scope = scope.clone();
+        self.with_engine(move |e, _| {
+            let is_agent = matches!(e.store().member(member), Ok(Some(m)) if m.kind == MemberKind::Agent);
+            if !is_agent {
+                return Err("no such agent".to_string());
+            }
+            match scope {
+                LifecycleScope::Global => {
+                    let mut channels = Vec::new();
+                    for project in e.store().projects().map_err(|e| e.to_string())? {
+                        channels.extend(
+                            e.store()
+                                .channels_of(member, &project.id)
+                                .map_err(|e| e.to_string())?
+                                .into_iter()
+                                .map(|c| c.id),
+                        );
+                    }
+                    Ok(channels)
+                }
+                LifecycleScope::Chat(chat) => {
+                    let targets = e.store().chat_targets(chat).map_err(|e| e.to_string())?;
+                    if targets.is_empty() {
+                        return Err("no such chat".to_string());
+                    }
+                    Ok(targets.into_iter().map(|t| t.channel).collect())
+                }
+            }
+        })
+        .await?
+    }
+
+    async fn interrupt_scoped(
+        &self,
+        agent: MemberId,
+        channels: Vec<ChannelId>,
+        fallback_close: bool,
+    ) -> Result<Vec<(ChannelId, InterruptOutcome)>, String> {
+        if channels.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (reply, wait) = oneshot::channel();
+        if self
+            .tx
+            .send(Cmd::InterruptScoped {
+                agent,
+                channels,
+                fallback_close,
+                reply,
+            })
+            .is_err()
+        {
+            return Err("runtime stopped".to_string());
+        }
+        wait.await.map_err(|_| "runtime stopped".to_string())
+    }
+
+    /// High-priority instruction straight to a live session. It creates no
+    /// message, batch or obligation, and its acceptance is not proof of
+    /// compliance.
+    async fn deliver_instruction(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+        prompt: Arc<str>,
+    ) -> Result<(), String> {
+        let (reply, wait) = oneshot::channel();
+        if self
+            .tx
+            .send(Cmd::DeliverInstruction {
+                agent,
+                channel,
+                prompt,
+                reply,
+            })
+            .is_err()
+        {
+            return Err("runtime stopped".to_string());
+        }
+        wait.await.map_err(|_| "runtime stopped".to_string())?
+    }
+
+    /// Stop: interrupt the running turn at the selected scope. Wake preference
+    /// and lifecycle state are unchanged. The report says per channel whether
+    /// cancellation was confirmed, unsupported, failed, or fell back to
+    /// closing the owned session. Completed side effects are never undone.
+    pub async fn stop(
+        &self,
+        member: MemberId,
+        scope: LifecycleScope,
+    ) -> Result<ControlOutcome, String> {
+        let channels = self.channels_for_scope(member, &scope).await?;
+        let interruptions = self.interrupt_scoped(member, channels, true).await?;
+        Ok(ControlOutcome {
+            interruptions,
+            sleep: None,
+        })
+    }
+
+    /// Force sleep: interrupt first, then persist Sleeping at the selected
+    /// scope. A user-forced sleep beats the agent's wake preference and is not
+    /// cleared by global activation.
+    pub async fn force_sleep(
+        &self,
+        member: MemberId,
+        scope: LifecycleScope,
+    ) -> Result<ControlOutcome, String> {
+        let channels = self.channels_for_scope(member, &scope).await?;
+        let interruptions = self.interrupt_scoped(member, channels, true).await?;
+        let sleep = match scope {
+            LifecycleScope::Global => {
+                self.set_agent_lifecycle(member, LifecycleState::Sleeping, true)
+                    .await?;
+                SleepApplied::Global(LifecycleState::Sleeping)
+            }
+            LifecycleScope::Chat(chat) => {
+                self.set_chat_membership_lifecycle(
+                    chat,
+                    member,
+                    MembershipState::Sleeping,
+                    true,
+                )
+                .await?;
+                SleepApplied::Chat(chat, MembershipState::Sleeping)
+            }
+        };
+        Ok(ControlOutcome {
+            interruptions,
+            sleep: Some(sleep),
+        })
+    }
+
+    /// Last Stop-and-check-chat instruction for an agent in a chat/channel.
+    /// `instruction_delivered` is not a claim that the agent read anything.
+    pub async fn context_refresh(
+        &self,
+        member: MemberId,
+        channel: ChannelId,
+    ) -> Result<Option<ContextRefresh>, String> {
+        self.with_engine(move |e, _| e.context_refresh(member, channel).cloned())
+            .await
+    }
+
+    /// Stop and check chat: interrupt first, then hand a high-priority
+    /// instruction to every live session in scope telling it to inspect the
+    /// unread part of that chat before doing anything else. The instruction is
+    /// not a chat message, creates no batch or obligation, and delivery is not
+    /// proof of compliance. Pending work stays pending, so a resume cannot lose
+    /// or duplicate an obligation.
+    pub async fn stop_and_check_chat(
+        &self,
+        member: MemberId,
+        scope: LifecycleScope,
+    ) -> Result<RefreshOutcome, String> {
+        let channels = self.channels_for_scope(member, &scope).await?;
+        // Do not close the session as a fallback here: we still need it to
+        // receive the instruction. Unsupported/failed interrupts are reported.
+        let interruptions = self.interrupt_scoped(member, channels.clone(), false).await?;
+
+        let points = self
+            .with_engine(move |e, now| {
+                let mut points = Vec::new();
+                for channel in channels {
+                    let Some(project) = e.store().project_for_channel(channel) else {
+                        continue;
+                    };
+                    let chats = e
+                        .store()
+                        .chats_for_channel(&project, channel)
+                        .map_err(|e| e.to_string())?;
+                    let Some(chat) = chats.into_iter().next() else {
+                        continue;
+                    };
+                    let cursor = e.store().cursor(member, channel).map_err(|e| e.to_string())?;
+                    let head = e.store().head_seq(channel).map_err(|e| e.to_string())?;
+                    points.push((now, chat, channel, cursor.read_through, head));
+                }
+                Ok::<_, String>(points)
+            })
+            .await??;
+
+        let mut instructed = Vec::new();
+        let mut no_session = Vec::new();
+        for (now, chat, channel, read_through, head) in points {
+            let interrupted = interruptions
+                .iter()
+                .find(|(c, _)| *c == channel)
+                .map(|(_, o)| o);
+            if interrupted == Some(&InterruptOutcome::NoActiveTurn) || interrupted.is_none() {
+                no_session.push(chat);
+                continue;
+            }
+            let unread = head.saturating_sub(read_through);
+            let prompt: Arc<str> = Arc::from(format!(
+                "Chaos Control runtime instruction (high priority, not a chat message). \
+                 Stop your current work. Before doing anything else, inspect this chat's \
+                 conversation from sequence {} through {} ({} messages past your last read point) \
+                 so your context is current, then continue from that context. \
+                 Delivery of this instruction does not prove you have read it.",
+                read_through.saturating_add(1),
+                head,
+                unread
+            ));
+            let delivered = self.deliver_instruction(member, channel, prompt).await.is_ok();
+            // The cancel notification was sent before the instruction. Some
+            // adapters track one turn at a time and can drop the cancelled
+            // turn's late response, so settle it here instead of waiting for
+            // that response; otherwise pending work would never resume.
+            self.with_engine(move |e, now| {
+                e.settle_interrupted(now, member, channel);
+            })
+            .await?;
+            let refresh = ContextRefresh {
+                requested_at: now,
+                read_through,
+                head_seq: head,
+                instruction_delivered: delivered,
+            };
+            if delivered {
+                instructed.push((chat, channel, unread));
+            }
+            self.with_engine(move |e, _| {
+                e.record_context_refresh(member, channel, refresh);
+            })
+            .await?;
+        }
+
+        Ok(RefreshOutcome {
+            interruptions,
+            instructed,
+            no_session,
+        })
     }
 
     /// Closes every session and stops the actor.
@@ -1734,6 +2073,108 @@ impl Actor {
                         let _ = session.interrupt().await;
                     });
                 }
+            }
+            Cmd::InterruptScoped {
+                agent,
+                channels,
+                fallback_close,
+                reply,
+            } => {
+                let mut outcomes = Vec::new();
+                let mut targets = Vec::new();
+                for channel in channels {
+                    match self.slots.get(&(agent, channel)) {
+                        None => outcomes.push((channel, InterruptOutcome::NoActiveTurn)),
+                        Some(Slot {
+                            state: SlotState::Ready { session, .. },
+                            ..
+                        }) => {
+                            if !session.info().caps.contains(Caps::INTERRUPT) {
+                                if fallback_close {
+                                    // Best effort: closing reports no result, so
+                                    // say exactly that rather than claiming a
+                                    // confirmed cancellation.
+                                    let session = session.clone();
+                                    tokio::spawn(async move { session.close().await });
+                                    outcomes.push((
+                                        channel,
+                                        InterruptOutcome::FallbackClosed {
+                                            reason:
+                                                "interrupt unsupported by session capabilities"
+                                                    .into(),
+                                        },
+                                    ));
+                                } else {
+                                    outcomes.push((channel, InterruptOutcome::Unsupported));
+                                }
+                                continue;
+                            }
+                            targets.push((channel, session.clone()));
+                        }
+                        Some(_) => outcomes.push((channel, InterruptOutcome::NoActiveTurn)),
+                    }
+                }
+                // Do not hold the actor while integrations answer. A late
+                // result from the interrupted turn still carries the old
+                // epoch, which `Cmd::Event` drops, so it cannot look like a
+                // new turn or overwrite newer state.
+                tokio::spawn(async move {
+                    for (channel, session) in targets {
+                        let outcome = match session.interrupt().await {
+                            Ok(()) => InterruptOutcome::Confirmed,
+                            Err(e) => InterruptOutcome::Failed(e.message.to_string()),
+                        };
+                        let outcome = if fallback_close
+                            && !matches!(outcome, InterruptOutcome::Confirmed)
+                        {
+                            session.close().await;
+                            InterruptOutcome::FallbackClosed {
+                                reason: match outcome {
+                                    InterruptOutcome::Unsupported => {
+                                        "interrupt unsupported by session capabilities".into()
+                                    }
+                                    InterruptOutcome::Failed(e) => {
+                                        format!("interrupt failed: {e}")
+                                    }
+                                    other => format!("{other:?}"),
+                                },
+                            }
+                        } else {
+                            outcome
+                        };
+                        outcomes.push((channel, outcome));
+                    }
+                    let _ = reply.send(outcomes);
+                });
+            }
+            Cmd::DeliverInstruction {
+                agent,
+                channel,
+                prompt,
+                reply,
+            } => {
+                let session = match self.slots.get(&(agent, channel)) {
+                    Some(Slot {
+                        state: SlotState::Ready { session, .. },
+                        ..
+                    }) => session.clone(),
+                    _ => {
+                        let _ = reply.send(Err("no live session".to_string()));
+                        return;
+                    }
+                };
+                // An instruction is not a batch: use a negative id that can
+                // never collide with a stored batch. The engine ignores events
+                // for unknown turns, so this cannot create or settle an
+                // obligation.
+                let turn = BatchId(-1);
+                tokio::spawn(async move {
+                    let r = session
+                        .deliver(turn, prompt)
+                        .await
+                        .map_err(|e| e.message.to_string());
+                    let _ = reply.send(r);
+                });
             }
             Cmd::Shutdown(reply) => {
                 for (_, slot) in self.slots.drain() {

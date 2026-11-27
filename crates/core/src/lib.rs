@@ -26,6 +26,7 @@ pub mod engine;
 pub mod fake;
 pub mod harness;
 pub mod host;
+pub mod lifecycle;
 pub mod mcp;
 pub mod model_cache;
 pub mod notify;

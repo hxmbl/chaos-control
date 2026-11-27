@@ -36,6 +36,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::{
     approval::{ApprovalId, ApprovalOutcome, ApprovalOutcomeState},
+    lifecycle::{LifecycleState, MembershipState},
     types::*,
 };
 
@@ -1073,6 +1074,160 @@ impl Store {
 
     pub fn project_for_batch(&self, batch: BatchId) -> Option<ProjectId> {
         self.batch_project.get(&batch).cloned()
+    }
+
+    // --- Agent lifecycle (STRM-686) -------------------------------------
+
+    /// Global lifecycle of an agent. A missing row means Sleeping: that is how
+    /// newly added agents start, without needing a write at creation time.
+    pub fn agent_lifecycle(&self, member: MemberId) -> Result<LifecycleState> {
+        let raw: Option<String> = self
+            .core
+            .query_row(
+                "SELECT state FROM agent_lifecycle WHERE member_id = ?1",
+                [member.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .as_deref()
+            .and_then(LifecycleState::parse)
+            .unwrap_or_else(LifecycleState::default_for_new_agent))
+    }
+
+    /// Whether the agent was put to sleep by an explicit user action (as
+    /// opposed to choosing not to receive normal messages).
+    pub fn agent_forced_sleep(&self, member: MemberId) -> Result<bool> {
+        let forced: Option<i64> = self
+            .core
+            .query_row(
+                "SELECT forced_sleep FROM agent_lifecycle WHERE member_id = ?1",
+                [member.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(forced.unwrap_or(0) != 0)
+    }
+
+    /// Set an agent's global lifecycle and whether this was a user-forced
+    /// sleep. Activating clears the forced flag; sleeping by preference is not
+    /// represented here (it lives in `model_members.wake_normal_messages`).
+    pub fn set_agent_lifecycle(
+        &self,
+        member: MemberId,
+        state: LifecycleState,
+        forced_sleep: bool,
+    ) -> Result<()> {
+        let kind: Option<String> = self
+            .core
+            .query_row("SELECT kind FROM members WHERE id = ?1", [member.0], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if kind.as_deref() != Some("agent") {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        self.core.execute(
+            "INSERT INTO agent_lifecycle (member_id, state, forced_sleep) VALUES (?1, ?2, ?3)
+             ON CONFLICT(member_id) DO UPDATE SET state = excluded.state,
+                                                  forced_sleep = excluded.forced_sleep",
+            params![member.0, state.as_str(), forced_sleep as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Chats that contain this channel as a target. v1 backfills one chat per
+    /// channel, but the schema permits fan-out; lifecycle is per chat, so a
+    /// channel wake consults every chat it belongs to.
+    pub fn chats_for_channel(
+        &self,
+        project: &ProjectId,
+        channel: ChannelId,
+    ) -> Result<Vec<ChatId>> {
+        let mut stmt = self.core.prepare(
+            "SELECT chat_id FROM chat_members WHERE project_id = ?1 AND channel_id = ?2 ORDER BY chat_id",
+        )?;
+        let rows = stmt.query_map(params![project.as_str(), channel.0], |r| r.get::<_, i64>(0))?;
+        rows.map(|r| Ok(ChatId(r?))).collect()
+    }
+
+    /// Per-chat participation state. A missing row means Active; joining a
+    /// chat does not write a row, so membership state is cheap to add later.
+    pub fn chat_membership_lifecycle(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+    ) -> Result<MembershipState> {
+        let raw: Option<String> = self
+            .core
+            .query_row(
+                "SELECT state FROM chat_member_lifecycle WHERE chat_id = ?1 AND member_id = ?2",
+                params![chat.0, member.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw
+            .as_deref()
+            .and_then(MembershipState::parse)
+            .unwrap_or_else(MembershipState::default_for_new_membership))
+    }
+
+    /// Whether this chat membership was put to sleep by an explicit user
+    /// action. An explicit ping wakes it and clears the flag.
+    pub fn chat_membership_forced_sleep(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+    ) -> Result<bool> {
+        let forced: Option<i64> = self
+            .core
+            .query_row(
+                "SELECT forced_sleep FROM chat_member_lifecycle WHERE chat_id = ?1 AND member_id = ?2",
+                params![chat.0, member.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(forced.unwrap_or(0) != 0)
+    }
+
+    /// Set one agent's participation state in one chat. Both the chat and the
+    /// agent must exist; lifecycle never invents either. Channel membership is
+    /// checked by the wake path, which only considers current channel members.
+    pub fn set_chat_membership_lifecycle(
+        &self,
+        chat: ChatId,
+        member: MemberId,
+        state: MembershipState,
+        forced_sleep: bool,
+    ) -> Result<()> {
+        let exists: Option<i64> = self
+            .core
+            .query_row(
+                "SELECT 1 FROM chats WHERE id = ?1 AND archived_at IS NULL",
+                [chat.0],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if exists.is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        let kind: Option<String> = self
+            .core
+            .query_row("SELECT kind FROM members WHERE id = ?1", [member.0], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if kind.as_deref() != Some("agent") {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        self.core.execute(
+            "INSERT INTO chat_member_lifecycle (chat_id, member_id, state, forced_sleep)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(chat_id, member_id) DO UPDATE SET state = excluded.state,
+                                                          forced_sleep = excluded.forced_sleep",
+            params![chat.0, member.0, state.as_str(), forced_sleep as i64],
+        )?;
+        Ok(())
     }
 
     /// Ensure project DBs exist/open (used when a new project is created).
@@ -2214,6 +2369,27 @@ CREATE TABLE chat_members (
 );
 CREATE INDEX chat_members_by_project_channel ON chat_members (project_id, channel_id);
 INSERT OR IGNORE INTO id_counters (name, next_id) VALUES ('chat', 1);
+"#,
+    r#"
+-- STRM-686: global agent lifecycle. Agents added after this migration have no
+-- row and are therefore Sleeping (see Store::agent_lifecycle); existing agents
+-- are seeded Active so an upgrade does not silently put live rooms to sleep.
+CREATE TABLE agent_lifecycle (
+    member_id    INTEGER PRIMARY KEY REFERENCES members(id) ON DELETE CASCADE,
+    state        TEXT NOT NULL CHECK (state IN ('active', 'sleeping', 'unresponsive')),
+    forced_sleep INTEGER NOT NULL DEFAULT 0 CHECK (forced_sleep IN (0, 1))
+);
+INSERT INTO agent_lifecycle (member_id, state, forced_sleep)
+    SELECT id, 'active', 0 FROM members WHERE kind = 'agent';
+-- Per-chat participation is keyed by ChatId, not by a project channel, so
+-- future multi-target chats keep independent lifecycle state.
+CREATE TABLE chat_member_lifecycle (
+    chat_id      INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+    member_id    INTEGER NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+    state        TEXT NOT NULL CHECK (state IN ('active', 'sleeping')),
+    forced_sleep INTEGER NOT NULL DEFAULT 0 CHECK (forced_sleep IN (0, 1)),
+    PRIMARY KEY (chat_id, member_id)
+);
 "#,
 ];
 
@@ -6687,5 +6863,65 @@ mod tests {
         assert!(s.rename_channel(ch.id, "general").unwrap());
         let chats = s.chats().unwrap();
         assert_eq!(chats[0].title.as_ref(), "general");
+    }
+
+    #[test]
+    fn lifecycle_defaults_and_survives_a_reopen() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("cc-lifecycle-store-{nanos}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let agent = {
+            let mut s = Store::open(&dir).unwrap();
+            let agent = s
+                .ensure_member(MemberKind::Agent, "bot", "Bot")
+                .unwrap();
+            // A new agent has no row: globally Sleeping.
+            assert_eq!(
+                s.agent_lifecycle(agent.id).unwrap(),
+                LifecycleState::Sleeping
+            );
+            assert!(!s.agent_forced_sleep(agent.id).unwrap());
+
+            let p = s
+                .ensure_project(&pid(P1), "Alpha", None, 1)
+                .unwrap();
+            let ch = s.ensure_channel(&p.id, "main", 10).unwrap();
+            s.join_project(&p.id, agent.id, 1).unwrap();
+            s.join(ch.id, &agent, 0, 1).unwrap();
+            let chat = s.chats().unwrap()[0].id;
+            assert_eq!(
+                s.chat_membership_lifecycle(chat, agent.id).unwrap(),
+                MembershipState::Active
+            );
+
+            s.set_agent_lifecycle(agent.id, LifecycleState::Active, false)
+                .unwrap();
+            s.set_chat_membership_lifecycle(chat, agent.id, MembershipState::Sleeping, true)
+                .unwrap();
+            agent.id
+        };
+        {
+            let s = Store::open(&dir).unwrap();
+            assert_eq!(s.agent_lifecycle(agent).unwrap(), LifecycleState::Active);
+            assert!(!s.agent_forced_sleep(agent).unwrap());
+            let chat = s.chats().unwrap()[0].id;
+            assert_eq!(
+                s.chat_membership_lifecycle(chat, agent).unwrap(),
+                MembershipState::Sleeping
+            );
+            assert!(s.chat_membership_forced_sleep(chat, agent).unwrap());
+
+            // Global activation never rewrites explicitly sleeping memberships.
+            s.set_agent_lifecycle(agent, LifecycleState::Active, false)
+                .unwrap();
+            assert_eq!(
+                s.chat_membership_lifecycle(chat, agent).unwrap(),
+                MembershipState::Sleeping
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
