@@ -11,7 +11,10 @@ use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use chaos_core::{
     acp::{AcpAdapter, FnTransport},
-    adapter::{AgentAdapter, AgentError, AgentSession, Caps, OpenSession, Probe, SessionInfo},
+    adapter::{
+        AgentAdapter, AgentError, AgentErrorKind, AgentSession, Caps, OpenSession, Probe,
+        SessionInfo,
+    },
     fake::{self, FakeAgent, Script},
     host::{AgentSpec, Core, HostConfig, ManualClock},
     lifecycle::{InterruptOutcome, LifecycleScope, LifecycleState, MembershipState, SleepApplied},
@@ -315,4 +318,222 @@ async fn ordinary_messages_do_not_requeue_a_sleeping_membership() {
             .unwrap(),
         MembershipState::Active
     );
+}
+
+/// Wraps a real ACP session but makes `interrupt()` fail. Used to cover
+/// cancellation-failure reporting (STRM-687 gap).
+struct FailInterruptAdapter(Arc<AcpAdapter>);
+
+impl AgentAdapter for FailInterruptAdapter {
+    fn describe(&self) -> String {
+        self.0.describe()
+    }
+    fn probe(&self) -> BoxFuture<'_, Probe> {
+        self.0.probe()
+    }
+    fn open(&self, req: OpenSession) -> BoxFuture<'_, Result<Arc<dyn AgentSession>, AgentError>> {
+        let inner = self.0.clone();
+        Box::pin(async move {
+            let session = inner.open(req).await?;
+            let info = session.info().clone();
+            Ok(Arc::new(FailInterruptSession {
+                inner: session,
+                info,
+            }) as Arc<dyn AgentSession>)
+        })
+    }
+}
+
+struct FailInterruptSession {
+    inner: Arc<dyn AgentSession>,
+    info: SessionInfo,
+}
+
+impl AgentSession for FailInterruptSession {
+    fn info(&self) -> &SessionInfo {
+        &self.info
+    }
+    fn deliver(&self, turn: BatchId, prompt: Arc<str>) -> BoxFuture<'_, Result<(), AgentError>> {
+        self.inner.deliver(turn, prompt)
+    }
+    fn interrupt(&self) -> BoxFuture<'_, Result<(), AgentError>> {
+        Box::pin(async move {
+            Err(AgentError::new(
+                AgentErrorKind::Protocol,
+                "simulated interrupt failure",
+            ))
+        })
+    }
+    fn close(&self) -> BoxFuture<'_, ()> {
+        self.inner.close()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_failure_with_fallback_reports_fallback_close() {
+    let clock = ManualClock::new(T0);
+    let (core, _events) = Core::start(HostConfig::default(), clock.clone())
+        .await
+        .unwrap();
+    let main = main_channel(&core).await.id;
+    let hx = core.human("hx", "Hx", main).await.unwrap();
+
+    let fake = FakeAgent::new(slow_turn());
+    let f = fake.clone();
+    let acp = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
+        "fake:failinterrupt".into(),
+        move || fake::in_process(f.clone()),
+    ))));
+    let bot = core
+        .add_agent(
+            AgentSpec {
+                handle: "failinterrupt".into(),
+                name: "FailInterrupt".into(),
+                adapter: Arc::new(FailInterruptAdapter(acp)),
+                cwd: Some(PathBuf::from("/tmp")),
+                ping_answers: None,
+            },
+            main,
+        )
+        .await
+        .unwrap();
+    core.set_agent_lifecycle(bot.id, LifecycleState::Active, false)
+        .await
+        .unwrap();
+    core.post(hx.id, main, "@failinterrupt work", None)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while fake.observed.lock().unwrap().prompts.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session never opened"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let outcome = core.stop(bot.id, LifecycleScope::Global).await.unwrap();
+    assert_eq!(outcome.interruptions.len(), 1);
+    assert_eq!(outcome.interruptions[0].0, main);
+    let InterruptOutcome::FallbackClosed { reason } = &outcome.interruptions[0].1 else {
+        panic!(
+            "expected fallback close, got {:?}",
+            outcome.interruptions[0].1
+        );
+    };
+    assert!(reason.contains("interrupt failed"), "reason: {reason}");
+    assert!(
+        reason.contains("simulated interrupt failure"),
+        "reason: {reason}"
+    );
+    assert!(!outcome.all_interrupted(), "fallback is not confirmed");
+    assert_eq!(
+        fake.observed.lock().unwrap().cancels,
+        0,
+        "no successful cancel was recorded"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interrupt_failure_without_fallback_reports_failed() {
+    let clock = ManualClock::new(T0);
+    let (core, _events) = Core::start(HostConfig::default(), clock.clone())
+        .await
+        .unwrap();
+    let main = main_channel(&core).await.id;
+    let hx = core.human("hx", "Hx", main).await.unwrap();
+
+    let fake = FakeAgent::new(slow_turn());
+    let f = fake.clone();
+    let acp = Arc::new(AcpAdapter::new(Arc::new(FnTransport(
+        "fake:failnofallback".into(),
+        move || fake::in_process(f.clone()),
+    ))));
+    let bot = core
+        .add_agent(
+            AgentSpec {
+                handle: "failnofallback".into(),
+                name: "FailNoFallback".into(),
+                adapter: Arc::new(FailInterruptAdapter(acp)),
+                cwd: Some(PathBuf::from("/tmp")),
+                ping_answers: None,
+            },
+            main,
+        )
+        .await
+        .unwrap();
+    core.set_agent_lifecycle(bot.id, LifecycleState::Active, false)
+        .await
+        .unwrap();
+    core.post(hx.id, main, "@failnofallback work", None)
+        .await
+        .unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while fake.observed.lock().unwrap().prompts.is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session never opened"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // stop_and_check_chat uses interrupt_scoped(..., fallback_close=false).
+    let outcome = core
+        .stop_and_check_chat(bot.id, LifecycleScope::Global)
+        .await
+        .unwrap();
+    assert_eq!(outcome.interruptions.len(), 1);
+    assert_eq!(outcome.interruptions[0].0, main);
+    match &outcome.interruptions[0].1 {
+        InterruptOutcome::Failed(msg) => {
+            assert!(msg.contains("simulated interrupt failure"), "msg: {msg}");
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(
+        outcome.instructed.is_empty(),
+        "failed interrupt must not deliver a context-refresh instruction"
+    );
+    assert!(
+        outcome.no_session.is_empty(),
+        "session existed; failure is not a missing session"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_chat_scope_does_not_interrupt_other_chat() {
+    let mut h = Harness::new().await;
+    let bot = h.agent("bot", slow_turn()).await;
+    let side = h.core.channel(&project_id(), "side").await.unwrap();
+    h.core.join(h.hx.id, side.id).await.unwrap();
+    h.core.join(bot.id, side.id).await.unwrap();
+    let side_chat = h
+        .core
+        .chats()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|c| c.targets.iter().any(|t| t.channel == side.id))
+        .unwrap();
+
+    h.say("@bot main work").await;
+    h.core
+        .post(h.hx.id, side.id, "@bot side work", None)
+        .await
+        .unwrap();
+    h.wait_prompts("bot", 2).await;
+
+    let outcome = h
+        .core
+        .stop(bot.id, LifecycleScope::Chat(side_chat.id))
+        .await
+        .unwrap();
+    assert_eq!(outcome.sleep, None);
+    assert_eq!(outcome.interruptions.len(), 1);
+    assert_eq!(outcome.interruptions[0].0, side.id);
+    assert_eq!(outcome.interruptions[0].1, InterruptOutcome::Confirmed);
+    wait_cancels(&h, "bot", 1).await;
+    assert_eq!(cancels(&h, "bot"), 1, "main chat must not be interrupted");
 }
