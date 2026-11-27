@@ -7,6 +7,7 @@ mod composer;
 mod conversation;
 #[cfg(target_os = "macos")]
 mod dock;
+mod lifecycle_controls;
 mod markdown;
 mod mention_highlight;
 mod model_picker;
