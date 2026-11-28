@@ -1729,6 +1729,32 @@ impl Store {
         };
         pending_batch_db(self.project_agents(&project)?, agent, channel)
     }
+    /// Channels that have queued work for `agent`. Activation re-pumps these:
+    /// lifecycle gates dispatch, so work queued while the agent slept waits
+    /// until it is woken.
+    pub fn channels_with_pending(&self, agent: MemberId) -> Result<Vec<ChannelId>> {
+        // Batches live in the per-project agents DBs, so scan each one.
+        let mut out = Vec::new();
+        for project in self.projects.keys() {
+            let mut stmt = self.project_agents(project)?.prepare(
+                "SELECT DISTINCT channel_id FROM batches WHERE agent_id = ?1 AND state = 'pending'",
+            )?;
+            let rows = stmt.query_map([agent.0], |r| Ok(ChannelId(r.get(0)?)))?;
+            for row in rows {
+                out.push(row?);
+            }
+        }
+        Ok(out)
+    }
+    /// Every channel a chat spans (`chat_members` maps chats to channels;
+    /// per-chat membership state lives separately, in `chat_member_lifecycle`).
+    pub fn chat_channels(&self, chat: ChatId) -> Result<Vec<ChannelId>> {
+        let mut stmt = self
+            .core
+            .prepare("SELECT DISTINCT channel_id FROM chat_members WHERE chat_id = ?1")?;
+        let rows = stmt.query_map([chat.0], |r| Ok(ChannelId(r.get(0)?)))?;
+        rows.collect()
+    }
     pub fn pending_batch_or_create(
         &mut self,
         agent: MemberId,
@@ -2630,6 +2656,16 @@ fn migrate_legacy(source: &Path, data_dir: &Path) -> std::result::Result<(), Ope
             "id, name, root_path, created_at, unclaimed_import",
         )?;
         copy_table(&legacy, &core, "members", "id, kind, handle, name")?;
+        // The STRM-686 migration that seeds `agent_lifecycle` ran during
+        // `open_db` above, when `members` was still empty, so the seed
+        // selected nothing. Seed here, after the copy, for the same reason
+        // the migration gives: an upgrade must not silently put live rooms
+        // to sleep (a missing row means Sleeping, which blocks even pings).
+        core.execute(
+            "INSERT OR IGNORE INTO agent_lifecycle (member_id, state, forced_sleep)
+             SELECT id, 'active', 0 FROM members WHERE kind = 'agent'",
+            [],
+        )?;
         copy_table(
             &legacy,
             &core,
@@ -6389,6 +6425,46 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, 9999);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3: legacy upgrade must not silently put live rooms to sleep. The
+    /// STRM-686 lifecycle seed runs inside `open_db` before `members` is
+    /// copied, so `migrate_legacy` must reseed `agent_lifecycle` afterwards;
+    /// a missing row would read as Sleeping and block even explicit pings.
+    #[test]
+    fn legacy_migration_seeds_agent_lifecycle_for_copied_agents() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-legacy-lifecycle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let legacy = dir.join("core.sqlite");
+        make_real_shaped_legacy_core(&legacy);
+
+        let s = Store::open(&dir).unwrap();
+
+        // member 1 is human; member 2 is an agent copied from the legacy DB.
+        assert_eq!(
+            s.agent_lifecycle(MemberId(1)).unwrap(),
+            LifecycleState::Sleeping,
+            "non-agent members have no lifecycle row; the agent check is what matters"
+        );
+        assert_eq!(
+            s.agent_lifecycle(MemberId(2)).unwrap(),
+            LifecycleState::Active,
+            "a copied agent must not be silently dead after upgrade"
+        );
+        assert!(
+            !s.agent_forced_sleep(MemberId(2)).unwrap(),
+            "a migrated agent is not force-slept"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

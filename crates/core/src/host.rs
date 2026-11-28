@@ -176,6 +176,9 @@ enum Cmd {
         agent: MemberId,
         channel: ChannelId,
         epoch: u64,
+        /// The batch in flight when the interrupt started; a fallback close
+        /// settles exactly that one (see `Engine::settle_interrupted`).
+        batch: Option<BatchId>,
     },
     /// A high-priority runtime instruction, sent straight to a live session.
     /// It deliberately bypasses the message graph: no batch, no obligation, no
@@ -1554,15 +1557,29 @@ impl Core {
 
     /// Set global lifecycle. `forced_sleep` records an explicit user action;
     /// activation clears it. Sleeping memberships are left untouched.
+    /// Activation re-pumps work queued while the agent slept: lifecycle
+    /// gates dispatch, so queued work would otherwise wait for the next post.
     pub async fn set_agent_lifecycle(
         &self,
         member: MemberId,
         state: LifecycleState,
         forced_sleep: bool,
     ) -> Result<(), String> {
-        self.with_engine(move |e, _| e.set_agent_lifecycle(member, state, forced_sleep))
-            .await?
-            .map_err(|e| e.to_string())
+        self.with_engine(move |e, now| {
+            e.set_agent_lifecycle(member, state, forced_sleep)
+                .map_err(|e| e.to_string())?;
+            if state == LifecycleState::Active {
+                let channels = e
+                    .store()
+                    .channels_with_pending(member)
+                    .map_err(|e| e.to_string())?;
+                for channel in channels {
+                    e.pump(now, member, channel);
+                }
+            }
+            Ok(())
+        })
+        .await?
     }
 
     /// Whether an agent was put to sleep by an explicit user action.
@@ -1584,6 +1601,8 @@ impl Core {
     }
 
     /// Set one chat membership's state. The chat and agent must exist.
+    /// Activation re-pumps that chat's queued work (lifecycle gates
+    /// dispatch).
     pub async fn set_chat_membership_lifecycle(
         &self,
         chat: ChatId,
@@ -1591,11 +1610,18 @@ impl Core {
         state: MembershipState,
         forced_sleep: bool,
     ) -> Result<(), String> {
-        self.with_engine(move |e, _| {
+        self.with_engine(move |e, now| {
             e.set_chat_membership_lifecycle(chat, member, state, forced_sleep)
+                .map_err(|e| e.to_string())?;
+            if state == MembershipState::Active {
+                let channels = e.store().chat_channels(chat).map_err(|e| e.to_string())?;
+                for channel in channels {
+                    e.pump(now, member, channel);
+                }
+            }
+            Ok(())
         })
         .await?
-        .map_err(|e| e.to_string())
     }
 
     /// Whether this chat membership was explicitly force-slept by the user.
@@ -1814,13 +1840,43 @@ impl Core {
         wait.await.map_err(|_| "runtime stopped".to_string())?
     }
 
+    /// The batch in flight per channel *right now* — the batch a subsequent
+    /// interrupt will cancel. Captured before the interrupt runs, so a late
+    /// cancel result that settles it and dispatches newer queued work cannot
+    /// redirect the settle to that newer batch.
+    async fn in_flight_batches(
+        &self,
+        member: MemberId,
+        channels: &[ChannelId],
+    ) -> Result<Vec<(ChannelId, Option<BatchId>)>, String> {
+        let channels = channels.to_vec();
+        self.with_engine(move |e, _| {
+            channels
+                .iter()
+                .map(|&channel| {
+                    let batch = e
+                        .store()
+                        .in_flight_batch(member, channel)
+                        .map_err(|e| e.to_string())?
+                        .map(|b| b.id);
+                    Ok((channel, batch))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })
+        .await?
+    }
+
     /// A confirmed cancel ended the turn; settle it even if the adapter drops
     /// the late response, so pending work is not stranded behind a dead batch.
+    /// `batches` was captured before the interrupt (see
+    /// [`Self::in_flight_batches`]): exactly that batch is settled, never a
+    /// newer one a late response may have dispatched meanwhile.
     /// Unsupported/failed results are left alone: the turn may still run.
     async fn settle_confirmed(
         &self,
         agent: MemberId,
         interruptions: &[(ChannelId, InterruptOutcome)],
+        batches: Vec<(ChannelId, Option<BatchId>)>,
     ) -> Result<(), String> {
         let confirmed: Vec<ChannelId> = interruptions
             .iter()
@@ -1832,7 +1888,11 @@ impl Core {
         }
         self.with_engine(move |e, now| {
             for channel in confirmed {
-                e.settle_interrupted(now, agent, channel);
+                let batch = batches
+                    .iter()
+                    .find(|(c, _)| *c == channel)
+                    .and_then(|(_, b)| *b);
+                e.settle_interrupted(now, agent, channel, batch);
             }
         })
         .await
@@ -1848,8 +1908,10 @@ impl Core {
         scope: LifecycleScope,
     ) -> Result<ControlOutcome, String> {
         let channels = self.channels_for_scope(member, &scope).await?;
+        let batches = self.in_flight_batches(member, &channels).await?;
         let interruptions = self.interrupt_scoped(member, channels, true).await?;
-        self.settle_confirmed(member, &interruptions).await?;
+        self.settle_confirmed(member, &interruptions, batches)
+            .await?;
         Ok(ControlOutcome {
             interruptions,
             sleep: None,
@@ -1865,6 +1927,7 @@ impl Core {
         scope: LifecycleScope,
     ) -> Result<ControlOutcome, String> {
         let channels = self.channels_for_scope(member, &scope).await?;
+        let batches = self.in_flight_batches(member, &channels).await?;
         let interruptions = self.interrupt_scoped(member, channels, true).await?;
         let sleep = match scope {
             LifecycleScope::Global => {
@@ -1879,9 +1942,12 @@ impl Core {
             }
         };
         // Settle after the sleep is persisted: a confirmed cancel must not
-        // let pending work pump into a freshly opened turn before the wake
-        // preference is written.
-        self.settle_confirmed(member, &interruptions).await?;
+        // let pending work pump into a freshly opened turn before the sleep
+        // is written (dispatch is lifecycle-gated on top of this ordering).
+        // `batches` pins the settle to the interrupted turn — a late cancel
+        // result may have dispatched queued work in the meantime.
+        self.settle_confirmed(member, &interruptions, batches)
+            .await?;
         Ok(ControlOutcome {
             interruptions,
             sleep: Some(sleep),
@@ -1952,6 +2018,10 @@ impl Core {
     ) -> Result<RefreshOutcome, String> {
         // Do not close the session as a fallback here: we still need it to
         // receive the instruction. Unsupported/failed interrupts are reported.
+        // Capture the batch each interrupt will cancel before it runs: a late
+        // cancel result may settle that batch and dispatch newer queued work
+        // first, and settling "whatever is in flight" then would destroy it.
+        let batches = self.in_flight_batches(member, &channels).await?;
         let interruptions = self
             .interrupt_scoped(member, channels.clone(), false)
             .await?;
@@ -2019,8 +2089,12 @@ impl Core {
             // adapters track one turn at a time and can drop the cancelled
             // turn's late response, so settle it here instead of waiting for
             // that response; otherwise pending work would never resume.
+            let batch = batches
+                .iter()
+                .find(|(c, _)| *c == channel)
+                .and_then(|(_, b)| *b);
             self.with_engine(move |e, now| {
-                e.settle_interrupted(now, member, channel);
+                e.settle_interrupted(now, member, channel, batch);
             })
             .await?;
             let refresh = ContextRefresh {
@@ -2161,6 +2235,7 @@ impl Actor {
                 agent,
                 channel,
                 epoch,
+                batch,
             } => {
                 if self.slots.get(&(agent, channel)).map(|s| s.epoch) == Some(epoch) {
                     if let Some(slot) = self.slots.remove(&(agent, channel)) {
@@ -2170,8 +2245,10 @@ impl Actor {
                     // Closing the owned session killed the turn even when the
                     // adapter could not confirm a cancel. Settle it so pending
                     // work can run on a fresh session; completed side effects
-                    // are not undone by this bookkeeping.
-                    self.engine.settle_interrupted(now, agent, channel);
+                    // are not undone by this bookkeeping. `batch` was captured
+                    // before the interrupt: a late cancel result may already
+                    // have settled it and dispatched newer queued work.
+                    self.engine.settle_interrupted(now, agent, channel, batch);
                 }
             }
             Cmd::DeliverFailed {
@@ -2213,6 +2290,24 @@ impl Actor {
                 // One slot per input channel keeps the report in the caller's
                 // order even when cancellations complete out of order.
                 let tx = self.tx.clone();
+                // The batch in flight per channel right now: a fallback close
+                // settles it later via Cmd::SlotClosed, possibly after a late
+                // cancel result already settled it and newer queued work
+                // dispatched — so the id is captured before any interrupt.
+                let in_flight: Vec<(ChannelId, Option<BatchId>)> = channels
+                    .iter()
+                    .map(|&channel| {
+                        (
+                            channel,
+                            self.engine
+                                .store()
+                                .in_flight_batch(agent, channel)
+                                .ok()
+                                .flatten()
+                                .map(|b| b.id),
+                        )
+                    })
+                    .collect();
                 let mut outcomes: Vec<Option<(ChannelId, InterruptOutcome)>> =
                     channels.iter().map(|_| None).collect();
                 let mut targets = Vec::new();
@@ -2233,12 +2328,17 @@ impl Actor {
                                     // confirmed cancellation.
                                     let session = session.clone();
                                     let tx = tx.clone();
+                                    let batch = in_flight
+                                        .iter()
+                                        .find(|(c, _)| *c == channel)
+                                        .and_then(|(_, b)| *b);
                                     tokio::spawn(async move {
                                         session.close().await;
                                         let _ = tx.send(Cmd::SlotClosed {
                                             agent,
                                             channel,
                                             epoch,
+                                            batch,
                                         });
                                     });
                                     outcomes[index] = Some((
@@ -2254,7 +2354,11 @@ impl Actor {
                                 }
                                 continue;
                             }
-                            targets.push((index, channel, epoch, session.clone()));
+                            let batch = in_flight
+                                .iter()
+                                .find(|(c, _)| *c == channel)
+                                .and_then(|(_, b)| *b);
+                            targets.push((index, channel, epoch, session.clone(), batch));
                         }
                         Some(_) => {
                             outcomes[index] = Some((channel, InterruptOutcome::NoActiveTurn));
@@ -2266,7 +2370,7 @@ impl Actor {
                 // epoch, which `Cmd::Event` drops, so it cannot look like a
                 // new turn or overwrite newer state.
                 tokio::spawn(async move {
-                    for (index, channel, epoch, session) in targets {
+                    for (index, channel, epoch, session, batch) in targets {
                         let outcome = match session.interrupt().await {
                             Ok(()) => InterruptOutcome::Confirmed,
                             Err(e) => InterruptOutcome::Failed(e.message.to_string()),
@@ -2278,6 +2382,7 @@ impl Actor {
                                     agent,
                                     channel,
                                     epoch,
+                                    batch,
                                 });
                                 InterruptOutcome::FallbackClosed {
                                     reason: match outcome {
