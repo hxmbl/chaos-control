@@ -853,6 +853,7 @@ impl Engine {
             } else {
                 WakeReason::Broadcast
             };
+            let mut wake_membership = false;
             match self
                 .effective_delivery(target.id, channel, reason)
                 .map_err(|e| PostError::Store(e.to_string()))?
@@ -861,9 +862,11 @@ impl Engine {
                 lifecycle::DeliveryDecision::Skip => continue,
                 lifecycle::DeliveryDecision::WakeMembership => {
                     // An explicit ping wakes only the chat membership; global
-                    // activation is a separate, explicit user action.
-                    self.wake_channel_memberships(target.id, channel)
-                        .map_err(|e| PostError::Store(e.to_string()))?;
+                    // activation is a separate, explicit user action. The wake
+                    // itself happens below, once the message is certain to
+                    // create a trigger: one that the hop limit or ping-pong
+                    // damp drops must not clear a user's forced chat sleep.
+                    wake_membership = true;
                 }
             }
             let id = TriggerId {
@@ -904,6 +907,12 @@ impl Engine {
                     }
                     Damp::Paused => continue,
                 }
+            }
+            if wake_membership {
+                // Only now, after every drop check, may the ping wake the
+                // chat membership (see the decision above).
+                self.wake_channel_memberships(target.id, channel)
+                    .map_err(|e| PostError::Store(e.to_string()))?;
             }
             let inserted = self
                 .store
@@ -1406,6 +1415,30 @@ impl Engine {
     /// Dispatches the pending batch for agent x channel if nothing is in flight
     /// and the agent is not backing off. One turn at a time; triggers that
     /// arrive meanwhile wait in the (single) pending batch.
+    /// Whether lifecycle lets queued work dispatch in this channel: the agent
+    /// is globally Active and not sleeping in any chat the channel targets.
+    /// Missing rows carry the documented defaults (new agents are Sleeping,
+    /// new memberships Active), so this matches `create_triggers` exactly —
+    /// a trigger exists only where this would dispatch.
+    fn dispatch_allowed_by_lifecycle(
+        &self,
+        agent: MemberId,
+        channel: ChannelId,
+    ) -> Result<bool, PostError> {
+        if self.store.agent_lifecycle(agent)? != LifecycleState::Active {
+            return Ok(false);
+        }
+        let Some(project) = self.store.project_for_channel(channel) else {
+            return Ok(true);
+        };
+        for chat in self.store.chats_for_channel(&project, channel)? {
+            if self.store.chat_membership_lifecycle(chat, agent)? == MembershipState::Sleeping {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(crate) fn pump(&mut self, now: Millis, agent: MemberId, channel: ChannelId) {
         if let Err(e) = self.try_pump(now, agent, channel) {
             let rt = self.rt.entry((agent, channel)).or_default();
@@ -1431,6 +1464,14 @@ impl Engine {
             return Ok(());
         }
         if self.store.in_flight_batch(agent, channel)?.is_some() {
+            return Ok(());
+        }
+        // Lifecycle gates dispatch (STRM-686): work queued before a force
+        // sleep must not run while the agent — or this channel's chat
+        // membership — is asleep, and a sleeping agent must not open a
+        // session for it. Waking re-pumps the queued work (see the
+        // `set_*_lifecycle` Core APIs).
+        if !self.dispatch_allowed_by_lifecycle(agent, channel)? {
             return Ok(());
         }
         let Some(pending) = self.store.pending_batch(agent, channel)? else {
@@ -1557,18 +1598,26 @@ impl Engine {
         self.rt.entry((agent, channel)).or_default().hold_dispatch = hold;
     }
 
-    /// A runtime control cancelled the in-flight turn. Settle it as cancelled
-    /// without waiting for the transport's late response: a cancel can be
-    /// followed immediately by a runtime instruction on the same session, and
-    /// adapters that track one turn at a time drop that late response. Pending
-    /// work must still resume after the instruction. Under
+    /// A runtime control cancelled the in-flight turn. Settle *that* batch:
+    /// `batch` is the id captured before the interrupt, because a late cancel
+    /// result may already have settled it and pumped newer queued work into
+    /// flight — settling whatever is in flight now would destroy that work,
+    /// marking it Cancelled with Unmet obligations that never re-trigger. A
+    /// missing id (nothing was in flight when the interrupt started) settles
+    /// nothing. Pending work must still resume after the instruction; under
     /// [`Engine::set_dispatch_hold`] this pump defers until the release.
-    pub fn settle_interrupted(&mut self, now: Millis, agent: MemberId, channel: ChannelId) {
-        let Ok(Some(batch)) = self.store.in_flight_batch(agent, channel) else {
+    pub fn settle_interrupted(
+        &mut self,
+        now: Millis,
+        agent: MemberId,
+        channel: ChannelId,
+        batch: Option<BatchId>,
+    ) {
+        let Some(id) = batch else {
             return;
         };
-        self.accepted(now, agent, channel, batch.id);
-        if let Err(e) = self.settle(now, agent, channel, batch.id, &TurnOutcome::Cancelled, "") {
+        self.accepted(now, agent, channel, id);
+        if let Err(e) = self.settle(now, agent, channel, id, &TurnOutcome::Cancelled, "") {
             self.rt.entry((agent, channel)).or_default().note =
                 Some(Arc::from(format!("internal error: {e}")));
         }

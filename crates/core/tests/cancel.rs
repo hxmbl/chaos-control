@@ -88,7 +88,20 @@ async fn interrupt_cancels_the_in_flight_turn_and_settles_it_unmet() {
         .await;
     let ping = h.say("@bot why is CI red?").await;
     h.until("turn accepted", batches_in("accepted", 1)).await;
-    let st = h.core.status(bot.id, h.main).await.unwrap();
+    // Accepted fires on the first text chunk; the tool-call label is a later
+    // event. Wait for the presence event instead of racing it.
+    let (main, bot_id) = (h.main, bot.id);
+    let st = match h
+        .wait_for("tool-call presence", |e| {
+            matches!(e, CoreEvent::Agent(s) if s.agent == bot_id
+                && s.channel == main
+                && s.presence.as_deref() == Some("working: Reading the CI logs"))
+        })
+        .await
+    {
+        CoreEvent::Agent(s) => s,
+        _ => unreachable!(),
+    };
     assert_eq!(st.glow, Glow::Active);
     assert_eq!(st.presence.as_deref(), Some("working: Reading the CI logs"));
 
