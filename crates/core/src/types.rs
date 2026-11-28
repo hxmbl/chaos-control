@@ -252,6 +252,17 @@ impl WakeReason {
     pub fn is_direct(self) -> bool {
         matches!(self, WakeReason::Mention | WakeReason::ReplyToMe)
     }
+
+    /// An explicit ping: the message is addressed at this agent (or at the
+    /// whole room on a human's word). A ping wakes a sleeping agent and, in
+    /// error mode, is what makes the harness try again; plain broadcasts
+    /// never do.
+    pub fn is_ping(self) -> bool {
+        matches!(
+            self,
+            WakeReason::Mention | WakeReason::ReplyToMe | WakeReason::Everyone
+        )
+    }
 }
 
 /// Identity of a trigger: one per (agent, channel, triggering message). A

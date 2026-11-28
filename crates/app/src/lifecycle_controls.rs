@@ -3,13 +3,17 @@
 //! Pure model for the discoverable, accessible control surface. The UI bridge
 //! in [`crate::lifecycle_runtime`] turns a [`LifecycleCommand`] into a core
 //! runtime call and reports the honest outcome; this module keeps the shared
-//! vocabulary and never claims guaranteed termination or rollback.
+//! vocabulary and never claims guaranteed termination or rollback. Delivery
+//! policy is shared with `chaos_core::lifecycle` so the app cannot drift
+//! from the runtime precedence rules.
 //!
 //! Contract (see chat #115 / STRM-670):
 //! - Lifecycle: `Unresponsive > global Sleeping > chat Sleeping`.
 //! - `Sleeping` members still wake on explicit pings.
-//! - `Unresponsive` surfaces failures (billing/auth, missing harness, repeated
-//!   delivery failures).
+//! - `Unresponsive` (error mode) surfaces failures (billing/auth, missing
+//!   harness, repeated delivery failures); nothing is notified until an
+//!   explicit ping, which makes the harness try again and may re-enter
+//!   error mode.
 //! - Harness-reported current activity is *presence*, separate from lifecycle.
 //! - `Stop` = interrupt only; `Force sleep` = interrupt + state change;
 //!   `Stop and check chat` = interrupt then high-priority context refresh.
@@ -102,22 +106,41 @@ pub enum Outcome {
 }
 
 /// Effective delivery precedence. Preference can only reduce, never override
-/// forced `Sleeping`. `Unresponsive` blocks delivery.
+/// forced `Sleeping`. Nothing is notified in `Sleeping` or `Unresponsive`
+/// (error mode) except on an explicit ping; a ping wakes a sleeping member
+/// (and a sleeping agent) and, in error mode, makes the harness try again.
 pub fn effective_delivery(
     global: LifecycleState,
     membership: MembershipState,
     preference_allows_normal: bool,
     explicit_ping: bool,
 ) -> bool {
-    if global == LifecycleState::Unresponsive {
-        return false;
-    }
-    let active = global == LifecycleState::Active && membership == MembershipState::Active;
-    if explicit_ping {
-        // explicit ping wakes only a sleeping membership when globally Active
-        return global == LifecycleState::Active;
-    }
-    active && preference_allows_normal
+    let global = match global {
+        LifecycleState::Active => chaos_core::lifecycle::LifecycleState::Active,
+        LifecycleState::Sleeping => chaos_core::lifecycle::LifecycleState::Sleeping,
+        LifecycleState::Unresponsive => chaos_core::lifecycle::LifecycleState::Unresponsive,
+    };
+    let membership = match membership {
+        MembershipState::Active => chaos_core::lifecycle::MembershipState::Active,
+        MembershipState::Sleeping => chaos_core::lifecycle::MembershipState::Sleeping,
+    };
+    let reason = if explicit_ping {
+        chaos_core::types::WakeReason::Mention
+    } else {
+        chaos_core::types::WakeReason::Broadcast
+    };
+    matches!(
+        chaos_core::lifecycle::delivery_decision(
+            global,
+            membership,
+            reason,
+            preference_allows_normal,
+        ),
+        chaos_core::lifecycle::DeliveryDecision::Deliver
+            | chaos_core::lifecycle::DeliveryDecision::WakeMembership
+            | chaos_core::lifecycle::DeliveryDecision::WakeAgent
+            | chaos_core::lifecycle::DeliveryDecision::RetryUnresponsive
+    )
 }
 
 /// Effective lifecycle for display, honoring precedence
@@ -208,8 +231,16 @@ mod tests {
     }
 
     #[test]
-    fn unresponsive_blocks_delivery_even_with_ping() {
+    fn unresponsive_notifies_nothing_without_ping_but_ping_retries() {
+        // No ping in error mode: nothing is notified.
         assert!(!effective_delivery(
+            LifecycleState::Unresponsive,
+            MembershipState::Active,
+            true,
+            false
+        ));
+        // A ping makes the harness try again.
+        assert!(effective_delivery(
             LifecycleState::Unresponsive,
             MembershipState::Active,
             true,
@@ -236,18 +267,26 @@ mod tests {
     }
 
     #[test]
-    fn explicit_ping_wakes_sleeping_membership_when_globally_active() {
+    fn explicit_ping_wakes_sleeping_membership_and_sleeping_agent() {
         assert!(effective_delivery(
             LifecycleState::Active,
             MembershipState::Sleeping,
             false,
             true
         ));
-        assert!(!effective_delivery(
+        // A ping wakes a globally sleeping agent too.
+        assert!(effective_delivery(
             LifecycleState::Sleeping,
             MembershipState::Active,
             true,
             true
+        ));
+        // But a global sleeping agent isn't notified on normal chat.
+        assert!(!effective_delivery(
+            LifecycleState::Sleeping,
+            MembershipState::Active,
+            true,
+            false
         ));
     }
 

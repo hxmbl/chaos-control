@@ -16,9 +16,13 @@ use crate::types::{ChannelId, ChatId, Millis, Seq, WakeReason};
 pub enum LifecycleState {
     /// Available for normal room activity.
     Active,
-    /// Master sit-and-wait state: no chat can wake or schedule the agent.
+    /// Master sit-and-wait state: no normal chat can wake or schedule the
+    /// agent; it can still read the chat. An explicit ping wakes it
+    /// (clearing any user-forced sleep).
     Sleeping,
-    /// Agent-wide failure. Not selectable as a sleep mode; blocks everything.
+    /// Agent-wide failure (error mode). Not selectable as a sleep mode.
+    /// Notified of nothing; only an explicit ping produces anything, making
+    /// the harness try again (and it may re-enter error mode).
     Unresponsive,
 }
 
@@ -166,6 +170,13 @@ pub enum DeliveryDecision {
     /// Flip a sleeping membership Active (explicit ping while globally Active)
     /// and queue the trigger. Global activation never does this.
     WakeMembership,
+    /// Ping on a globally sleeping agent: wake it globally (and its chat
+    /// membership) and queue the trigger.
+    WakeAgent,
+    /// Ping in error mode (`Unresponsive`): nothing else is notified, but
+    /// this ping makes the harness try again — clearing the recorded failure
+    /// — and it may re-enter error mode if the retry fails.
+    RetryUnresponsive,
 }
 
 /// Apply Unresponsive > global Sleeping > chat Sleeping, then the explicit-ping
@@ -175,6 +186,17 @@ pub enum DeliveryDecision {
 /// STRM-657. It only gates broadcasts: an explicit ping still wakes an agent
 /// that has opted out of ordinary room chatter. A user-forced sleep is already
 /// reflected in the state passed here; the preference cannot override it.
+///
+/// The interaction model (all silence is broken by an explicit ping):
+/// - **Active**: notified on every chat unless the agent chose not to
+///   (`preference_allows == false`); pings always deliver.
+/// - **Sleeping**: silent except for pings. A ping wakes the agent
+///   ([`DeliveryDecision::WakeAgent`]) or its chat membership
+///   ([`DeliveryDecision::WakeMembership`]); a sleeping agent can still read
+///   the chat, it just isn't notified.
+/// - **Unresponsive** (error mode): notified of nothing. Only an explicit
+///   ping produces anything: [`DeliveryDecision::RetryUnresponsive`], a
+///   fresh attempt at the harness which may re-enter error mode.
 pub fn delivery_decision(
     global: LifecycleState,
     membership: MembershipState,
@@ -182,7 +204,20 @@ pub fn delivery_decision(
     preference_allows: bool,
 ) -> DeliveryDecision {
     match global {
-        LifecycleState::Unresponsive | LifecycleState::Sleeping => DeliveryDecision::Skip,
+        LifecycleState::Unresponsive => {
+            if reason.is_ping() {
+                DeliveryDecision::RetryUnresponsive
+            } else {
+                DeliveryDecision::Skip
+            }
+        }
+        LifecycleState::Sleeping => {
+            if reason.is_ping() {
+                DeliveryDecision::WakeAgent
+            } else {
+                DeliveryDecision::Skip
+            }
+        }
         LifecycleState::Active => match reason {
             WakeReason::Broadcast => {
                 if !preference_allows || membership == MembershipState::Sleeping {
@@ -207,9 +242,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unresponsive_blocks_everything() {
+    fn unresponsive_notifies_nothing_but_a_ping_retries() {
+        // Non-ping: nothing is notified in error mode.
+        assert_eq!(
+            delivery_decision(
+                LifecycleState::Unresponsive,
+                MembershipState::Active,
+                WakeReason::Broadcast,
+                true
+            ),
+            DeliveryDecision::Skip
+        );
+        // Explicit ping: the harness tries again (may re-enter error mode).
         for reason in [
-            WakeReason::Broadcast,
             WakeReason::Mention,
             WakeReason::ReplyToMe,
             WakeReason::Everyone,
@@ -221,15 +266,25 @@ mod tests {
                     reason,
                     true
                 ),
-                DeliveryDecision::Skip
+                DeliveryDecision::RetryUnresponsive
             );
         }
     }
 
     #[test]
-    fn global_sleeping_blocks_everything_including_pings() {
+    fn global_sleeping_skips_normal_chat_but_a_ping_wakes() {
+        // Normal chat on a sleeping agent: nothing.
+        assert_eq!(
+            delivery_decision(
+                LifecycleState::Sleeping,
+                MembershipState::Active,
+                WakeReason::Broadcast,
+                true
+            ),
+            DeliveryDecision::Skip
+        );
+        // Explicit ping: wake the agent.
         for reason in [
-            WakeReason::Broadcast,
             WakeReason::Mention,
             WakeReason::ReplyToMe,
             WakeReason::Everyone,
@@ -241,7 +296,7 @@ mod tests {
                     reason,
                     true
                 ),
-                DeliveryDecision::Skip
+                DeliveryDecision::WakeAgent
             );
         }
     }

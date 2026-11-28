@@ -457,7 +457,14 @@ impl Engine {
         let default = Rt::default();
         let rt = self.rt.get(&(agent, channel)).unwrap_or(&default);
         let failing = rt.failures >= self.policy.max_failures;
-        let glow = if rt.red.is_some() || failing {
+        // Error mode is `Unresponsive > ...` in `lifecycle::delivery_decision`;
+        // render red for both a runtime failure and a persisted lifecycle.
+        let unresponsive_lifecycle = self
+            .store
+            .agent_lifecycle(agent)
+            .map(|s| s == LifecycleState::Unresponsive)
+            .unwrap_or(false);
+        let glow = if rt.red.is_some() || failing || unresponsive_lifecycle {
             Glow::Unresponsive
         } else if rt.phase == Phase::Open || busy || rt.retry_at.is_some() {
             Glow::Active
@@ -854,6 +861,8 @@ impl Engine {
                 WakeReason::Broadcast
             };
             let mut wake_membership = false;
+            let mut wake_agent = false;
+            let mut retry_unresponsive = false;
             match self
                 .effective_delivery(target.id, channel, reason)
                 .map_err(|e| PostError::Store(e.to_string()))?
@@ -861,11 +870,24 @@ impl Engine {
                 lifecycle::DeliveryDecision::Deliver => {}
                 lifecycle::DeliveryDecision::Skip => continue,
                 lifecycle::DeliveryDecision::WakeMembership => {
-                    // An explicit ping wakes only the chat membership; global
-                    // activation is a separate, explicit user action. The wake
+                    // An explicit ping wakes the chat membership; global
+                    // activation is a separate, explicit user action unless
+                    // the agent itself is asleep (`WakeAgent`). The wake
                     // itself happens below, once the message is certain to
                     // create a trigger: one that the hop limit or ping-pong
                     // damp drops must not clear a user's forced chat sleep.
+                    wake_membership = true;
+                }
+                lifecycle::DeliveryDecision::WakeAgent => {
+                    // An explicit ping wakes a globally sleeping agent.
+                    wake_agent = true;
+                    wake_membership = true;
+                }
+                lifecycle::DeliveryDecision::RetryUnresponsive => {
+                    // Error mode notifies nothing; only an explicit ping
+                    // makes the harness try again (and it may re-enter
+                    // error mode if the retry fails).
+                    retry_unresponsive = true;
                     wake_membership = true;
                 }
             }
@@ -908,6 +930,38 @@ impl Engine {
                     Damp::Paused => continue,
                 }
             }
+            // Only now, after every drop check, may the ping change
+            // lifecycle state (see the decision above).
+            if wake_agent {
+                // An explicit ping wakes a globally sleeping agent (and
+                // clears any user-forced sleep); ping wakes are not a
+                // user-set sleep.
+                self.store
+                    .set_agent_lifecycle(target.id, LifecycleState::Active, false)
+                    .map_err(|e| PostError::Store(e.to_string()))?;
+                self.publish_status(target.id, channel);
+            }
+            if retry_unresponsive {
+                // Leave error mode to retry; a failed attempt re-enters it.
+                if self
+                    .store
+                    .agent_lifecycle(target.id)
+                    .map_err(|e| PostError::Store(e.to_string()))?
+                    != LifecycleState::Active
+                {
+                    self.store
+                        .set_agent_lifecycle(target.id, LifecycleState::Active, false)
+                        .map_err(|e| PostError::Store(e.to_string()))?;
+                }
+                let rt = self.rt.entry((target.id, channel)).or_default();
+                // Leave error mode to retry once. Sit one short of the
+                // failure limit so a successful retry resets to 0 but a
+                // failed one re-enters error mode (no auto-retry once red).
+                rt.failures = self.policy.max_failures.saturating_sub(1);
+                rt.red = None;
+                rt.retry_at = None;
+                self.publish_status(target.id, channel);
+            }
             if wake_membership {
                 // Only now, after every drop check, may the ping wake the
                 // chat membership (see the decision above).
@@ -928,14 +982,6 @@ impl Engine {
                 .map_err(|e| PostError::Store(e.to_string()))?;
             if !inserted {
                 continue;
-            }
-            if author.kind == MemberKind::Human {
-                let rt = self.rt.entry((target.id, channel)).or_default();
-                if rt.failures >= self.policy.max_failures || rt.red.is_some() {
-                    rt.failures = 0;
-                    rt.red = None;
-                    rt.retry_at = None;
-                }
             }
             woken.push(target.id);
         }
@@ -1301,13 +1347,22 @@ impl Engine {
 
     /// Full precedence check for a candidate wake: Unresponsive > global
     /// Sleeping > chat Sleeping, then the wake preference for broadcasts.
+    ///
+    /// `Unresponsive` is the error mode: it applies when the persisted
+    /// lifecycle says so OR when this channel's runtime has recorded a
+    /// failure (`rt.red`, or `max_failures` reached). In error mode nothing
+    /// is notified; an explicit ping yields
+    /// [`DeliveryDecision::RetryUnresponsive`].
     pub fn effective_delivery(
         &self,
         member: MemberId,
         channel: ChannelId,
         reason: WakeReason,
     ) -> Result<DeliveryDecision, SettingError> {
-        let global = self.agent_lifecycle(member)?;
+        let mut global = self.agent_lifecycle(member)?;
+        if global != LifecycleState::Unresponsive && self.in_error(member, channel) {
+            global = LifecycleState::Unresponsive;
+        }
         let membership = self
             .channel_memberships(member, channel)?
             .into_iter()
@@ -1319,6 +1374,16 @@ impl Engine {
             reason,
             self.wake_preference_allows(member)?,
         ))
+    }
+
+    /// Whether this agent x channel is in error mode right now: a recorded
+    /// runtime failure (harness missing, sign-in, or `max_failures`
+    /// consecutive delivery failures). Same test that renders `Glow::Unresponsive`.
+    fn in_error(&self, member: MemberId, channel: ChannelId) -> bool {
+        match self.rt.get(&(member, channel)) {
+            Some(rt) => rt.red.is_some() || rt.failures >= self.policy.max_failures,
+            None => false,
+        }
     }
 
     /// Last Stop-and-check-chat instruction for this agent in this chat.

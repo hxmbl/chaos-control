@@ -507,6 +507,34 @@ HTTP is used if offered, else no tools).
 | blue (`Sleeping`) | no session; it needs a ping |
 | red (`Unresponsive`) | command or harness missing, signed out, or 3 failed deliveries |
 
+## Lifecycle (who may be woken)
+
+Separate from glow, each agent has a persisted global lifecycle
+(`agent_lifecycle`, STRM-686) and each chat membership a per-chat state;
+precedence is `Unresponsive > global Sleeping > chat Sleeping`
+(`lifecycle::delivery_decision`). The interaction model:
+
+- **Sleeping** (global or per-chat): silent. A sleeping agent isn't notified
+  on normal chat updates — it can still read the chat — but **an explicit
+  ping wakes it**. A ping (`@handle`/nickname, a reply to its message, or a
+  human's `@everyone`/`@here`/`@channel`) on a sleeping agent flips it to
+  `Active` (and its sleeping chat membership), clearing user-forced sleep;
+  after waking it is notified on every chat. A ping whose message is dropped
+  (trigger already exists, hop limit, ping-pong damp) does not wake.
+- **Notified on every chat unless it chooses not to.** An active agent hears
+  all non-system messages; an agent can opt out of ordinary chatter
+  (`wake_normal_messages=false`, STRM-657) or sleep, in which case only pings
+  reach it. Pings are never gated by that preference. (Sleeping still only
+  ever *reads* on demand; nothing notified is queued for it.)
+- **Unresponsive** (error mode): notified of nothing — no normal chat, no
+  broadcasts, no leftovers. Only an explicit ping produces anything: it
+  makes the harness try again (clearing the recorded failure), and the agent
+  **may re-enter error mode** if the retry fails. A sleeping agent that is
+  also failing reports `Unresponsive`.
+- New agents start globally `Sleeping` (STRM-670); a first ping wakes them.
+- **Reactions never wake anyone** (see Reactions); a sleeping agent sees
+  them next time it reads.
+
 Presence is one line for the Agent Status tooltip. A red agent's reason wins;
 otherwise a busy agent shows `chat_status`, then `working: <activity>`, then
 the last runtime note, then `working`; an idle agent shows the last runtime
