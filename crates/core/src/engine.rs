@@ -261,6 +261,10 @@ struct Rt {
     /// What the agent runtime called itself in the last handshake.
     runtime: Option<Arc<str>>,
     last_status: Option<(Glow, Option<Arc<str>>)>,
+    /// Stop-and-check holds dispatch while its high-priority instruction is
+    /// in flight, so a late cancel result cannot resume queued work first.
+    /// Released (and pumped) by the caller; see [`Engine::set_dispatch_hold`].
+    hold_dispatch: bool,
 }
 
 pub struct Engine {
@@ -1257,10 +1261,33 @@ impl Engine {
         Ok(())
     }
 
-    /// Whether an agent receives normal (non-ping) broadcasts. Overridden in
-    /// the wake path by STRM-657's per-agent preference once that lands.
-    pub fn wake_preference_allows(&self, _member: MemberId) -> Result<bool, SettingError> {
-        Ok(true)
+    /// Whether an agent receives normal (non-ping) broadcasts (STRM-657).
+    /// An agent with no stored preference (not a roster model member) keeps
+    /// the default: broadcasts deliver.
+    pub fn wake_preference_allows(&self, member: MemberId) -> Result<bool, SettingError> {
+        Ok(self.member_wake_normal_messages(member)?.unwrap_or(true))
+    }
+
+    /// Whether a model member receives normal (broadcast) messages. `None` if
+    /// not a model member.
+    pub fn member_wake_normal_messages(
+        &self,
+        member: MemberId,
+    ) -> Result<Option<bool>, rusqlite::Error> {
+        crate::roster::wake_normal_messages(self.conn(), member)
+    }
+
+    /// Sets whether a model member receives normal (broadcast) messages.
+    /// Err if not a model member.
+    pub fn set_member_wake_normal_messages(
+        &mut self,
+        member: MemberId,
+        enabled: bool,
+    ) -> Result<(), SettingError> {
+        if !crate::roster::set_wake_normal_messages(self.conn(), member, enabled)? {
+            return Err(SettingError::NotModelMember);
+        }
+        Ok(())
     }
 
     /// Full precedence check for a candidate wake: Unresponsive > global
@@ -1394,6 +1421,9 @@ impl Engine {
         channel: ChannelId,
     ) -> Result<(), PostError> {
         let rt = self.rt.entry((agent, channel)).or_default();
+        if rt.hold_dispatch {
+            return Ok(());
+        }
         if rt.red.is_some() || rt.failures >= self.policy.max_failures {
             return Ok(());
         }
@@ -1517,11 +1547,22 @@ impl Engine {
         self.publish_status(agent, channel);
     }
 
+    /// Holds (or releases) dispatch of queued work for `agent` x `channel`.
+    /// Stop-and-check sets this across the interrupt-to-instruction window:
+    /// the interrupt's late cancel result settles and pumps on its own, and
+    /// must not resume queued work before the instruction reaches the
+    /// session. While held, every pump defers, so the caller must release and
+    /// pump again or pending work would be stranded.
+    pub fn set_dispatch_hold(&mut self, agent: MemberId, channel: ChannelId, hold: bool) {
+        self.rt.entry((agent, channel)).or_default().hold_dispatch = hold;
+    }
+
     /// A runtime control cancelled the in-flight turn. Settle it as cancelled
     /// without waiting for the transport's late response: a cancel can be
     /// followed immediately by a runtime instruction on the same session, and
     /// adapters that track one turn at a time drop that late response. Pending
-    /// work must still resume after the instruction.
+    /// work must still resume after the instruction. Under
+    /// [`Engine::set_dispatch_hold`] this pump defers until the release.
     pub fn settle_interrupted(&mut self, now: Millis, agent: MemberId, channel: ChannelId) {
         let Ok(Some(batch)) = self.store.in_flight_batch(agent, channel) else {
             return;
