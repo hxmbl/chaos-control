@@ -11,7 +11,12 @@
 //! gone…") is not drawn until summaries exist: a card that shimmers forever
 //! for a feature that isn't there reads as fake, and it repainted every frame.
 
-use gpui::{Context, Entity, SharedString, Window, div, prelude::*, px};
+use std::sync::Arc;
+
+use gpui::{
+    AnyElement, Context, Corner, Entity, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
+    Pixels, Point, SharedString, Window, anchored, deferred, div, prelude::*, px,
+};
 use ui::{
     ActiveTheme, Elevation, Ellipsis, IconName, Theme, Tooltip, TooltipText, TypeStyleExt,
     brand_icon, icon, pill,
@@ -20,10 +25,19 @@ use ui::{
 };
 
 use crate::{
+    lifecycle_controls::{self, LifecycleCommand},
+    lifecycle_runtime::ControlScope,
     model_picker::ModelPicker,
     pane_host::PaneHost,
     store::{ChangedFile, ChatStore, StoreEvent},
 };
+
+#[derive(Clone)]
+struct LifecycleMenu {
+    agent: model::Id,
+    name: Arc<str>,
+    position: Point<Pixels>,
+}
 
 pub struct RightSidebar {
     store: Entity<ChatStore>,
@@ -42,6 +56,10 @@ pub struct RightSidebar {
     older_changes: usize,
     /// The Agents row under the pointer (shows its remove button).
     hovered_agent: Option<model::Id>,
+    /// Open lifecycle-control menu for one agent row.
+    lifecycle_menu: Option<LifecycleMenu>,
+    /// Focus target for the menu, so Escape can dismiss it.
+    lifecycle_focus: FocusHandle,
 }
 
 impl RightSidebar {
@@ -75,7 +93,193 @@ impl RightSidebar {
             changes,
             older_changes,
             hovered_agent: None,
+            lifecycle_menu: None,
+            lifecycle_focus: cx.focus_handle(),
         }
+    }
+
+    fn open_lifecycle_menu(
+        &mut self,
+        agent: model::Id,
+        name: Arc<str>,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.lifecycle_focus.focus(window);
+        self.lifecycle_menu = Some(LifecycleMenu {
+            agent,
+            name,
+            position,
+        });
+        self.hovered_agent = Some(agent);
+        cx.notify();
+    }
+
+    fn close_lifecycle_menu(
+        &mut self,
+        restore_focus: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.lifecycle_menu.take().is_some() {
+            cx.notify();
+            if restore_focus {
+                self.lifecycle_focus.focus(window);
+            }
+        }
+    }
+
+    fn run_lifecycle_command(
+        &mut self,
+        command: LifecycleCommand,
+        scope: ControlScope,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.lifecycle_menu.take() else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.run_lifecycle_command(menu.agent, command, scope, cx);
+        });
+        cx.notify();
+    }
+
+    fn render_lifecycle_menu(&self, chat: &str, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.lifecycle_menu.as_ref()?.clone();
+        let t = *cx.theme();
+        let this = cx.entity().downgrade();
+        let item = |id: &'static str,
+                    icon_name: IconName,
+                    label: &'static str,
+                    command: LifecycleCommand,
+                    scope: ControlScope| {
+            let this = this.clone();
+            let tip = lifecycle_controls::accessible_label(
+                command,
+                &match scope {
+                    ControlScope::Global => lifecycle_controls::LifecycleScope::Global,
+                    ControlScope::Chat => {
+                        lifecycle_controls::LifecycleScope::Chat(chat.to_string())
+                    }
+                },
+                &menu.name,
+            );
+            div()
+                .id(id)
+                .px(space::X2)
+                .py(space::X1_5)
+                .rounded(radius::SM)
+                .flex()
+                .items_center()
+                .gap(space::X2)
+                .type_style(text::SMALL)
+                .text_color(t.ink)
+                .cursor_pointer()
+                .hover(|s| s.bg(t.hover))
+                .tooltip(Tooltip::text(tip))
+                .on_click(move |_, _, cx| {
+                    let (command, scope) = (command, scope);
+                    this.update(cx, |this, cx| {
+                        this.run_lifecycle_command(command, scope, cx)
+                    })
+                    .ok();
+                })
+                .child(icon(icon_name, icons::SM, t.ink_soft))
+                .child(label)
+        };
+
+        Some(
+            deferred(
+                anchored()
+                    .position(menu.position)
+                    .anchor(Corner::TopLeft)
+                    .snap_to_window_with_margin(px(8.))
+                    .child(
+                        div()
+                            .track_focus(&self.lifecycle_focus)
+                            .on_mouse_down_out(cx.listener(|this, _, window, cx| {
+                                this.close_lifecycle_menu(false, window, cx)
+                            }))
+                            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                                if event.keystroke.key.as_str() == "escape" {
+                                    cx.stop_propagation();
+                                    this.close_lifecycle_menu(true, window, cx);
+                                }
+                            }))
+                            .child(
+                                div()
+                                    .id("lifecycle-menu")
+                                    .occlude()
+                                    .min_w(px(216.))
+                                    .p(space::X1)
+                                    .rounded(radius::MD)
+                                    .bg(t.surface)
+                                    .border_1()
+                                    .border_color(t.line)
+                                    .shadow(t.elevation(Elevation::Overlay))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(space::X0_5)
+                                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                        cx.stop_propagation()
+                                    })
+                                    .child(
+                                        div()
+                                            .px(space::X2)
+                                            .pt(space::X1)
+                                            .pb(space::X0_5)
+                                            .type_style(text::CAPTION)
+                                            .text_color(t.muted)
+                                            .child(truncated(format!(
+                                                "Controls for {}",
+                                                menu.name
+                                            ))),
+                                    )
+                                    .child(item(
+                                        "lifecycle-stop-global",
+                                        IconName::Square,
+                                        "Stop · agent-wide",
+                                        LifecycleCommand::Stop,
+                                        ControlScope::Global,
+                                    ))
+                                    .child(item(
+                                        "lifecycle-stop-chat",
+                                        IconName::Square,
+                                        "Stop · in this chat",
+                                        LifecycleCommand::Stop,
+                                        ControlScope::Chat,
+                                    ))
+                                    .child(item(
+                                        "lifecycle-sleep-global",
+                                        IconName::Minus,
+                                        "Force sleep · agent-wide",
+                                        LifecycleCommand::ForceSleep,
+                                        ControlScope::Global,
+                                    ))
+                                    .child(item(
+                                        "lifecycle-sleep-chat",
+                                        IconName::Minus,
+                                        "Force sleep · in this chat",
+                                        LifecycleCommand::ForceSleep,
+                                        ControlScope::Chat,
+                                    ))
+                                    .child(item(
+                                        "lifecycle-check-chat",
+                                        IconName::ChatCircle,
+                                        "Stop and check chat",
+                                        LifecycleCommand::StopAndCheckChat,
+                                        ControlScope::Chat,
+                                    )),
+                            ),
+                    ),
+            )
+            .with_priority(10)
+            .into_any_element(),
+        )
     }
 }
 
@@ -121,6 +325,7 @@ impl Render for RightSidebar {
         // seen the newest message, a count when it is behind.
         let channel = self.store.read(cx).selected();
         let channel_name = ws.channel(channel).map(|c| c.name.clone());
+        let this = cx.entity().downgrade();
         let agents: Vec<_> = ws
             .agents
             .iter()
@@ -175,6 +380,8 @@ impl Render for RightSidebar {
         let open = self.mentions_open;
         let changes = self.changes.clone();
         let older = self.older_changes;
+        let lifecycle_menu =
+            self.render_lifecycle_menu(channel_name.as_deref().unwrap_or("this chat"), cx);
 
         div()
             .size_full()
@@ -594,7 +801,7 @@ impl Render for RightSidebar {
                                                 .min_w_0()
                                                 .ellipsis()
                                                 .type_style(text::SMALL)
-                                                .child(truncated(SharedString::from(name))),
+                                                .child(truncated(SharedString::from(name.clone()))),
                                         )
                                         // Seen everything in the open
                                         // channel: a quiet check. Behind: how
@@ -616,6 +823,47 @@ impl Render for RightSidebar {
                                                     })
                                                     .into_any_element()
                                             })
+                                        })
+                                        // Lifecycle controls stay on the agent
+                                        // row, so scope and identity are never
+                                        // ambiguous (STRM-689).
+                                        .when(hovered, |row| {
+                                            let this = this.clone();
+                                            let agent = id;
+                                            let name = name.clone();
+                                            row.child(
+                                                div()
+                                                    .id(("agent-controls", id.0 as usize))
+                                                    .flex_none()
+                                                    .size(size::CHIP)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .rounded(radius::SM)
+                                                    .hover(|s| s.bg(t.selected))
+                                                    .tooltip(Tooltip::text(format!(
+                                                        "Lifecycle controls for {name}"
+                                                    )))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        move |event: &MouseDownEvent, window, cx| {
+                                                            cx.stop_propagation();
+                                                            let position = event.position;
+                                                            let name = name.clone();
+                                                            this.update(cx, |this, cx| {
+                                                                this.open_lifecycle_menu(
+                                                                    agent, name, position, window, cx,
+                                                                )
+                                                            })
+                                                            .ok();
+                                                        },
+                                                    )
+                                                    .child(icon(
+                                                        IconName::DotsThree,
+                                                        icons::SM,
+                                                        t.ink_soft,
+                                                    )),
+                                            )
                                         })
                                         .when(hovered && removable, |row| {
                                             row.child(
@@ -680,5 +928,6 @@ impl Render for RightSidebar {
                         )
                     }),
             )
+            .children(lifecycle_menu)
     }
 }

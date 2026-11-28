@@ -28,6 +28,8 @@ use model::{
 use crate::{
     agents::{self, CoreLink, DormantMember, LinkedAgent, OpenProject},
     agents_file, chats,
+    lifecycle_controls::LifecycleCommand,
+    lifecycle_runtime::{self, ControlScope},
     project::{self, Confirm, Question, Target},
     project_context::{ProjectContext, ProjectLifecycle},
     recents,
@@ -1139,6 +1141,78 @@ impl ChatStore {
             read_at: receipt.read_at / 1000,
             behind: len.saturating_sub(read_row + 1),
         })
+    }
+
+    /// Runs a lifecycle control from the Agent Status surface and reports the
+    /// runtime's honest outcome as a local note in the channel where it was
+    /// asked. No note claims a guaranteed stop, rollback, or context compliance.
+    pub fn run_lifecycle_command(
+        &mut self,
+        agent: Id,
+        command: LifecycleCommand,
+        scope: ControlScope,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(attached) = self.core.as_ref() else {
+            self.system_note("Lifecycle controls need a running project.", cx);
+            return;
+        };
+        let Some(member) = core_member(agent) else {
+            return;
+        };
+        let core = attached.link.core.clone();
+        let generation = attached.generation;
+        let channel = self.selected;
+        let core_channel = core_channel(channel);
+        cx.spawn(async move |this, cx| {
+            let chat = if scope == ControlScope::Global {
+                None
+            } else {
+                let Some(target) = core_channel else {
+                    this.update(cx, |s, cx| {
+                        s.system_note_in(
+                            channel,
+                            "This chat has no core chat id; choose agent-wide scope.",
+                            cx,
+                        )
+                    })
+                    .ok();
+                    return;
+                };
+                match core.chats().await {
+                    Ok(chats) => chats
+                        .into_iter()
+                        .find(|c| c.targets.iter().any(|t| t.channel == target))
+                        .map(|c| c.id),
+                    Err(error) => {
+                        this.update(cx, |s, cx| {
+                            s.system_note_in(
+                                channel,
+                                &format!("Could not resolve this chat's scope: {error}"),
+                                cx,
+                            )
+                        })
+                        .ok();
+                        return;
+                    }
+                }
+            };
+            let note = match lifecycle_runtime::run(&core, member, chat, command, scope).await {
+                Ok(note) => note,
+                Err(error) => format!("{command:?} could not run: {error}"),
+            };
+            this.update(cx, move |store, cx| {
+                if store
+                    .core
+                    .as_ref()
+                    .is_some_and(|a| a.generation == generation)
+                {
+                    store.system_note_in(channel, &note, cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Agents actively working in `channel`, as `(display name, verb)` pairs in
@@ -3160,6 +3234,13 @@ impl ChatStore {
 
     /// A local notice in the selected channel (e.g. a post core refused).
     fn system_note(&mut self, body: &str, cx: &mut Context<Self>) {
+        let channel = self.selected;
+        self.system_note_in(channel, body, cx);
+    }
+
+    /// A local notice in a captured channel, so an async control result lands
+    /// where the user asked for it even if the selection changed meanwhile.
+    fn system_note_in(&mut self, channel: Id, body: &str, cx: &mut Context<Self>) {
         let id = Id(self.next_message_id);
         self.next_message_id += 1;
         let sent_at = std::time::SystemTime::now()
@@ -3174,7 +3255,7 @@ impl ChatStore {
             reply_to: None,
             stance: None,
         };
-        self.append(self.selected, vec![message], cx);
+        self.append(channel, vec![message], cx);
     }
 
     /// The sample conversation in #main (see `model::sample_history`).
@@ -3191,6 +3272,18 @@ impl ChatStore {
 
 fn channel_id(channel: ct::ChannelId) -> Id {
     Id(CORE_CHANNEL_BASE.saturating_add(channel.0 as u32))
+}
+
+fn core_channel(channel: Id) -> Option<ct::ChannelId> {
+    Some(ct::ChannelId(i64::from(
+        channel.0.checked_sub(CORE_CHANNEL_BASE)?,
+    )))
+}
+
+fn core_member(agent: Id) -> Option<ct::MemberId> {
+    Some(ct::MemberId(i64::from(
+        agent.0.checked_sub(CORE_AGENT_BASE)?,
+    )))
 }
 
 /// The picker's badge for a project without an emoji: its first letter.

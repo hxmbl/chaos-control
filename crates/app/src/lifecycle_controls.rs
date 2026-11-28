@@ -1,10 +1,9 @@
-//! STRM-689 scaffolding: agent lifecycle controls + harness-reported activity.
+//! Agent lifecycle controls + harness-reported activity (STRM-689).
 //!
-//! Pure model for the discoverable, accessible control surface. Runtime calls
-//! are an *intent seam*: this module records what the user asked for and how to
-//! present observable outcomes; it does not claim guaranteed termination or
-//! rollback. Core runtime APIs land via STRM-686/687; wiring here stays in app
-//! UI and never touches core crates.
+//! Pure model for the discoverable, accessible control surface. The UI bridge
+//! in [`crate::lifecycle_runtime`] turns a [`LifecycleCommand`] into a core
+//! runtime call and reports the honest outcome; this module keeps the shared
+//! vocabulary and never claims guaranteed termination or rollback.
 //!
 //! Contract (see chat #115 / STRM-670):
 //! - Lifecycle: `Unresponsive > global Sleeping > chat Sleeping`.
@@ -17,9 +16,8 @@
 //! - Present observable outcomes, cancellation failures, and unsupported
 //!   provider capabilities honestly.
 
-// The scaffold compiles and is tested, but nothing in the UI reaches it yet;
-// until STRM-689 wires it to the roster/card surface, everything here would
-// otherwise be dead code.
+// Presentation helpers below are the shared contract for tests and the UI; a
+// few are not constructed by the current app surface yet.
 #![allow(dead_code)]
 
 /// Which scope a lifecycle command applies to.
