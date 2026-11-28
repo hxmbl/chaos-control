@@ -1911,6 +1911,45 @@ impl Core {
         scope: LifecycleScope,
     ) -> Result<RefreshOutcome, String> {
         let channels = self.channels_for_scope(member, &scope).await?;
+        // Hold queued work off while the instruction is in flight. The
+        // interrupt's late cancel result settles and pumps on the actor; if
+        // that lands before `deliver_instruction`, queued work would resume
+        // ahead of the instruction that says "before doing anything else"
+        // (and a test's prompt order would depend on actor timing). Every
+        // pump defers until the release below, which also resumes the work.
+        let held = channels.clone();
+        self.with_engine(move |e, _| {
+            for channel in &held {
+                e.set_dispatch_hold(member, *channel, true);
+            }
+        })
+        .await?;
+        let scoped = channels.clone();
+        let outcome = self.stop_and_check_body(member, channels).await;
+        let released = self
+            .with_engine(move |e, now| {
+                for channel in &scoped {
+                    e.set_dispatch_hold(member, *channel, false);
+                    e.pump(now, member, *channel);
+                }
+            })
+            .await;
+        match outcome {
+            Ok(outcome) => {
+                released?;
+                Ok(outcome)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The interrupt -> instruction -> settle body of
+    /// [`stop_and_check_chat`], which holds dispatch around it.
+    async fn stop_and_check_body(
+        &self,
+        member: MemberId,
+        channels: Vec<ChannelId>,
+    ) -> Result<RefreshOutcome, String> {
         // Do not close the session as a fallback here: we still need it to
         // receive the instruction. Unsupported/failed interrupts are reported.
         let interruptions = self

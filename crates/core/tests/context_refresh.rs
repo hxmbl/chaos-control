@@ -141,6 +141,15 @@ async fn pending_obligations_survive_the_refresh_and_resume() {
         "the pending obligation was not lost or duplicated"
     );
     assert_eq!(h.prompts("bot").len(), 3, "one turn per hand-off");
+    // The instruction must reach the session before the queued ping resumes:
+    // prompt order decides which turn answers which hand-off, and a late
+    // cancel result used to be able to race the instruction and deliver the
+    // ping first (the reply then had no owed message to chain to).
+    assert!(
+        h.prompts("bot")[1].contains("runtime instruction"),
+        "the instruction precedes queued work; prompt 1 was: {:?}",
+        h.prompts("bot")[1]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
